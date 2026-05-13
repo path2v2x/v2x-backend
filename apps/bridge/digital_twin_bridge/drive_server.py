@@ -50,6 +50,9 @@ _traffic_actor_ids: set[int] = set()
 # Dynamic actors are individually spawned from the Add Actor panel and carry
 # session-scoped moving geofences.
 _dynamic_actor_ids: set[int] = set()
+DYNAMIC_GEOFENCE_DRAW_SEGMENTS = 32
+DYNAMIC_GEOFENCE_DRAW_LIFETIME = 0.25
+DYNAMIC_GEOFENCE_DRAW_INTERVAL = 0.10
 
 
 @dataclass
@@ -311,6 +314,7 @@ class DriveSession:
         self._accepting_frames = False  # Guard against callbacks after stop
         self._placed_objects: list = []  # User-placed objects (actor, blueprint_id, pos)
         self._dynamic_actors: dict[int, DynamicActorMeta] = {}
+        self._last_dynamic_geofence_draw = 0.0
         # Camera stream config — survives set_camera_settings respawns.
         # Default to 1:1 square to match the drive UI's split layout.
         self._camera_width = 720
@@ -568,6 +572,7 @@ class DriveSession:
             "nearby_actors": self.get_nearby_actors(),
             "dynamic_actors": self.get_dynamic_actors_snapshot(),
         }
+        self._draw_dynamic_actor_geofences()
         eva_alerts = self._check_emergency_vehicle_proximity()
         yield_alerts = self._check_yield_to_firetruck()
         all_alerts = eva_alerts + yield_alerts
@@ -1003,6 +1008,53 @@ class DriveSession:
             _dynamic_actor_ids.discard(actor_id)
 
         return snapshot
+
+    def _draw_dynamic_actor_geofences(self) -> None:
+        """Draw moving dynamic actor geofence outlines in CARLA debug view."""
+        if not self._dynamic_actors:
+            return
+
+        now = time.monotonic()
+        if now - self._last_dynamic_geofence_draw < DYNAMIC_GEOFENCE_DRAW_INTERVAL:
+            return
+        self._last_dynamic_geofence_draw = now
+
+        try:
+            import carla
+            color = carla.Color(255, 60, 60, 220)
+        except Exception:
+            return
+
+        for actor_id, meta in list(self._dynamic_actors.items()):
+            actor = self._world.get_actor(actor_id)
+            if actor is None or getattr(actor, "is_destroyed", False):
+                continue
+
+            radius = float(meta.geofence_radius)
+            if not math.isfinite(radius) or radius <= 0:
+                continue
+
+            try:
+                center = actor.get_transform().location
+                z = center.z + 0.20
+                points = [
+                    carla.Location(
+                        x=center.x + math.cos((2 * math.pi * i) / DYNAMIC_GEOFENCE_DRAW_SEGMENTS) * radius,
+                        y=center.y + math.sin((2 * math.pi * i) / DYNAMIC_GEOFENCE_DRAW_SEGMENTS) * radius,
+                        z=z,
+                    )
+                    for i in range(DYNAMIC_GEOFENCE_DRAW_SEGMENTS)
+                ]
+                for i, start in enumerate(points):
+                    self._world.debug.draw_line(
+                        start,
+                        points[(i + 1) % len(points)],
+                        thickness=0.12,
+                        color=color,
+                        life_time=DYNAMIC_GEOFENCE_DRAW_LIFETIME,
+                    )
+            except Exception as e:
+                logger.debug("Failed to draw dynamic geofence for actor %d: %s", actor_id, e)
 
     def _destroy_dynamic_actor(self, actor_id: int) -> bool:
         actor = self._world.get_actor(actor_id)

@@ -455,6 +455,38 @@ class TestDynamicActorGeofences:
         assert telemetry["nearby_actors"][0]["type"] == "dynamic"
 
     @pytest.mark.asyncio
+    async def test_dynamic_actor_geofence_is_drawn_in_carla(self, mock_world, fake_v2x_api):
+        from digital_twin_bridge.drive_server import DriveSession
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+        spawned = session.spawn_dynamic_actor(
+            blueprint_id="vehicle.carlamotors.firetruck",
+            geofence_radius=20.0,
+            message="Firefighter response vehicle active",
+        )
+
+        actor = mock_world.get_actor(spawned["actor"]["actor_id"])
+        actor.set_transform(type(actor.get_transform())(
+            location=type(actor.get_transform().location)(10, 20, 0),
+            rotation=actor.get_transform().rotation,
+        ))
+
+        session.apply_control(steer=0.0, throttle=0.0, brake=0.0)
+
+        assert len(mock_world.debug.lines) == 32
+        first_line = mock_world.debug.lines[0]
+        assert first_line["thickness"] == 0.12
+        assert first_line["life_time"] == 0.25
+        assert first_line["color"].r == 255
+        assert first_line["color"].g == 60
+        assert first_line["color"].b == 60
+
+    @pytest.mark.asyncio
     async def test_dynamic_actor_radius_is_clamped(self, mock_world, fake_v2x_api):
         from digital_twin_bridge.drive_server import DriveSession
 

@@ -61,6 +61,28 @@ class MockVehiclePhysicsControl:
     max_rpm = 6000.0
 
 
+@dataclass
+class MockColor:
+    r: int = 0
+    g: int = 0
+    b: int = 0
+    a: int = 255
+
+
+class MockDebugHelper:
+    def __init__(self):
+        self.lines: list[dict[str, Any]] = []
+
+    def draw_line(self, start, end, thickness=0.1, color=None, life_time=0.0) -> None:
+        self.lines.append({
+            "start": start,
+            "end": end,
+            "thickness": thickness,
+            "color": color,
+            "life_time": life_time,
+        })
+
+
 class MockActor:
     """Mock CARLA actor (vehicle or prop)."""
 
@@ -219,6 +241,7 @@ class MockWorld:
         self._map = MockMap()
         self._tick_count = 0
         self._blueprint_library = MockBlueprintLibrary()
+        self.debug = MockDebugHelper()
 
     def get_map(self) -> MockMap:
         return self._map
@@ -347,6 +370,7 @@ def _install_fake_carla_module() -> None:
     fake_carla.Transform = MockTransform
     fake_carla.VehicleControl = MockVehicleControl
     fake_carla.Vector3D = MockLocation
+    fake_carla.Color = MockColor
     fake_carla.Client = MockCarlaClient
     fake_carla.Map = MockMap
     fake_carla.World = MockWorld
