@@ -13,6 +13,8 @@ export interface RuntimeConfig {
 	mapDataPath: string;
 	demoVideosPath: string;
 	videoCameraIds: string[];
+	cloudflareDriveWsUrl: string;
+	tailscaleDriveWsUrl: string;
 }
 
 const DEFAULT_CONFIG: RuntimeConfig = {
@@ -27,7 +29,9 @@ const DEFAULT_CONFIG: RuntimeConfig = {
 	statePath: '/state',
 	mapDataPath: '/map-data',
 	demoVideosPath: '/demo-videos',
-	videoCameraIds: ['ch1', 'ch2', 'ch3', 'ch4']
+	videoCameraIds: ['ch1', 'ch2', 'ch3', 'ch4'],
+	cloudflareDriveWsUrl: '',
+	tailscaleDriveWsUrl: 'wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net'
 };
 
 let configPromise: Promise<RuntimeConfig> | null = null;
@@ -70,7 +74,9 @@ function normalizeConfig(config: Partial<RuntimeConfig>): RuntimeConfig {
 		statePath: withDefaultPath(config.statePath, DEFAULT_CONFIG.statePath),
 		mapDataPath: withDefaultPath(config.mapDataPath, DEFAULT_CONFIG.mapDataPath),
 		demoVideosPath: withDefaultPath(config.demoVideosPath, DEFAULT_CONFIG.demoVideosPath),
-		videoCameraIds: config.videoCameraIds || DEFAULT_CONFIG.videoCameraIds
+		videoCameraIds: config.videoCameraIds || DEFAULT_CONFIG.videoCameraIds,
+		cloudflareDriveWsUrl: config.cloudflareDriveWsUrl || DEFAULT_CONFIG.cloudflareDriveWsUrl,
+		tailscaleDriveWsUrl: config.tailscaleDriveWsUrl || DEFAULT_CONFIG.tailscaleDriveWsUrl
 	};
 }
 

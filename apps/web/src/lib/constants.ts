@@ -1,3 +1,5 @@
+import type { RuntimeConfig } from './runtime-config';
+
 export const MAP_CENTER = { lat: 37.915, lon: -122.335 };
 
 export const DEFAULT_ZOOM = 16;
@@ -30,29 +32,55 @@ export const SNAPSHOT_PLACEHOLDER =
 
 // ── Drive Mode Constants ──
 
-const TAILSCALE_DRIVE_WS_URL =
+const DEFAULT_TAILSCALE_DRIVE_WS_URL =
 	import.meta.env.VITE_TAILSCALE_DRIVE_WS_URL ??
 	'wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net';
 
-const CLOUDFLARE_DRIVE_WS_URL =
+const DEFAULT_CLOUDFLARE_DRIVE_WS_URL =
 	import.meta.env.VITE_CLOUDFLARE_DRIVE_WS_URL ?? import.meta.env.VITE_DRIVE_WS_URL;
 
-export const DRIVE_TUNNELS = [
-	...(CLOUDFLARE_DRIVE_WS_URL
-		? [{
-				id: 'cloudflare' as const,
-				label: 'Cloudflare',
-				url: CLOUDFLARE_DRIVE_WS_URL,
-			}]
-		: []),
-	{
-		id: 'tailscale',
-		label: 'Tailscale',
-		url: TAILSCALE_DRIVE_WS_URL,
-	},
-] as const;
+export interface DriveTunnel {
+	id: string;
+	label: string;
+	url: string;
+}
 
-export type TunnelId = (typeof DRIVE_TUNNELS)[number]['id'];
+function normalizeWsUrl(url: string | undefined): string {
+	if (!url) return '';
+	return url.trim().replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://');
+}
+
+export function buildDriveTunnels(
+	config?: Pick<RuntimeConfig, 'cloudflareDriveWsUrl' | 'tailscaleDriveWsUrl'>
+): DriveTunnel[] {
+	const cloudflareDriveWsUrl = normalizeWsUrl(
+		config?.cloudflareDriveWsUrl || DEFAULT_CLOUDFLARE_DRIVE_WS_URL
+	);
+	const tailscaleDriveWsUrl = normalizeWsUrl(
+		config?.tailscaleDriveWsUrl || DEFAULT_TAILSCALE_DRIVE_WS_URL
+	);
+
+	return [
+		...(cloudflareDriveWsUrl
+			? [
+					{
+						id: 'cloudflare',
+						label: 'Cloudflare',
+						url: cloudflareDriveWsUrl
+					}
+				]
+			: []),
+		{
+			id: 'tailscale',
+			label: 'Tailscale',
+			url: tailscaleDriveWsUrl
+		}
+	] satisfies DriveTunnel[];
+}
+
+export const DRIVE_TUNNELS = buildDriveTunnels();
+
+export type TunnelId = DriveTunnel['id'];
 
 export const DRIVE_WS_URL: string = DRIVE_TUNNELS[0].url;
 

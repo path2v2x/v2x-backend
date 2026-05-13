@@ -25,6 +25,8 @@ Optional:
 - `STATE_BUCKET` is only needed if you explicitly want to point the dashboard at raw bucket URLs
 - `STATE_PATH` defaults to `/state`
 - `MAP_DATA_PATH` defaults to `/map-data`
+- `CLOUDFLARE_DRIVE_WS_URL` adds the Cloudflare drive WebSocket tunnel to `/drive`
+- `TAILSCALE_DRIVE_WS_URL` defaults to `wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net`
 
 ## Destroy
 

@@ -24,6 +24,8 @@ STATE_PATH="${STATE_PATH:-/state}"
 MAP_DATA_PATH="${MAP_DATA_PATH:-/map-data}"
 VIDEO_CAMERA_IDS="${VIDEO_CAMERA_IDS:-[\"ch1\",\"ch2\",\"ch3\",\"ch4\"]}"
 DEMO_VIDEOS_PATH="${DEMO_VIDEOS_PATH:-/demo-videos}"
+CLOUDFLARE_DRIVE_WS_URL="${CLOUDFLARE_DRIVE_WS_URL:-${VITE_CLOUDFLARE_DRIVE_WS_URL:-${VITE_DRIVE_WS_URL:-}}}"
+TAILSCALE_DRIVE_WS_URL="${TAILSCALE_DRIVE_WS_URL:-${VITE_TAILSCALE_DRIVE_WS_URL:-wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net}}"
 
 if [[ -z "${API_BASE_URL}" ]]; then
   echo "API_BASE_URL is required (from provision-read-api.sh output)." >&2
@@ -57,7 +59,9 @@ cat > "${BUILD_DIR}/config.json" <<JSON
   "statePath": "${STATE_PATH}",
   "mapDataPath": "${MAP_DATA_PATH}",
   "demoVideosPath": "${DEMO_VIDEOS_PATH}",
-  "videoCameraIds": ${VIDEO_CAMERA_IDS}
+  "videoCameraIds": ${VIDEO_CAMERA_IDS},
+  "cloudflareDriveWsUrl": "${CLOUDFLARE_DRIVE_WS_URL}",
+  "tailscaleDriveWsUrl": "${TAILSCALE_DRIVE_WS_URL}"
 }
 JSON
 

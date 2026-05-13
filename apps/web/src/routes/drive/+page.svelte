@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { DRIVE_TUNNELS, type TunnelId } from '$lib/constants';
+	import { DRIVE_TUNNELS, buildDriveTunnels, type DriveTunnel, type TunnelId } from '$lib/constants';
 	import type { CameraView, SpawnableObject } from '$lib/types';
 
 	import {
@@ -71,6 +71,7 @@
 	import { syncV2xZones } from '$lib/stores/driveSocket';
 	import { shouldSyncZone } from '$lib/zoneRules';
 	import { fetchMapDataFull, type MapDataResponse } from '$lib/api';
+	import { loadRuntimeConfig } from '$lib/runtime-config';
 
 	type InputMode = 'wheel' | 'keyboard';
 
@@ -79,6 +80,7 @@
 	let controlLoopId = $state<number | null>(null);
 	let inputMode = $state<InputMode>('keyboard');
 	let cameraViewRef = $state<CameraViewComponent | null>(null);
+	let driveTunnels = $state<DriveTunnel[]>(DRIVE_TUNNELS);
 	let selectedTunnel = $state<TunnelId>(DRIVE_TUNNELS[0].id);
 	let selectedVehicle = $state('vehicle.tesla.model3');
 	let showObjectPlacer = $state(false);
@@ -166,7 +168,7 @@
 	);
 
 	function getSelectedUrl(): string {
-		return DRIVE_TUNNELS.find(t => t.id === selectedTunnel)?.url ?? DRIVE_TUNNELS[0].url;
+		return driveTunnels.find(t => t.id === selectedTunnel)?.url ?? driveTunnels[0].url;
 	}
 
 	function switchTunnel(id: TunnelId) {
@@ -215,6 +217,14 @@
 	onMount(async () => {
 		startPolling();
 		startKeyboardInput();
+		try {
+			const config = await loadRuntimeConfig();
+			driveTunnels = buildDriveTunnels(config);
+			selectedTunnel = driveTunnels[0].id;
+		} catch {
+			driveTunnels = DRIVE_TUNNELS;
+			selectedTunnel = driveTunnels[0].id;
+		}
 		connect(getSelectedUrl());
 
 		setOnFrame((blob: Blob) => {
@@ -517,7 +527,7 @@
 					<div class="mb-4">
 						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Tunnel</label>
 						<div class="flex bg-gray-800/50 rounded-xl p-1 border border-gray-800">
-							{#each DRIVE_TUNNELS as tunnel}
+							{#each driveTunnels as tunnel}
 								<button onclick={() => switchTunnel(tunnel.id)}
 									class="flex-1 px-3 py-2 rounded-lg text-xs font-body tracking-wider transition-all duration-200 cursor-pointer
 									{selectedTunnel === tunnel.id
