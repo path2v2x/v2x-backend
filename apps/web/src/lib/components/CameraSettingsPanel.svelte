@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { setCameraSettings } from '$lib/stores/driveSocket';
+	import { setCameraSettings, cameraAspect } from '$lib/stores/driveSocket';
 
 	interface Props {
 		onClose: () => void;
@@ -37,6 +37,9 @@
 		if (busy) return;
 		busy = true;
 		activeAspect = preset.id;
+		// Drive the visible viewport shape (frontend) and the CARLA capture
+		// resolution (bridge) from the same preset.
+		cameraAspect.set({ w: preset.width, h: preset.height });
 		setCameraSettings({
 			image_size_x: preset.width,
 			image_size_y: preset.height,

@@ -51,6 +51,7 @@
 		undoPlace,
 		undoV2xSignal,
 		setOnFrame,
+		cameraAspect,
 	} from '$lib/stores/driveSocket';
 
 	import CalibrationWizard from '$lib/components/CalibrationWizard.svelte';
@@ -689,7 +690,12 @@
 			<div class="flex flex-col flex-1 min-w-0 min-h-0 h-full">
 				<!-- Camera area (takes remaining height; absolute children overlay it) -->
 			<div class="relative flex-1 min-w-0 min-h-0 overflow-hidden">
-				<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
+				<!-- Aspect-constrained camera viewport: container reshapes with the chosen aspect preset -->
+				<div class="absolute inset-0 flex items-center justify-center">
+					<div style="height: 100%; max-width: 100%; aspect-ratio: {$cameraAspect.w} / {$cameraAspect.h};">
+						<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
+					</div>
+				</div>
 				<HudOverlay telemetry={currentTelemetry} isRecording={true} />
 
 				{#if mapMode === 'overlay' && mapData}

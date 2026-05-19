@@ -40,6 +40,10 @@ export const scenarioList = writable<ScenarioInfo[]>([]);
 export const v2xSignals = writable<V2xSignal[]>([]);
 export const v2xSignalCount = writable<number>(0);
 export const v2xAlerts = writable<V2xAlert[]>([]);
+
+/** Current camera frame aspect (drives the camera viewport's visible shape).
+ * Defaults to 1:1 to match the bridge's default 720x720 capture. */
+export const cameraAspect = writable<{ w: number; h: number }>({ w: 1, h: 1 });
 export const trajectoryList = writable<TrajectoryInfo[]>([]);
 export const trajectoryStatus = writable<TrajectoryStatus>({ active: false });
 export const dynamicActors = writable<DynamicActor[]>([]);

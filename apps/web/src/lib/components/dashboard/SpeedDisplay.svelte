@@ -15,19 +15,44 @@
 </script>
 
 <div
-	class="flex flex-col items-center justify-center select-none"
+	class="relative flex flex-col items-center justify-center select-none"
 	data-testid="speed-display"
 >
+	<!-- Soft radial glow behind the speed numeral -->
+	<div
+		class="absolute inset-0 pointer-events-none"
+		style="
+			background: radial-gradient(
+				ellipse at center,
+				rgba(62, 130, 247, 0.10) 0%,
+				rgba(62, 130, 247, 0.04) 35%,
+				transparent 70%
+			);
+			filter: blur(2px);
+		"
+		aria-hidden="true"
+	></div>
+
 	<span
-		class="font-tesla font-medium leading-none tracking-tight text-white tabular-nums"
-		style="font-size: clamp(3rem, 9vw, 6rem); font-feature-settings: 'tnum';"
+		class="relative font-tesla font-semibold leading-[0.9] tracking-tight text-white tabular-nums"
+		style="
+			font-size: clamp(4rem, 10vw, 7.5rem);
+			font-feature-settings: 'tnum', 'ss01';
+			text-shadow:
+				0 0 18px rgba(255, 255, 255, 0.32),
+				0 0 38px rgba(62, 130, 247, 0.18),
+				0 2px 0 rgba(0, 0, 0, 0.6);
+		"
 		data-testid="speed-value"
 	>
 		{displayed}
 	</span>
 	<span
-		class="font-tesla mt-1 text-xs uppercase tracking-[0.18em]"
-		style="color: var(--color-tesla-text-secondary);"
+		class="relative font-tesla mt-1 text-[11px] uppercase tracking-[0.32em] font-medium"
+		style="
+			color: var(--color-tesla-text-secondary);
+			text-shadow: 0 1px 0 rgba(0, 0, 0, 0.6);
+		"
 		data-testid="speed-unit"
 	>
 		{label}

@@ -18,7 +18,7 @@
 
 <div
 	class="font-tesla flex select-none {orientation === 'row'
-		? 'flex-row gap-2 sm:gap-3 items-baseline'
+		? 'flex-row gap-2 sm:gap-3 items-center'
 		: 'flex-col gap-1 items-center'}"
 	data-testid="gear-column"
 	role="group"
@@ -27,12 +27,18 @@
 	{#each GEARS as gear}
 		{@const isActive = gear === active}
 		<span
-			class="font-medium leading-none tracking-wide transition-colors duration-200"
-			class:is-active={isActive}
+			class="relative font-bold leading-none tracking-wide transition-all duration-200 flex items-center justify-center"
 			style="
-				font-size: 1.5rem;
-				color: {isActive ? 'var(--color-tesla-text)' : 'var(--color-tesla-text-muted)'};
+				font-size: 1.4rem;
+				width: 1.9rem;
+				height: 1.9rem;
+				color: {isActive ? '#ffffff' : 'var(--color-tesla-text-muted)'};
 				opacity: {isActive ? 1 : 0.35};
+				background: {isActive
+					? 'radial-gradient(circle at center, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0) 70%)'
+					: 'transparent'};
+				border-radius: 0.4rem;
+				text-shadow: {isActive ? '0 0 10px rgba(255,255,255,0.55)' : 'none'};
 			"
 			data-testid="gear-{gear.toLowerCase()}"
 			data-active={isActive}

@@ -33,7 +33,6 @@
 
 	let { telemetry, warnings = [], now, speedUnit = 'mph' }: Props = $props();
 
-	// Internal tick: re-evaluate fade state every ~150ms when `now` not injected.
 	let tick = $state(Date.now());
 	let timerId: ReturnType<typeof setInterval> | null = null;
 
@@ -51,7 +50,6 @@
 
 	const effectiveNow = $derived(now ?? tick);
 
-	// Derived telemetry pieces with safe defaults so first paint is never blank.
 	const speed = $derived(telemetry?.speed ?? 0);
 	const gear = $derived(gearFromCarla(telemetry?.gear ?? 1));
 	const throttle = $derived(telemetry?.throttle ?? 0);
@@ -67,20 +65,51 @@
 </script>
 
 <div
-	class="flex w-full h-full font-tesla overflow-hidden"
-	style="background: var(--color-tesla-bg); border-top: 1px solid var(--color-tesla-divider);"
+	class="relative flex w-full h-full font-tesla overflow-hidden"
+	style="
+		background: linear-gradient(180deg, #050608 0%, #0a0a0c 25%, #14171c 100%);
+		box-shadow:
+			inset 0 1px 0 rgba(255, 255, 255, 0.04),
+			inset 0 14px 28px -16px rgba(0, 0, 0, 0.85);
+	"
 	data-testid="driver-dashboard"
 >
-	<!-- Left: instrument cluster -->
+	<!-- Top recessed-screen highlight -->
 	<div
-		class="shrink-0"
-		style="width: 50%; min-width: 0; border-right: 1px solid var(--color-tesla-divider);"
-	>
+		class="absolute top-0 left-0 right-0 h-[2px] pointer-events-none"
+		style="
+			background: linear-gradient(90deg,
+				transparent 0%,
+				rgba(255, 255, 255, 0.08) 18%,
+				rgba(62, 130, 247, 0.28) 50%,
+				rgba(255, 255, 255, 0.08) 82%,
+				transparent 100%);
+		"
+		aria-hidden="true"
+	></div>
+
+	<!-- Left: instrument cluster -->
+	<div class="shrink-0" style="width: 50%; min-width: 0;">
 		<InstrumentCluster {speed} {gear} {throttle} {brake} {steer} {speedUnit} />
 	</div>
 
+	<!-- Center divider with subtle glow -->
+	<div
+		class="shrink-0 self-stretch w-px relative"
+		style="background: linear-gradient(180deg, transparent 0%, rgba(255,255,255,0.18) 50%, transparent 100%);"
+		aria-hidden="true"
+	>
+		<div
+			class="absolute inset-y-4 left-0 w-px"
+			style="
+				background: linear-gradient(180deg, transparent 0%, rgba(62, 130, 247, 0.55) 50%, transparent 100%);
+				filter: blur(2px);
+			"
+		></div>
+	</div>
+
 	<!-- Right: center stack (viz + warnings) -->
-	<div class="grow" style="min-width: 0;">
+	<div class="grow relative" style="min-width: 0;">
 		<CenterStack
 			{egoPos}
 			{egoYaw}
