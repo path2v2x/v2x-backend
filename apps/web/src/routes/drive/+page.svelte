@@ -56,6 +56,7 @@
 	import CalibrationWizard from '$lib/components/CalibrationWizard.svelte';
 	import CameraViewComponent from '$lib/components/CameraView.svelte';
 	import HudOverlay from '$lib/components/HudOverlay.svelte';
+	import DriverDashboardConnected from '$lib/components/dashboard/DriverDashboardConnected.svelte';
 	// V2xToast removed — warnings now stack into the DriverDashboard center stack.
 	import V2xSignalPlacer from '$lib/components/V2xSignalPlacer.svelte';
 	import V2xZoneEditor from '$lib/components/V2xZoneEditor.svelte';
@@ -682,9 +683,11 @@
 		</div>
 
 	{:else if state === 'driving'}
-		<!-- Tesla-style split layout: camera left, map right -->
+		<!-- Tesla-style split layout: (camera + dashboard) left, map right -->
 		<div class="flex h-full w-full">
-			<!-- Left: Camera feed + HUD -->
+			<!-- Left column: camera viewport + Tesla dashboard strip -->
+			<div class="flex flex-col flex-1 min-w-0">
+				<!-- Camera area (takes remaining height; absolute children overlay it) -->
 			<div class="relative flex-1 min-w-0">
 				<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
 				<HudOverlay telemetry={currentTelemetry} isRecording={true} />
@@ -814,6 +817,12 @@
 				{#if showTrajectoryPanel}
 					<TrajectoryPanel onClose={() => { showTrajectoryPanel = false; }} />
 				{/if}
+			</div>
+
+			<!-- Tesla-style driver dashboard strip below the camera viewport -->
+				<div class="shrink-0" style="height: 200px;">
+					<DriverDashboardConnected />
+				</div>
 			</div>
 
 			<!-- Draggable divider -->
