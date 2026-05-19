@@ -686,9 +686,9 @@
 		<!-- Tesla-style split layout: (camera + dashboard) left, map right -->
 		<div class="flex h-full w-full">
 			<!-- Left column: camera viewport + Tesla dashboard strip -->
-			<div class="flex flex-col flex-1 min-w-0">
+			<div class="flex flex-col flex-1 min-w-0 min-h-0 h-full">
 				<!-- Camera area (takes remaining height; absolute children overlay it) -->
-			<div class="relative flex-1 min-w-0">
+			<div class="relative flex-1 min-w-0 min-h-0 overflow-hidden">
 				<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
 				<HudOverlay telemetry={currentTelemetry} isRecording={true} />
 
