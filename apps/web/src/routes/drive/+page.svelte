@@ -826,7 +826,7 @@
 			</div>
 
 			<!-- Tesla-style driver dashboard strip below the camera viewport -->
-				<div class="shrink-0" style="height: 200px;">
+				<div class="shrink-0" style="height: 260px;">
 					<DriverDashboardConnected />
 				</div>
 			</div>

@@ -48,13 +48,13 @@ describe('VehicleVisualization', () => {
 				radiusM: 30,
 			},
 		});
-		// ego is centered at SVG (120, 90). Actor 10m forward (+x) → SVG up (smaller y).
+		// ego sits at SVG (130, 127.6). Actor 10m forward (+x) → SVG up (smaller y).
 		const g = getByTestId('nearby-1');
 		const transform = g.getAttribute('transform') || '';
 		const match = transform.match(/translate\(([\d.\-]+),([\d.\-]+)\)/);
 		expect(match).not.toBeNull();
 		const sy = parseFloat(match![2]);
-		expect(sy).toBeLessThan(90);
+		expect(sy).toBeLessThan(128);
 	});
 
 	it('projects an actor directly to ego right (yaw=0) to the right on SVG', () => {
@@ -72,8 +72,8 @@ describe('VehicleVisualization', () => {
 		const match = transform.match(/translate\(([\d.\-]+),([\d.\-]+)\)/);
 		expect(match).not.toBeNull();
 		const sx = parseFloat(match![1]);
-		// Ego right (+y_world when egoYaw=0) → SVG +x. Should be greater than center 120.
-		expect(sx).toBeGreaterThan(120);
+		// Ego right (+y_world when egoYaw=0) → SVG +x. Should be greater than center (130).
+		expect(sx).toBeGreaterThan(130);
 	});
 
 	it('rotates front wheels with steer input', () => {
@@ -111,6 +111,6 @@ describe('VehicleVisualization', () => {
 		const match = transform.match(/translate\(([\d.\-]+),([\d.\-]+)\)/);
 		expect(match).not.toBeNull();
 		const sy = parseFloat(match![2]);
-		expect(sy).toBeLessThan(90);
+		expect(sy).toBeLessThan(128);
 	});
 });

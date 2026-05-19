@@ -1,10 +1,10 @@
 <script lang="ts">
 	/**
-	 * Top-down stylized vehicle visualization, Tesla driver-block style.
+	 * Top-down stylized vehicle visualization (Tesla driver-block aesthetic).
 	 *
-	 * Ego car is always centered on the SVG pointing up. Nearby actors
-	 * are projected into the ego's local frame and drawn as rounded
-	 * rectangles. Ego's front wheels turn with the `steer` input.
+	 * Ego car is always centered on the SVG pointing up. Lane stripes flank
+	 * the ego, soft headlight beams project forward, surrounding traffic is
+	 * projected into the ego's local frame. Front wheels rotate with steer.
 	 */
 
 	export interface NearbyActor {
@@ -15,16 +15,13 @@
 	}
 
 	interface Props {
-		/** Ego position in world coords, [x, y] meters. */
 		egoPos: [number, number];
-		/** Ego yaw in degrees (CARLA convention). */
 		egoYaw: number;
-		/** Steering input in [-1, 1]. Drives front-wheel rotation. */
 		steer: number;
-		/** Other vehicles within range, from bridge telemetry. */
 		nearby?: NearbyActor[];
-		/** Visibility radius in meters. */
 		radiusM?: number;
+		/** Show headlight beams (typically when moving forward or low light). */
+		showHeadlights?: boolean;
 	}
 
 	let {
@@ -33,16 +30,15 @@
 		steer = 0,
 		nearby = [],
 		radiusM = 30,
+		showHeadlights = true,
 	}: Props = $props();
 
-	// SVG viewport
-	const VIEW_W = 240;
-	const VIEW_H = 200;
+	const VIEW_W = 260;
+	const VIEW_H = 220;
 	const CENTER_X = VIEW_W / 2;
-	const CENTER_Y = VIEW_H / 2;
+	const CENTER_Y = VIEW_H * 0.58; // bias ego slightly low so more road shows ahead
 	const PX_PER_M = $derived(Math.min(VIEW_W / 2, VIEW_H / 2) / radiusM);
 
-	// Ego car silhouette (Tesla Model 3-ish proportions)
 	const EGO_LEN_M = 4.7;
 	const EGO_WID_M = 1.85;
 	const egoLenPx = $derived(EGO_LEN_M * PX_PER_M);
@@ -91,7 +87,7 @@
 		return result;
 	});
 
-	// Subtle "sensor pulse" animation around the ego — Tesla active-perception accent.
+	// Sensor pulse animation
 	let pulse = $state(0);
 	$effect(() => {
 		const start = performance.now();
@@ -104,7 +100,10 @@
 		return () => cancelAnimationFrame(raf);
 	});
 	const pulseRadius = $derived(egoLenPx * 0.6 + pulse * egoLenPx * 1.8);
-	const pulseOpacity = $derived(0.25 * (1 - pulse));
+	const pulseOpacity = $derived(0.22 * (1 - pulse));
+
+	// Lane geometry: two stripes flanking the ego at ~1.6m offset (typical lane half-width).
+	const laneOffsetPx = $derived(EGO_WID_M * 1.05 * PX_PER_M);
 </script>
 
 <svg
@@ -115,59 +114,114 @@
 	aria-label="Surrounding traffic visualization"
 >
 	<defs>
-		<!-- Subtle background gradient: top darker, bottom slightly lighter -->
-		<linearGradient id="viz-bg" x1="0%" y1="0%" x2="0%" y2="100%">
-			<stop offset="0%" stop-color="#0a0a0c" />
-			<stop offset="100%" stop-color="#14171c" />
-		</linearGradient>
+		<!-- Background: deep blue-black with a warmer road tint near ego -->
+		<radialGradient id="viz-bg" cx="50%" cy="58%" r="60%">
+			<stop offset="0%" stop-color="#1c2230" />
+			<stop offset="60%" stop-color="#0e1015" />
+			<stop offset="100%" stop-color="#050608" />
+		</radialGradient>
 
-		<!-- Ego car body gradient (light grey, slightly warmer at front) -->
+		<!-- Ego car body gradient -->
 		<linearGradient id="ego-body" x1="0%" y1="0%" x2="0%" y2="100%">
-			<stop offset="0%" stop-color="#d8dbe0" />
+			<stop offset="0%" stop-color="#dde0e6" />
 			<stop offset="100%" stop-color="#a8aeb8" />
 		</linearGradient>
 
-		<!-- Windshield gradient (cool dark with subtle gloss) -->
+		<!-- Glass gradient (cool dark, subtle gloss) -->
 		<linearGradient id="ego-glass" x1="0%" y1="0%" x2="0%" y2="100%">
-			<stop offset="0%" stop-color="rgba(80, 100, 130, 0.85)" />
+			<stop offset="0%" stop-color="rgba(90, 115, 150, 0.85)" />
 			<stop offset="50%" stop-color="rgba(20, 28, 40, 0.92)" />
-			<stop offset="100%" stop-color="rgba(50, 70, 100, 0.78)" />
+			<stop offset="100%" stop-color="rgba(60, 80, 110, 0.78)" />
 		</linearGradient>
-
-		<!-- Drop-shadow filter for the ego car -->
-		<filter id="ego-shadow" x="-50%" y="-50%" width="200%" height="200%">
-			<feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.7" />
-		</filter>
 
 		<!-- Traffic vehicle gradient -->
 		<linearGradient id="traffic-body" x1="0%" y1="0%" x2="0%" y2="100%">
-			<stop offset="0%" stop-color="#6a7280" />
-			<stop offset="100%" stop-color="#454c57" />
+			<stop offset="0%" stop-color="#737a86" />
+			<stop offset="100%" stop-color="#3f454f" />
 		</linearGradient>
 
-		<!-- Soft radial fade so the edge of visibility softly dims -->
-		<radialGradient id="viz-fade" cx="50%" cy="50%" r="50%">
+		<!-- Drop-shadow filter for ego -->
+		<filter id="ego-shadow" x="-50%" y="-50%" width="200%" height="200%">
+			<feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity="0.75" />
+		</filter>
+
+		<!-- Edge fade -->
+		<radialGradient id="viz-fade" cx="50%" cy="58%" r="55%">
 			<stop offset="0%" stop-color="rgba(255,255,255,0)" />
-			<stop offset="80%" stop-color="rgba(10,10,12,0.0)" />
-			<stop offset="100%" stop-color="rgba(10,10,12,0.95)" />
+			<stop offset="80%" stop-color="rgba(5, 6, 8, 0.0)" />
+			<stop offset="100%" stop-color="rgba(5, 6, 8, 0.95)" />
+		</radialGradient>
+
+		<!-- Headlight beam cone gradient -->
+		<radialGradient id="headlight-beam" cx="50%" cy="100%" r="100%">
+			<stop offset="0%" stop-color="rgba(255, 246, 200, 0.45)" />
+			<stop offset="55%" stop-color="rgba(255, 246, 200, 0.12)" />
+			<stop offset="100%" stop-color="rgba(255, 246, 200, 0)" />
 		</radialGradient>
 	</defs>
 
 	<!-- Background -->
 	<rect width={VIEW_W} height={VIEW_H} fill="url(#viz-bg)" />
 
-	<!-- Faint road grid lines (parallel to ego's forward direction) -->
-	<g opacity="0.08" stroke="#ffffff" stroke-width="0.5">
-		{#each [-2, -1, 0, 1, 2] as i}
-			<line
-				x1={CENTER_X + i * egoWidPx * 1.2}
-				y1="0"
-				x2={CENTER_X + i * egoWidPx * 1.2}
-				y2={VIEW_H}
-				stroke-dasharray="4 6"
-			/>
-		{/each}
+	<!-- Lane stripes (white dashed, parallel to ego forward) -->
+	<g opacity="0.65" stroke="#e8ecf2" stroke-width="2" stroke-linecap="round" pointer-events="none">
+		<line
+			x1={CENTER_X - laneOffsetPx}
+			y1="0"
+			x2={CENTER_X - laneOffsetPx}
+			y2={VIEW_H}
+			stroke-dasharray="10 14"
+		/>
+		<line
+			x1={CENTER_X + laneOffsetPx}
+			y1="0"
+			x2={CENTER_X + laneOffsetPx}
+			y2={VIEW_H}
+			stroke-dasharray="10 14"
+		/>
 	</g>
+
+	<!-- Outer faint road grid (suggests wider road) -->
+	<g opacity="0.18" stroke="#ffffff" stroke-width="0.6" pointer-events="none">
+		<line
+			x1={CENTER_X - laneOffsetPx * 2.2}
+			y1="0"
+			x2={CENTER_X - laneOffsetPx * 2.2}
+			y2={VIEW_H}
+			stroke-dasharray="3 9"
+		/>
+		<line
+			x1={CENTER_X + laneOffsetPx * 2.2}
+			y1="0"
+			x2={CENTER_X + laneOffsetPx * 2.2}
+			y2={VIEW_H}
+			stroke-dasharray="3 9"
+		/>
+	</g>
+
+	<!-- Headlight beams (projected forward from the front bumper) -->
+	{#if showHeadlights}
+		<g transform="translate({CENTER_X},{CENTER_Y}) rotate({wheelDeg * 0.3})">
+			<!-- Left beam -->
+			<ellipse
+				cx={-egoWidPx * 0.34}
+				cy={-egoLenPx * 1.0}
+				rx={egoWidPx * 0.7}
+				ry={egoLenPx * 0.95}
+				fill="url(#headlight-beam)"
+				opacity="0.9"
+			/>
+			<!-- Right beam -->
+			<ellipse
+				cx={egoWidPx * 0.34}
+				cy={-egoLenPx * 1.0}
+				rx={egoWidPx * 0.7}
+				ry={egoLenPx * 0.95}
+				fill="url(#headlight-beam)"
+				opacity="0.9"
+			/>
+		</g>
+	{/if}
 
 	<!-- Sensor pulse ring (Tesla active-perception accent) -->
 	<circle
@@ -187,7 +241,6 @@
 			transform="translate({a.x},{a.y}) rotate({-a.relYaw})"
 			data-testid="nearby-{a.id}"
 		>
-			<!-- Body -->
 			<rect
 				x={-egoWidPx / 2}
 				y={-egoLenPx / 2}
@@ -199,7 +252,6 @@
 				stroke-width="0.6"
 				opacity="0.92"
 			/>
-			<!-- Roof hint -->
 			<rect
 				x={-egoWidPx * 0.34}
 				y={-egoLenPx * 0.18}
@@ -224,21 +276,21 @@
 			height={egoLenPx}
 			rx={egoWidPx * 0.32}
 			fill="url(#ego-body)"
-			stroke="rgba(255,255,255,0.12)"
+			stroke="rgba(255,255,255,0.14)"
 			stroke-width="0.6"
 		/>
 
-		<!-- Hood/cowl line -->
+		<!-- Hood line -->
 		<path
 			d="M {-egoWidPx * 0.46} {-egoLenPx * 0.22}
 				Q 0 {-egoLenPx * 0.30}
 				{egoWidPx * 0.46} {-egoLenPx * 0.22}"
 			fill="none"
-			stroke="rgba(0,0,0,0.25)"
+			stroke="rgba(0,0,0,0.28)"
 			stroke-width="0.6"
 		/>
 
-		<!-- Windshield (front glass) -->
+		<!-- Windshield -->
 		<path
 			d="M {-egoWidPx * 0.40} {-egoLenPx * 0.22}
 				L {-egoWidPx * 0.34} {-egoLenPx * 0.04}
@@ -248,7 +300,7 @@
 			fill="url(#ego-glass)"
 		/>
 
-		<!-- Roof (slightly darker than body for depth) -->
+		<!-- Roof -->
 		<rect
 			x={-egoWidPx * 0.36}
 			y={-egoLenPx * 0.04}
@@ -269,7 +321,7 @@
 			opacity="0.85"
 		/>
 
-		<!-- Headlights (front) -->
+		<!-- Headlight housings -->
 		<rect
 			x={-egoWidPx * 0.42}
 			y={-egoLenPx * 0.48}
@@ -277,7 +329,7 @@
 			height={egoLenPx * 0.045}
 			rx="1"
 			fill="#fff6c2"
-			style="filter: drop-shadow(0 0 4px rgba(255, 246, 194, 0.9));"
+			style="filter: drop-shadow(0 0 5px rgba(255, 246, 194, 0.95));"
 		/>
 		<rect
 			x={egoWidPx * 0.26}
@@ -286,10 +338,10 @@
 			height={egoLenPx * 0.045}
 			rx="1"
 			fill="#fff6c2"
-			style="filter: drop-shadow(0 0 4px rgba(255, 246, 194, 0.9));"
+			style="filter: drop-shadow(0 0 5px rgba(255, 246, 194, 0.95));"
 		/>
 
-		<!-- Taillights (rear, single LED strip across the back) -->
+		<!-- Taillight LED strip -->
 		<rect
 			x={-egoWidPx * 0.42}
 			y={egoLenPx * 0.44}
@@ -298,10 +350,10 @@
 			rx="1.2"
 			fill="#ff3030"
 			opacity="0.85"
-			style="filter: drop-shadow(0 0 3px rgba(255, 48, 48, 0.7));"
+			style="filter: drop-shadow(0 0 3px rgba(255, 48, 48, 0.75));"
 		/>
 
-		<!-- Front wheels — turn with steer -->
+		<!-- Front wheels -->
 		<g transform="translate({-egoWidPx / 2}, {frontY}) rotate({wheelDeg})" data-testid="ego-wheel-left">
 			<rect
 				x={-wheelW / 2}
