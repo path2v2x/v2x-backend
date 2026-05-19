@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 CAMERA_CONFIGS = {
     "chase": {"dx": -8.0, "dy": 0.0, "dz": 4.0, "pitch": -15.0},
-    "hood":  {"dx": 0.5,  "dy": 0.0, "dz": 1.5, "pitch": 0.0},
+    "hood":  {"dx": 0.2,  "dy": -0.38, "dz": 1.15, "pitch": 0.0},
     "bird":  {"dx": 0.0,  "dy": 0.0, "dz": 25.0, "pitch": -90.0},
     "free":  {"dx": -5.0, "dy": 0.0, "dz": 3.0, "pitch": -10.0},
 }

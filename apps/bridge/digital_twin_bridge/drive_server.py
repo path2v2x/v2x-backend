@@ -451,8 +451,9 @@ class DriveSession:
         import carla
         bx, by, bz = self._bound_x, self._bound_y, self._bound_z
         if view == "hood":
-            # manual_control index 1: dashboard / front-bumper view
-            return carla.Transform(carla.Location(x=+0.8 * bx, y=0.0, z=1.3 * bz))
+            # Driver-seat cockpit POV (left-hand drive). Absolute meters —
+            # cabin geometry doesn't scale linearly with bbox.
+            return carla.Transform(carla.Location(x=0.2, y=-0.38, z=1.15))
         if view == "free":
             # manual_control index 3: high-back chase, slightly tilted
             return carla.Transform(
@@ -804,8 +805,12 @@ class DriveSession:
         # Stop accepting frames during swap
         self._accepting_frames = False
 
-        # Save current transform
-        current_transform = self._camera_sensor.get_transform()
+        # Use the configured local-frame transform for the active view.
+        # Actor.get_transform() returns world-space coords; passing that to
+        # spawn_actor(attach_to=vehicle) makes CARLA treat the world coords
+        # as a child-relative offset, drifting the camera further from the
+        # car on every respawn.
+        local_transform = self._transform_for_view(self.active_camera)
 
         # Stop and destroy old sensor
         try:
@@ -855,7 +860,7 @@ class DriveSession:
                 logger.debug("Camera attribute '%s' failed: %s", key, e)
 
         self._camera_sensor = self._world.spawn_actor(
-            camera_bp, current_transform, attach_to=self.vehicle,
+            camera_bp, local_transform, attach_to=self.vehicle,
             attachment_type=self._attachment_for_view(self.active_camera),
         )
         self._camera_sensor.listen(self._on_camera_frame)
