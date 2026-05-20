@@ -42,7 +42,7 @@ describe('DriverDashboard', () => {
 		});
 		expect(getByTestId('driver-dashboard')).toBeInTheDocument();
 		expect(getByTestId('instrument-cluster')).toBeInTheDocument();
-		expect(getByTestId('center-stack')).toBeInTheDocument();
+		expect(getByTestId('warning-stack')).toBeInTheDocument();
 	});
 
 	it('shows 0 mph with null telemetry', () => {

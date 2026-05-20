@@ -1,58 +1,40 @@
 <script lang="ts" module>
-	import type { Gear } from './InstrumentCluster.svelte';
+	import type { Gear } from './ThrottleGauge.svelte';
 	import type { DashboardWarning } from './WarningStack.svelte';
 
 	export type { DashboardWarning };
 
 	/** Convert CARLA's gear int to a Tesla-style P/R/N/D letter.
 	 * CARLA: positive = forward, 0 = neutral, negative = reverse. */
-	export function gearFromCarla(gear: number): Gear {
-		if (gear > 0) return 'D';
-		if (gear < 0) return 'R';
+	export function gearFromCarla(g: number): Gear {
+		if (g > 0) return 'D';
+		if (g < 0) return 'R';
 		return 'N';
 	}
 </script>
 
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
 	import type { VehicleTelemetry } from '$lib/types';
 	import InstrumentCluster from './InstrumentCluster.svelte';
-	import CenterStack from './CenterStack.svelte';
+	import WarningStack from './WarningStack.svelte';
 
 	interface Props {
 		/** Latest telemetry from the bridge. May be null on initial mount. */
 		telemetry: VehicleTelemetry | null;
 		/** All active warnings (V2X, EVA, scenario verdict, etc.). */
 		warnings?: DashboardWarning[];
-		/** Override `now` for tests. */
-		now?: number;
+		/** Current time in ms for warning fade-out decisions. Required —
+		 * the connected wrapper supplies a live-ticking value. */
+		now: number;
 		/** Speed display unit. */
 		speedUnit?: 'mph' | 'kmh';
 	}
 
 	let { telemetry, warnings = [], now, speedUnit = 'mph' }: Props = $props();
 
-	let tick = $state(Date.now());
-	let timerId: ReturnType<typeof setInterval> | null = null;
-
-	onMount(() => {
-		if (now === undefined) {
-			timerId = setInterval(() => {
-				tick = Date.now();
-			}, 150);
-		}
-	});
-
-	onDestroy(() => {
-		if (timerId != null) clearInterval(timerId);
-	});
-
-	const effectiveNow = $derived(now ?? tick);
-
 	const speed = $derived(telemetry?.speed ?? 0);
 	const gear = $derived(gearFromCarla(telemetry?.gear ?? 1));
 	const throttle = $derived(telemetry?.throttle ?? 0);
-	const brake = $derived(telemetry?.brake ?? 0);
 	const steer = $derived(telemetry?.steer ?? 0);
 </script>
 
@@ -93,7 +75,7 @@
 
 	<!-- Left: instrument cluster — sized to its content, no wasted width -->
 	<div class="shrink-0">
-		<InstrumentCluster {speed} {gear} {throttle} {brake} {steer} {speedUnit} />
+		<InstrumentCluster {speed} {gear} {throttle} {steer} {speedUnit} />
 	</div>
 
 	<!-- Center divider with subtle glow -->
@@ -113,6 +95,6 @@
 
 	<!-- Right: messages only -->
 	<div class="grow relative" style="min-width: 0;">
-		<CenterStack {warnings} now={effectiveNow} />
+		<WarningStack {warnings} {now} />
 	</div>
 </div>

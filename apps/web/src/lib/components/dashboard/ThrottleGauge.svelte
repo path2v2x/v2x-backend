@@ -95,7 +95,6 @@
 			stroke="rgba(58, 63, 71, 0.55)"
 			stroke-width={STROKE}
 			stroke-linecap="round"
-			style="filter: drop-shadow(inset 0 1px 1px rgba(0,0,0,0.6));"
 		/>
 
 		<!-- Tick marks -->

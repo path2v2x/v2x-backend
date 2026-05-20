@@ -89,9 +89,6 @@
 			</linearGradient>
 		</defs>
 
-		<!-- Far-distance fade gradient -->
-		<rect x="0" y="0" width="100" height="100" fill="none" />
-
 		<!-- Centre dashed hint line (subtle white) -->
 		<path
 			d={centerPath}

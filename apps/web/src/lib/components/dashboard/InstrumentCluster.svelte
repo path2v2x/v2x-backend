@@ -1,7 +1,3 @@
-<script lang="ts" module>
-	export type { Gear } from './ThrottleGauge.svelte';
-</script>
-
 <script lang="ts">
 	import ThrottleGauge, { type Gear } from './ThrottleGauge.svelte';
 	import SteeringPath from './SteeringPath.svelte';
@@ -10,7 +6,6 @@
 		speed: number;
 		gear: Gear;
 		throttle: number;
-		brake: number;
 		steer: number;
 		speedUnit?: 'mph' | 'kmh';
 	}
@@ -19,7 +14,6 @@
 		speed = 0,
 		gear = 'D',
 		throttle = 0,
-		brake = 0,
 		steer = 0,
 		speedUnit = 'mph',
 	}: Props = $props();

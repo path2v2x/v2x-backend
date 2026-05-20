@@ -1,6 +1,6 @@
 /**
  * Translate the various warning sources into a single DashboardWarning
- * list consumed by WarningStack / CenterStack.
+ * list consumed by WarningStack.
  *
  * Sources covered:
  *  - V2X alerts from telemetry (EVA firetruck, V2X signals)
