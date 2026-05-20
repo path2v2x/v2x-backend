@@ -4,7 +4,7 @@
 
 <script lang="ts">
 	import ThrottleGauge, { type Gear } from './ThrottleGauge.svelte';
-	import SteeringBar from './SteeringBar.svelte';
+	import SteeringPath from './SteeringPath.svelte';
 
 	interface Props {
 		speed: number;
@@ -38,8 +38,8 @@
 	<!-- LEFT: circular gas-car-style throttle gauge with speed + gear in centre -->
 	<ThrottleGauge {throttle} {speed} {gear} unit={speedUnit} size={86} />
 
-	<!-- MIDDLE: steering bar -->
-	<SteeringBar {steer} width="10rem" />
+	<!-- MIDDLE: Tesla-style path-prediction visualization -->
+	<SteeringPath {steer} width={88} height={82} />
 
 	<!-- RIGHT: vertical brake bar -->
 	<div

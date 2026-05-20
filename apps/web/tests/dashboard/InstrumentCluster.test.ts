@@ -3,7 +3,7 @@ import { render } from '@testing-library/svelte';
 import InstrumentCluster from '$lib/components/dashboard/InstrumentCluster.svelte';
 
 describe('InstrumentCluster', () => {
-	it('mounts and renders gauge, steering bar, and brake bar', () => {
+	it('mounts and renders gauge, steering path, and brake bar', () => {
 		const { getByTestId } = render(InstrumentCluster, {
 			props: { speed: 50, gear: 'D', throttle: 0.3, brake: 0, steer: 0 },
 		});
@@ -11,7 +11,7 @@ describe('InstrumentCluster', () => {
 		expect(getByTestId('throttle-gauge')).toBeInTheDocument();
 		expect(getByTestId('gauge-speed')).toBeInTheDocument();
 		expect(getByTestId('gauge-gear')).toBeInTheDocument();
-		expect(getByTestId('steering-bar')).toBeInTheDocument();
+		expect(getByTestId('steering-path')).toBeInTheDocument();
 		expect(getByTestId('brake-bar')).toBeInTheDocument();
 	});
 
@@ -31,25 +31,32 @@ describe('InstrumentCluster', () => {
 		expect(letter.textContent).toBe('R');
 	});
 
-	it('centers steering dot at zero steer', () => {
+	it('exposes the clamped steer value on the steering path', () => {
 		const { getByTestId } = render(InstrumentCluster, {
 			props: { speed: 0, gear: 'D', throttle: 0, brake: 0, steer: 0 },
 		});
-		expect(getByTestId('steering-dot').dataset.pct).toBe('50.0');
+		expect(getByTestId('steering-path').dataset.steer).toBe('0.000');
 	});
 
-	it('moves steering dot left when steer is negative', () => {
+	it('reflects negative steer (left turn)', () => {
 		const { getByTestId } = render(InstrumentCluster, {
 			props: { speed: 0, gear: 'D', throttle: 0, brake: 0, steer: -0.5 },
 		});
-		expect(getByTestId('steering-dot').dataset.pct).toBe('25.0');
+		expect(getByTestId('steering-path').dataset.steer).toBe('-0.500');
 	});
 
-	it('moves steering dot right when steer is positive', () => {
+	it('reflects positive steer (right turn)', () => {
 		const { getByTestId } = render(InstrumentCluster, {
 			props: { speed: 0, gear: 'D', throttle: 0, brake: 0, steer: 0.5 },
 		});
-		expect(getByTestId('steering-dot').dataset.pct).toBe('75.0');
+		expect(getByTestId('steering-path').dataset.steer).toBe('0.500');
+	});
+
+	it('clamps extreme steer values', () => {
+		const { getByTestId } = render(InstrumentCluster, {
+			props: { speed: 0, gear: 'D', throttle: 0, brake: 0, steer: 2 },
+		});
+		expect(getByTestId('steering-path').dataset.steer).toBe('1.000');
 	});
 
 	it('reflects throttle on the gauge fill', () => {
