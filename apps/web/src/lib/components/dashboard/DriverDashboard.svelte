@@ -62,9 +62,9 @@
 		background:
 			radial-gradient(ellipse at 50% 0%, rgba(62, 130, 247, 0.08) 0%, transparent 60%),
 			linear-gradient(180deg,
-				rgba(8, 9, 12, 0.45) 0%,
-				rgba(14, 16, 21, 0.55) 50%,
-				rgba(20, 23, 28, 0.62) 100%);
+				rgba(8, 9, 12, 0.25) 0%,
+				rgba(14, 16, 21, 0.32) 50%,
+				rgba(20, 23, 28, 0.38) 100%);
 		backdrop-filter: blur(16px) saturate(130%);
 		-webkit-backdrop-filter: blur(16px) saturate(130%);
 		border: 1px solid rgba(255, 255, 255, 0.10);
@@ -91,8 +91,8 @@
 		aria-hidden="true"
 	></div>
 
-	<!-- Left: instrument cluster -->
-	<div class="shrink-0" style="width: 60%; min-width: 0;">
+	<!-- Left: instrument cluster — sized to its content, no wasted width -->
+	<div class="shrink-0">
 		<InstrumentCluster {speed} {gear} {throttle} {brake} {steer} {speedUnit} />
 	</div>
 

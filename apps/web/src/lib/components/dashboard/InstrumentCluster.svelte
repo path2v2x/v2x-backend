@@ -37,7 +37,7 @@
 </script>
 
 <div
-	class="relative flex h-full w-full font-tesla overflow-hidden items-center justify-center gap-3 sm:gap-5 px-4"
+	class="relative flex h-full font-tesla overflow-hidden items-center gap-3 sm:gap-5 px-4"
 	style="
 		background:
 			radial-gradient(ellipse at 50% 0%, rgba(62, 130, 247, 0.06) 0%, transparent 55%);
