@@ -49,14 +49,36 @@
 	const visible = $derived(sorted.slice(0, maxVisible));
 	const overflow = $derived(Math.max(0, sorted.length - maxVisible));
 
-	function severityBg(s: WarningSeverity): string {
+	/** Per-severity colour palette — full-bleed colour fill on the cards
+	 * so warnings stand out against the translucent dashboard glass.
+	 * - `stripe`: opaque accent (left border, icon)
+	 * - `bg`: semi-transparent tint for the card background
+	 * - `glow`: ambient shadow colour radiating from the card
+	 */
+	function severityColors(s: WarningSeverity): {
+		stripe: string;
+		bg: string;
+		glow: string;
+	} {
 		switch (s) {
 			case 'critical':
-				return 'var(--color-tesla-critical)';
+				return {
+					stripe: '#ff3a40',
+					bg: 'rgba(232, 33, 39, 0.42)',
+					glow: 'rgba(232, 33, 39, 0.5)',
+				};
 			case 'warning':
-				return 'var(--color-tesla-warning)';
+				return {
+					stripe: '#ffb74a',
+					bg: 'rgba(245, 165, 36, 0.38)',
+					glow: 'rgba(245, 165, 36, 0.45)',
+				};
 			default:
-				return 'var(--color-tesla-accent)';
+				return {
+					stripe: '#5fa0ff',
+					bg: 'rgba(62, 130, 247, 0.36)',
+					glow: 'rgba(62, 130, 247, 0.42)',
+				};
 		}
 	}
 </script>
@@ -73,12 +95,14 @@
 		<div class="sr-only" data-testid="warning-empty">No active warnings</div>
 	{:else}
 		{#each visible as w (w.id)}
+			{@const c = severityColors(w.severity)}
 			<div
 				class="flex items-center gap-2.5 rounded-md px-3 py-2 overflow-hidden font-tesla"
 				style="
-					background: var(--color-tesla-bg-elevated);
-					border-left: 3px solid {severityBg(w.severity)};
-					box-shadow: 0 0 12px {severityBg(w.severity)}33;
+					background: {c.bg};
+					border: 1px solid {c.stripe}33;
+					border-left: 3px solid {c.stripe};
+					box-shadow: 0 0 14px {c.glow}, inset 0 1px 0 rgba(255,255,255,0.07);
 				"
 				in:fly={{ y: -8, duration: 180 }}
 				out:fly={{ y: -8, duration: 140 }}
@@ -88,30 +112,31 @@
 			>
 				<span
 					class="shrink-0"
-					style="color: {severityBg(w.severity)};"
+					style="color: {c.stripe}; filter: drop-shadow(0 0 4px {c.glow});"
 					aria-hidden="true"
 				>
 					{#if w.severity === 'critical'}
-						<AlertTriangle size={16} strokeWidth={2.4} />
+						<AlertTriangle size={16} strokeWidth={2.6} />
 					{:else if w.severity === 'warning'}
-						<AlertCircle size={16} strokeWidth={2.4} />
+						<AlertCircle size={16} strokeWidth={2.6} />
 					{:else}
-						<Info size={16} strokeWidth={2.4} />
+						<Info size={16} strokeWidth={2.6} />
 					{/if}
 				</span>
 				<span
-					class="flex-1 text-sm leading-tight truncate"
-					style="color: var(--color-tesla-text);"
+					class="flex-1 text-sm leading-tight truncate font-medium"
+					style="color: #ffffff; text-shadow: 0 1px 1px rgba(0,0,0,0.45);"
 					data-testid="warning-msg-{w.id}"
 				>
 					{w.message}
 				</span>
 				{#if w.detail}
 					<span
-						class="shrink-0 text-xs tabular-nums"
+						class="shrink-0 text-xs tabular-nums font-semibold"
 						style="
-							color: var(--color-tesla-text-secondary);
+							color: #ffffff;
 							font-feature-settings: 'tnum';
+							text-shadow: 0 1px 1px rgba(0,0,0,0.45);
 						"
 						data-testid="warning-detail-{w.id}"
 					>
