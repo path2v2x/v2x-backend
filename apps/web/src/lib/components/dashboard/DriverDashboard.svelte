@@ -60,37 +60,33 @@
 	class="relative flex w-full h-full font-tesla overflow-hidden"
 	style="
 		background:
-			radial-gradient(ellipse at 50% -10%, rgba(62, 130, 247, 0.10) 0%, transparent 60%),
+			radial-gradient(ellipse at 50% 0%, rgba(62, 130, 247, 0.08) 0%, transparent 60%),
 			linear-gradient(180deg,
-				rgba(8, 9, 12, 0.78) 0%,
-				rgba(14, 16, 21, 0.86) 50%,
-				rgba(20, 23, 28, 0.92) 100%);
-		backdrop-filter: blur(14px) saturate(120%);
-		-webkit-backdrop-filter: blur(14px) saturate(120%);
-		border: 1px solid rgba(255, 255, 255, 0.08);
+				rgba(8, 9, 12, 0.45) 0%,
+				rgba(14, 16, 21, 0.55) 50%,
+				rgba(20, 23, 28, 0.62) 100%);
+		backdrop-filter: blur(16px) saturate(130%);
+		-webkit-backdrop-filter: blur(16px) saturate(130%);
+		border: 1px solid rgba(255, 255, 255, 0.10);
 		border-top: 1px solid rgba(255, 255, 255, 0.18);
-		/* Arched binnacle-pod shape: top edge curves up like an instrument cluster cowl */
-		border-radius: 36% 36% 18px 18px / 60% 60% 18px 18px;
+		border-radius: 14px;
 		box-shadow:
-			0 -1px 0 rgba(255, 255, 255, 0.06),
-			0 8px 28px rgba(0, 0, 0, 0.55),
-			0 24px 48px -16px rgba(0, 0, 0, 0.7),
-			inset 0 1px 0 rgba(255, 255, 255, 0.06),
-			inset 0 12px 28px -16px rgba(0, 0, 0, 0.7);
+			0 8px 24px rgba(0, 0, 0, 0.45),
+			0 18px 36px -16px rgba(0, 0, 0, 0.55),
+			inset 0 1px 0 rgba(255, 255, 255, 0.08);
 	"
 	data-testid="driver-dashboard"
 >
-	<!-- Top recessed-screen highlight: thin glowing arc along the cowl edge -->
+	<!-- Top edge highlight: thin glowing line -->
 	<div
-		class="absolute top-0 left-[8%] right-[8%] h-[2px] pointer-events-none"
+		class="absolute top-0 left-[10%] right-[10%] h-px pointer-events-none"
 		style="
 			background: linear-gradient(90deg,
 				transparent 0%,
-				rgba(255, 255, 255, 0.10) 15%,
-				rgba(62, 130, 247, 0.32) 50%,
-				rgba(255, 255, 255, 0.10) 85%,
+				rgba(255, 255, 255, 0.10) 18%,
+				rgba(62, 130, 247, 0.28) 50%,
+				rgba(255, 255, 255, 0.10) 82%,
 				transparent 100%);
-			filter: blur(0.4px);
 		"
 		aria-hidden="true"
 	></div>
