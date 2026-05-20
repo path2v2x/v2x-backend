@@ -455,7 +455,7 @@
 
 <div class="h-screen w-screen bg-black relative overflow-hidden">
 	{#if state === 'idle' || state === 'connecting'}
-		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
+		<div class="absolute inset-0 flex justify-center bg-gray-950 overflow-y-auto py-6" style="align-items: safe center;">
 			<!-- Subtle radial glow behind card -->
 			<div class="absolute inset-0 flex items-center justify-center pointer-events-none">
 				<div class="w-[600px] h-[600px] rounded-full bg-accent/5 blur-[120px]"></div>
@@ -672,7 +672,7 @@
 		</div>
 
 	{:else if state === 'reconstructing'}
-		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
+		<div class="absolute inset-0 flex justify-center bg-gray-950 overflow-y-auto py-6" style="align-items: safe center;">
 			<div class="text-center">
 				<div class="relative w-16 h-16 mx-auto mb-5">
 					<div class="absolute inset-0 border-2 border-accent/20 rounded-full animate-ping"></div>
@@ -994,7 +994,7 @@
 		{/if}
 
 	{:else if state === 'error'}
-		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
+		<div class="absolute inset-0 flex justify-center bg-gray-950 overflow-y-auto py-6" style="align-items: safe center;">
 			<div class="text-center max-w-md px-8">
 				<div class="w-12 h-12 mx-auto mb-4 rounded-full border-2 border-accent/50 flex items-center justify-center">
 					<svg class="w-6 h-6 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
