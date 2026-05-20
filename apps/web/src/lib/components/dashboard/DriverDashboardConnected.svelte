@@ -61,6 +61,7 @@
 			xoscLastResult: $xoscLastResult,
 			xoscResultSetAt,
 			now,
+			detections: $telemetry.detections,
 		})
 	);
 </script>

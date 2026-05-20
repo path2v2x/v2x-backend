@@ -16,6 +16,7 @@
 <script lang="ts">
 	import type { VehicleTelemetry } from '$lib/types';
 	import InstrumentCluster from './InstrumentCluster.svelte';
+	import PerceptionPanel from './PerceptionPanel.svelte';
 	import WarningStack from './WarningStack.svelte';
 
 	interface Props {
@@ -36,6 +37,7 @@
 	const gear = $derived(gearFromCarla(telemetry?.gear ?? 1));
 	const throttle = $derived(telemetry?.throttle ?? 0);
 	const steer = $derived(telemetry?.steer ?? 0);
+	const detections = $derived(telemetry?.detections ?? []);
 </script>
 
 <div
@@ -93,8 +95,11 @@
 		></div>
 	</div>
 
-	<!-- Right: messages only -->
-	<div class="grow relative" style="min-width: 0;">
-		<WarningStack {warnings} {now} />
+	<!-- Right: perception viz with warning cards overlaying it -->
+	<div class="grow relative overflow-hidden" style="min-width: 0;">
+		<PerceptionPanel {detections} />
+		<div class="absolute inset-0 pointer-events-none">
+			<WarningStack {warnings} {now} />
+		</div>
 	</div>
 </div>

@@ -22,6 +22,7 @@ from PIL import Image
 from digital_twin_bridge.scene_reconstructor import SceneReconstructor
 from digital_twin_bridge.camera_streamer import compute_camera_transform
 from digital_twin_bridge.openscenario_runner import list_xosc
+from digital_twin_bridge.perception import PerceptionService
 from digital_twin_bridge.trajectory_player import (
     TrajectoryPlayer,
     list_trajectory_files,
@@ -311,6 +312,8 @@ class DriveSession:
         self._camera_sensor = None
         self._latest_frame: Optional[bytes] = None
         self._frame_lock = threading.Lock()
+        # Tesla-style 8-camera perception stack — attached lazily on session start.
+        self._perception = PerceptionService()
         self._accepting_frames = False  # Guard against callbacks after stop
         self._placed_objects: list = []  # User-placed objects (actor, blueprint_id, pos)
         self._dynamic_actors: dict[int, DynamicActorMeta] = {}
@@ -410,6 +413,12 @@ class DriveSession:
 
             # Attach RGB camera sensor to the vehicle
             self._attach_camera(bp_lib)
+
+            # Attach the perception sensor stack (8 semantic + 8 depth cameras).
+            try:
+                self._perception.attach(self._world, self.vehicle)
+            except Exception as e:
+                logger.warning("Perception attach failed: %s", e, exc_info=True)
 
             self._accepting_frames = True
             self._active = True
@@ -572,6 +581,7 @@ class DriveSession:
             "brake": round(brake, 3),
             "nearby_actors": self.get_nearby_actors(),
             "dynamic_actors": self.get_dynamic_actors_snapshot(),
+            "detections": [d.to_dict() for d in self._perception.scan()],
         }
         self._draw_dynamic_actor_geofences()
         eva_alerts = self._check_emergency_vehicle_proximity()
@@ -1632,6 +1642,14 @@ class DriveSession:
         # Stop accepting frames first to prevent callback race
         self._accepting_frames = False
         self._active = False
+
+        # Tear down the perception sensor stack BEFORE the ego vehicle is
+        # destroyed — the sensors are attached_to the ego and trying to
+        # destroy them after the parent is gone logs spurious errors.
+        try:
+            self._perception.detach()
+        except Exception as e:
+            logger.warning("Perception detach failed: %s", e, exc_info=True)
 
         # Camera sensor: stop and destroy in separate try blocks
         if self._camera_sensor is not None:

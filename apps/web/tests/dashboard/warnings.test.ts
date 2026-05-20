@@ -3,9 +3,24 @@ import {
 	buildDashboardWarnings,
 	mapSignalType,
 	classifyV2xSource,
+	perceptionDetectionToWarning,
 	VERDICT_TTL_MS,
+	PERCEPTION_THRESHOLDS,
 } from '$lib/components/dashboard/warnings';
-import type { V2xAlert, V2xZone, XoscFinishedEvent } from '$lib/types';
+import type { Detection, V2xAlert, V2xZone, XoscFinishedEvent } from '$lib/types';
+
+function mkDet(overrides: Partial<Detection> = {}): Detection {
+	return {
+		id: 'vehicle-0',
+		class: 'vehicle',
+		pos: [10, 0],
+		distance: 10,
+		bbox_dim: [4.5, 1.8],
+		in_path: true,
+		alert: 'none',
+		...overrides,
+	};
+}
 
 describe('mapSignalType', () => {
 	it('maps alert to critical', () => {
@@ -230,5 +245,143 @@ describe('buildDashboardWarnings', () => {
 			now: 0,
 		});
 		expect(out[0].source).toBe('v2x');
+	});
+});
+
+describe('perceptionDetectionToWarning', () => {
+	it('promotes a pedestrian in path within threshold to critical', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'pedestrian', in_path: true, distance: 12 }),
+			1000
+		);
+		expect(w).not.toBeNull();
+		expect(w!.severity).toBe('critical');
+		expect(w!.source).toBe('perception');
+		expect(w!.message).toContain('Pedestrian');
+		expect(w!.detail).toBe('12.0m');
+	});
+
+	it('drops a pedestrian off the path', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'pedestrian', in_path: false, distance: 5 }),
+			1000
+		);
+		expect(w).toBeNull();
+	});
+
+	it('drops a pedestrian beyond pedestrianInPathM', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({
+				class: 'pedestrian',
+				in_path: true,
+				distance: PERCEPTION_THRESHOLDS.pedestrianInPathM + 1,
+			}),
+			1000
+		);
+		expect(w).toBeNull();
+	});
+
+	it('promotes a close vehicle in path to critical', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'vehicle', in_path: true, distance: 10 }),
+			1000
+		);
+		expect(w!.severity).toBe('critical');
+		expect(w!.message).toContain('Vehicle close');
+	});
+
+	it('promotes a farther vehicle in path to warning', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'vehicle', in_path: true, distance: 30 }),
+			1000
+		);
+		expect(w!.severity).toBe('warning');
+		expect(w!.message).toBe('Vehicle ahead');
+	});
+
+	it('drops a vehicle off path', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'vehicle', in_path: false, distance: 10 }),
+			1000
+		);
+		expect(w).toBeNull();
+	});
+
+	it('promotes a cone in path to warning', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'cone', in_path: true, distance: 8 }),
+			1000
+		);
+		expect(w!.severity).toBe('warning');
+		expect(w!.message).toBe('Obstacle in path');
+	});
+
+	it('drops a cone far from the ego', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({
+				class: 'cone',
+				in_path: true,
+				distance: PERCEPTION_THRESHOLDS.coneInPathM + 5,
+			}),
+			1000
+		);
+		expect(w).toBeNull();
+	});
+
+	it('promotes a traffic light in path to info', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'traffic_light', in_path: true, distance: 20 }),
+			1000
+		);
+		expect(w!.severity).toBe('info');
+	});
+
+	it('ignores traffic signs (visual only, no warning card)', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ class: 'traffic_sign', in_path: true, distance: 10 }),
+			1000
+		);
+		expect(w).toBeNull();
+	});
+
+	it('uses stable id prefix so cards dedup across ticks', () => {
+		const w = perceptionDetectionToWarning(
+			mkDet({ id: 'vehicle-42', class: 'vehicle', in_path: true, distance: 10 }),
+			1234
+		);
+		expect(w!.id).toBe('perception-vehicle-42');
+		expect(w!.lastUpdate).toBe(1234);
+	});
+});
+
+describe('buildDashboardWarnings with perception inputs', () => {
+	it('includes detection-derived warnings alongside V2X / verdict', () => {
+		const out = buildDashboardWarnings({
+			v2xAlerts: [],
+			activeZoneAlerts: [],
+			xoscLastResult: null,
+			xoscResultSetAt: null,
+			now: 100,
+			detections: [
+				mkDet({ id: 'p1', class: 'pedestrian', in_path: true, distance: 8 }),
+				mkDet({ id: 'v1', class: 'vehicle', in_path: true, distance: 11 }),
+				mkDet({ id: 'v2', class: 'vehicle', in_path: false, distance: 5 }),
+			],
+		});
+		const ids = out.map((w) => w.id);
+		expect(ids).toContain('perception-p1');
+		expect(ids).toContain('perception-v1');
+		expect(ids).not.toContain('perception-v2'); // off-path vehicle dropped
+	});
+
+	it('handles missing detections array gracefully', () => {
+		const out = buildDashboardWarnings({
+			v2xAlerts: [],
+			activeZoneAlerts: [],
+			xoscLastResult: null,
+			xoscResultSetAt: null,
+			now: 0,
+		});
+		expect(out).toEqual([]);
 	});
 });

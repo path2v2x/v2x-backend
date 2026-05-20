@@ -1,6 +1,11 @@
 <script lang="ts" module>
 	export type WarningSeverity = 'critical' | 'warning' | 'info';
-	export type WarningSource = 'v2x' | 'eva' | 'scenario' | 'verdict';
+	export type WarningSource =
+		| 'v2x'
+		| 'eva'
+		| 'scenario'
+		| 'verdict'
+		| 'perception';
 
 	export interface DashboardWarning {
 		/** Stable dedup key — same id replaces an existing entry in place. */
