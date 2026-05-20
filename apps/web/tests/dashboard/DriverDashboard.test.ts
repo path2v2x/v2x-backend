@@ -49,35 +49,35 @@ describe('DriverDashboard', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: null, now: 0 },
 		});
-		expect(getByTestId('speed-value').textContent).toBe('0');
+		expect(getByTestId('gauge-speed').textContent).toBe('0');
 	});
 
 	it('renders speed from telemetry (60 km/h ≈ 37 mph)', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ speed: 60, gear: 1 }), now: 0 },
 		});
-		expect(getByTestId('speed-value').textContent).toBe('37');
+		expect(getByTestId('gauge-speed').textContent).toBe('37');
 	});
 
 	it('renders D when gear is positive', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ gear: 2 }), now: 0 },
 		});
-		expect(getByTestId('gear-letter').dataset.gear).toBe('D');
+		expect(getByTestId('gauge-gear').dataset.gear).toBe('D');
 	});
 
 	it('renders R when gear is negative', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ gear: -1 }), now: 0 },
 		});
-		expect(getByTestId('gear-letter').dataset.gear).toBe('R');
+		expect(getByTestId('gauge-gear').dataset.gear).toBe('R');
 	});
 
 	it('renders N when gear is zero', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ gear: 0 }), now: 0 },
 		});
-		expect(getByTestId('gear-letter').dataset.gear).toBe('N');
+		expect(getByTestId('gauge-gear').dataset.gear).toBe('N');
 	});
 
 	// Vehicle-visualization removed by user request — the right side of
