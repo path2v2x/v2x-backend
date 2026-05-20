@@ -693,7 +693,7 @@
 					<div class="relative" style="height: 100%; max-width: 100%; aspect-ratio: {$cameraAspect.w} / {$cameraAspect.h};">
 						<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
 						<!-- Dashboard overlay anchored to the visible camera frame (scales with aspect) -->
-						<div class="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 pointer-events-auto" style="width: 94%; height: 130px;">
+						<div class="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 pointer-events-auto" style="width: 82%; height: 100px;">
 							<DriverDashboardConnected />
 						</div>
 					</div>

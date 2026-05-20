@@ -1,5 +1,5 @@
 <script lang="ts" module>
-	import type { Gear } from './GearColumn.svelte';
+	import type { Gear } from './InstrumentCluster.svelte';
 	import type { DashboardWarning } from './WarningStack.svelte';
 
 	export type { DashboardWarning };

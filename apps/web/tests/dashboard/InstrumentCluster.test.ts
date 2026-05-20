@@ -9,7 +9,7 @@ describe('InstrumentCluster', () => {
 		});
 		expect(getByTestId('instrument-cluster')).toBeInTheDocument();
 		expect(getByTestId('speed-display')).toBeInTheDocument();
-		expect(getByTestId('gear-column')).toBeInTheDocument();
+		expect(getByTestId('gear-letter')).toBeInTheDocument();
 		expect(getByTestId('throttle-bar')).toBeInTheDocument();
 		expect(getByTestId('brake-bar')).toBeInTheDocument();
 		expect(getByTestId('steering-bar')).toBeInTheDocument();
@@ -22,12 +22,13 @@ describe('InstrumentCluster', () => {
 		expect(getByTestId('speed-value').textContent).toBe('31');
 	});
 
-	it('marks the active gear', () => {
+	it('shows only the active gear letter', () => {
 		const { getByTestId } = render(InstrumentCluster, {
 			props: { speed: 0, gear: 'R', throttle: 0, brake: 0.5, steer: 0 },
 		});
-		expect(getByTestId('gear-r').dataset.active).toBe('true');
-		expect(getByTestId('gear-d').dataset.active).toBe('false');
+		const letter = getByTestId('gear-letter');
+		expect(letter.dataset.gear).toBe('R');
+		expect(letter.textContent).toBe('R');
 	});
 
 	it('centers steering dot at zero steer', () => {

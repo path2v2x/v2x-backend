@@ -63,21 +63,21 @@ describe('DriverDashboard', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ gear: 2 }), now: 0 },
 		});
-		expect(getByTestId('gear-d').dataset.active).toBe('true');
+		expect(getByTestId('gear-letter').dataset.gear).toBe('D');
 	});
 
 	it('renders R when gear is negative', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ gear: -1 }), now: 0 },
 		});
-		expect(getByTestId('gear-r').dataset.active).toBe('true');
+		expect(getByTestId('gear-letter').dataset.gear).toBe('R');
 	});
 
 	it('renders N when gear is zero', () => {
 		const { getByTestId } = render(DriverDashboard, {
 			props: { telemetry: mkTelemetry({ gear: 0 }), now: 0 },
 		});
-		expect(getByTestId('gear-n').dataset.active).toBe('true');
+		expect(getByTestId('gear-letter').dataset.gear).toBe('N');
 	});
 
 	// Vehicle-visualization removed by user request — the right side of
