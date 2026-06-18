@@ -84,6 +84,70 @@ class TestDriveServerSession:
         vehicle = mock_world.get_actor(vehicle_id)
         assert vehicle.is_destroyed
         assert session.vehicle is None
+        assert mock_world.weather.sun_altitude_angle == 75.0
+
+    @pytest.mark.asyncio
+    async def test_set_weather_clamps_black_or_opaque_values(self, mock_world, fake_v2x_api):
+        """Weather controls should not be able to make the drive feed unusable."""
+        from digital_twin_bridge.drive_server import DriveSession
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+
+        response = session.set_weather({
+            "sun_altitude_angle": -90,
+            "fog_density": 100,
+            "fog_distance": 0,
+            "dust_storm": 100,
+            "precipitation": float("inf"),
+        })
+
+        assert response["type"] == "weather_set"
+        assert response["params"]["sun_altitude_angle"] == 10.0
+        assert response["params"]["fog_density"] == 25.0
+        assert response["params"]["fog_distance"] == 25.0
+        assert response["params"]["dust_storm"] == 30.0
+        assert response["params"]["precipitation"] == 0.0
+        assert mock_world.weather.sun_altitude_angle == 10.0
+
+    @pytest.mark.asyncio
+    async def test_set_camera_settings_clamps_black_screen_values(self, mock_world, fake_v2x_api):
+        """Camera settings should preserve postprocessing and bounded exposure."""
+        from digital_twin_bridge.drive_server import DriveSession
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+
+        response = session.set_camera_settings({
+            "image_size_x": 99999,
+            "image_size_y": 1,
+            "fov": 999,
+            "enable_postprocess_effects": "false",
+            "exposure_mode": ["bad"],
+            "exposure_compensation": -99,
+            "black_clip": 1,
+            "white_clip": 1,
+            "gamma": 10,
+        })
+
+        assert response["type"] == "camera_settings_set"
+        assert response["width"] == 1280
+        assert response["height"] == 480
+        assert response["fov"] == 110.0
+        assert session._camera_extra_attrs["enable_postprocess_effects"] == "true"
+        assert session._camera_extra_attrs["exposure_mode"] == "histogram"
+        assert session._camera_extra_attrs["exposure_compensation"] == "0.0"
+        assert session._camera_extra_attrs["black_clip"] == "0.02"
+        assert session._camera_extra_attrs["white_clip"] == "0.06"
+        assert session._camera_extra_attrs["gamma"] == "2.4"
 
     @pytest.mark.asyncio
     async def test_control_before_start_raises(self, mock_world, fake_v2x_api):
@@ -225,6 +289,28 @@ class TestDriveServerMessageHandling:
         response = await handle_message(session, {"type": "bogus"})
         assert response["type"] == "error"
         assert "unknown" in response["message"].lower() or "Unknown" in response["message"]
+
+    @pytest.mark.asyncio
+    async def test_handle_server_status_reports_active_sessions(self, mock_world, fake_v2x_api):
+        from digital_twin_bridge import drive_server
+        from digital_twin_bridge.drive_server import DriveSession, handle_message
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        drive_server._active_sessions.clear()
+        drive_server._active_sessions.append(session)
+
+        response = await handle_message(session, {"type": "server_status"})
+
+        assert response == {
+            "type": "server_status",
+            "active_sessions": 1,
+            "this_session_active": False,
+        }
+        drive_server._active_sessions.clear()
 
 
 @pytest.mark.unit
