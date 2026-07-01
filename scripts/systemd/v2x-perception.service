@@ -16,7 +16,7 @@ Environment=PYTHON_BIN=/home/path/V2XCarla/perception-venv/bin/python
 Environment=V2X_PERCEPTION_MODEL_PATH=yolov8n.pt
 Environment=V2X_PERCEPTION_VIDEO_PATHS=v2x-backend-cam-ch1,v2x-backend-cam-ch2,v2x-backend-cam-ch3,v2x-backend-cam-ch4
 Environment=V2X_VIDEO_SESSION_API_BASE_URL=https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com
-Environment=V2X_PERCEPTION_CONFIDENCE=0.5
+Environment=V2X_PERCEPTION_CONFIDENCE=0.4
 Environment=V2X_PERCEPTION_SHOW_LIVE=false
 Environment=V2X_PERCEPTION_STREAM_HOST=0.0.0.0
 Environment=V2X_PERCEPTION_STREAM_PORT=8090
