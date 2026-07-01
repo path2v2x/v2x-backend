@@ -148,7 +148,8 @@ function shouldSkipDriveConfigOverlay(): boolean {
 
 export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
 	if (!configPromise) {
-		configPromise = fetch('/config.json', { cache: 'no-store' })
+		const configUrl = `/config.json?v=${Date.now()}`;
+		configPromise = fetch(configUrl, { cache: 'no-store' })
 			.then(async (response) => {
 				if (!response.ok) {
 					return DEFAULT_CONFIG;
