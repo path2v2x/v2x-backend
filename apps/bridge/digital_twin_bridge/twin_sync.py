@@ -163,8 +163,9 @@ class TwinSync:
                 sidewalk = None
             if sidewalk is not None and sidewalk.transform.location.distance(location) < 5.0:
                 location.z = sidewalk.transform.location.z
-        # Slight lift avoids ground clipping on spawn.
-        location.z += 0.2
+        # Lift above the surface or try_spawn_actor fails on ground collision;
+        # walkers are placed by their capsule centre so they need ~1 m.
+        location.z += 1.1 if track.object_type == "person" else 0.3
         return location
 
     # ------------------------------------------------------------------
@@ -224,7 +225,11 @@ class TwinSync:
                 transform = carla.Transform(location, carla.Rotation(yaw=track.yaw))
                 actor = self._world.try_spawn_actor(bp, transform)
                 if actor is None:
-                    # Spawn collision (another actor there); retry next poll.
+                    # Spawn collision; lift a little more and retry next poll.
+                    logger.info(
+                        "Twin spawn blocked for %s (%s) at (%.1f, %.1f, %.1f); retrying",
+                        object_id, bp.id, location.x, location.y, location.z,
+                    )
                     continue
                 try:
                     actor.set_simulate_physics(False)
