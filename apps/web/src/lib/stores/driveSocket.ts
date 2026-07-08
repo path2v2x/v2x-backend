@@ -6,7 +6,7 @@
  */
 
 import { writable, get } from 'svelte/store';
-import type { DriveSessionState, VehicleTelemetry, CameraView, DriveMessage, VehicleOption, SpawnableObject, PlacedObject, ScenarioInfo, V2xSignal, V2xAlert, V2xZone, TrajectoryInfo, TrajectoryStatus, XoscScenarioInfo, XoscRunnerStatus, XoscEvent, XoscFinishedEvent, DynamicActor } from '$lib/types';
+import type { DriveSessionState, VehicleTelemetry, CameraView, DriveMessage, VehicleOption, SpawnableObject, PlacedObject, ScenarioInfo, V2xSignal, V2xAlert, V2xZone, TrajectoryInfo, TrajectoryStatus, XoscScenarioInfo, XoscRunnerStatus, XoscEvent, XoscFinishedEvent, DynamicActor, DriveMapId, DriveMapOption } from '$lib/types';
 import { v2xZones } from './v2xZones';
 
 // ── Stores ──
@@ -33,6 +33,9 @@ export const lastError = writable<string | null>(null);
 export const vehicleId = writable<number | null>(null);
 export const objectsCount = writable<number>(0);
 export const vehicleList = writable<VehicleOption[]>([]);
+export const driveMaps = writable<DriveMapOption[]>([]);
+export const currentDriveMap = writable<DriveMapId | null>(null);
+export const mapSwitching = writable<boolean>(false);
 export const spawnableObjects = writable<SpawnableObject[]>([]);
 export const placedObjects = writable<PlacedObject[]>([]);
 export const placedCount = writable<number>(0);
@@ -40,10 +43,6 @@ export const scenarioList = writable<ScenarioInfo[]>([]);
 export const v2xSignals = writable<V2xSignal[]>([]);
 export const v2xSignalCount = writable<number>(0);
 export const v2xAlerts = writable<V2xAlert[]>([]);
-
-/** Current camera frame aspect (drives the camera viewport's visible shape).
- * Defaults to 1:1 to match the bridge's default 720x720 capture. */
-export const cameraAspect = writable<{ w: number; h: number }>({ w: 1, h: 1 });
 export const trajectoryList = writable<TrajectoryInfo[]>([]);
 export const trajectoryStatus = writable<TrajectoryStatus>({ active: false });
 export const dynamicActors = writable<DynamicActor[]>([]);
@@ -178,6 +177,25 @@ function handleServerMessage(msg: DriveMessage): void {
 
 		case 'vehicle_list':
 			vehicleList.set((msg.vehicles as VehicleOption[]) ?? []);
+			break;
+
+		case 'map_status':
+			driveMaps.set((msg.maps as DriveMapOption[]) ?? []);
+			currentDriveMap.set((msg.current_map as DriveMapId | null) ?? null);
+			mapSwitching.set(false);
+			break;
+
+		case 'map_set':
+			driveMaps.set((msg.maps as DriveMapOption[]) ?? []);
+			currentDriveMap.set((msg.current_map as DriveMapId | null) ?? null);
+			mapSwitching.set(false);
+			lastError.set(null);
+			vehicleList.set([]);
+			spawnableObjects.set([]);
+			scenarioList.set([]);
+			requestVehicles();
+			requestObjects();
+			requestScenarios();
 			break;
 
 		case 'object_list':
@@ -348,6 +366,7 @@ function handleServerMessage(msg: DriveMessage): void {
 			break;
 
 		case 'error':
+			mapSwitching.set(false);
 			lastError.set(msg.message as string);
 			if (get(sessionState) === 'reconstructing') {
 				sessionState.set('error');
@@ -369,6 +388,16 @@ function send(msg: DriveMessage): void {
 
 export function requestVehicles(): void {
 	send({ type: 'list_vehicles' });
+}
+
+export function requestMaps(): void {
+	send({ type: 'list_maps' });
+}
+
+export function setDriveMap(map: DriveMapId): void {
+	mapSwitching.set(true);
+	lastError.set(null);
+	send({ type: 'set_map', map });
 }
 
 export function startSession(start: string, end: string, vehicle?: string): void {

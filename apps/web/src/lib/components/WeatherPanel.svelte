@@ -8,6 +8,7 @@
 	let { onClose }: Props = $props();
 
 	let activeTab = $state<'weather' | 'graphics'>('weather');
+	const ENABLE_GRAPHICS_CONTROLS = false;
 
 	// ── Weather parameters ──
 	let cloudiness = $state(5);
@@ -17,7 +18,7 @@
 	let sunAzimuth = $state(45);
 	let sunAltitude = $state(45);
 	let fogDensity = $state(2);
-	let fogDistance = $state(0.75);
+	let fogDistance = $state(100);
 	let fogFalloff = $state(0.1);
 	let wetness = $state(0);
 	let scatteringIntensity = $state(1);
@@ -55,58 +56,37 @@
 		'Clear Noon': () => {
 			cloudiness = 5; precipitation = 0; precipitationDeposits = 0;
 			windIntensity = 10; sunAzimuth = -1; sunAltitude = 45;
-			fogDensity = 2; fogDistance = 0.75; fogFalloff = 0.1;
+			fogDensity = 2; fogDistance = 100; fogFalloff = 0.1;
 			wetness = 0; scatteringIntensity = 1; mieScattering = 0.03;
 			rayleighScattering = 0.0331; dustStorm = 0;
 		},
 		'Sunset': () => {
 			cloudiness = 5; precipitation = 0; precipitationDeposits = 0;
 			windIntensity = 10; sunAzimuth = -1; sunAltitude = 15;
-			fogDensity = 2; fogDistance = 0.75; fogFalloff = 0.1;
-			wetness = 0; scatteringIntensity = 1; mieScattering = 0.03;
-			rayleighScattering = 0.0331; dustStorm = 0;
-		},
-		'Night': () => {
-			cloudiness = 5; precipitation = 0; precipitationDeposits = 0;
-			windIntensity = 10; sunAzimuth = -1; sunAltitude = -90;
-			fogDensity = 60; fogDistance = 75; fogFalloff = 1;
+			fogDensity = 2; fogDistance = 100; fogFalloff = 0.1;
 			wetness = 0; scatteringIntensity = 1; mieScattering = 0.03;
 			rayleighScattering = 0.0331; dustStorm = 0;
 		},
 		'Cloudy': () => {
 			cloudiness = 60; precipitation = 0; precipitationDeposits = 0;
 			windIntensity = 10; sunAzimuth = -1; sunAltitude = 45;
-			fogDensity = 3; fogDistance = 0.75; fogFalloff = 0.1;
+			fogDensity = 3; fogDistance = 100; fogFalloff = 0.1;
 			wetness = 0; scatteringIntensity = 1; mieScattering = 0.03;
 			rayleighScattering = 0.0331; dustStorm = 0;
 		},
 		'Rainy': () => {
 			cloudiness = 80; precipitation = 60; precipitationDeposits = 60;
 			windIntensity = 60; sunAzimuth = -1; sunAltitude = 45;
-			fogDensity = 3; fogDistance = 0.75; fogFalloff = 0.1;
+			fogDensity = 3; fogDistance = 100; fogFalloff = 0.1;
 			wetness = 80; scatteringIntensity = 1; mieScattering = 0.03;
 			rayleighScattering = 0.0331; dustStorm = 0;
 		},
 		'Storm': () => {
-			cloudiness = 100; precipitation = 100; precipitationDeposits = 90;
-			windIntensity = 100; sunAzimuth = -1; sunAltitude = 45;
-			fogDensity = 7; fogDistance = 0.75; fogFalloff = 0.1;
-			wetness = 100; scatteringIntensity = 1; mieScattering = 0.03;
+			cloudiness = 85; precipitation = 70; precipitationDeposits = 70;
+			windIntensity = 80; sunAzimuth = -1; sunAltitude = 45;
+			fogDensity = 7; fogDistance = 100; fogFalloff = 0.1;
+			wetness = 80; scatteringIntensity = 1; mieScattering = 0.03;
 			rayleighScattering = 0.0331; dustStorm = 0;
-		},
-		'Foggy': () => {
-			cloudiness = 40; precipitation = 0; precipitationDeposits = 0;
-			windIntensity = 5; sunAzimuth = -1; sunAltitude = 45;
-			fogDensity = 70; fogDistance = 0.75; fogFalloff = 0.1;
-			wetness = 0; scatteringIntensity = 1; mieScattering = 0.03;
-			rayleighScattering = 0.0331; dustStorm = 0;
-		},
-		'Dust': () => {
-			cloudiness = 100; precipitation = 0; precipitationDeposits = 0;
-			windIntensity = 100; sunAzimuth = -1; sunAltitude = 45;
-			fogDensity = 2; fogDistance = 0.75; fogFalloff = 0.1;
-			wetness = 0; scatteringIntensity = 1; mieScattering = 0.03;
-			rayleighScattering = 0.0331; dustStorm = 100;
 		},
 	};
 
@@ -234,20 +214,20 @@
 	type SliderDef = { label: string; get: () => number; set: (v: number) => void; min: number; max: number; step: number };
 
 	const weatherSliders: SliderDef[] = [
-		{ label: 'Sun Altitude', get: () => sunAltitude, set: (v) => sunAltitude = v, min: -90, max: 90, step: 1 },
+		{ label: 'Sun Altitude', get: () => sunAltitude, set: (v) => sunAltitude = v, min: 10, max: 90, step: 1 },
 		{ label: 'Sun Azimuth', get: () => sunAzimuth, set: (v) => sunAzimuth = v, min: -1, max: 360, step: 1 },
-		{ label: 'Cloudiness', get: () => cloudiness, set: (v) => cloudiness = v, min: 0, max: 100, step: 1 },
-		{ label: 'Precipitation', get: () => precipitation, set: (v) => precipitation = v, min: 0, max: 100, step: 1 },
-		{ label: 'Puddles', get: () => precipitationDeposits, set: (v) => precipitationDeposits = v, min: 0, max: 100, step: 1 },
-		{ label: 'Wind', get: () => windIntensity, set: (v) => windIntensity = v, min: 0, max: 100, step: 1 },
-		{ label: 'Fog Density', get: () => fogDensity, set: (v) => fogDensity = v, min: 0, max: 100, step: 1 },
-		{ label: 'Fog Distance', get: () => fogDistance, set: (v) => fogDistance = v, min: 0, max: 100, step: 0.25 },
-		{ label: 'Fog Falloff', get: () => fogFalloff, set: (v) => fogFalloff = v, min: 0, max: 5, step: 0.1 },
-		{ label: 'Wetness', get: () => wetness, set: (v) => wetness = v, min: 0, max: 100, step: 1 },
-		{ label: 'Scattering', get: () => scatteringIntensity, set: (v) => scatteringIntensity = v, min: 0, max: 5, step: 0.1 },
-		{ label: 'Mie Scatter', get: () => mieScattering, set: (v) => mieScattering = v, min: 0, max: 1, step: 0.01 },
-		{ label: 'Rayleigh', get: () => rayleighScattering, set: (v) => rayleighScattering = v, min: 0, max: 0.1, step: 0.001 },
-		{ label: 'Dust Storm', get: () => dustStorm, set: (v) => dustStorm = v, min: 0, max: 100, step: 1 },
+		{ label: 'Cloudiness', get: () => cloudiness, set: (v) => cloudiness = v, min: 0, max: 85, step: 1 },
+		{ label: 'Precipitation', get: () => precipitation, set: (v) => precipitation = v, min: 0, max: 70, step: 1 },
+		{ label: 'Puddles', get: () => precipitationDeposits, set: (v) => precipitationDeposits = v, min: 0, max: 70, step: 1 },
+		{ label: 'Wind', get: () => windIntensity, set: (v) => windIntensity = v, min: 0, max: 80, step: 1 },
+		{ label: 'Fog Density', get: () => fogDensity, set: (v) => fogDensity = v, min: 0, max: 25, step: 1 },
+		{ label: 'Fog Distance', get: () => fogDistance, set: (v) => fogDistance = v, min: 25, max: 100, step: 0.25 },
+		{ label: 'Fog Falloff', get: () => fogFalloff, set: (v) => fogFalloff = v, min: 0.05, max: 5, step: 0.1 },
+		{ label: 'Wetness', get: () => wetness, set: (v) => wetness = v, min: 0, max: 80, step: 1 },
+		{ label: 'Scattering', get: () => scatteringIntensity, set: (v) => scatteringIntensity = v, min: 0.5, max: 2, step: 0.1 },
+		{ label: 'Mie Scatter', get: () => mieScattering, set: (v) => mieScattering = v, min: 0, max: 0.2, step: 0.01 },
+		{ label: 'Rayleigh', get: () => rayleighScattering, set: (v) => rayleighScattering = v, min: 0, max: 0.08, step: 0.001 },
+		{ label: 'Dust Storm', get: () => dustStorm, set: (v) => dustStorm = v, min: 0, max: 30, step: 1 },
 	];
 
 	const graphicsSliders: SliderDef[] = [
@@ -285,13 +265,15 @@
 		>
 			Weather
 		</button>
-		<button
-			onclick={() => { activeTab = 'graphics'; }}
-			class="flex-1 px-3 py-2 text-xs font-semibold tracking-wider uppercase transition-colors
-				{activeTab === 'graphics' ? 'text-white border-b-2 border-cyan-500' : 'text-gray-500 hover:text-gray-300'}"
-		>
-			Graphics
-		</button>
+		{#if ENABLE_GRAPHICS_CONTROLS}
+			<button
+				onclick={() => { activeTab = 'graphics'; }}
+				class="flex-1 px-3 py-2 text-xs font-semibold tracking-wider uppercase transition-colors
+					{activeTab === 'graphics' ? 'text-white border-b-2 border-cyan-500' : 'text-gray-500 hover:text-gray-300'}"
+			>
+				Graphics
+			</button>
+		{/if}
 		<button onclick={onClose}
 			class="px-3 py-2 text-gray-500 hover:text-white text-xs transition-colors">
 			X

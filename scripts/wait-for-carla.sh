@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER="${CARLA_CONTAINER:-carla-sanramon}"
+CONTAINER="${CARLA_CONTAINER:-carla-custommaps}"
 CARLA_HOST="${CARLA_HOST:-localhost}"
 CARLA_PORT="${CARLA_PORT:-2000}"
 TIMEOUT_SECONDS="${CARLA_WAIT_TIMEOUT:-600}"
@@ -19,7 +19,9 @@ host = sys.argv[1]
 port = int(sys.argv[2])
 client = carla.Client(host, port)
 client.set_timeout(5.0)
-client.get_world()
+world = client.get_world()
+world.get_map()
+world.get_blueprint_library()
 PY
         then
             echo "CARLA is ready on ${CARLA_HOST}:${CARLA_PORT} (${CONTAINER})."

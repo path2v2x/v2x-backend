@@ -76,7 +76,10 @@ python -m digital_twin_bridge.drive_main
   "stateBaseUrl": "https://<api-id>.execute-api.us-west-1.amazonaws.com",
   "statePath": "/state",
   "mapDataPath": "/map-data",
-  "videoCameraIds": ["ch1", "ch2", "ch3", "ch4"]
+  "videoCameraIds": ["ch1", "ch2", "ch3", "ch4"],
+  "perceptionStreamUrls": {},
+  "perceptionStreamBaseUrl": "",
+  "perceptionStreamPathTemplate": "/streams/{camera_id}.mjpg"
 }
 ```
 
@@ -88,6 +91,43 @@ The dashboard reads digital twin state and snapshot assets through the read API.
 - Camera stream names default to: `v2x-backend-cam-ch1` through `v2x-backend-cam-ch4`
 - The API exposes `GET /video/session/{camera_id}` and returns a short-lived HLS URL
 - The dashboard requests HLS sessions through the API; browser clients do not use AWS credentials directly
+- `/live` prefers `perceptionStreamUrls[cameraId]` when configured, then falls back to the raw
+  Kinesis HLS session. It can also build URLs from `perceptionStreamBaseUrl`, using
+  `/streams/{camera_id}.mjpg` by default. Use this for Path PC object-detection output with bounding boxes:
+
+```json
+{
+  "perceptionStreamBaseUrl": "https://perception.path2v2x.net"
+}
+```
+
+The perception service should upload detection records to `POST /detections` using the same schema shown
+on the Objects DB documentation tab. The `/live` page shows the recent Objects DB table below the camera
+grid, so detections posted by the Path PC will appear there without leaving Street View.
+
+## Perception App
+
+The object detection/localization pipeline from `path2v2x/co-perception` now lives in
+`apps/perception`. Run it from this repo on the Path PC with:
+
+```bash
+python3.10 -m venv /home/path/V2XCarla/perception-venv
+/home/path/V2XCarla/perception-venv/bin/pip install -r apps/perception/requirements.txt
+sudo install -m 0755 scripts/launch-perception.sh /home/path/V2XCarla/v2x-backend/scripts/launch-perception.sh
+sudo install -m 0644 scripts/systemd/v2x-perception.service /etc/systemd/system/v2x-perception.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now v2x-perception.service
+```
+
+The service starts with `V2X_PERCEPTION_UPLOAD=false`; enable uploads after validating calibration and
+model output. With `V2X_PERCEPTION_STREAM_PORT=8090`, the service publishes:
+
+```text
+http://<path-pc-host>:8090/streams/ch1.mjpg
+http://<path-pc-host>:8090/streams/ch2.mjpg
+http://<path-pc-host>:8090/streams/ch3.mjpg
+http://<path-pc-host>:8090/streams/ch4.mjpg
+```
 
 ## GPU Server
 

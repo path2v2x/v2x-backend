@@ -9,7 +9,7 @@ set -euo pipefail
 # scenes from V2X detection history.
 #
 # CARLA must already be running on port 2000 before invoking this
-# script — start the UE4 Editor manually first.
+# script.
 #
 # NOTE: Mutually exclusive with the observation bridge — do not
 # run both against the same CARLA instance.
@@ -25,18 +25,32 @@ CARLA_PORT="${CARLA_PORT:-2000}"
 WS_PORT="${WS_PORT:-8765}"
 
 DRIVE_PID=""
+SHUTTING_DOWN=0
 
 cleanup() {
+    local status=$?
+    trap - INT TERM EXIT
     echo ""
     echo "Shutting down..."
     if [ -n "$DRIVE_PID" ]; then
         echo "  Stopping drive server (PID $DRIVE_PID)..."
         kill "$DRIVE_PID" 2>/dev/null
-        wait "$DRIVE_PID" 2>/dev/null
+        wait "$DRIVE_PID" 2>/dev/null || true
     fi
     echo "Done."
+    if [ "$SHUTTING_DOWN" = "1" ]; then
+        exit 0
+    fi
+    exit "$status"
 }
-trap cleanup INT TERM EXIT
+
+request_shutdown() {
+    SHUTTING_DOWN=1
+    cleanup
+}
+
+trap request_shutdown INT TERM
+trap cleanup EXIT
 
 # ─────────────────────────────────────────────────────────────
 # 1. Check AWS credentials
@@ -67,7 +81,9 @@ if python3 -c "
 import carla
 c = carla.Client('localhost', $CARLA_PORT)
 c.set_timeout(3.0)
-c.get_world()
+w = c.get_world()
+w.get_map()
+w.get_blueprint_library()
 " &>/dev/null; then
     echo "  CARLA OK"
 else
@@ -82,6 +98,8 @@ fi
 echo "Starting Drive Server..."
 cd "$BRIDGE_DIR"
 export AWS_PROFILE
+export DTB_CARLA_HOST="${CARLA_HOST:-localhost}"
+export DTB_CARLA_PORT="$CARLA_PORT"
 export DTB_WS_PORT="$WS_PORT"
 python -m digital_twin_bridge.drive_main &
 DRIVE_PID=$!

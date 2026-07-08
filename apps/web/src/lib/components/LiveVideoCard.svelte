@@ -5,15 +5,18 @@
 
 	interface Props {
 		cameraId: string;
+		streamUrl?: string;
+		sourceLabel?: string;
 	}
 
-	let { cameraId }: Props = $props();
+	let { cameraId, streamUrl = '', sourceLabel = 'Raw' }: Props = $props();
 
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	let loading = $state(false);
 	let error = $state<string | null>(null);
 	let connected = $state(false);
 	let sessionExpiresIn = $state<number | null>(null);
+	let mjpegUrl = $state('');
 	let hls: Hls | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -34,6 +37,7 @@
 
 	function destroyPlayer() {
 		clearRefreshTimer();
+		mjpegUrl = '';
 		if (hls) {
 			hls.destroy();
 			hls = null;
@@ -46,28 +50,54 @@
 		connected = false;
 	}
 
+	function isImageStream(url: string): boolean {
+		const cleanUrl = url.split('?')[0].toLowerCase();
+		return (
+			cleanUrl.endsWith('.mjpg') ||
+			cleanUrl.endsWith('.mjpeg') ||
+			cleanUrl.endsWith('.jpg') ||
+			cleanUrl.endsWith('.jpeg') ||
+			cleanUrl.endsWith('.png') ||
+			cleanUrl.endsWith('.svg')
+		);
+	}
+
 	async function connect() {
 		loading = true;
 		error = null;
 		destroyPlayer();
 
 		try {
-			const session = await fetchVideoSession(cameraId);
-			sessionExpiresIn = session.expiresIn;
-			scheduleRefresh(session.expiresIn);
+			const sourceUrl = streamUrl.trim();
+			let hlsUrl = sourceUrl;
+			if (sourceUrl) {
+				sessionExpiresIn = null;
+				scheduleRefresh(null);
+			} else {
+				const session = await fetchVideoSession(cameraId);
+				hlsUrl = session.hlsUrl;
+				sessionExpiresIn = session.expiresIn;
+				scheduleRefresh(session.expiresIn);
+			}
+
+			if (sourceUrl && isImageStream(sourceUrl)) {
+				mjpegUrl = sourceUrl;
+				connected = true;
+				return;
+			}
 
 			if (!videoEl) {
 				throw new Error('Video element unavailable');
 			}
 
 			if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-				videoEl.src = session.hlsUrl;
+				videoEl.src = hlsUrl;
 			} else if (Hls.isSupported()) {
 				hls = new Hls({
 					enableWorker: true,
 					lowLatencyMode: false,
 				});
-				hls.loadSource(session.hlsUrl);
+				hls.loadSource(hlsUrl);
 				hls.attachMedia(videoEl);
 			} else {
 				throw new Error('HLS playback is not supported in this browser');
@@ -98,6 +128,9 @@
 	</div>
 
 	<div class="absolute top-2 right-2 z-10 flex items-center gap-2">
+		<span class="bg-black/70 px-2 py-1 text-[10px] font-medium tracking-[0.16em] text-gray-200 uppercase">
+			{sourceLabel}
+		</span>
 		{#if connected}
 			<span class="bg-red-600 px-2 py-1 text-[10px] font-semibold tracking-[0.16em] text-white uppercase">
 				Live
@@ -111,12 +144,27 @@
 	</div>
 
 	<div class="absolute inset-0">
-		<video
-			bind:this={videoEl}
-			class="h-full w-full object-cover"
-			playsinline
-			muted
-		></video>
+		{#if mjpegUrl}
+			<img
+				src={mjpegUrl}
+				alt={`${cameraId} perception stream`}
+				class="h-full w-full object-cover"
+				onload={() => {
+					connected = true;
+				}}
+				onerror={() => {
+					error = 'Perception stream unavailable';
+					connected = false;
+				}}
+			/>
+		{:else}
+			<video
+				bind:this={videoEl}
+				class="h-full w-full object-cover"
+				playsinline
+				muted
+			></video>
+		{/if}
 
 		{#if !connected && !loading}
 			<div class="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/55">

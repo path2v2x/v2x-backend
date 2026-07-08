@@ -226,6 +226,12 @@ def _get_map_data():
         return error
     return _resp(200, payload)
 
+def _get_drive_config():
+    payload, error = _get_s3_json("api/drive-config.json")
+    if error:
+        return error
+    return _resp(200, payload)
+
 def _get_snapshot(object_id):
     key = f"snapshots/{object_id}/latest.jpg"
     try:
@@ -353,6 +359,39 @@ def _get_hls_session(camera_id):
             },
         )
 
+def _timestamp_in_range(item, start, end):
+    timestamp = item.get("timestamp_utc") or ""
+    if not timestamp:
+        return False
+    if start and timestamp < start:
+        return False
+    if end and timestamp > end:
+        return False
+    return True
+
+def _get_detections_range(qs, limit):
+    start = qs.get("start") or ""
+    end = qs.get("end") or ""
+
+    # DynamoDB has no global timestamp index in the current table schema.
+    # Keep this as a bounded scan so callers get the expected route today.
+    scan_limit = max(limit, min(MAX_LIMIT, limit * 4))
+    kwargs = {"Limit": scan_limit}
+    resp = table.scan(**kwargs)
+    items = [
+        _strip_api_fields(item)
+        for item in (resp.get("Items", []) or [])
+        if _timestamp_in_range(item, start, end)
+    ]
+    items = sorted(items, key=lambda x: (x.get("timestamp_utc") or ""), reverse=True)
+    return _resp(
+        200,
+        {
+            "items": _jsonable(items[:limit]),
+            "next": _b64(resp.get("LastEvaluatedKey")),
+        },
+    )
+
 def handler(event, context):
     path = (event.get("rawPath") or event.get("path") or "").rstrip("/")
     qs = event.get("queryStringParameters") or {}
@@ -379,6 +418,9 @@ def handler(event, context):
 
     if path == "/map-data":
         return _get_map_data()
+
+    if path == "/drive-config":
+        return _get_drive_config()
 
     if path.startswith("/snapshots/") and path.endswith("/latest"):
         object_id = path_params.get("object_id") or path.split("/snapshots/", 1)[1].rsplit("/latest", 1)[0]
@@ -423,6 +465,9 @@ def handler(event, context):
             },
         )
 
+    if path == "/detections/range":
+        return _get_detections_range(qs, limit)
+
     if path == "/detections/recent":
         # NOTE: DynamoDB has no global "recent" query without a dedicated index.
         # This is a best-effort scan for small tables; sort client-side.
@@ -449,7 +494,9 @@ def handler(event, context):
                     "/demo-videos",
                     "/state",
                     "/map-data",
+                    "/drive-config",
                     "/snapshots/{object_id}/latest",
+                    "/detections/range",
                     "/detections/recent",
                     "/detections/object/{object_id}",
                     "/detections/geohash/{geohash}",
@@ -511,11 +558,13 @@ INTEGRATION_ID="$(aws apigatewayv2 create-integration \
   --query IntegrationId --output text)"
 
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /detections/recent" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
+aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /detections/range" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /detections/object/{object_id}" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /detections/geohash/{geohash}" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /demo-videos" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /state" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /map-data" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
+aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /drive-config" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /snapshots/{object_id}/latest" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 aws apigatewayv2 create-route --api-id "${API_ID}" --route-key "GET /video/session/{camera_id}" --target "integrations/${INTEGRATION_ID}" >/dev/null || true
 

@@ -98,26 +98,6 @@ export interface ActorGeofenceAlert {
 	distance: number;
 }
 
-export type PerceptionClass =
-	| 'vehicle'
-	| 'pedestrian'
-	| 'cone'
-	| 'traffic_sign'
-	| 'traffic_light';
-
-export type PerceptionAlertLevel = 'none' | 'info' | 'warn' | 'critical';
-
-export interface Detection {
-	id: string;
-	class: PerceptionClass;
-	pos: [number, number];     // [x_forward_m, y_right_m] in ego frame
-	distance: number;
-	bbox_dim: [number, number]; // [length_m, width_m] — crude estimate
-	in_path: boolean;
-	alert: PerceptionAlertLevel;
-	velocity?: [number, number]; // [vx_forward, vy_right] when tracked
-}
-
 export interface VehicleTelemetry {
 	speed: number;
 	gear: number;
@@ -128,7 +108,6 @@ export interface VehicleTelemetry {
 	brake: number;
 	nearby_actors?: NearbyActor[];
 	dynamic_actors?: DynamicActor[];
-	detections?: Detection[];
 }
 
 export type TrafficPreset = 'none' | 'light' | 'medium' | 'heavy' | 'chaos';
@@ -146,6 +125,14 @@ export interface VehicleOption {
 	id: string;
 	name: string;
 	wheels: number;
+}
+
+export type DriveMapId = 'richmond' | 'san_ramon';
+
+export interface DriveMapOption {
+	id: DriveMapId;
+	label: string;
+	map_name: string;
 }
 
 export interface SpawnableObject {

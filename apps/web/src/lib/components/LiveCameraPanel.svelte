@@ -7,6 +7,18 @@
 	}
 
 	let { config }: Props = $props();
+
+	function buildPerceptionStreamUrl(cameraId: string): string {
+		if (!config) return '';
+		const explicitUrl = config.perceptionStreamUrls[cameraId];
+		if (explicitUrl) return explicitUrl;
+		if (!config.perceptionStreamBaseUrl) return '';
+		const path = config.perceptionStreamPathTemplate.replace(
+			'{camera_id}',
+			encodeURIComponent(cameraId)
+		);
+		return `${config.perceptionStreamBaseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+	}
 </script>
 
 <section class="bg-black">
@@ -16,7 +28,12 @@
 			style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));"
 		>
 			{#each config.videoCameraIds as cameraId}
-				<LiveVideoCard {cameraId} />
+				{@const streamUrl = buildPerceptionStreamUrl(cameraId)}
+				<LiveVideoCard
+					{cameraId}
+					{streamUrl}
+					sourceLabel={streamUrl ? 'Perception' : 'Raw'}
+				/>
 			{/each}
 		</div>
 	{:else}

@@ -14,10 +14,52 @@ from digital_twin_bridge.config import Config
 
 logger = logging.getLogger(__name__)
 
+DRIVE_MAP_OPTIONS = {
+    "richmond": {
+        "id": "richmond",
+        "label": "Richmond",
+        "map_name": "Richmond_Field_Station_Richmond_CA",
+    },
+    "san_ramon": {
+        "id": "san_ramon",
+        "label": "San Ramon",
+        "map_name": "San_Ramon_P1_Roads",
+    },
+}
+
 
 def _map_leaf(name: str) -> str:
     """Return the final path component for CARLA map identifiers."""
     return name.rsplit("/", 1)[-1]
+
+
+def normalize_drive_map_id(value: str) -> str:
+    """Resolve a public two-choice drive map id or CARLA map name."""
+    raw = (value or "").strip()
+    lowered = raw.lower().replace(" ", "_").replace("-", "_")
+    if lowered in DRIVE_MAP_OPTIONS:
+        return lowered
+
+    leaf = _map_leaf(raw).lower()
+    for map_id, option in DRIVE_MAP_OPTIONS.items():
+        if leaf == option["map_name"].lower():
+            return map_id
+    raise ValueError("Unsupported drive map")
+
+
+def drive_map_status(carla_map_name: str) -> dict:
+    """Return the public map status payload for a CARLA map name."""
+    current_id = None
+    leaf = _map_leaf(carla_map_name).lower()
+    for map_id, option in DRIVE_MAP_OPTIONS.items():
+        if leaf == option["map_name"].lower():
+            current_id = map_id
+            break
+    return {
+        "current_map": current_id,
+        "current_map_name": carla_map_name,
+        "maps": list(DRIVE_MAP_OPTIONS.values()),
+    }
 
 
 class CarlaConnection:
@@ -107,6 +149,10 @@ class CarlaConnection:
         requested_map = self._config.CARLA_MAP.strip()
         if not requested_map:
             return
+        try:
+            requested_map = DRIVE_MAP_OPTIONS[normalize_drive_map_id(requested_map)]["map_name"]
+        except ValueError:
+            pass
 
         current_map = self._map.name
         if current_map == requested_map or _map_leaf(current_map) == requested_map:
@@ -151,6 +197,56 @@ class CarlaConnection:
         self._world = self._client.load_world(target_map)
         self._map = self._world.get_map()
         logger.info("Loaded CARLA map: %s", self._map.name)
+
+    def switch_drive_map(self, map_id_or_name: str) -> dict:
+        """Switch between the two supported public drive maps."""
+        if self._client is None or self._world is None or self._map is None:
+            raise RuntimeError("Not connected to CARLA.")
+
+        map_id = normalize_drive_map_id(map_id_or_name)
+        requested_map = DRIVE_MAP_OPTIONS[map_id]["map_name"]
+        current_map = self._map.name
+        if current_map == requested_map or _map_leaf(current_map) == requested_map:
+            return {"changed": False, **drive_map_status(current_map)}
+
+        available_maps = list(self._client.get_available_maps())
+        target_map = next(
+            (
+                candidate
+                for candidate in available_maps
+                if candidate == requested_map or _map_leaf(candidate) == requested_map
+            ),
+            None,
+        )
+        if target_map is None:
+            raise RuntimeError(
+                f"Drive map '{DRIVE_MAP_OPTIONS[map_id]['label']}' is not available in CARLA"
+            )
+
+        logger.info("Switching drive map from %s to %s", current_map, target_map)
+        self._client.set_timeout(120.0)
+        self._world = self._client.load_world(target_map)
+        self._map = self._world.get_map()
+        self._original_settings = self._world.get_settings()
+
+        settings = self._world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05
+        self._world.apply_settings(settings)
+        self._world.set_weather(carla.WeatherParameters(
+            cloudiness=0.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            wind_intensity=30.0,
+            sun_azimuth_angle=180.0,
+            sun_altitude_angle=75.0,
+            fog_density=0.0,
+            fog_distance=100000.0,
+            wetness=0.0,
+        ))
+        self._client.set_timeout(10.0)
+        logger.info("Switched drive map: %s", self._map.name)
+        return {"changed": True, **drive_map_status(self._map.name)}
 
     def disconnect(self) -> None:
         """Restore original world settings and release references."""

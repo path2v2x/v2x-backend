@@ -22,7 +22,6 @@ from PIL import Image
 from digital_twin_bridge.scene_reconstructor import SceneReconstructor
 from digital_twin_bridge.camera_streamer import compute_camera_transform
 from digital_twin_bridge.openscenario_runner import list_xosc
-from digital_twin_bridge.perception import PerceptionService
 from digital_twin_bridge.trajectory_player import (
     TrajectoryPlayer,
     list_trajectory_files,
@@ -35,6 +34,67 @@ VALID_CAMERA_VIEWS = {"chase", "hood", "bird", "free"}
 
 # Default vehicle if none specified
 DEFAULT_VEHICLE = "vehicle.tesla.model3"
+FALLBACK_VEHICLES = [
+    DEFAULT_VEHICLE,
+    "vehicle.lincoln.mkz",
+    "vehicle.dodge.charger",
+    "vehicle.nissan.patrol",
+    "vehicle.mini.cooper",
+]
+DEFAULT_DRIVE_WEATHER = {
+    "cloudiness": 0.0,
+    "precipitation": 0.0,
+    "precipitation_deposits": 0.0,
+    "wind_intensity": 30.0,
+    "sun_azimuth_angle": 180.0,
+    "sun_altitude_angle": 75.0,
+    "fog_density": 0.0,
+    "fog_distance": 100000.0,
+    "fog_falloff": 0.1,
+    "wetness": 0.0,
+    "scattering_intensity": 1.0,
+    "mie_scattering_scale": 0.03,
+    "rayleigh_scattering_scale": 0.0331,
+    "dust_storm": 0.0,
+}
+SAFE_WEATHER_LIMITS = {
+    "cloudiness": (0.0, 85.0),
+    "precipitation": (0.0, 70.0),
+    "precipitation_deposits": (0.0, 70.0),
+    "wind_intensity": (0.0, 80.0),
+    "sun_azimuth_angle": (-1.0, 360.0),
+    "sun_altitude_angle": (10.0, 90.0),
+    "fog_density": (0.0, 25.0),
+    "fog_distance": (25.0, 100000.0),
+    "fog_falloff": (0.05, 5.0),
+    "wetness": (0.0, 80.0),
+    "scattering_intensity": (0.5, 2.0),
+    "mie_scattering_scale": (0.0, 0.2),
+    "rayleigh_scattering_scale": (0.0, 0.08),
+    "dust_storm": (0.0, 30.0),
+}
+SAFE_CAMERA_ATTR_LIMITS = {
+    "bloom_intensity": (0.1, 0.8),
+    "lens_flare_intensity": (0.0, 0.2),
+    "motion_blur_intensity": (0.0, 0.45),
+    "motion_blur_max_distortion": (0.0, 0.35),
+    "exposure_compensation": (0.0, 1.0),
+    "exposure_min_bright": (8.0, 12.0),
+    "exposure_max_bright": (10.0, 16.0),
+    "exposure_speed_up": (1.0, 4.0),
+    "exposure_speed_down": (0.8, 4.0),
+    "gamma": (2.0, 2.4),
+    "temp": (5500.0, 7500.0),
+    "tint": (-0.2, 0.2),
+    "slope": (0.7, 1.0),
+    "toe": (0.4, 0.7),
+    "shoulder": (0.2, 0.4),
+    "black_clip": (0.0, 0.02),
+    "white_clip": (0.02, 0.06),
+    "chromatic_aberration_intensity": (0.0, 0.2),
+    "lens_circle_multiplier": (0.0, 0.2),
+    "lens_circle_falloff": (4.0, 8.0),
+}
 
 # Traffic presets
 TRAFFIC_PRESETS = {
@@ -121,6 +181,65 @@ def get_available_vehicles(world) -> list[dict]:
     # Sort: 4-wheeled first, then alphabetically
     vehicles.sort(key=lambda v: (0 if v["wheels"] >= 4 else 1, v["name"]))
     return vehicles
+
+
+def resolve_vehicle_blueprint(bp_lib, requested_blueprint: str):
+    """Resolve a requested vehicle, falling back across CARLA catalogs."""
+    vehicle_bps = bp_lib.filter(requested_blueprint)
+    if vehicle_bps:
+        return vehicle_bps[0]
+
+    for fallback in FALLBACK_VEHICLES:
+        vehicle_bps = bp_lib.filter(fallback)
+        if vehicle_bps:
+            logger.warning(
+                "Vehicle '%s' not found, falling back to '%s'",
+                requested_blueprint,
+                vehicle_bps[0].id,
+            )
+            return vehicle_bps[0]
+
+    for bp in bp_lib.filter("vehicle.*"):
+        try:
+            if blueprint_wheel_count(bp) >= 4:
+                logger.warning(
+                    "Vehicle '%s' not found, falling back to first available four-wheel vehicle '%s'",
+                    requested_blueprint,
+                    bp.id,
+                )
+                return bp
+        except Exception:
+            continue
+
+    return None
+
+
+def _safe_float(params: dict, key: str, default: float, limits: tuple[float, float]) -> float:
+    value = params.get(key, default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
+    lo, hi = limits
+    return max(lo, min(hi, parsed))
+
+
+def safe_drive_weather(params: dict | None = None) -> dict[str, float]:
+    """Return weather values constrained to keep the drive camera usable."""
+    params = params or {}
+    return {
+        key: _safe_float(params, key, DEFAULT_DRIVE_WEATHER[key], limits)
+        for key, limits in SAFE_WEATHER_LIMITS.items()
+    }
+
+
+def apply_default_drive_weather(world) -> None:
+    """Reset CARLA to a bright weather state for the shared drive world."""
+    import carla
+
+    world.set_weather(carla.WeatherParameters(**safe_drive_weather(DEFAULT_DRIVE_WEATHER)))
 
 
 def get_spawnable_objects(world) -> list[dict]:
@@ -312,8 +431,6 @@ class DriveSession:
         self._camera_sensor = None
         self._latest_frame: Optional[bytes] = None
         self._frame_lock = threading.Lock()
-        # Tesla-style 8-camera perception stack — attached lazily on session start.
-        self._perception = PerceptionService()
         self._accepting_frames = False  # Guard against callbacks after stop
         self._placed_objects: list = []  # User-placed objects (actor, blueprint_id, pos)
         self._dynamic_actors: dict[int, DynamicActorMeta] = {}
@@ -332,6 +449,21 @@ class DriveSession:
         self._bound_y = 1.0
         self._bound_z = 0.8
 
+    def update_runtime(
+        self,
+        world,
+        carla_map,
+        trajectory_player: Optional[TrajectoryPlayer] = None,
+        openscenario_runner=None,
+    ) -> None:
+        """Refresh server-owned CARLA references after an idle map switch."""
+        if self._active:
+            raise RuntimeError("Cannot update session runtime while active")
+        self._world = world
+        self._map = carla_map
+        self._trajectory_player = trajectory_player
+        self._openscenario_runner = openscenario_runner
+
     async def start(self, start: str, end: str, vehicle_blueprint: str = DEFAULT_VEHICLE) -> dict:
         """Start a driving session: reconstruct scene, spawn vehicle, attach camera.
 
@@ -341,6 +473,8 @@ class DriveSession:
             raise RuntimeError("Session already active")
 
         try:
+            if not any(s.is_active for s in _active_sessions):
+                apply_default_drive_weather(self._world)
             self._reconstructor = SceneReconstructor(
                 world=self._world,
                 carla_map=self._map,
@@ -350,19 +484,14 @@ class DriveSession:
             recon_result = self._reconstructor.reconstruct(start, end)
 
             bp_lib = self._world.get_blueprint_library()
-            vehicle_bps = bp_lib.filter(vehicle_blueprint)
-            if not vehicle_bps:
-                # Fallback to default if selected vehicle not found
-                logger.warning("Vehicle '%s' not found, falling back to '%s'", vehicle_blueprint, DEFAULT_VEHICLE)
-                vehicle_bps = bp_lib.filter(DEFAULT_VEHICLE)
-            if not vehicle_bps:
+            ego_bp = resolve_vehicle_blueprint(bp_lib, vehicle_blueprint)
+            if ego_bp is None:
                 raise RuntimeError("Vehicle blueprint not found")
 
             # Tag the ego so ScenarioRunner attaches to it by role_name
             # instead of trying to spawn a duplicate from the .xosc. The role
             # is per-session (see self._ego_role) so SR picks this session's
             # ego specifically when other drivers are sharing the world.
-            ego_bp = vehicle_bps[0]
             ego_bp.set_attribute("role_name", self._ego_role)
 
             import random
@@ -414,12 +543,6 @@ class DriveSession:
             # Attach RGB camera sensor to the vehicle
             self._attach_camera(bp_lib)
 
-            # Attach the perception sensor stack (8 semantic + 8 depth cameras).
-            try:
-                self._perception.attach(self._world, self.vehicle)
-            except Exception as e:
-                logger.warning("Perception attach failed: %s", e, exc_info=True)
-
             self._accepting_frames = True
             self._active = True
             self.active_camera = "chase"
@@ -460,9 +583,8 @@ class DriveSession:
         import carla
         bx, by, bz = self._bound_x, self._bound_y, self._bound_z
         if view == "hood":
-            # Driver-seat cockpit POV (left-hand drive). Absolute meters —
-            # cabin geometry doesn't scale linearly with bbox.
-            return carla.Transform(carla.Location(x=0.2, y=-0.38, z=1.15))
+            # manual_control index 1: dashboard / front-bumper view
+            return carla.Transform(carla.Location(x=+0.8 * bx, y=0.0, z=1.3 * bz))
         if view == "free":
             # manual_control index 3: high-back chase, slightly tilted
             return carla.Transform(
@@ -581,7 +703,6 @@ class DriveSession:
             "brake": round(brake, 3),
             "nearby_actors": self.get_nearby_actors(),
             "dynamic_actors": self.get_dynamic_actors_snapshot(),
-            "detections": [d.to_dict() for d in self._perception.scan()],
         }
         self._draw_dynamic_actor_geofences()
         eva_alerts = self._check_emergency_vehicle_proximity()
@@ -815,12 +936,8 @@ class DriveSession:
         # Stop accepting frames during swap
         self._accepting_frames = False
 
-        # Use the configured local-frame transform for the active view.
-        # Actor.get_transform() returns world-space coords; passing that to
-        # spawn_actor(attach_to=vehicle) makes CARLA treat the world coords
-        # as a child-relative offset, drifting the camera further from the
-        # car on every respawn.
-        local_transform = self._transform_for_view(self.active_camera)
+        # Save current transform
+        current_transform = self._camera_sensor.get_transform()
 
         # Stop and destroy old sensor
         try:
@@ -836,17 +953,17 @@ class DriveSession:
         # post-processing edits don't revert the user's aspect ratio.
         if "image_size_x" in params:
             try:
-                self._camera_width = max(64, int(float(params.pop("image_size_x"))))
+                self._camera_width = max(480, min(1280, int(float(params.pop("image_size_x")))))
             except (TypeError, ValueError):
                 params.pop("image_size_x", None)
         if "image_size_y" in params:
             try:
-                self._camera_height = max(64, int(float(params.pop("image_size_y"))))
+                self._camera_height = max(480, min(1280, int(float(params.pop("image_size_y")))))
             except (TypeError, ValueError):
                 params.pop("image_size_y", None)
         if "fov" in params:
             try:
-                self._camera_fov = float(params.pop("fov"))
+                self._camera_fov = max(50.0, min(110.0, float(params.pop("fov"))))
             except (TypeError, ValueError):
                 params.pop("fov", None)
 
@@ -862,7 +979,22 @@ class DriveSession:
 
         # Apply remaining post-processing settings, persisting them so
         # later view-switch respawns don't reset the user's tweaks.
+        safe_params = {}
         for key, value in params.items():
+            if key == "exposure_mode":
+                value_str = str(value)
+                safe_params[key] = value_str if value_str in {"manual", "histogram"} else "histogram"
+                continue
+            if key == "enable_postprocess_effects":
+                safe_params[key] = "true"
+                continue
+            limits = SAFE_CAMERA_ATTR_LIMITS.get(key)
+            if limits is None:
+                logger.debug("Ignoring unsupported camera attribute '%s'", key)
+                continue
+            safe_params[key] = _safe_float(params, key, limits[0], limits)
+
+        for key, value in safe_params.items():
             try:
                 camera_bp.set_attribute(key, str(value))
                 self._camera_extra_attrs[key] = str(value)
@@ -870,7 +1002,7 @@ class DriveSession:
                 logger.debug("Camera attribute '%s' failed: %s", key, e)
 
         self._camera_sensor = self._world.spawn_actor(
-            camera_bp, local_transform, attach_to=self.vehicle,
+            camera_bp, current_transform, attach_to=self.vehicle,
             attachment_type=self._attachment_for_view(self.active_camera),
         )
         self._camera_sensor.listen(self._on_camera_frame)
@@ -878,7 +1010,7 @@ class DriveSession:
 
         logger.info(
             "Camera settings updated: %dx%d fov=%.1f, %d extra attrs",
-            self._camera_width, self._camera_height, self._camera_fov, len(params),
+            self._camera_width, self._camera_height, self._camera_fov, len(safe_params),
         )
         return {
             "type": "camera_settings_set",
@@ -1459,26 +1591,17 @@ class DriveSession:
 
         import carla
 
-        weather = carla.WeatherParameters(
-            cloudiness=float(params.get("cloudiness", 0)),
-            precipitation=float(params.get("precipitation", 0)),
-            precipitation_deposits=float(params.get("precipitation_deposits", 0)),
-            wind_intensity=float(params.get("wind_intensity", 0)),
-            sun_azimuth_angle=float(params.get("sun_azimuth_angle", 45)),
-            sun_altitude_angle=float(params.get("sun_altitude_angle", 45)),
-            fog_density=float(params.get("fog_density", 0)),
-            fog_distance=float(params.get("fog_distance", 0)),
-            fog_falloff=float(params.get("fog_falloff", 0)),
-            wetness=float(params.get("wetness", 0)),
-            scattering_intensity=float(params.get("scattering_intensity", 1)),
-            mie_scattering_scale=float(params.get("mie_scattering_scale", 0.03)),
-            rayleigh_scattering_scale=float(params.get("rayleigh_scattering_scale", 0.0331)),
-            dust_storm=float(params.get("dust_storm", 0)),
-        )
+        safe_params = safe_drive_weather(params)
+        weather = carla.WeatherParameters(**safe_params)
         self._world.set_weather(weather)
-        logger.info("Weather updated: sun_alt=%.0f, cloud=%.0f, rain=%.0f",
-                     weather.sun_altitude_angle, weather.cloudiness, weather.precipitation)
-        return {"type": "weather_set"}
+        logger.info(
+            "Weather updated: sun_alt=%.0f, cloud=%.0f, rain=%.0f, fog=%.0f",
+            weather.sun_altitude_angle,
+            weather.cloudiness,
+            weather.precipitation,
+            weather.fog_density,
+        )
+        return {"type": "weather_set", "params": safe_params}
 
     def sync_v2x_zones(self, zones: list[dict]) -> dict:
         """Draw V2X zone outlines + hatching on the CARLA ground.
@@ -1630,6 +1753,11 @@ class DriveSession:
     def end(self) -> dict:
         """End the session: destroy camera, vehicle, cleanup scene."""
         self._force_cleanup()
+        if not any(s is not self and s.is_active for s in _active_sessions):
+            try:
+                apply_default_drive_weather(self._world)
+            except Exception:
+                logger.warning("Failed to reset drive weather on session end", exc_info=True)
         logger.info("Drive session ended")
         return {"type": "session_ended"}
 
@@ -1642,14 +1770,6 @@ class DriveSession:
         # Stop accepting frames first to prevent callback race
         self._accepting_frames = False
         self._active = False
-
-        # Tear down the perception sensor stack BEFORE the ego vehicle is
-        # destroyed — the sensors are attached_to the ego and trying to
-        # destroy them after the parent is gone logs spurious errors.
-        try:
-            self._perception.detach()
-        except Exception as e:
-            logger.warning("Perception detach failed: %s", e, exc_info=True)
 
         # Camera sensor: stop and destroy in separate try blocks
         if self._camera_sensor is not None:
@@ -1699,12 +1819,36 @@ class DriveSession:
         return self._active
 
 
-async def handle_message(session: DriveSession, msg: dict) -> dict:
+async def handle_message(session: DriveSession, msg: dict, map_controller=None) -> dict:
     """Route an incoming WebSocket message to the appropriate session method."""
     msg_type = msg.get("type", "")
 
     try:
-        if msg_type == "list_vehicles":
+        if msg_type == "server_status":
+            response = {
+                "type": "server_status",
+                "active_sessions": active_session_count(),
+                "this_session_active": session.is_active,
+            }
+            if map_controller is not None:
+                response["map"] = map_controller.status_payload()
+            return response
+        elif msg_type == "list_maps":
+            if map_controller is None:
+                return {"type": "map_status", "current_map": None, "maps": []}
+            return {"type": "map_status", **map_controller.status_payload()}
+        elif msg_type == "set_map":
+            if map_controller is None:
+                return {"type": "error", "message": "Map switching is unavailable"}
+            result = await map_controller.switch_map(str(msg.get("map", "")))
+            session.update_runtime(
+                map_controller.world,
+                map_controller.carla_map,
+                map_controller.trajectory_player,
+                map_controller.openscenario_runner,
+            )
+            return result
+        elif msg_type == "list_vehicles":
             vehicles = get_available_vehicles(session._world)
             return {"type": "vehicle_list", "vehicles": vehicles}
         elif msg_type == "list_objects":
@@ -1851,6 +1995,10 @@ async def handle_message(session: DriveSession, msg: dict) -> dict:
 _active_sessions: list[DriveSession] = []
 
 
+def active_session_count() -> int:
+    return sum(1 for session in _active_sessions if session.is_active)
+
+
 async def serve_drive(
     websocket,
     world,
@@ -1860,6 +2008,7 @@ async def serve_drive(
     trajectory_player: Optional[TrajectoryPlayer] = None,
     openscenario_runner=None,
     eva_warning_distance_m: float = 20.0,
+    map_controller=None,
 ):
     """
     Handle a single WebSocket connection for driving.
@@ -1877,6 +2026,12 @@ async def serve_drive(
     serve_drive task subscribes to its event stream and forwards events to
     this connection's browser.
     """
+    if map_controller is not None:
+        world = map_controller.world
+        carla_map = map_controller.carla_map
+        trajectory_player = map_controller.trajectory_player
+        openscenario_runner = map_controller.openscenario_runner
+
     session = DriveSession(
         world=world,
         carla_map=carla_map,
@@ -1934,7 +2089,7 @@ async def serve_drive(
                 continue
 
             msg = json.loads(raw_message)
-            response = await handle_message(session, msg)
+            response = await handle_message(session, msg, map_controller=map_controller)
             await websocket.send(json.dumps(response))
 
             # Track session and start frame streaming once active

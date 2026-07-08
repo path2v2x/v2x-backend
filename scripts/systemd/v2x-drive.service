@@ -12,11 +12,14 @@ Group=path
 SupplementaryGroups=docker
 WorkingDirectory=/home/path/V2XCarla/v2x-backend
 Environment=AWS_PROFILE=Path-Emerging-Dev-147229569658
-Environment=CARLA_CONTAINER=carla-sanramon
-Environment=DTB_CARLA_MAP=San_Ramon
+Environment=CARLA_CONTAINER=carla-custommaps
+Environment=DTB_CARLA_MAP=Richmond_Field_Station_Richmond_CA
 Environment=CARLA_PORT=2000
 Environment=WS_PORT=8765
 Environment=VENV=/home/path/V2XCarla/carla-venv/bin/activate
+Environment=DTB_SCENARIO_RUNNER_PATH=/home/path/scenario_runner
+Environment=DTB_SCENARIO_RUNNER_PYTHON=/home/path/V2XCarla/carla-venv-310/bin/python
+Environment=DTB_SCENARIO_RUNNER_PYTHONPATH=/home/path/V2XCarla/Carla/PythonAPI/carla
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/home/path/V2XCarla/v2x-backend/scripts/wait-for-carla.sh
 ExecStart=/home/path/V2XCarla/v2x-backend/scripts/launch-drive.sh

@@ -37,7 +37,9 @@ const DEFAULT_TAILSCALE_DRIVE_WS_URL =
 	'wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net';
 
 const DEFAULT_CLOUDFLARE_DRIVE_WS_URL =
-	import.meta.env.VITE_CLOUDFLARE_DRIVE_WS_URL ?? import.meta.env.VITE_DRIVE_WS_URL;
+	import.meta.env.VITE_CLOUDFLARE_DRIVE_WS_URL ??
+	import.meta.env.VITE_DRIVE_WS_URL ??
+	'wss://drive.path2v2x.net';
 
 export interface DriveTunnel {
 	id: string;

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { DRIVE_TUNNELS, buildDriveTunnels, type DriveTunnel, type TunnelId } from '$lib/constants';
-	import type { CameraView, SpawnableObject } from '$lib/types';
+	import type { CameraView, DriveMapId, DriveMapOption, SpawnableObject } from '$lib/types';
 
 	import {
 		gamepadConnected,
@@ -26,6 +26,9 @@
 		lastError,
 		objectsCount,
 		vehicleList,
+		driveMaps,
+		currentDriveMap,
+		mapSwitching,
 		spawnableObjects,
 		placedCount,
 		scenarioList,
@@ -40,6 +43,7 @@
 		respawnVehicle,
 		clearNonEgoVehicles,
 		requestVehicles,
+		requestMaps,
 		requestObjects,
 		requestScenarios,
 		saveScenario,
@@ -51,14 +55,13 @@
 		undoPlace,
 		undoV2xSignal,
 		setOnFrame,
-		cameraAspect,
+		setDriveMap,
 	} from '$lib/stores/driveSocket';
 
 	import CalibrationWizard from '$lib/components/CalibrationWizard.svelte';
 	import CameraViewComponent from '$lib/components/CameraView.svelte';
 	import HudOverlay from '$lib/components/HudOverlay.svelte';
-	import DriverDashboardConnected from '$lib/components/dashboard/DriverDashboardConnected.svelte';
-	// V2xToast removed — warnings now stack into the DriverDashboard center stack.
+	import V2xToast from '$lib/components/V2xToast.svelte';
 	import V2xSignalPlacer from '$lib/components/V2xSignalPlacer.svelte';
 	import V2xZoneEditor from '$lib/components/V2xZoneEditor.svelte';
 	import DriveMiniMap from '$lib/components/DriveMiniMap.svelte';
@@ -92,6 +95,7 @@
 	let geofenceRadiusM = $state(35);
 	let dynamicActorMessage = $state('Moving emergency vehicle geofence active');
 	let selectedScenario = $state('');
+	let lastLoadedScenarioFile = $state('');
 	let showSaveDialog = $state(false);
 	let scenarioName = $state('');
 	let showZoneEditor = $state(false);
@@ -156,6 +160,11 @@
 	let numZones = $derived($v2xZones.length);
 
 	let vehicles = $derived($vehicleList);
+	let maps: DriveMapOption[] = $derived($driveMaps.length > 0 ? $driveMaps : [
+		{ id: 'richmond', label: 'Richmond', map_name: 'Richmond_Field_Station_Richmond_CA' },
+		{ id: 'san_ramon', label: 'San Ramon', map_name: 'San_Ramon_P1_Roads' },
+	]);
+	let selectedMap: DriveMapId = $derived($currentDriveMap ?? 'richmond');
 	let objects = $derived($spawnableObjects);
 	let scenarios = $derived($scenarioList);
 	let numPlaced = $derived($placedCount);
@@ -182,6 +191,23 @@
 		connect(getSelectedUrl());
 	}
 
+	async function refreshMapData() {
+		try {
+			mapData = await fetchMapDataFull();
+		} catch {
+			console.warn('Failed to load map data for mini-map');
+		}
+	}
+
+	function handleMapSwitch(id: DriveMapId) {
+		if (id === selectedMap || $mapSwitching || !canSwitchMap) return;
+		selectedScenario = '';
+		lastLoadedScenarioFile = '';
+		clearZones();
+		mapData = null;
+		setDriveMap(id);
+	}
+
 	let connected = $derived($driveConnected);
 	let state = $derived($sessionState);
 	let currentTelemetry = $derived($telemetry);
@@ -189,6 +215,7 @@
 	let isCalibrated = $derived($calibrated);
 	let wheelReady = $derived(inputMode === 'keyboard' || isCalibrated);
 	let error = $derived($lastError);
+	let canSwitchMap = $derived(state === 'idle' || state === 'connecting');
 
 	$effect(() => {
 		if ($sessionState === 'driving') {
@@ -211,9 +238,18 @@
 	// Request vehicle list and scenarios once connected
 	$effect(() => {
 		if ($driveConnected && $vehicleList.length === 0) {
+			requestMaps();
 			requestVehicles();
 			requestScenarios();
 		}
+	});
+
+	let lastMapDataRefresh = $state('');
+	$effect(() => {
+		const mapId = $currentDriveMap;
+		if (!mapId || mapId === lastMapDataRefresh) return;
+		lastMapDataRefresh = mapId;
+		void refreshMapData();
 	});
 
 	onMount(async () => {
@@ -235,12 +271,7 @@
 			}
 		});
 
-		// Fetch map data for mini-map and coordinate conversion
-		try {
-			mapData = await fetchMapDataFull();
-		} catch {
-			console.warn('Failed to load map data for mini-map');
-		}
+		await refreshMapData();
 	});
 
 	onDestroy(() => {
@@ -249,7 +280,6 @@
 
 	// Load scenario zones immediately at idle when user selects one.
 	// Server responds with zones (and no object spawn because no active session).
-	let lastLoadedScenarioFile = $state('');
 	$effect(() => {
 		if (!$driveConnected || !selectedScenario) return;
 		if (selectedScenario === lastLoadedScenarioFile) return;
@@ -455,7 +485,7 @@
 
 <div class="h-screen w-screen bg-black relative overflow-hidden">
 	{#if state === 'idle' || state === 'connecting'}
-		<div class="absolute inset-0 flex justify-center bg-gray-950 overflow-y-auto py-6" style="align-items: safe center;">
+		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
 			<!-- Subtle radial glow behind card -->
 			<div class="absolute inset-0 flex items-center justify-center pointer-events-none">
 				<div class="w-[600px] h-[600px] rounded-full bg-accent/5 blur-[120px]"></div>
@@ -536,6 +566,25 @@
 										? 'bg-gray-700 text-white shadow-sm'
 										: 'text-gray-500 hover:text-gray-300'}">
 									{tunnel.label.toUpperCase()}
+								</button>
+							{/each}
+						</div>
+					</div>
+
+					<!-- Vehicle picker -->
+					<div class="mb-3">
+						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Map</label>
+						<div class="flex bg-gray-800/50 rounded-xl p-1 border border-gray-800">
+							{#each maps as map}
+								<button
+									onclick={() => handleMapSwitch(map.id)}
+									disabled={$mapSwitching || !canSwitchMap}
+									aria-pressed={selectedMap === map.id}
+									class="flex-1 px-3 py-2 rounded-lg text-xs font-body tracking-wider transition-all duration-200 cursor-pointer disabled:cursor-wait disabled:opacity-60
+									{selectedMap === map.id
+										? 'bg-gray-700 text-white shadow-sm'
+										: 'text-gray-500 hover:text-gray-300'}">
+									{map.label.toUpperCase()}
 								</button>
 							{/each}
 						</div>
@@ -672,7 +721,7 @@
 		</div>
 
 	{:else if state === 'reconstructing'}
-		<div class="absolute inset-0 flex justify-center bg-gray-950 overflow-y-auto py-6" style="align-items: safe center;">
+		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
 			<div class="text-center">
 				<div class="relative w-16 h-16 mx-auto mb-5">
 					<div class="absolute inset-0 border-2 border-accent/20 rounded-full animate-ping"></div>
@@ -684,20 +733,11 @@
 		</div>
 
 	{:else if state === 'driving'}
-		<!-- Tesla-style split layout: (camera + dashboard) left, map right -->
+		<!-- Tesla-style split layout: camera left, map right -->
 		<div class="flex h-full w-full">
-			<!-- Left: camera viewport with translucent dashboard overlay -->
-			<div class="relative flex-1 min-w-0 overflow-hidden">
-				<!-- Aspect-constrained camera viewport: container reshapes with the chosen aspect preset -->
-				<div class="absolute inset-0 flex items-center justify-center">
-					<div class="relative" style="height: 100%; max-width: 100%; aspect-ratio: {$cameraAspect.w} / {$cameraAspect.h};">
-						<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
-						<!-- Dashboard overlay anchored to the visible camera frame (scales with aspect) -->
-						<div class="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 pointer-events-auto" style="width: 94%; height: 95px;">
-							<DriverDashboardConnected />
-						</div>
-					</div>
-				</div>
+			<!-- Left: Camera feed + HUD -->
+			<div class="relative flex-1 min-w-0">
+				<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
 				<HudOverlay telemetry={currentTelemetry} isRecording={true} />
 
 				{#if mapMode === 'overlay' && mapData}
@@ -708,6 +748,9 @@
 						fullPanel={false}
 					/>
 				{/if}
+
+				<!-- V2X toast notifications -->
+				<V2xToast />
 
 				<!-- Camera switcher (top-right) -->
 				<div class="absolute top-4 right-4 z-20 flex items-center gap-0.5 bg-black/40 backdrop-blur-md rounded-xl border border-white/10 p-1 shadow-lg pointer-events-auto">
@@ -994,7 +1037,7 @@
 		{/if}
 
 	{:else if state === 'error'}
-		<div class="absolute inset-0 flex justify-center bg-gray-950 overflow-y-auto py-6" style="align-items: safe center;">
+		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
 			<div class="text-center max-w-md px-8">
 				<div class="w-12 h-12 mx-auto mb-4 rounded-full border-2 border-accent/50 flex items-center justify-center">
 					<svg class="w-6 h-6 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">

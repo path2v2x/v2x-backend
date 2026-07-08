@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart V2X CARLA drive stack
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/path/V2XCarla/v2x-backend
+Environment=CARLA_CONTAINER=carla-custommaps
+Environment=DRIVE_SERVICE=v2x-drive.service
+Environment=CARLA_WAIT_TIMEOUT=600
+ExecStart=/home/path/V2XCarla/v2x-backend/scripts/restart-drive-stack.sh
