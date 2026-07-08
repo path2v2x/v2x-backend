@@ -137,6 +137,30 @@ export function layoutHistogram(
 	return visible.map((bar) => ({ ...bar, intensity: bar.total / max }));
 }
 
+/** Merge sorted-ish coverage intervals (e.g. from chunked requests). */
+export function mergeCoverageIntervals(
+	intervals: CoverageInterval[],
+	toleranceMs = 15_000
+): CoverageInterval[] {
+	const parsed = intervals
+		.map((i) => ({ start: parseIsoMs(i.start), end: parseIsoMs(i.end) }))
+		.filter((i): i is { start: number; end: number } => i.start !== null && i.end !== null)
+		.sort((a, b) => a.start - b.start);
+	const merged: { start: number; end: number }[] = [];
+	for (const interval of parsed) {
+		const last = merged[merged.length - 1];
+		if (last && interval.start - last.end <= toleranceMs) {
+			if (interval.end > last.end) last.end = interval.end;
+		} else {
+			merged.push({ ...interval });
+		}
+	}
+	return merged.map((i) => ({
+		start: new Date(i.start).toISOString(),
+		end: new Date(i.end).toISOString()
+	}));
+}
+
 export function formatClock(epochMs: number): string {
 	return new Date(epochMs).toLocaleTimeString([], {
 		hour: '2-digit',

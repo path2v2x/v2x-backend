@@ -77,19 +77,35 @@ def horizontal_fov_deg(intrinsics: dict) -> float:
 
 
 def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
-    """CARLA Transform for a real camera: pole GPS + height, mirrored pose."""
+    """CARLA Transform for a real camera: pole GPS + height, mirrored pose.
+
+    Optional per-camera ``twin_pose`` overrides in cameras.json refine the
+    twin against the modelled map (fitted with tools/fit_twin_camera_poses.py):
+    ``yaw_offset_deg``, ``pitch_offset_deg``, ``height_offset_m``, and
+    ``forward_offset_m`` (moves the camera off the modelled pole mesh so it
+    doesn't occlude the view).
+    """
     import carla
+
+    twin_pose = camera.get("twin_pose") or {}
+    yaw = heading_to_carla_yaw(
+        float(camera["heading_deg"]),
+        float(camera["yaw_deg"]) + float(twin_pose.get("yaw_offset_deg", 0.0)),
+    )
+    pitch = float(camera["pitch_deg"]) + float(twin_pose.get("pitch_offset_deg", 0.0))
 
     location = gps_to_carla(carla_map, site["lat"], site["lon"])
     # gps_to_carla snaps z to the road surface; the camera sits on the
     # pole `height_m` above that.
-    location.z += float(camera["height_m"])
+    location.z += float(camera["height_m"]) + float(twin_pose.get("height_offset_m", 0.0))
 
-    rotation = carla.Rotation(
-        pitch=float(camera["pitch_deg"]),
-        yaw=heading_to_carla_yaw(float(camera["heading_deg"]), float(camera["yaw_deg"])),
-        roll=0.0,
-    )
+    forward = float(twin_pose.get("forward_offset_m", 0.5))
+    if forward:
+        yaw_rad = math.radians(yaw)
+        location.x += forward * math.cos(yaw_rad)
+        location.y += forward * math.sin(yaw_rad)
+
+    rotation = carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)
     return carla.Transform(location, rotation)
 
 

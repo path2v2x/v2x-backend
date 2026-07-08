@@ -17,7 +17,20 @@
       "pitch_deg": -39.2,
       "yaw_deg": -46.06,
       "heading_deg": 200.0,
-      "intrinsics": { "fx": 1325.4, "fy": 1325.4, "cx": 1280.0, "cy": 960.0, "width": 2560, "height": 1920 }
+      "intrinsics": {
+        "fx": 1325.4,
+        "fy": 1325.4,
+        "cx": 1280.0,
+        "cy": 960.0,
+        "width": 2560,
+        "height": 1920
+      },
+      "twin_pose": {
+        "yaw_offset_deg": 0.0,
+        "pitch_offset_deg": 0.0,
+        "height_offset_m": 0.0,
+        "forward_offset_m": 0.5
+      }
     },
     {
       "id": "ch2",
@@ -27,7 +40,20 @@
       "pitch_deg": -40.52,
       "yaw_deg": 71.25,
       "heading_deg": 300.0,
-      "intrinsics": { "fx": 1325.4, "fy": 1325.4, "cx": 1280.0, "cy": 960.0, "width": 2560, "height": 1920 }
+      "intrinsics": {
+        "fx": 1325.4,
+        "fy": 1325.4,
+        "cx": 1280.0,
+        "cy": 960.0,
+        "width": 2560,
+        "height": 1920
+      },
+      "twin_pose": {
+        "yaw_offset_deg": 5.74,
+        "pitch_offset_deg": 15.49,
+        "height_offset_m": 1.48,
+        "forward_offset_m": 0.5
+      }
     },
     {
       "id": "ch3",
@@ -37,7 +63,20 @@
       "pitch_deg": -30.42,
       "yaw_deg": 14.58,
       "heading_deg": 315.0,
-      "intrinsics": { "fx": 1325.4, "fy": 1325.4, "cx": 1280.0, "cy": 960.0, "width": 2560, "height": 1920 }
+      "intrinsics": {
+        "fx": 1325.4,
+        "fy": 1325.4,
+        "cx": 1280.0,
+        "cy": 960.0,
+        "width": 2560,
+        "height": 1920
+      },
+      "twin_pose": {
+        "yaw_offset_deg": 0.08,
+        "pitch_offset_deg": 0.26,
+        "height_offset_m": -0.04,
+        "forward_offset_m": 1.5
+      }
     },
     {
       "id": "ch4",
@@ -47,7 +86,20 @@
       "pitch_deg": -43.48,
       "yaw_deg": -22.63,
       "heading_deg": 260.0,
-      "intrinsics": { "fx": 1325.4, "fy": 1325.4, "cx": 1280.0, "cy": 960.0, "width": 2560, "height": 1920 }
+      "intrinsics": {
+        "fx": 1325.4,
+        "fy": 1325.4,
+        "cx": 1280.0,
+        "cy": 960.0,
+        "width": 2560,
+        "height": 1920
+      },
+      "twin_pose": {
+        "yaw_offset_deg": -2.16,
+        "pitch_offset_deg": 4.95,
+        "height_offset_m": -0.61,
+        "forward_offset_m": 0.5
+      }
     }
   ]
 }

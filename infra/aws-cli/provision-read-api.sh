@@ -106,6 +106,7 @@ import base64
 import json
 import mimetypes
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import quote
@@ -461,7 +462,12 @@ def _get_video_coverage(camera_id, qs):
         fragments = []
         next_token = None
         pages = 0
-        while pages < 25:
+        # ~2s fragments -> a 24h window is ~45 pages of 1000, which cannot
+        # finish inside API Gateway's 30s integration limit. Stop on a time
+        # budget and report truncation; the web client requests coverage in
+        # ~4h chunks so real queries never hit this.
+        deadline = time.monotonic() + 20.0
+        while pages < 60 and time.monotonic() < deadline:
             kwargs = {
                 "StreamName": stream_name,
                 "MaxResults": 1000,

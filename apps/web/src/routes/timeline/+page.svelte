@@ -63,10 +63,42 @@
 	async function loadCoverage() {
 		const end = Date.now();
 		const start = end - TIMELINE_SPAN_MS;
+		// The Lambda pages ListFragments sequentially and can't sweep 24h of
+		// ~2s fragments inside API Gateway's 30s limit — fan out 4h chunks
+		// per camera and merge the intervals client-side.
+		const CHUNK_MS = 4 * 60 * 60 * 1000;
+		const chunks: { start: number; end: number }[] = [];
+		for (let t = start; t < end; t += CHUNK_MS) {
+			chunks.push({ start: t, end: Math.min(t + CHUNK_MS, end) });
+		}
 		const results = await Promise.allSettled(
-			cameraIds.map((cameraId) =>
-				fetchVideoCoverage(cameraId, { start: toIsoMillis(start), end: toIsoMillis(end) })
-			)
+			cameraIds.map(async (cameraId) => {
+				const parts = await Promise.allSettled(
+					chunks.map((chunk) =>
+						fetchVideoCoverage(cameraId, {
+							start: toIsoMillis(chunk.start),
+							end: toIsoMillis(chunk.end)
+						})
+					)
+				);
+				const intervals = parts.flatMap((part) =>
+					part.status === 'fulfilled' ? part.value.intervals : []
+				);
+				const fragmentCount = parts.reduce(
+					(sum, part) => sum + (part.status === 'fulfilled' ? part.value.fragmentCount : 0),
+					0
+				);
+				return {
+					cameraId,
+					start: toIsoMillis(start),
+					end: toIsoMillis(end),
+					intervals: mergeCoverageIntervals(intervals),
+					fragmentCount,
+					truncated: parts.some(
+						(part) => part.status === 'fulfilled' && part.value.truncated
+					)
+				} satisfies VideoCoverage;
+			})
 		);
 		const next: Record<string, VideoCoverage> = {};
 		results.forEach((result, i) => {
