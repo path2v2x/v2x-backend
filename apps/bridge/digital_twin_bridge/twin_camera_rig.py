@@ -23,8 +23,8 @@ import json
 import logging
 import math
 import os
-import threading
 from copy import deepcopy
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -87,14 +87,55 @@ def horizontal_fov_deg(intrinsics: dict) -> float:
     return math.degrees(2.0 * math.atan((intrinsics["width"] / 2.0) / intrinsics["fx"]))
 
 
+def twin_horizontal_fov_deg(camera: dict) -> float:
+    """Configured twin FOV, including an auditable calibration offset."""
+    twin_pose = camera.get("twin_pose") or {}
+    return horizontal_fov_deg(camera["intrinsics"]) + float(
+        twin_pose.get("fov_offset_deg", 0.0)
+    )
+
+
+def camera_with_twin_pose(camera: dict, overrides: dict) -> dict:
+    """Return a candidate camera without mutating the shared configuration."""
+    candidate = deepcopy(camera)
+    pose = dict(candidate.get("twin_pose") or {})
+    pose.update({key: float(value) for key, value in overrides.items()})
+    candidate["twin_pose"] = pose
+    return candidate
+
+
+def configure_twin_camera_blueprint(
+    camera_bp,
+    camera: dict,
+    image_width: int,
+    image_height: int,
+    fps: Optional[float] = None,
+) -> None:
+    """Apply only the non-lens camera model shared by rig and verifier.
+
+    RR lens-attribute mutation is held after the exit-139 canary.  Callers
+    must reject ``twin_lens`` before this helper and verify the complete lens
+    tuple observed on the spawned actor instead of writing lens attributes.
+    """
+    camera_bp.set_attribute("image_size_x", str(int(image_width)))
+    camera_bp.set_attribute("image_size_y", str(int(image_height)))
+    camera_bp.set_attribute("fov", f"{twin_horizontal_fov_deg(camera):.6f}")
+    if fps is not None:
+        camera_bp.set_attribute("sensor_tick", f"{1.0 / float(fps):.6f}")
+
+    if camera.get("twin_lens"):
+        raise ValueError("twin lens overrides are held for runtime safety")
+
+
 def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
     """CARLA Transform for a real camera: pole GPS + height, mirrored pose.
 
     Optional per-camera ``twin_pose`` overrides in cameras.json refine the
     twin against the modelled map (fitted with tools/fit_twin_camera_poses.py):
-    ``yaw_offset_deg``, ``pitch_offset_deg``, ``height_offset_m``, and
-    ``forward_offset_m`` (moves the camera off the modelled pole mesh so it
-    doesn't occlude the view).
+    ``yaw_offset_deg``, ``pitch_offset_deg``, ``roll_offset_deg``,
+    ``height_offset_m``, ``forward_offset_m``, and ``right_offset_m``. The
+    translations move the virtual camera away from modelled pole/tree meshes
+    and allow a full 6-DOF physical mounting calibration.
     """
     import carla
 
@@ -104,19 +145,29 @@ def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
         float(camera["yaw_deg"]) + float(twin_pose.get("yaw_offset_deg", 0.0)),
     )
     pitch = float(camera["pitch_deg"]) + float(twin_pose.get("pitch_offset_deg", 0.0))
+    roll = float(camera.get("roll_deg", 0.0)) + float(
+        twin_pose.get("roll_offset_deg", 0.0)
+    )
 
     location = gps_to_carla(carla_map, site["lat"], site["lon"])
     # gps_to_carla snaps z to the road surface; the camera sits on the
     # pole `height_m` above that.
     location.z += float(camera["height_m"]) + float(twin_pose.get("height_offset_m", 0.0))
 
-    forward = float(twin_pose.get("forward_offset_m", 0.5))
+    # A missing translation must mean the surveyed pole location.  A hidden
+    # forward offset made fitted, deployed, and verified cameras disagree.
+    forward = float(twin_pose.get("forward_offset_m", 0.0))
+    right = float(twin_pose.get("right_offset_m", 0.0))
     if forward:
         yaw_rad = math.radians(yaw)
         location.x += forward * math.cos(yaw_rad)
         location.y += forward * math.sin(yaw_rad)
+    if right:
+        yaw_rad = math.radians(yaw)
+        location.x -= right * math.sin(yaw_rad)
+        location.y += right * math.cos(yaw_rad)
 
-    rotation = carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)
+    rotation = carla.Rotation(pitch=pitch, yaw=yaw, roll=roll)
     return carla.Transform(location, rotation)
 
 
@@ -194,10 +245,13 @@ class TwinCameraRig:
                     camera_id,
                 )
                 continue
-            camera_bp.set_attribute("image_size_x", str(self._image_width))
-            camera_bp.set_attribute("image_size_y", str(self._image_height))
-            camera_bp.set_attribute("fov", f"{horizontal_fov_deg(camera['intrinsics']):.2f}")
-            camera_bp.set_attribute("sensor_tick", f"{1.0 / self._fps:.4f}")
+            configure_twin_camera_blueprint(
+                camera_bp,
+                camera,
+                self._image_width,
+                self._image_height,
+                self._fps,
+            )
             try:
                 camera_bp.set_attribute("role_name", "twin_rig")
             except (IndexError, RuntimeError):
@@ -224,7 +278,7 @@ class TwinCameraRig:
                 transform.location.z,
                 transform.rotation.yaw,
                 transform.rotation.pitch,
-                horizontal_fov_deg(camera["intrinsics"]),
+                twin_horizontal_fov_deg(camera),
             )
 
         logger.info("Twin camera rig ready: %d cameras", len(self._cameras))
