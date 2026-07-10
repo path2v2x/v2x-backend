@@ -336,6 +336,67 @@ def _object_from_twin_status(status, object_id):
     return matches[0]
 
 
+def validate_twin_camera_model(hello, expected_camera_id):
+    """Validate the exact calibrated UE5 sensor that produced twin frames."""
+    if hello.get("camera_id") != expected_camera_id:
+        raise VerificationError("twin stream camera does not match the request")
+    model = hello.get("camera_model")
+    if not isinstance(model, dict) or model.get("camera_id") != expected_camera_id:
+        raise VerificationError("twin stream has no matching camera model")
+    actor_id = model.get("actor_id")
+    if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id <= 0:
+        raise VerificationError("twin camera model has no valid UE5 actor_id")
+    fingerprint = str(model.get("config_sha256") or "")
+    if not (
+        len(fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise VerificationError("twin camera model has no valid config fingerprint")
+    transform = _finite_transform_payload(model.get("transform"), "twin camera model")
+    image = model.get("image")
+    if not isinstance(image, dict):
+        raise VerificationError("twin camera model has no image geometry")
+    width, height = image.get("width"), image.get("height")
+    fov = image.get("horizontal_fov_deg")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+        or width != hello.get("width")
+        or height != hello.get("height")
+        or isinstance(fov, bool)
+        or not isinstance(fov, (int, float))
+        or not math.isfinite(float(fov))
+        or not 10.0 <= float(fov) <= 170.0
+    ):
+        raise VerificationError("twin camera model image geometry is invalid")
+    lens = model.get("lens")
+    if not isinstance(lens, dict) or set(lens) != {"lens_k", "lens_kcube"}:
+        raise VerificationError("twin camera model lens geometry is invalid")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in lens.values()
+    ):
+        raise VerificationError("twin camera model lens geometry is invalid")
+    return {
+        "camera_id": expected_camera_id,
+        "actor_id": actor_id,
+        "config_sha256": fingerprint,
+        "transform": transform,
+        "image": {
+            "width": width,
+            "height": height,
+            "horizontal_fov_deg": float(fov),
+        },
+        "lens": {key: float(value) for key, value in lens.items()},
+    }
+
+
 def _exact_schema_version(value, expected):
     return (
         not isinstance(value, bool)
@@ -769,6 +830,9 @@ async def verify_twin(args, world=None):
         )
         if evidence["stream_hello"]["type"] == "twin_error":
             raise VerificationError(evidence["stream_hello"].get("message", "twin error"))
+        evidence["validated_camera_model"] = validate_twin_camera_model(
+            evidence["stream_hello"], args.twin_camera
+        )
         live_digest = await receive_binary_frame(
             stream_socket, args.timeout, evidence=evidence
         )

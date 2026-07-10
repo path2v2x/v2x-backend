@@ -19,12 +19,37 @@ from tools.verify_phase4_live import (
     validate_cli_args,
     validate_isolated_ego_roles,
     validate_session_actor_manifest,
+    validate_twin_camera_model,
     validate_twin_object_sample,
     validate_twin_object_samples,
     validate_zero_active_sessions,
     verify_twin,
     websocket_url,
 )
+
+
+def twin_camera_hello(camera_id="ch1"):
+    return {
+        "type": "twin_hello",
+        "camera_id": camera_id,
+        "width": 1280,
+        "height": 960,
+        "camera_model": {
+            "camera_id": camera_id,
+            "actor_id": 33,
+            "config_sha256": "a" * 64,
+            "transform": {
+                "location": {"x": 1.0, "y": 2.0, "z": 8.0},
+                "rotation": {"pitch": -35.0, "yaw": 90.0, "roll": 0.0},
+            },
+            "image": {
+                "width": 1280,
+                "height": 960,
+                "horizontal_fov_deg": 90.0,
+            },
+            "lens": {"lens_k": 0.0, "lens_kcube": 0.0},
+        },
+    }
 
 
 class FakeLocation:
@@ -127,6 +152,34 @@ def twin_status(
             }
         ],
     }
+
+
+def test_validates_fingerprinted_twin_camera_model():
+    model = validate_twin_camera_model(twin_camera_hello(), "ch1")
+    assert model["camera_id"] == "ch1"
+    assert model["actor_id"] == 33
+    assert model["image"]["horizontal_fov_deg"] == pytest.approx(90.0)
+
+
+@pytest.mark.parametrize(
+    "mutate,error",
+    [
+        (lambda hello: hello.pop("camera_model"), "no matching camera model"),
+        (
+            lambda hello: hello["camera_model"].update(config_sha256="bad"),
+            "config fingerprint",
+        ),
+        (
+            lambda hello: hello["camera_model"]["image"].update(width=640),
+            "image geometry",
+        ),
+    ],
+)
+def test_rejects_unverifiable_twin_camera_model(mutate, error):
+    hello = twin_camera_hello()
+    mutate(hello)
+    with pytest.raises(VerificationError, match=error):
+        validate_twin_camera_model(hello, "ch1")
 
 
 def twin_sample(clock, x, *, actor_id=77):
@@ -574,7 +627,7 @@ async def test_twin_replay_restores_live_when_acceptance_fails(monkeypatch):
     monkeypatch.setattr(live_probe.websockets, "connect", lambda *_a, **_k: Context())
 
     async def fake_receive_json(*_args, **_kwargs):
-        return {"type": "twin_hello"}
+        return twin_camera_hello()
 
     binary_calls = 0
 

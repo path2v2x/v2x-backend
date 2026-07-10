@@ -746,6 +746,10 @@ async def main():
         await websocket.send(json.dumps({
             "type": "twin_hello",
             "camera_id": None if control_only else camera_id,
+            "camera_model": (
+                None if control_only or rig is None
+                else rig.camera_model(camera_id)
+            ),
             "width": rig_status["width"],
             "height": rig_status["height"],
             "fps": rig_status["fps"],

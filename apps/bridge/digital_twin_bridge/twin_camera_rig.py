@@ -18,6 +18,7 @@ Pose conversion notes:
   same sign convention as CARLA's Rotation.pitch (negative = down).
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -198,6 +199,10 @@ class TwinCameraRig:
         self._world = world
         self._map = carla_map
         self._config = config
+        self._camera_config = {
+            str(camera["id"]): deepcopy(camera)
+            for camera in config.get("cameras", [])
+        }
         self._image_width = int(image_width)
         self._image_height = int(image_height)
         self._fps = float(fps)
@@ -308,6 +313,52 @@ class TwinCameraRig:
     def get_latest_frame(self, camera_id: str) -> Optional[bytes]:
         with self._lock:
             return self._frames.get(camera_id)
+
+    def camera_model(self, camera_id: str) -> Optional[dict]:
+        """Return the exact, fingerprinted UE5 camera model behind a stream.
+
+        Acceptance tooling must be able to project a replay actor through the
+        same transform and optical settings that produced the JPEG.  Returning
+        only a channel name lets stale or differently configured cameras look
+        equivalent, so the hello protocol carries this immutable evidence.
+        """
+        actor = self._cameras.get(camera_id)
+        camera = self._camera_config.get(camera_id)
+        if actor is None or camera is None:
+            return None
+        transform = actor.get_transform()
+        lens = {"lens_k": 0.0, "lens_kcube": 0.0}
+        lens.update(camera.get("twin_lens") or {})
+        canonical = json.dumps(
+            camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return {
+            "camera_id": camera_id,
+            "actor_id": int(actor.id),
+            "config_sha256": hashlib.sha256(canonical).hexdigest(),
+            "transform": {
+                "location": {
+                    "x": float(transform.location.x),
+                    "y": float(transform.location.y),
+                    "z": float(transform.location.z),
+                },
+                "rotation": {
+                    "pitch": float(transform.rotation.pitch),
+                    "yaw": float(transform.rotation.yaw),
+                    "roll": float(transform.rotation.roll),
+                },
+            },
+            "image": {
+                "width": self._image_width,
+                "height": self._image_height,
+                "horizontal_fov_deg": float(twin_horizontal_fov_deg(camera)),
+            },
+            "lens": {
+                key: float(value)
+                for key, value in lens.items()
+                if key in {"lens_k", "lens_kcube"}
+            },
+        }
 
     def status(self) -> dict:
         with self._lock:

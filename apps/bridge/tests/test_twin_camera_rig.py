@@ -174,6 +174,18 @@ class TestTwinCameraRig:
         listener(object())
         assert rig.get_latest_frame("ch1") == b"jpeg"
         assert rig.status()["frame_counts"]["ch1"] == 1
+        model = rig.camera_model("ch1")
+        assert model["camera_id"] == "ch1"
+        assert model["actor_id"] in rig.actor_ids()
+        assert len(model["config_sha256"]) == 64
+        assert model["image"]["width"] == 1280
+        assert model["image"]["height"] == 960
+        assert model["image"]["horizontal_fov_deg"] == pytest.approx(
+            horizontal_fov_deg(CAMERA["intrinsics"])
+        )
+        assert model["lens"] == {"lens_k": 0.0, "lens_kcube": 0.0}
+        assert model["transform"]["location"]["z"] == pytest.approx(7.0)
+        assert rig.camera_model("ch9") is None
 
         rig.destroy()
         assert rig.camera_ids == []
