@@ -1,4 +1,5 @@
 import sys
+import copy
 from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
@@ -14,6 +15,9 @@ from process_video import (  # noqa: E402
     FrameBroadcaster,
     MultiCameraPipeline,
     VideoObjectDetector,
+    attach_media_clock_metadata,
+    assess_media_clock,
+    records_ready_for_upload,
 )
 
 
@@ -108,6 +112,185 @@ class FrameBroadcasterTests(unittest.TestCase):
         ]
         self.assertNotIn("other.example", last_error)
         self.assertNotIn("another-secret", last_error)
+
+    def test_latest_detection_exposes_media_clock_for_correlation(self):
+        media_clock = {
+            "source": "hls_ext_x_program_date_time",
+            "anchor_program_date_time_utc": "2026-07-10T03:57:23.138Z",
+            "position_milliseconds": 250.5,
+        }
+        self.broadcaster.publish_detections(
+            "ch1",
+            [{
+                "timestamp_utc": "2026-07-10T03:57:27.000Z",
+                "media_timestamp_utc": "2026-07-10T03:57:23.388Z",
+                "media_clock": media_clock,
+            }],
+        )
+        detection = self.broadcaster.snapshot_detections()["cameras"]["ch1"][
+            "detections"
+        ][0]
+        self.assertEqual(
+            detection["media_timestamp_utc"],
+            "2026-07-10T03:57:23.388Z",
+        )
+        self.assertEqual(detection["media_clock"], media_clock)
+
+
+class MediaClockPersistenceTests(unittest.TestCase):
+    def test_media_time_becomes_replay_index_and_receipt_is_preserved(self):
+        record = {
+            "event_id": "event-1",
+            "timestamp_utc": "2026-07-10T03:57:27.000Z",
+            "ingested_at_epoch": 1_783_655_847.0,
+        }
+        attach_media_clock_metadata(
+            [record],
+            {
+                "media_timestamp_utc": "2026-07-10T03:57:23.388Z",
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                    "anchor_program_date_time_utc": "2026-07-10T03:57:23.138Z",
+                    "anchor_fragment_id": "frag-123",
+                    "position_milliseconds": 250.5,
+                    "signed_url": "https://example.invalid/?SessionToken=secret",
+                },
+            },
+        )
+
+        self.assertEqual(record["timestamp_utc"], "2026-07-10T03:57:23.388Z")
+        self.assertEqual(
+            record["decode_received_at_utc"], "2026-07-10T03:57:27.000Z"
+        )
+        self.assertEqual(record["decode_received_at_epoch"], 1_783_655_847.0)
+        self.assertEqual(
+            record["media_timestamp_utc"], "2026-07-10T03:57:23.388Z"
+        )
+        self.assertEqual(
+            record["ts_event"], "2026-07-10T03:57:23.388Z#event-1"
+        )
+        self.assertEqual(record["media_clock_status"], "matched")
+        self.assertNotIn("signed_url", record["media_clock"])
+
+    def test_missing_exact_match_is_marked_unavailable(self):
+        record = {"timestamp_utc": "2026-07-10T03:57:27.000Z"}
+        attach_media_clock_metadata([record], None)
+        self.assertEqual(record["media_clock_status"], "unavailable")
+        self.assertNotIn("media_timestamp_utc", record)
+
+    def test_wrong_schema_or_implausible_latency_is_not_trusted(self):
+        base = {
+            "media_timestamp_utc": "2026-07-10T03:57:23.388Z",
+            "media_clock": {
+                "source": "hls_ext_x_program_date_time",
+                "schema_version": 1,
+                "anchor_program_date_time_utc": "2026-07-10T03:57:23.138Z",
+                "position_milliseconds": 250.0,
+            },
+        }
+        wrong_schema = copy.deepcopy(base)
+        wrong_schema["media_clock"]["schema_version"] = 2
+        self.assertEqual(
+            assess_media_clock(wrong_schema, 1_783_655_847.0)["status"],
+            "unsupported_schema",
+        )
+        implausible = assess_media_clock(
+            base,
+            1_783_655_847.0 + 121.0,
+        )
+        self.assertFalse(implausible["trusted"])
+        self.assertEqual(implausible["status"], "latency_out_of_bounds")
+
+    def test_anchor_position_must_reconstruct_media_timestamp(self):
+        assessment = assess_media_clock(
+            {
+                "media_timestamp_utc": "2026-07-10T03:57:23.388Z",
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                    "anchor_program_date_time_utc": "2026-07-10T03:57:20.000Z",
+                    "position_milliseconds": 100.0,
+                },
+            },
+            1_783_655_847.0,
+        )
+        self.assertFalse(assessment["trusted"])
+        self.assertEqual(assessment["status"], "inconsistent_provenance")
+
+    def test_live_uploads_fail_closed_without_trusted_media_schema(self):
+        trusted = {
+            "event_id": "trusted",
+            "timestamp_schema_version": 2,
+            "media_time_trusted": True,
+        }
+        unavailable = {
+            "event_id": "unavailable",
+            "timestamp_schema_version": 2,
+            "media_time_trusted": False,
+        }
+        legacy = {"event_id": "legacy"}
+        records = [trusted, unavailable, legacy]
+        self.assertEqual(records_ready_for_upload(records, True), [trusted])
+        self.assertEqual(records_ready_for_upload(records, False), records)
+
+
+class RunScopedIdentityTests(unittest.TestCase):
+    @staticmethod
+    def pipeline(run_id):
+        pipeline = object.__new__(MultiCameraPipeline)
+        pipeline.global_tracks = {}
+        pipeline.local_to_global = {}
+        pipeline.next_global_id = 0
+        pipeline.perception_run_id = run_id
+        pipeline.perception_run_prefix = run_id.replace("-", "")[:8]
+        return pipeline
+
+    @staticmethod
+    def detection(camera="ch1", confidence=0.8, media_timestamp="first"):
+        return {
+            "event_id": f"event-{camera}",
+            "object_id": f"car_{camera}_7",
+            "object_type": "car",
+            "confidence_score": confidence,
+            "gps_location": {"latitude": 37.0, "longitude": -122.0},
+            "device_id": camera,
+            "track_id": 7,
+            "embedding": None,
+            "timestamp_utc": media_timestamp,
+            "media_timestamp_utc": media_timestamp,
+            "media_clock": {"source": "hls_ext_x_program_date_time"},
+            "camera_data": {"bifocal_metadata": {"bbox": {}}},
+        }
+
+    def test_same_local_track_in_different_runs_gets_different_global_id(self):
+        run_one = "123e4567-e89b-12d3-a456-426614174000"
+        run_two = "abcdef01-e89b-12d3-a456-426614174000"
+        first = self.pipeline(run_one).deduplicate(
+            [self.detection()], 1_000.0
+        )[0]
+        second = self.pipeline(run_two).deduplicate(
+            [self.detection()], 1_000.0
+        )[0]
+
+        self.assertEqual(first["object_id"], "global_car_123e4567_1")
+        self.assertEqual(second["object_id"], "global_car_abcdef01_1")
+        self.assertNotEqual(first["object_id"], second["object_id"])
+        self.assertEqual(first["perception_run_id"], run_one)
+        self.assertEqual(first["track_id"], 7)
+
+    def test_cross_camera_winner_keeps_one_consistent_media_observation(self):
+        run_id = "123e4567-e89b-12d3-a456-426614174000"
+        older = self.detection("ch1", 0.7, "older")
+        winner = self.detection("ch2", 0.9, "winner")
+        result = self.pipeline(run_id).deduplicate(
+            [copy.deepcopy(older), copy.deepcopy(winner)], 1_000.0
+        )[0]
+
+        self.assertEqual(result["device_id"], "ch2")
+        self.assertEqual(result["timestamp_utc"], "winner")
+        self.assertEqual(result["media_timestamp_utc"], "winner")
+        self.assertEqual(result["event_id"], "event-ch2")
 
 
 class BatchUploadTests(unittest.TestCase):

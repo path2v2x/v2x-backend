@@ -82,6 +82,22 @@ def bounded_frame_identity(frame, axis_samples=64):
     return digest.digest()
 
 
+def exact_frame_identity(frame):
+    """Fingerprint every byte for clock matching, where collisions are unsafe."""
+    digest = hashlib.blake2b(digest_size=32)
+    shape = tuple(getattr(frame, "shape", ()) or ())
+    dtype = str(getattr(frame, "dtype", ""))
+    digest.update(repr((shape, dtype)).encode("ascii", errors="replace"))
+    try:
+        digest.update(memoryview(frame))
+    except (TypeError, ValueError, BufferError):
+        try:
+            digest.update(frame.tobytes())
+        except AttributeError:
+            digest.update(_bounded_bytes(frame, limit=1_048_576))
+    return digest.digest()
+
+
 class LiveStreamReader:
     """Continuously read one renewable live source in a daemon thread.
 
@@ -99,6 +115,10 @@ class LiveStreamReader:
         wall_time=None,
         monotonic=None,
         frame_identity=None,
+        media_clock_factory=None,
+        capture_position_milliseconds=None,
+        media_frame_identity=None,
+        media_clock_retry_seconds=2.0,
         frame_identity_history_size=256,
         duplicate_frame_limit=90,
     ):
@@ -109,6 +129,12 @@ class LiveStreamReader:
         self.wall_time = wall_time or time.time
         self.monotonic = monotonic or time.monotonic
         self.frame_identity = frame_identity or bounded_frame_identity
+        self.media_clock_factory = media_clock_factory
+        self.capture_position_milliseconds = capture_position_milliseconds
+        self.media_frame_identity = media_frame_identity or exact_frame_identity
+        self.media_clock_retry_seconds = max(
+            0.1, float(media_clock_retry_seconds)
+        )
         self.frame_identity_history_size = max(
             1, int(frame_identity_history_size)
         )
@@ -151,12 +177,13 @@ class LiveStreamReader:
         with self._condition:
             if self._latest is None or self._sequence <= int(after_sequence):
                 return None
-            frame, source_epoch, source_monotonic = self._latest
+            frame, source_epoch, source_monotonic, media_clock = self._latest
             return {
                 "sequence": self._sequence,
                 "frame": frame,
                 "source_epoch": source_epoch,
                 "source_monotonic": source_monotonic,
+                "media_clock": media_clock,
             }
 
     def wait_for_frame(self, after_sequence=0, timeout=None):
@@ -195,13 +222,18 @@ class LiveStreamReader:
 
             cap = None
             try:
-                # Do not retain or log this value. It may contain a signed HLS
-                # session token and must be renewed on every outer-loop attempt.
+                # Keep this signed URL only in the connection-local stack so an
+                # exact clock can be retried/re-anchored. Never publish, log, or
+                # retain it in reader state; renew it on every outer attempt.
                 source = self.source_factory()
+                media_clock = None
+                next_media_clock_retry = 0.0
+                last_capture_position = None
                 cap = self.capture_factory(source)
-                source = None
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("capture open failed")
+                if self.media_clock_factory is None:
+                    source = None
 
                 connected = False
                 while not self._stop_event.is_set():
@@ -221,6 +253,57 @@ class LiveStreamReader:
 
                     source_epoch = self.wall_time()
                     source_monotonic = self.monotonic()
+                    frame_media_clock = None
+                    capture_position = None
+                    if self.capture_position_milliseconds is not None:
+                        try:
+                            capture_position = self.capture_position_milliseconds(cap)
+                        except (AttributeError, TypeError, ValueError):
+                            capture_position = None
+                    if (
+                        media_clock is not None
+                        and capture_position is not None
+                        and last_capture_position is not None
+                        and capture_position < last_capture_position - 0.5
+                    ):
+                        # A discontinuity/PTS reset invalidates the prior UTC
+                        # mapping. Re-match this exact frame before trusting it.
+                        media_clock = None
+                        next_media_clock_retry = 0.0
+                    if capture_position is not None:
+                        last_capture_position = capture_position
+                    if (
+                        media_clock is None
+                        and self.media_clock_factory is not None
+                        and capture_position is not None
+                        and source_monotonic >= next_media_clock_retry
+                    ):
+                        try:
+                            media_clock = self.media_clock_factory(
+                                source,
+                                frame,
+                                capture_position,
+                                self.media_frame_identity,
+                            )
+                        except Exception:
+                            # Clock metadata is additive. A temporary playlist,
+                            # fragment, or match failure must not hide a
+                            # decodable safety feed.
+                            media_clock = None
+                        if media_clock is None:
+                            next_media_clock_retry = (
+                                self.monotonic() + self.media_clock_retry_seconds
+                            )
+                    if (
+                        media_clock is not None
+                        and capture_position is not None
+                    ):
+                        try:
+                            frame_media_clock = media_clock.metadata_at(
+                                capture_position
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            frame_media_clock = None
                     self._remember_frame_identity(identity)
                     self._consecutive_duplicate_frames = 0
                     self.recovery.record_success()
@@ -230,7 +313,12 @@ class LiveStreamReader:
 
                     with self._condition:
                         self._sequence += 1
-                        self._latest = (frame, source_epoch, source_monotonic)
+                        self._latest = (
+                            frame,
+                            source_epoch,
+                            source_monotonic,
+                            frame_media_clock,
+                        )
                         self._condition.notify_all()
             except Exception as exc:
                 if self._stop_event.is_set():

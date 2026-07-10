@@ -180,5 +180,126 @@ class RecentDetectionsTest(unittest.TestCase):
         )
 
 
+class DetectionTimelineTrustTest(unittest.TestCase):
+    def setUp(self):
+        self.table = FakeTable()
+        self.table.last_evaluated_key = None
+        self.table.items = [
+            {
+                "event_id": "trusted-event",
+                "object_id": "global_car_run_1",
+                "object_type": "car",
+                "timestamp_utc": "2026-07-10T05:30:00.000Z",
+                "media_timestamp_utc": "2026-07-10T05:30:00.000Z",
+                "timestamp_schema_version": 2,
+                "media_time_trusted": True,
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                    "anchor_program_date_time_utc": "2026-07-10T05:29:59.000Z",
+                    "position_milliseconds": 1000.0,
+                },
+                "device_id": "ch1",
+                "confidence_score": 0.9,
+            },
+            {
+                "event_id": "legacy-event",
+                "object_id": "global_car_legacy_1",
+                "object_type": "car",
+                "timestamp_utc": "2026-07-10T05:31:00.000Z",
+                "device_id": "ch4",
+                "confidence_score": 0.8,
+            },
+            {
+                "event_id": "mismatched-event",
+                "object_id": "global_car_timestamp_mismatch_1",
+                "object_type": "car",
+                "timestamp_utc": "2026-07-10T05:32:00.000Z",
+                "media_timestamp_utc": "2026-07-10T04:32:00.000Z",
+                "timestamp_schema_version": 2,
+                "media_time_trusted": True,
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                    "anchor_program_date_time_utc": "2026-07-10T04:31:59.000Z",
+                    "position_milliseconds": 1000.0,
+                },
+                "device_id": "ch1",
+                "confidence_score": 0.7,
+            },
+            {
+                "event_id": "boolean-schema-event",
+                "object_id": "global_car_boolean_schema_1",
+                "object_type": "car",
+                "timestamp_utc": "2026-07-10T05:33:00.000Z",
+                "media_timestamp_utc": "2026-07-10T05:33:00.000Z",
+                "timestamp_schema_version": 2,
+                "media_time_trusted": True,
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": True,
+                    "anchor_program_date_time_utc": "2026-07-10T05:32:59.000Z",
+                    "position_milliseconds": 1000.0,
+                },
+                "device_id": "ch1",
+                "confidence_score": 0.7,
+            },
+            {
+                "event_id": "spoofed-event",
+                "object_id": "global_car_schema_spoof_1",
+                "object_type": "car",
+                "timestamp_utc": "2026-07-10T05:34:00.000Z",
+                "media_timestamp_utc": "2026-07-10T05:34:00.000Z",
+                "timestamp_schema_version": 2,
+                "media_time_trusted": True,
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                },
+                "device_id": "ch1",
+                "confidence_score": 0.7,
+            },
+        ]
+        self.module = load_generated_lambda(self.table)
+
+    def test_timeline_labels_only_strict_schema_v2_media_events_trusted(self):
+        response = self.module["handler"](
+            {
+                "rawPath": "/detections/timeline",
+                "queryStringParameters": {
+                    "start": "2026-07-10T05:00:00.000Z",
+                    "end": "2026-07-10T06:00:00.000Z",
+                },
+            },
+            None,
+        )
+        self.assertEqual(response["statusCode"], 200)
+        body = json.loads(response["body"])
+        events = {event["object_id"]: event for event in body["events"]}
+        self.assertIs(events["global_car_run_1"]["media_time_trusted"], True)
+        self.assertEqual(
+            events["global_car_run_1"]["timestamp_schema_version"], 2
+        )
+        self.assertEqual(
+            events["global_car_run_1"]["first_event_id"], "trusted-event"
+        )
+        self.assertIs(events["global_car_legacy_1"]["media_time_trusted"], False)
+        self.assertIs(
+            events["global_car_timestamp_mismatch_1"]["media_time_trusted"],
+            False,
+        )
+        self.assertIs(
+            events["global_car_boolean_schema_1"]["media_time_trusted"],
+            False,
+        )
+        self.assertIs(
+            events["global_car_schema_spoof_1"]["media_time_trusted"],
+            False,
+        )
+        projection = self.table.query_calls[-1]["ProjectionExpression"]
+        self.assertIn("media_clock", projection)
+        self.assertIn("media_time_trusted", projection)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -136,6 +136,11 @@
 
 	function handleSelectEvent(event: TimelineEvent) {
 		selectedObjectId = event.object_id;
+		if (event.media_time_trusted !== true || event.timestamp_schema_version !== 2) {
+			timelineError =
+				'This event uses the legacy receipt-time clock; archive correlation is not trusted.';
+			return;
+		}
 		const firstSeen = parseIsoMs(event.first_seen);
 		if (firstSeen !== null) {
 			scrubTo(Math.max(firstSeen - 10_000, Date.now() - TIMELINE_SPAN_MS));

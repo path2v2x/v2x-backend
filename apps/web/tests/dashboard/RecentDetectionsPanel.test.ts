@@ -25,6 +25,70 @@ afterEach(() => {
 });
 
 describe('RecentDetectionsPanel request ordering', () => {
+	it('labels strict schema-v2 media records separately from legacy rows', async () => {
+		const mediaTimestamp = '2026-07-10T05:30:00.000Z';
+		const trustedClock = {
+			source: 'hls_ext_x_program_date_time',
+			schema_version: 1,
+			anchor_program_date_time_utc: '2026-07-10T05:29:59.000Z',
+			position_milliseconds: 1000
+		};
+		fetchDetectionsPage.mockResolvedValue({
+			items: [
+				{
+					object_id: 'trusted-car',
+					object_type: 'car',
+					timestamp_utc: mediaTimestamp,
+					media_timestamp_utc: mediaTimestamp,
+					media_time_trusted: true,
+					timestamp_schema_version: 2,
+					media_clock: trustedClock,
+					decode_latency_ms: 5270.9
+				},
+				{
+					object_id: 'timestamp-mismatch',
+					object_type: 'car',
+					timestamp_utc: '2026-07-10T06:30:00.000Z',
+					media_timestamp_utc: mediaTimestamp,
+					media_time_trusted: true,
+					timestamp_schema_version: 2,
+					media_clock: trustedClock
+				},
+				{
+					object_id: 'boolean-schema-spoof',
+					object_type: 'car',
+					timestamp_utc: mediaTimestamp,
+					media_timestamp_utc: mediaTimestamp,
+					media_time_trusted: true,
+					timestamp_schema_version: 2,
+					media_clock: { ...trustedClock, schema_version: true as unknown as number }
+				},
+				{
+					object_id: 'missing-provenance-spoof',
+					object_type: 'car',
+					timestamp_utc: mediaTimestamp,
+					media_timestamp_utc: mediaTimestamp,
+					media_time_trusted: true,
+					timestamp_schema_version: 2,
+					media_clock: {
+						source: 'hls_ext_x_program_date_time',
+						schema_version: 1
+					}
+				},
+				{
+					object_id: 'legacy-car',
+					object_type: 'car',
+					timestamp_utc: new Date().toISOString()
+				}
+			]
+		});
+		render(RecentDetectionsPanel, { props: { refreshMs: 60_000 } });
+		await waitFor(() => expect(screen.getByText('trusted-car')).toBeInTheDocument());
+		expect(screen.getAllByText('Trusted HLS')).toHaveLength(1);
+		expect(screen.getByText('5271 ms')).toBeInTheDocument();
+		expect(screen.getAllByText('Legacy / untrusted')).toHaveLength(4);
+	});
+
 	it('does not let an older overlapping live poll overwrite a refresh', async () => {
 		const first = deferred<DetectionPage>();
 		const second = deferred<DetectionPage>();

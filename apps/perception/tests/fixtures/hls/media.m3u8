@@ -1,0 +1,14 @@
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:201
+#EXT-X-MAP:URI="init.mp4?SessionToken=fixture-secret"
+#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:20.000Z
+#EXTINF:4.000,
+segment-201.mp4?SessionToken=fixture-secret
+#EXTINF:4.000,
+segment-202.mp4?SessionToken=fixture-secret
+#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:29.250Z
+#EXTINF:3.500,
+segment-203.mp4?SessionToken=fixture-secret
+#EXT-X-ENDLIST

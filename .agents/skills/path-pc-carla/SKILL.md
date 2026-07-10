@@ -17,7 +17,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 - Use only the packaged Unreal Engine 5.5 worker container `carla-rr-maps` for production V2X simulator work. The accepted image is RR/CARLA 0.10 and its runtime reports `5.5.0-0+UE5`.
 - Never use the retired `carla-rfs`/CARLA 0.9.16 restart recipe.
 - Do not build, launch, debug, authorize, retry, coordinate, or accept evidence from `/home/path/V2XCarla/CarlaUE6`, `/home/path/V2XCarla/UnrealEngine_6`, `ue6-*` user units, or ports `2100-2102` in a V2X task. A separate UE6 task owns those paths, processes, changes, and acceptance criteria.
-- UE6 work must not stop, hold, delay, restart, or reconfigure V2X services or timers. A V2X task may detect UE6 resources and fail closed, but must not operate them. If UE6 cannot run without affecting V2X, the UE6 task must stop and await a separately authorized maintenance task.
+- UE6 work must not stop, hold, delay, restart, or reconfigure V2X services or timers. V2X work must likewise remain independent: do not inspect, poll, gate on, coordinate, or operate UE6 paths, units, processes, listeners, or evidence. Validate only the V2X-owned UE5.5 resources below. Any cross-runtime contention is owned by the separate UE6 task, which must stop itself rather than asking V2X to change state.
 - Before service or tunnel changes, stop every mutation-capable timer in the maintenance window, snapshot its state, and restore it only after validation:
 
 ```bash
@@ -97,15 +97,6 @@ if find /home/path/V2XCarla/v2x-backend \
   \( -path '*/.git' -o -path '*/node_modules' -o -path '*/.svelte-kit' \) \
   -prune -o -iname '*ue6*' -print -quit | grep -q .; then
   echo 'A UE6 artifact exists inside the production V2X checkout; stop.' >&2
-  exit 1
-fi
-if systemctl --user list-units --all --no-legend --no-pager \
-  | awk 'tolower($1) ~ /ue6|carlaue6/ {found=1; print} END {exit !found}'; then
-  echo 'A separate UE6 unit is loaded; do not mutate V2X while it is present.' >&2
-  exit 1
-fi
-if ss -ltnH | awk '$4 ~ /:(2100|2101|2102)$/ {found=1} END {exit !found}'; then
-  echo 'A separate UE6 listener is active; do not mutate V2X while it is present.' >&2
   exit 1
 fi
 ss -ltnp | awk 'NR==1 || /:(2000|2001|2002|8765|5173|8090)( |$)/'
@@ -317,7 +308,7 @@ WebSocket-only origin; require a real WebSocket `101`/handshake for acceptance.
 
 ## Perception diagnosis
 
-Do not use HTTP `200`, MJPEG byte flow, or a rising republished-frame counter as freshness proof. The service can replay `last_valid_frames` while an upstream camera is frozen. The tracked event timestamp is Path-PC decoded-frame receipt time; it proves local capture freshness and monotonic upload time, not upstream Kinesis transport latency.
+Do not use HTTP `200`, MJPEG byte flow, or a rising republished-frame counter as freshness proof. The service can replay `last_valid_frames` while an upstream camera is frozen. Legacy detections created before timestamp schema v2 used Path-PC decode-receipt time and are not valid archive-correlation evidence. Accept a new record for replay proof only when `timestamp_schema_version=2`, `media_time_trusted=true`, `timestamp_utc == media_timestamp_utc`, and `media_clock.source=hls_ext_x_program_date_time` with schema version 1. `decode_received_at_utc` and `decode_latency_ms` must remain separate diagnostics.
 
 Check producer timestamps twice and require all four channels to advance:
 
@@ -348,10 +339,44 @@ Never print or retain signed HLS query strings. For acceptance, require:
 
 - ch1-ch4 decoded-frame capture timestamps remain recent and advance;
 - real frames change, not only response bytes;
+- `/health.media_clock_ready` is true and every channel reports a trusted matched media clock with bounded decode latency;
 - event timestamps are monotonic and close to DynamoDB ingestion time;
 - forced HLS expiry/reconnect recovers within the agreed bound;
 - socket counts do not accumulate `CLOSE_WAIT`;
-- a new DynamoDB record proves current event and ingestion timestamps.
+- a new DynamoDB record proves current media, decode-receipt, and ingestion timestamps plus schema-v2 provenance.
+
+For an archived vehicle/bbox acceptance gate, use the tracked read-only verifier
+with one exact persisted detection JSON and the local model. It keeps signed HLS
+URLs internal, requires trusted persisted provenance, selects the nearest actual
+fMP4 frame, and exits nonzero for timing, bbox, or semantic mismatch:
+
+```bash
+/home/path/V2XCarla/perception-venv/bin/python \
+  /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_historical_correlation.py \
+  https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com \
+  --detection-json /path/to/one-sanitized-detection.json \
+  --output /tmp/v2x-correlation-frame.jpg \
+  --yolo-model /home/path/V2XCarla/v2x-backend/apps/perception/yolov8n.pt \
+  --require-yolo
+```
+
+Do not treat a legacy row, a CLI-supplied timestamp, a merely nonblank bbox, or
+a changed twin JPEG as same-object proof. Require the selected `object_id` in a
+`twin_status` response to carry the strict schema-v2 HLS clock provenance and
+map to an `actor_present=true` UE5 CARLA `actor_id`, type, role, and transform.
+Require three status samples spanning at least two replay seconds, one stable
+actor ID, and at least 0.25 m of movement; validate the actor directly in CARLA.
+
+Twin camera alignment is a separate gate from channel wiring. The existing
+perception CSVs contain only 4-7 local-XZ points per channel, no independent
+holdouts, no global landmark IDs, and internally inconsistent shared points;
+treat the current camera verifier as diagnostic only. Do not deploy pose, pole,
+FOV, or lens changes fitted from those rows. To create acceptance evidence,
+survey one shared pole pose and at least 12 globally identified CARLA-XYZ (or
+GPS) correspondences per channel, pre-split into at least eight fit points and
+four untouched holdouts spanning 50% of image width and 30% of height. Record
+the source frame hash and measured intrinsics/distortion. Then require held-out
+RMSE/P95/max of 75/125/175 pixels at 1280x960 and all four retained renders.
 
 Useful logs:
 
@@ -393,12 +418,25 @@ up owned actors in `finally`:
   /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py --apply
 ```
 
+After one post-schema-v2 persisted detection has passed the historical frame
+verifier, use its exact run-scoped object, replay start, and camera for the
+same-object twin gate without creating a Drive session:
+
+```bash
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py \
+  --apply --skip-drive \
+  --twin-object-id global_car_RUN_ID_TRACK \
+  --twin-replay-start 2026-07-10T00:00:00.000Z \
+  --twin-camera ch1
+```
+
 ## Controlled deployment gate
 
 Before changing live services:
 
 1. Confirm the clean worktree commit and successful web/bridge/perception tests.
-2. Confirm all simulator operations target only the UE5.5 `carla-rr-maps` worker on ports `2000-2002`; reject UE6 paths, units, ports, or evidence.
+2. Confirm all simulator operations target only the UE5.5 `carla-rr-maps` worker on ports `2000-2002`. Do not inspect or depend on UE6 paths, units, ports, processes, or evidence.
 3. Confirm no active drive session.
 4. Stop both repair timers and the hourly restart timer.
 5. Capture installed unit hashes, process commands, container image ID, live Git status, tunnel/runtime config, ignored-model/cache hashes, perception Python/pip state, and service logs.

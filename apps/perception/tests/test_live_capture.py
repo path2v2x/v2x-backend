@@ -32,6 +32,52 @@ class ScriptedCapture:
         self.released = True
 
 
+class FakeMediaClock:
+    def __init__(self, timestamp="2026-07-10T03:57:23.388Z"):
+        self.positions = []
+        self.timestamp = timestamp
+
+    def metadata_at(self, position_milliseconds):
+        self.positions.append(position_milliseconds)
+        return {
+            "media_timestamp_utc": self.timestamp,
+            "media_clock": {
+                "source": "hls_ext_x_program_date_time",
+                "position_milliseconds": position_milliseconds,
+            },
+        }
+
+
+class GatedPositionCapture:
+    def __init__(self, frames, positions, next_frame_gate):
+        self.frames = list(frames)
+        self.positions = list(positions)
+        self.next_frame_gate = next_frame_gate
+        self.index = 0
+        self.current_position = None
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        if self.index >= len(self.frames):
+            self.next_frame_gate.wait(1.0)
+            return False, None
+        if self.index > 0:
+            self.next_frame_gate.wait(1.0)
+        frame = self.frames[self.index]
+        self.current_position = self.positions[self.index]
+        self.index += 1
+        return True, frame
+
+    def get(self, _property):
+        return self.current_position
+
+    def release(self):
+        self.released = True
+
+
 class LiveStreamReaderTests(unittest.TestCase):
     def wait_until(self, predicate, timeout=2.0):
         deadline = time.monotonic() + timeout
@@ -90,6 +136,135 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertIsNone(reader.snapshot(first["sequence"]))
         finally:
             release_read.set()
+            reader.stop(timeout=2.0)
+
+    def test_snapshot_keeps_media_time_separate_from_decode_receipt_time(self):
+        release_read = threading.Event()
+        clock = FakeMediaClock()
+        capture = ScriptedCapture(
+            ["frame-1"], block_after_frames=release_read
+        )
+        capture.get = lambda _property: 250.5
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            wall_time=lambda: 1_000.25,
+            media_clock_factory=(
+                lambda _source, _frame, _position, _identity: clock
+            ),
+            capture_position_milliseconds=lambda cap: cap.get(0),
+        )
+        reader.start()
+        try:
+            snapshot = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot["source_epoch"], 1_000.25)
+            self.assertEqual(
+                snapshot["media_clock"]["media_timestamp_utc"],
+                "2026-07-10T03:57:23.388Z",
+            )
+            self.assertEqual(clock.positions, [250.5])
+        finally:
+            release_read.set()
+            reader.stop(timeout=2.0)
+
+    def test_media_clock_failure_does_not_hide_a_decodable_frame(self):
+        release_read = threading.Event()
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: ScriptedCapture(
+                ["frame-1"], block_after_frames=release_read
+            ),
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=(
+                lambda _source, _frame, _position, _identity: (
+                    _ for _ in ()
+                ).throw(RuntimeError("playlist unavailable"))
+            ),
+            capture_position_milliseconds=lambda _cap: 0.0,
+        )
+        reader.start()
+        try:
+            snapshot = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(snapshot)
+            self.assertIsNone(snapshot["media_clock"])
+        finally:
+            release_read.set()
+            reader.stop(timeout=2.0)
+
+    def test_unmatched_clock_retries_on_a_later_frame(self):
+        allow_next = threading.Event()
+        capture = GatedPositionCapture(
+            ["frame-1", "frame-2"], [0.0, 100.0], allow_next
+        )
+        calls = []
+        recovered_clock = FakeMediaClock("2026-07-10T03:57:24.000Z")
+
+        def media_clock_factory(*_args):
+            calls.append(len(calls) + 1)
+            return None if len(calls) == 1 else recovered_clock
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=media_clock_factory,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_retry_seconds=0.1,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNone(first["media_clock"])
+            time.sleep(0.11)
+            allow_next.set()
+            second = reader.wait_for_frame(first["sequence"], timeout=1.0)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(
+                second["media_clock"]["media_timestamp_utc"],
+                "2026-07-10T03:57:24.000Z",
+            )
+        finally:
+            allow_next.set()
+            reader.stop(timeout=2.0)
+
+    def test_capture_position_reset_forces_an_exact_reanchor(self):
+        allow_next = threading.Event()
+        capture = GatedPositionCapture(
+            ["before-reset", "after-reset"], [1000.0, 0.0], allow_next
+        )
+        clocks = [
+            FakeMediaClock("2026-07-10T03:57:23.000Z"),
+            FakeMediaClock("2026-07-10T03:57:25.000Z"),
+        ]
+
+        def media_clock_factory(*_args):
+            return clocks.pop(0)
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=media_clock_factory,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertEqual(
+                first["media_clock"]["media_timestamp_utc"],
+                "2026-07-10T03:57:23.000Z",
+            )
+            allow_next.set()
+            second = reader.wait_for_frame(first["sequence"], timeout=1.0)
+            self.assertEqual(
+                second["media_clock"]["media_timestamp_utc"],
+                "2026-07-10T03:57:25.000Z",
+            )
+            self.assertEqual(clocks, [])
+        finally:
+            allow_next.set()
             reader.stop(timeout=2.0)
 
     def test_blocked_camera_does_not_delay_a_healthy_camera(self):

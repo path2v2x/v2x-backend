@@ -1,4 +1,9 @@
-import type { CoverageInterval, TimelineEvent, TimelineHistogramBucket } from './types';
+import type {
+	CoverageInterval,
+	DetectionItem,
+	TimelineEvent,
+	TimelineHistogramBucket
+} from './types';
 
 /** Length of one archive playback window requested from the read API. */
 export const PLAYBACK_WINDOW_MS = 15 * 60 * 1000;
@@ -7,6 +12,75 @@ export const PLAYBACK_WINDOW_MS = 15 * 60 * 1000;
 export const WINDOW_EDGE_MARGIN_MS = 60 * 1000;
 
 export const TIMELINE_SPAN_MS = 24 * 60 * 60 * 1000;
+
+/** Maximum tolerated wall-clock skew between an archive pane and replay. */
+export const ARCHIVE_MAX_CURSOR_DRIFT_MS = 250;
+
+const TRUSTED_MEDIA_CLOCK_SOURCE = 'hls_ext_x_program_date_time';
+const MEDIA_CLOCK_CONSISTENCY_TOLERANCE_MS = 5;
+
+function parseTimezoneTimestamp(value: unknown): number | null {
+	if (typeof value !== 'string') return null;
+	const text = value.trim();
+	if (!text || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(text)) return null;
+	const parsed = Date.parse(text);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Fail-closed schema-v2 predicate for user-visible HLS media-time trust. */
+export function hasTrustedMediaTime(item: DetectionItem): boolean {
+	if (item.media_time_trusted !== true || item.timestamp_schema_version !== 2) return false;
+	if (
+		typeof item.timestamp_utc !== 'string' ||
+		typeof item.media_timestamp_utc !== 'string' ||
+		!item.timestamp_utc.trim() ||
+		item.timestamp_utc.trim() !== item.media_timestamp_utc.trim()
+	) {
+		return false;
+	}
+
+	const mediaTimestampMs = parseTimezoneTimestamp(item.media_timestamp_utc);
+	const clock = item.media_clock;
+	if (
+		mediaTimestampMs === null ||
+		clock?.source !== TRUSTED_MEDIA_CLOCK_SOURCE ||
+		clock.schema_version !== 1 ||
+		typeof clock.position_milliseconds !== 'number' ||
+		!Number.isFinite(clock.position_milliseconds) ||
+		clock.position_milliseconds < 0
+	) {
+		return false;
+	}
+	const anchorMs = parseTimezoneTimestamp(clock.anchor_program_date_time_utc);
+	return (
+		anchorMs !== null &&
+		Math.abs(anchorMs + clock.position_milliseconds - mediaTimestampMs) <=
+			MEDIA_CLOCK_CONSISTENCY_TOLERANCE_MS
+	);
+}
+
+export function archiveMediaTimeForEpoch(
+	epochMs: number,
+	pdtOffsetMs: number | null,
+	windowStartMs: number
+): number {
+	const base = pdtOffsetMs ?? windowStartMs;
+	return Math.max(0, (epochMs - base) / 1000);
+}
+
+export function archiveCursorNeedsCorrection(
+	cursorMs: number,
+	currentEpochMs: number,
+	maxDriftMs = ARCHIVE_MAX_CURSOR_DRIFT_MS
+): boolean {
+	return (
+		Number.isFinite(cursorMs) &&
+		Number.isFinite(currentEpochMs) &&
+		Number.isFinite(maxDriftMs) &&
+		maxDriftMs >= 0 &&
+		Math.abs(cursorMs - currentEpochMs) > maxDriftMs
+	);
+}
 
 export const OBJECT_TYPE_COLORS: Record<string, string> = {
 	car: '#38bdf8',
@@ -71,7 +145,7 @@ export function layoutMarkers(
 		markers.push({
 			event,
 			x: (t - viewStartMs) / span,
-			color: objectTypeColor(event.object_type)
+			color: event.media_time_trusted === true ? objectTypeColor(event.object_type) : '#64748b'
 		});
 	}
 	return markers;

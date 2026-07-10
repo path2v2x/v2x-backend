@@ -61,6 +61,48 @@ export interface TimelineEvent {
 	last_seen: string;
 	count: number;
 	max_confidence: number;
+	media_time_trusted?: boolean;
+	timestamp_schema_version?: number | null;
+	first_event_id?: string;
+	last_event_id?: string;
+	first_media_timestamp_utc?: string;
+	last_media_timestamp_utc?: string;
+}
+
+export interface TwinObjectEvidence {
+	object_id: string;
+	object_type: string;
+	event_id?: string | null;
+	detection_timestamp_utc?: string | null;
+	media_timestamp_utc?: string | null;
+	timestamp_schema_version?: number | null;
+	media_time_trusted?: boolean;
+	media_clock?: {
+		schema_version?: number | null;
+		source?: string | null;
+		anchor_program_date_time_utc?: string | null;
+		position_milliseconds?: number | null;
+	} | null;
+	device_id?: string | null;
+	track_id?: number | string | null;
+	bbox?: {
+		x1?: number;
+		y1?: number;
+		x2?: number;
+		y2?: number;
+	} | null;
+	gps_location?: {
+		latitude?: number;
+		longitude?: number;
+	} | null;
+	tracked_actor_id?: number | null;
+	actor_id?: number | null;
+	actor_present?: boolean;
+	actor_type?: string | null;
+	carla_transform?: {
+		location: { x: number; y: number; z: number };
+		rotation: { pitch: number; yaw: number; roll: number };
+	} | null;
 }
 
 export interface TimelineHistogramBucket {
@@ -80,13 +122,29 @@ export interface DetectionTimeline {
 
 export type DetectionQueryMode = 'recent' | 'object' | 'geohash';
 
+export interface PersistedMediaClock {
+	source?: string | null;
+	schema_version?: number | null;
+	anchor_program_date_time_utc?: string | null;
+	position_milliseconds?: number | null;
+}
+
 export interface DetectionItem {
+	event_id?: string;
 	object_id?: string;
 	object_type?: string | null;
 	geohash?: string | null;
 	confidence_score?: number | string | null;
 	device_id?: string | null;
 	timestamp_utc?: string | null;
+	media_timestamp_utc?: string | null;
+	decode_received_at_utc?: string | null;
+	decode_latency_ms?: number | string | null;
+	timestamp_schema_version?: number | null;
+	media_time_trusted?: boolean;
+	media_clock?: PersistedMediaClock | null;
+	media_clock_status?: string | null;
+	perception_run_id?: string | null;
 }
 
 export interface DetectionPage {

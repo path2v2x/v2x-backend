@@ -557,6 +557,7 @@ if [[ "${RECONCILE_LAMBDA}" == "true" ]]; then
 cat > "${WORKDIR}/index.py" <<PY
 import base64
 import json
+import math
 import mimetypes
 import os
 import time
@@ -783,6 +784,77 @@ def _parse_ts(value):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+def _parse_trusted_ts(value):
+    """Parse only explicit timezone-bearing timestamps for trust decisions."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
+
+def _exact_schema_version(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+def _trusted_media_time(item):
+    """Apply the persisted schema-v2 HLS media-time acceptance contract."""
+    if item.get("media_time_trusted") is not True:
+        return False
+    if _exact_schema_version(item.get("timestamp_schema_version")) != 2:
+        return False
+
+    timestamp_raw = item.get("timestamp_utc")
+    media_timestamp_raw = item.get("media_timestamp_utc")
+    if (
+        not isinstance(timestamp_raw, str)
+        or not timestamp_raw.strip()
+        or not isinstance(media_timestamp_raw, str)
+        or not media_timestamp_raw.strip()
+        or timestamp_raw.strip() != media_timestamp_raw.strip()
+    ):
+        return False
+    media_timestamp = _parse_trusted_ts(media_timestamp_raw)
+    if media_timestamp is None:
+        return False
+
+    media_clock = item.get("media_clock")
+    if not isinstance(media_clock, dict):
+        return False
+    if media_clock.get("source") != "hls_ext_x_program_date_time":
+        return False
+    if _exact_schema_version(media_clock.get("schema_version")) != 1:
+        return False
+    anchor = _parse_trusted_ts(media_clock.get("anchor_program_date_time_utc"))
+    position = media_clock.get("position_milliseconds")
+    if (
+        anchor is None
+        or isinstance(position, bool)
+        or not isinstance(position, (int, float, Decimal))
+    ):
+        return False
+    try:
+        position_ms = float(position)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(position_ms) or position_ms < 0:
+        return False
+    reconstructed = anchor + timedelta(milliseconds=position_ms)
+    return abs((reconstructed - media_timestamp).total_seconds()) * 1000.0 <= 5.0
 
 def _iso_millis(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -1077,7 +1149,11 @@ def _get_detections_timeline(qs):
         "KeyConditionExpression": Key("geohash").eq(SITE_GEOHASH)
         & Key("ts_event").between(start_key, end_key),
         "ScanIndexForward": True,
-        "ProjectionExpression": "object_id, object_type, timestamp_utc, device_id, confidence_score",
+        "ProjectionExpression": (
+            "event_id, object_id, object_type, timestamp_utc, "
+            "media_timestamp_utc, timestamp_schema_version, media_time_trusted, "
+            "media_clock, device_id, confidence_score"
+        ),
     }
     condition = _range_filter_expression(qs)
     if condition is not None:
@@ -1102,6 +1178,11 @@ def _get_detections_timeline(qs):
             object_type = str(item.get("object_type") or "unknown")
             confidence = item.get("confidence_score")
             confidence = float(confidence) if isinstance(confidence, (int, float, Decimal)) else 0.0
+            schema_raw = item.get("timestamp_schema_version")
+            timestamp_schema_version = _exact_schema_version(schema_raw)
+            media_time_trusted = _trusted_media_time(item)
+            event_id = str(item.get("event_id") or "")
+            media_timestamp = str(item.get("media_timestamp_utc") or "")
 
             track = tracks.get(object_id)
             if track is None:
@@ -1113,13 +1194,26 @@ def _get_detections_timeline(qs):
                     "last_seen": ts,
                     "count": 1,
                     "max_confidence": confidence,
+                    "media_time_trusted": media_time_trusted,
+                    "timestamp_schema_version": timestamp_schema_version,
+                    "first_event_id": event_id,
+                    "last_event_id": event_id,
+                    "first_media_timestamp_utc": media_timestamp,
+                    "last_media_timestamp_utc": media_timestamp,
                 }
             else:
                 track["count"] += 1
+                track["media_time_trusted"] = (
+                    track["media_time_trusted"] and media_time_trusted
+                )
                 if ts < track["first_seen"]:
                     track["first_seen"] = ts
+                    track["first_event_id"] = event_id
+                    track["first_media_timestamp_utc"] = media_timestamp
                 if ts > track["last_seen"]:
                     track["last_seen"] = ts
+                    track["last_event_id"] = event_id
+                    track["last_media_timestamp_utc"] = media_timestamp
                 if confidence > track["max_confidence"]:
                     track["max_confidence"] = confidence
 
@@ -1151,6 +1245,12 @@ def _get_detections_timeline(qs):
                     "last_seen": _iso_millis(t["last_seen"]),
                     "count": t["count"],
                     "max_confidence": round(t["max_confidence"], 4),
+                    "media_time_trusted": t["media_time_trusted"],
+                    "timestamp_schema_version": t["timestamp_schema_version"],
+                    "first_event_id": t["first_event_id"],
+                    "last_event_id": t["last_event_id"],
+                    "first_media_timestamp_utc": t["first_media_timestamp_utc"],
+                    "last_media_timestamp_utc": t["last_media_timestamp_utc"],
                 }
                 for t in events
             ],

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { fetchDetectionsPage, fetchDetectionsRange } from '$lib/api';
 	import type { DetectionItem } from '$lib/types';
+	import { hasTrustedMediaTime } from '$lib/timeline';
 	import {
 		isProducerTimestampFresh,
 		latestProducerTimestamp
@@ -38,6 +39,12 @@
 	function displayConfidence(value: DetectionItem['confidence_score']): string {
 		if (typeof value === 'number') return value.toFixed(2);
 		return displayValue(value);
+	}
+
+	function displayLatency(value: DetectionItem['decode_latency_ms']): string | null {
+		if (value == null || value === '') return null;
+		const parsed = typeof value === 'number' ? value : Number(value);
+		return Number.isFinite(parsed) ? `${Math.round(parsed)} ms` : null;
 	}
 
 	function currentQuery(): DetectionQuery {
@@ -185,18 +192,19 @@
 						<th class="px-4 py-3 font-medium">Type</th>
 						<th class="px-4 py-3 font-medium">Confidence</th>
 						<th class="px-4 py-3 font-medium">Device</th>
+						<th class="px-4 py-3 font-medium">Media clock</th>
 					</tr>
 				</thead>
 				<tbody class="font-mono text-xs text-gray-200">
 					{#if isLoading}
 						<tr>
-							<td colspan="5" class="px-4 py-8 text-center text-sm text-gray-500">
+							<td colspan="6" class="px-4 py-8 text-center text-sm text-gray-500">
 								Loading...
 							</td>
 						</tr>
 					{:else if items.length === 0}
 						<tr>
-							<td colspan="5" class="px-4 py-8 text-center text-sm text-gray-500">
+							<td colspan="6" class="px-4 py-8 text-center text-sm text-gray-500">
 								No detections returned for this query yet.
 							</td>
 						</tr>
@@ -214,6 +222,16 @@
 								<td class="px-4 py-3 align-top">{displayValue(item.object_type)}</td>
 								<td class="px-4 py-3 align-top">{displayConfidence(item.confidence_score)}</td>
 								<td class="px-4 py-3 align-top">{displayValue(item.device_id)}</td>
+								<td class="px-4 py-3 align-top">
+									{#if hasTrustedMediaTime(item)}
+										<span class="text-emerald-300">Trusted HLS</span>
+										{#if displayLatency(item.decode_latency_ms)}
+											<span class="mt-1 block text-gray-500">{displayLatency(item.decode_latency_ms)}</span>
+										{/if}
+									{:else}
+										<span class="text-gray-500">Legacy / untrusted</span>
+									{/if}
+								</td>
 							</tr>
 						{/each}
 					{/if}

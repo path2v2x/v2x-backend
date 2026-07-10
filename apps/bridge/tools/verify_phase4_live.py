@@ -2,8 +2,9 @@
 """Bounded live verification for Drive session isolation and twin replay.
 
 Without ``--apply`` this tool is observational: it reads server and twin status.
-Mutation is explicit, refuses to run while another Drive session exists, and
-always closes/ends sessions in ``finally`` so CARLA-owned actors are cleaned up.
+Mutation is explicit, refuses to run while another Drive session exists, always
+restores twin live mode, and closes/ends any owned sessions in ``finally``.
+``--skip-drive`` keeps Drive observational while replay acceptance runs.
 """
 
 import argparse
@@ -270,6 +271,307 @@ def replay_clock_epoch(value):
         return None
 
 
+def _finite_transform_payload(value, label):
+    """Normalize a JSON/CARLA-style transform while rejecting partial data."""
+    try:
+        location = value["location"]
+        rotation = value["rotation"]
+        parsed = {
+            "location": {
+                axis: float(location[axis]) for axis in ("x", "y", "z")
+            },
+            "rotation": {
+                axis: float(rotation[axis]) for axis in ("pitch", "yaw", "roll")
+            },
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VerificationError(f"{label} has no valid transform") from exc
+    if not all(
+        math.isfinite(number)
+        for group in parsed.values()
+        for number in group.values()
+    ):
+        raise VerificationError(f"{label} has no valid transform")
+    return parsed
+
+
+def _actor_transform_payload(actor):
+    transform = actor.get_transform()
+    return _finite_transform_payload(
+        {
+            "location": {
+                "x": transform.location.x,
+                "y": transform.location.y,
+                "z": transform.location.z,
+            },
+            "rotation": {
+                "pitch": transform.rotation.pitch,
+                "yaw": transform.rotation.yaw,
+                "roll": transform.rotation.roll,
+            },
+        },
+        "CARLA actor",
+    )
+
+
+def _angular_error(left, right):
+    return abs(((float(left) - float(right) + 180.0) % 360.0) - 180.0)
+
+
+def _object_from_twin_status(status, object_id):
+    objects = status.get("objects")
+    if not isinstance(objects, list):
+        raise VerificationError("twin_status has no valid objects list")
+    matches = [
+        item
+        for item in objects
+        if isinstance(item, dict) and item.get("object_id") == object_id
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise VerificationError(
+            f"twin_status contains duplicate object_id {object_id!r}"
+        )
+    return matches[0]
+
+
+def _exact_schema_version(value, expected):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value).is_integer()
+        and int(value) == expected
+    )
+
+
+def _validate_trusted_twin_media(item, replay_epoch):
+    """Require the persisted schema-v2 provenance used by archive proof."""
+    if item.get("media_time_trusted") is not True:
+        raise VerificationError("twin object media time is not trusted")
+    if not _exact_schema_version(item.get("timestamp_schema_version"), 2):
+        raise VerificationError("twin object timestamp schema is not version 2")
+    detection_epoch = replay_clock_epoch(item.get("detection_timestamp_utc"))
+    media_epoch = replay_clock_epoch(item.get("media_timestamp_utc"))
+    if detection_epoch is None or media_epoch is None:
+        raise VerificationError("twin object has no valid persisted media timestamp")
+    if abs(detection_epoch - media_epoch) > 0.005:
+        raise VerificationError("twin object detection/media timestamps disagree")
+    clock = item.get("media_clock")
+    if not isinstance(clock, dict):
+        raise VerificationError("twin object has no persisted media clock")
+    if clock.get("source") != "hls_ext_x_program_date_time":
+        raise VerificationError("twin object has an untrusted media clock source")
+    if not _exact_schema_version(clock.get("schema_version"), 1):
+        raise VerificationError("twin object media clock schema is not version 1")
+    anchor_epoch = replay_clock_epoch(clock.get("anchor_program_date_time_utc"))
+    position_ms = clock.get("position_milliseconds")
+    if (
+        anchor_epoch is None
+        or isinstance(position_ms, bool)
+        or not isinstance(position_ms, (int, float))
+        or not math.isfinite(float(position_ms))
+        or float(position_ms) < 0.0
+    ):
+        raise VerificationError("twin object has invalid media clock provenance")
+    if abs((anchor_epoch + float(position_ms) / 1000.0) - media_epoch) > 0.005:
+        raise VerificationError("twin object media clock reconstruction disagrees")
+    age = replay_epoch - media_epoch
+    if age < -0.25 or age > 15.0:
+        raise VerificationError(
+            f"twin object media time is {age:.3f}s from the replay clock"
+        )
+    return media_epoch
+
+
+def validate_twin_object_sample(
+    status,
+    object_id,
+    world,
+    *,
+    position_tolerance_m,
+    rotation_tolerance_deg,
+):
+    """Prove one protocol object maps to the same concrete UE5 CARLA actor."""
+    if status.get("mode") != "replay":
+        raise VerificationError("twin_status object evidence is not in replay mode")
+    replay_epoch = replay_clock_epoch(status.get("replay_clock"))
+    if replay_epoch is None:
+        raise VerificationError("twin_status has no valid replay clock")
+
+    item = _object_from_twin_status(status, object_id)
+    if item is None:
+        raise VerificationError(f"twin object {object_id!r} is not present")
+    if item.get("actor_present") is not True:
+        raise VerificationError("twin object does not report a present CARLA actor")
+    event_id = str(item.get("event_id") or "").strip()
+    if not event_id:
+        raise VerificationError("twin object has no persisted event_id")
+    media_epoch = _validate_trusted_twin_media(item, replay_epoch)
+    actor_id = item.get("actor_id")
+    if (
+        isinstance(actor_id, bool)
+        or not isinstance(actor_id, int)
+        or actor_id <= 0
+    ):
+        raise VerificationError("twin object has no valid CARLA actor_id")
+
+    actor = world.get_actor(actor_id)
+    if actor is None:
+        raise VerificationError(
+            f"mapped UE5 CARLA actor {actor_id} does not exist"
+        )
+    actual_type = str(getattr(actor, "type_id", ""))
+    reported_type = str(item.get("actor_type") or "")
+    if not reported_type or reported_type != actual_type:
+        raise VerificationError(
+            "twin actor type does not match the mapped UE5 CARLA actor"
+        )
+    object_type = str(item.get("object_type") or "")
+    expected_prefix = "walker." if object_type == "person" else "vehicle."
+    if object_type not in {"car", "truck", "bus", "person"} or not actual_type.startswith(
+        expected_prefix
+    ):
+        raise VerificationError(
+            f"twin object type {object_type!r} is incompatible with {actual_type!r}"
+        )
+    attributes = getattr(actor, "attributes", None) or {}
+    role_name = str(attributes.get("role_name", ""))
+    if role_name != "twin_object":
+        raise VerificationError(
+            f"mapped UE5 CARLA actor has unexpected role {role_name!r}"
+        )
+
+    reported = _finite_transform_payload(
+        item.get("carla_transform"), "twin_status object"
+    )
+    observed = _actor_transform_payload(actor)
+    reported_location = reported["location"]
+    observed_location = observed["location"]
+    position_error = math.sqrt(
+        sum(
+            (reported_location[axis] - observed_location[axis]) ** 2
+            for axis in ("x", "y", "z")
+        )
+    )
+    rotation_errors = {
+        axis: _angular_error(
+            reported["rotation"][axis], observed["rotation"][axis]
+        )
+        for axis in ("pitch", "yaw", "roll")
+    }
+    rotation_error = max(rotation_errors.values())
+    if position_error > position_tolerance_m or rotation_error > rotation_tolerance_deg:
+        raise VerificationError(
+            "twin_status transform does not match the mapped UE5 CARLA actor: "
+            f"position={position_error:.3f}m rotation={rotation_error:.3f}deg"
+        )
+
+    return {
+        "sampled_at": utc_iso(),
+        "replay_clock": status.get("replay_clock"),
+        "replay_clock_epoch": replay_epoch,
+        "object_id": object_id,
+        "object_type": object_type,
+        "event_id": event_id,
+        "media_timestamp_utc": item.get("media_timestamp_utc"),
+        "media_timestamp_epoch": media_epoch,
+        "actor_id": actor_id,
+        "actor_type": actual_type,
+        "role_name": role_name,
+        "reported_transform": reported,
+        "observed_transform": observed,
+        "position_error_m": round(position_error, 3),
+        "rotation_error_deg": round(rotation_error, 3),
+    }
+
+
+def validate_twin_object_samples(
+    samples,
+    *,
+    min_samples=3,
+    min_span_seconds=2.0,
+    min_movement_m=0.25,
+):
+    """Require stable identity plus visible motion over distinct replay samples."""
+    if len(samples) < min_samples:
+        raise VerificationError(
+            f"twin object has only {len(samples)} samples; need {min_samples}"
+        )
+    object_ids = {sample.get("object_id") for sample in samples}
+    actor_ids = {sample.get("actor_id") for sample in samples}
+    if len(object_ids) != 1 or len(actor_ids) != 1:
+        raise VerificationError(
+            "twin object samples do not retain one object_id and CARLA actor_id"
+        )
+    event_ids = [str(sample.get("event_id") or "").strip() for sample in samples]
+    if any(not event_id for event_id in event_ids):
+        raise VerificationError("twin object samples have missing event IDs")
+    media_clocks = [sample.get("media_timestamp_epoch") for sample in samples]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in media_clocks
+    ):
+        raise VerificationError("twin object samples have invalid media timestamps")
+    if any(right < left for left, right in zip(media_clocks, media_clocks[1:])):
+        raise VerificationError("twin object media timestamps regressed")
+    clocks = [sample.get("replay_clock_epoch") for sample in samples]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in clocks
+    ):
+        raise VerificationError("twin object samples have invalid replay clocks")
+    if any(right <= left for left, right in zip(clocks, clocks[1:])):
+        raise VerificationError("twin object sample replay clocks did not advance")
+    span = float(clocks[-1] - clocks[0])
+    if span < min_span_seconds:
+        raise VerificationError(
+            f"twin object samples span only {span:.3f}s; need {min_span_seconds:.3f}s"
+        )
+
+    locations = [
+        [
+            sample["reported_transform"]["location"][axis]
+            for axis in ("x", "y", "z")
+        ]
+        for sample in samples
+    ]
+    displacements = [
+        planar_distance(left, right)
+        for index, left in enumerate(locations)
+        for right in locations[index + 1 :]
+    ]
+    max_movement = max(displacements, default=0.0)
+    path_length = sum(
+        planar_distance(left, right)
+        for left, right in zip(locations, locations[1:])
+    )
+    if max_movement < min_movement_m:
+        raise VerificationError(
+            f"twin object moved only {max_movement:.3f}m; need {min_movement_m:.3f}m"
+        )
+    return {
+        "sample_count": len(samples),
+        "object_id": next(iter(object_ids)),
+        "actor_id": next(iter(actor_ids)),
+        "event_ids": event_ids,
+        "media_start": utc_iso(
+            datetime.fromtimestamp(media_clocks[0], timezone.utc)
+        ),
+        "media_end": utc_iso(
+            datetime.fromtimestamp(media_clocks[-1], timezone.utc)
+        ),
+        "replay_span_seconds": round(span, 3),
+        "max_planar_movement_m": round(max_movement, 3),
+        "planar_path_length_m": round(path_length, 3),
+    }
+
+
 def actor_snapshot(world, actor_ids):
     snapshots = {}
     for actor_id in actor_ids:
@@ -369,10 +671,87 @@ async def observational_probe(args):
     return evidence
 
 
-async def verify_twin(args):
+def validate_zero_active_sessions(status):
+    active_sessions = status.get("active_sessions")
+    if (
+        isinstance(active_sessions, bool)
+        or not isinstance(active_sessions, int)
+        or active_sessions < 0
+    ):
+        raise VerificationError("server_status has no valid active_sessions count")
+    if active_sessions != 0:
+        raise VerificationError(
+            "refusing mutation while another Drive session is active"
+        )
+    return status
+
+
+async def verify_zero_active_sessions(args):
+    """Read-only mutation preflight; never sends start_session."""
+    async with websockets.connect(
+        args.ws_url,
+        open_timeout=args.timeout,
+        max_size=args.max_message_bytes,
+    ) as websocket:
+        status = await request_json(
+            websocket,
+            {"type": "server_status"},
+            {"server_status"},
+            args.timeout,
+        )
+    return validate_zero_active_sessions(status)
+
+
+async def collect_twin_object_samples(args, control_socket, world, evidence):
+    """Collect three independently timestamped exact-object status samples."""
+    samples = []
+    deadline = asyncio.get_running_loop().time() + args.timeout
+    next_sample_clock = None
+    while len(samples) < 3:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise VerificationError(
+                f"timed out collecting twin object {args.twin_object_id!r} samples"
+            )
+        status = await request_json(
+            control_socket,
+            {"type": "twin_status"},
+            {"twin_mode", "twin_error"},
+            min(args.timeout, remaining),
+            evidence,
+        )
+        if status.get("type") == "twin_error":
+            raise VerificationError(status.get("message", "twin status failed"))
+        item = _object_from_twin_status(status, args.twin_object_id)
+        if item is None:
+            await asyncio.sleep(min(0.2, max(0.0, remaining)))
+            continue
+        replay_epoch = replay_clock_epoch(status.get("replay_clock"))
+        if replay_epoch is None:
+            raise VerificationError("twin_status has no valid replay clock")
+        if next_sample_clock is not None and replay_epoch < next_sample_clock:
+            await asyncio.sleep(min(0.1, max(0.0, remaining)))
+            continue
+        sample = validate_twin_object_sample(
+            status,
+            args.twin_object_id,
+            world,
+            position_tolerance_m=args.position_tolerance_m,
+            rotation_tolerance_deg=args.yaw_tolerance_deg,
+        )
+        samples.append(sample)
+        next_sample_clock = replay_epoch + 1.0
+
+    summary = validate_twin_object_samples(samples)
+    return {"samples": samples, **summary}
+
+
+async def verify_twin(args, world=None):
     evidence = {"binary_frames": 0, "json_types": []}
     control_url = websocket_url(args.ws_url, "/twin", "control=1")
-    stream_url = websocket_url(args.ws_url, "/twin", "cam=ch1")
+    stream_url = websocket_url(
+        args.ws_url, "/twin", f"cam={args.twin_camera}"
+    )
 
     async with websockets.connect(
         stream_url, open_timeout=args.timeout, max_size=args.max_message_bytes
@@ -412,9 +791,11 @@ async def verify_twin(args):
 
             restored = False
             try:
-                replay_start = utc_iso(
-                    datetime.now(timezone.utc) - timedelta(seconds=args.replay_age_seconds)
+                replay_start = args.twin_replay_start or utc_iso(
+                    datetime.now(timezone.utc)
+                    - timedelta(seconds=args.replay_age_seconds)
                 )
+                evidence["replay_start"] = replay_start
                 replay = await request_json(
                     control_socket,
                     {"type": "twin_replay", "start": replay_start, "speed": 1.0},
@@ -434,6 +815,17 @@ async def verify_twin(args):
                 )
                 evidence["replay_frame_sha256"] = replay_digest
                 evidence["replay_frame_changed"] = True
+
+                if args.twin_object_id:
+                    if world is None:
+                        raise VerificationError(
+                            "exact twin object verification requires a CARLA world"
+                        )
+                    evidence["object_correlation"] = (
+                        await collect_twin_object_samples(
+                            args, control_socket, world, evidence
+                        )
+                    )
 
                 first_clock = None
                 second_clock = None
@@ -505,10 +897,7 @@ async def verify_drive_sessions(args, world, carla_map):
             evidence,
         )
         evidence["pre_status"] = pre_status
-        if pre_status.get("active_sessions") != 0:
-            raise VerificationError(
-                "refusing mutation while another Drive session is active"
-            )
+        validate_zero_active_sessions(pre_status)
 
         now = datetime.now(timezone.utc)
         start = args.start or utc_iso(now - timedelta(hours=1))
@@ -768,25 +1157,39 @@ async def verify_drive_sessions(args, world, carla_map):
     return evidence
 
 
-async def apply_probe(args):
-    try:
-        import carla
-    except ImportError as exc:
-        raise VerificationError(
-            "--apply requires the CARLA Python environment"
-        ) from exc
+async def apply_probe(args, carla_module=None):
+    if carla_module is None:
+        try:
+            import carla as carla_module
+        except ImportError as exc:
+            raise VerificationError(
+                "--apply requires the CARLA Python environment"
+            ) from exc
 
-    client = carla.Client(args.carla_host, args.carla_port)
+    client = carla_module.Client(args.carla_host, args.carla_port)
     client.set_timeout(args.timeout)
     world = client.get_world()
     result = {
         "mode": "apply",
         "checked_at": utc_iso(),
         "map": world.get_map().name,
-        "drive": await verify_drive_sessions(args, world, world.get_map()),
+        "preflight_server_status": await verify_zero_active_sessions(args),
     }
+    if args.skip_drive:
+        result["drive"] = {
+            "skipped": True,
+            "reason": (
+                "--skip-drive requested; no start_session request or "
+                "Drive-owned CARLA actor was created"
+            ),
+        }
+    else:
+        result["drive"] = await verify_drive_sessions(
+            args, world, world.get_map()
+        )
     if not args.skip_twin:
-        result["twin"] = await verify_twin(args)
+        result["pre_twin_server_status"] = await verify_zero_active_sessions(args)
+        result["twin"] = await verify_twin(args, world=world)
     return result
 
 
@@ -809,16 +1212,56 @@ def build_parser():
     parser.add_argument("--max-message-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--skip-twin", action="store_true")
     parser.add_argument(
+        "--skip-drive",
+        action="store_true",
+        help="do not create Drive sessions; still require zero active sessions",
+    )
+    parser.add_argument(
+        "--twin-object-id",
+        help="require exact replay object-to-CARLA actor motion evidence",
+    )
+    parser.add_argument(
+        "--twin-replay-start",
+        help="exact ISO replay start; defaults to --replay-age-seconds ago",
+    )
+    parser.add_argument(
+        "--twin-camera",
+        choices=("ch1", "ch2", "ch3", "ch4"),
+        default="ch1",
+        help="twin camera whose replay frames must visibly change",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
-        help="create two bounded Drive sessions and exercise replay; default is read-only",
+        help=(
+            "exercise bounded acceptance; creates two Drive sessions unless "
+            "--skip-drive is set; default is read-only"
+        ),
     )
     return parser
 
 
+def validate_cli_args(args):
+    if args.skip_drive and not args.apply:
+        raise VerificationError("--skip-drive is meaningful only with --apply")
+    if args.twin_replay_start and not args.apply:
+        raise VerificationError("--twin-replay-start requires --apply")
+    if args.twin_replay_start and replay_clock_epoch(args.twin_replay_start) is None:
+        raise VerificationError("--twin-replay-start must be a valid ISO timestamp")
+    if args.twin_object_id is not None:
+        args.twin_object_id = args.twin_object_id.strip()
+        if not args.twin_object_id:
+            raise VerificationError("--twin-object-id must not be blank")
+        if not args.apply:
+            raise VerificationError("--twin-object-id requires --apply")
+        if args.skip_twin:
+            raise VerificationError("--twin-object-id cannot be used with --skip-twin")
+    return args
+
+
 def main():
-    args = build_parser().parse_args()
     try:
+        args = validate_cli_args(build_parser().parse_args())
         result = asyncio.run(apply_probe(args) if args.apply else observational_probe(args))
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))

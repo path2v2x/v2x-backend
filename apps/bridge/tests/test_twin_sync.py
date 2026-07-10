@@ -13,9 +13,23 @@ from tests.conftest import MockBlueprint, MockLocation
 
 def make_detection(object_id="global_car_1", object_type="car", lat=37.9155, lon=-122.3348):
     return {
+        "event_id": "event-1",
         "object_id": object_id,
         "object_type": object_type,
         "confidence_score": 0.9,
+        "timestamp_utc": "2026-07-10T03:57:26.073Z",
+        "media_timestamp_utc": "2026-07-10T03:57:18.942Z",
+        "timestamp_schema_version": 2,
+        "media_time_trusted": True,
+        "media_clock": {
+            "schema_version": 1,
+            "source": "hls_ext_x_program_date_time",
+            "anchor_program_date_time_utc": "2026-07-10T03:57:10.000Z",
+            "position_milliseconds": 8942,
+        },
+        "device_id": "ch1",
+        "track_id": 13,
+        "bbox": {"x1": 488.0, "y1": 122.0, "x2": 836.0, "y2": 336.0},
         "gps_location": {"latitude": lat, "longitude": lon},
     }
 
@@ -56,6 +70,66 @@ class TestSpawn:
         first_ids = sync.actor_ids()
         sync._apply([make_detection(lat=37.9156)])
         assert sync.actor_ids() == first_ids
+
+    def test_status_exposes_detection_to_actor_evidence(self, sync, mock_world):
+        sync._apply([make_detection()])
+
+        status = sync.status()
+
+        assert status["actors"] == 1
+        assert len(status["objects"]) == 1
+        evidence = status["objects"][0]
+        actor = mock_world.get_actor(evidence["actor_id"])
+        assert evidence == {
+            "object_id": "global_car_1",
+            "object_type": "car",
+            "event_id": "event-1",
+            "detection_timestamp_utc": "2026-07-10T03:57:26.073Z",
+            "media_timestamp_utc": "2026-07-10T03:57:18.942Z",
+            "timestamp_schema_version": 2,
+            "media_time_trusted": True,
+            "media_clock": {
+                "schema_version": 1,
+                "source": "hls_ext_x_program_date_time",
+                "anchor_program_date_time_utc": "2026-07-10T03:57:10.000Z",
+                "position_milliseconds": 8942,
+            },
+            "device_id": "ch1",
+            "track_id": 13,
+            "bbox": {"x1": 488.0, "y1": 122.0, "x2": 836.0, "y2": 336.0},
+            "gps_location": {"latitude": 37.9155, "longitude": -122.3348},
+            "tracked_actor_id": actor.id,
+            "actor_id": actor.id,
+            "actor_present": True,
+            "actor_type": actor.type_id,
+            "carla_transform": {
+                "location": {
+                    "x": actor.get_transform().location.x,
+                    "y": actor.get_transform().location.y,
+                    "z": actor.get_transform().location.z,
+                },
+                "rotation": {
+                    "pitch": actor.get_transform().rotation.pitch,
+                    "yaw": actor.get_transform().rotation.yaw,
+                    "roll": actor.get_transform().rotation.roll,
+                },
+            },
+        }
+
+    def test_status_fails_closed_when_tracked_actor_vanished(self, sync, mock_world):
+        sync._apply([make_detection()])
+        tracked_actor_id = next(iter(sync.actor_ids()))
+        mock_world._actors.clear()
+
+        status = sync.status()
+
+        assert status["actors"] == 0
+        evidence = status["objects"][0]
+        assert evidence["tracked_actor_id"] == tracked_actor_id
+        assert evidence["actor_id"] is None
+        assert evidence["actor_present"] is False
+        assert evidence["actor_type"] is None
+        assert evidence["carla_transform"] is None
 
     def test_unknown_types_and_missing_gps_ignored(self, sync):
         sync._apply([

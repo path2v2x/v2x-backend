@@ -1,5 +1,6 @@
 from ultralytics import YOLO
 import cv2
+import math
 import os
 import re
 import threading
@@ -25,6 +26,175 @@ from runtime_health import (
     validate_batch_response,
 )
 from tracking_utils import AppearanceExtractor, KalmanTracker
+
+
+TIMESTAMP_SCHEMA_VERSION = 2
+
+
+def assess_media_clock(
+    frame_media_clock,
+    decode_received_epoch,
+    minimum_latency_ms=-1_000.0,
+    maximum_latency_ms=120_000.0,
+):
+    result = {
+        "status": "unavailable",
+        "trusted": False,
+        "media_timestamp_utc": None,
+        "media_clock": None,
+        "decode_latency_ms": None,
+        "media_epoch": None,
+    }
+    if not isinstance(frame_media_clock, dict):
+        return result
+
+    media_timestamp = frame_media_clock.get("media_timestamp_utc")
+    raw_clock = frame_media_clock.get("media_clock")
+    if not isinstance(media_timestamp, str) or not isinstance(raw_clock, dict):
+        result["status"] = "invalid_metadata"
+        return result
+    if raw_clock.get("source") != "hls_ext_x_program_date_time":
+        result["status"] = "unsupported_source"
+        return result
+    if raw_clock.get("schema_version") != 1:
+        result["status"] = "unsupported_schema"
+        return result
+
+    try:
+        parsed_media = datetime.fromisoformat(
+            media_timestamp.replace("Z", "+00:00")
+        )
+        if parsed_media.tzinfo is None:
+            raise ValueError("media timestamp lacks timezone")
+        media_epoch = parsed_media.timestamp()
+        receipt_epoch = float(decode_received_epoch)
+    except (TypeError, ValueError, OverflowError):
+        result["status"] = "invalid_timestamp"
+        return result
+    if not math.isfinite(media_epoch) or not math.isfinite(receipt_epoch):
+        result["status"] = "invalid_timestamp"
+        return result
+
+    decode_latency_ms = (receipt_epoch - media_epoch) * 1000.0
+    if not (
+        float(minimum_latency_ms)
+        <= decode_latency_ms
+        <= float(maximum_latency_ms)
+    ):
+        result["status"] = "latency_out_of_bounds"
+        result["decode_latency_ms"] = round(decode_latency_ms, 3)
+        return result
+
+    safe_clock = {
+        "source": "hls_ext_x_program_date_time",
+        "schema_version": 1,
+    }
+    anchor_timestamp = raw_clock.get("anchor_program_date_time_utc")
+    if isinstance(anchor_timestamp, str):
+        try:
+            parsed_anchor = datetime.fromisoformat(
+                anchor_timestamp.replace("Z", "+00:00")
+            )
+            if parsed_anchor.tzinfo is not None:
+                safe_clock["anchor_program_date_time_utc"] = anchor_timestamp
+        except ValueError:
+            pass
+    fragment_id = raw_clock.get("anchor_fragment_id")
+    if isinstance(fragment_id, str) and re.fullmatch(
+        r"[A-Za-z0-9._~-]{1,256}", fragment_id
+    ):
+        safe_clock["anchor_fragment_id"] = fragment_id
+    for key in (
+        "anchor_fragment_frame_offset_milliseconds",
+        "anchor_capture_position_milliseconds",
+        "anchor_media_sequence",
+        "position_milliseconds",
+        "capture_position_milliseconds",
+        "segment_duration_seconds",
+    ):
+        value = raw_clock.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) >= 0
+        ):
+            safe_clock[key] = value
+
+    try:
+        anchor_epoch = datetime.fromisoformat(
+            safe_clock["anchor_program_date_time_utc"].replace("Z", "+00:00")
+        ).timestamp()
+        reconstructed_epoch = (
+            anchor_epoch + float(safe_clock["position_milliseconds"]) / 1000.0
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        result["status"] = "incomplete_provenance"
+        return result
+    if abs(reconstructed_epoch - media_epoch) * 1000.0 > 5.0:
+        result["status"] = "inconsistent_provenance"
+        return result
+
+    result.update({
+        "status": "matched",
+        "trusted": True,
+        "media_timestamp_utc": media_timestamp,
+        "media_clock": safe_clock,
+        "decode_latency_ms": round(decode_latency_ms, 3),
+        "media_epoch": media_epoch,
+    })
+    return result
+
+
+def attach_media_clock_metadata(
+    records,
+    frame_media_clock,
+    minimum_latency_ms=-1_000.0,
+    maximum_latency_ms=120_000.0,
+):
+    """Use exact HLS media time while preserving decode-receipt time."""
+    for record in records:
+        assessment = assess_media_clock(
+            frame_media_clock,
+            record.get("ingested_at_epoch"),
+            minimum_latency_ms,
+            maximum_latency_ms,
+        )
+        record["timestamp_schema_version"] = TIMESTAMP_SCHEMA_VERSION
+        record["media_time_trusted"] = assessment["trusted"]
+        record["media_clock_status"] = assessment["status"]
+        if not assessment["trusted"]:
+            if assessment["decode_latency_ms"] is not None:
+                record["decode_latency_ms"] = assessment["decode_latency_ms"]
+            continue
+
+        media_timestamp = assessment["media_timestamp_utc"]
+        receipt_timestamp = record.get("timestamp_utc")
+        receipt_epoch = record.get("ingested_at_epoch")
+        record["decode_received_at_utc"] = receipt_timestamp
+        record["decode_received_at_epoch"] = receipt_epoch
+        record["timestamp_utc"] = media_timestamp
+        record["media_timestamp_utc"] = media_timestamp
+        record["media_clock"] = dict(assessment["media_clock"])
+        record["decode_latency_ms"] = assessment["decode_latency_ms"]
+        record["expires_at"] = int(assessment["media_epoch"]) + 86400
+        event_id = record.get("event_id")
+        if event_id:
+            record["ts_event"] = f"{media_timestamp}#{event_id}"
+    return records
+
+
+def records_ready_for_upload(records, live):
+    if not live:
+        return list(records)
+    return [
+        record
+        for record in records
+        if (
+            record.get("timestamp_schema_version") == TIMESTAMP_SCHEMA_VERSION
+            and record.get("media_time_trusted") is True
+        )
+    ]
 
 def env_bool(name, default=False):
     value = os.getenv(name)
@@ -103,6 +273,9 @@ class FrameBroadcaster:
                 "last_frame_monotonic": None,
                 "last_error": None,
                 "reconnect_attempts": 0,
+                "media_clock_status": "unavailable",
+                "media_time_trusted": False,
+                "decode_latency_ms": None,
             }
             for camera_id in self.camera_ids
         }
@@ -122,6 +295,7 @@ class FrameBroadcaster:
         frame,
         source_updated_at=None,
         source_monotonic=None,
+        media_clock_health=None,
     ):
         ok, encoded = cv2.imencode(
             ".jpg",
@@ -144,6 +318,18 @@ class FrameBroadcaster:
                     else float(source_monotonic)
                 ),
             })
+            if isinstance(media_clock_health, dict):
+                camera_health.update({
+                    "media_clock_status": media_clock_health.get(
+                        "status", "unavailable"
+                    ),
+                    "media_time_trusted": bool(
+                        media_clock_health.get("trusted")
+                    ),
+                    "decode_latency_ms": media_clock_health.get(
+                        "decode_latency_ms"
+                    ),
+                })
             # A final genuine buffered frame may finish inference after the
             # reader has already reported its next read failure. Publishing it
             # must not erase the newer reconnecting state or claim readiness.
@@ -164,6 +350,14 @@ class FrameBroadcaster:
                 "object_type": det.get("object_type"),
                 "confidence_score": det.get("confidence_score"),
                 "timestamp_utc": det.get("timestamp_utc"),
+                "media_timestamp_utc": det.get("media_timestamp_utc"),
+                "media_clock": det.get("media_clock"),
+                "media_clock_status": det.get("media_clock_status"),
+                "decode_received_at_utc": det.get("decode_received_at_utc"),
+                "decode_latency_ms": det.get("decode_latency_ms"),
+                "timestamp_schema_version": det.get("timestamp_schema_version"),
+                "media_time_trusted": det.get("media_time_trusted"),
+                "perception_run_id": det.get("perception_run_id"),
                 "device_id": det.get("device_id"),
                 "track_id": det.get("track_id"),
                 "bbox": metadata.get("bbox"),
@@ -202,6 +396,7 @@ class FrameBroadcaster:
         with self.condition:
             cameras = {}
             ready = True
+            media_clock_ready = True
             for camera_id in self.camera_ids:
                 entry = self.camera_health[camera_id]
                 last_frame = entry["last_frame_monotonic"]
@@ -211,6 +406,9 @@ class FrameBroadcaster:
                 if state == "streaming" and not fresh:
                     state = "stale"
                 ready = ready and fresh and state == "streaming"
+                media_clock_ready = (
+                    media_clock_ready and entry["media_time_trusted"] is True
+                )
                 cameras[camera_id] = {
                     "state": state,
                     "fresh": fresh,
@@ -219,10 +417,14 @@ class FrameBroadcaster:
                     "frame_count": self.frame_counts.get(camera_id, 0),
                     "last_error": sanitize_source_error(entry["last_error"]),
                     "reconnect_attempts": entry["reconnect_attempts"],
+                    "media_clock_status": entry["media_clock_status"],
+                    "media_time_trusted": entry["media_time_trusted"],
+                    "decode_latency_ms": entry["decode_latency_ms"],
                 }
             return {
                 "status": "ok" if ready else "degraded",
                 "ready": ready,
+                "media_clock_ready": media_clock_ready,
                 "generated_at": utc_iso(),
                 "stale_after_seconds": self.stale_seconds,
                 "cameras": cameras,
@@ -443,7 +645,7 @@ def compute_geohash(lat, lon, precision=5):
     return "".join(geohash)
 
 class MultiCameraPipeline:
-    def __init__(self, detectors):
+    def __init__(self, detectors, perception_run_id=None):
         """
         Initialize the MultiCameraPipeline.
 
@@ -458,6 +660,10 @@ class MultiCameraPipeline:
         self.global_tracks = {} # Store global tracks
         self.local_to_global = {} # "device_id_local_track_id" -> global_id
         self.next_global_id = 0
+        self.perception_run_id = str(
+            uuid.UUID(str(perception_run_id or uuid.uuid4()))
+        )
+        self.perception_run_prefix = self.perception_run_id.replace("-", "")[:8]
         self.extractor = AppearanceExtractor()
 
     @staticmethod
@@ -521,10 +727,11 @@ class MultiCameraPipeline:
                 if dist < radius:
                     is_duplicate = True
                     if new_det['confidence_score'] > existing_det['confidence_score']:
-                        existing_det['confidence_score'] = new_det['confidence_score']
-                        existing_det['gps_location'] = new_det['gps_location']
-                        existing_det['device_id'] = new_det['device_id']
-                        existing_det['camera_data'] = new_det['camera_data']
+                        # Select one internally consistent observation. Partial
+                        # field replacement used to pair one camera's bbox with
+                        # another camera's timestamp/media clock.
+                        existing_det.clear()
+                        existing_det.update(new_det)
                     break
 
             if not is_duplicate:
@@ -602,7 +809,10 @@ class MultiCameraPipeline:
                         self.global_tracks[best_match_id]['embedding'] = det['embedding']
 
                 self.global_tracks[best_match_id]['last_seen'] = current_time_epoch
-                det['object_id'] = f"global_{self.global_tracks[best_match_id]['type']}_{best_match_id}"
+                det['object_id'] = (
+                    f"global_{self.global_tracks[best_match_id]['type']}_"
+                    f"{self.perception_run_prefix}_{best_match_id}"
+                )
                 det['object_type'] = self.global_tracks[best_match_id]['type'] # Enforce stable class
                 self.local_to_global[local_key] = best_match_id
             else:
@@ -614,9 +824,13 @@ class MultiCameraPipeline:
                     'embedding': det.get('embedding'),
                     'last_seen': current_time_epoch
                 }
-                det['object_id'] = f"global_{det['object_type']}_{new_gid}"
+                det['object_id'] = (
+                    f"global_{det['object_type']}_"
+                    f"{self.perception_run_prefix}_{new_gid}"
+                )
                 self.local_to_global[local_key] = new_gid
 
+            det['perception_run_id'] = self.perception_run_id
             tracked_buffer.append(det)
 
         return tracked_buffer
@@ -665,6 +879,12 @@ class MultiCameraPipeline:
         duplicate_frame_limit = int(env_float(
             "V2X_PERCEPTION_DUPLICATE_FRAME_LIMIT", 90
         ))
+        media_clock_min_latency_ms = env_float(
+            "V2X_PERCEPTION_MEDIA_CLOCK_MIN_LATENCY_MS", -1_000.0
+        )
+        media_clock_max_latency_ms = env_float(
+            "V2X_PERCEPTION_MEDIA_CLOCK_MAX_LATENCY_MS", 120_000.0
+        )
         caps = [None] * len(video_paths)
         buffered_frames = [None] * len(video_paths)
         buffered_msecs = [-1.0] * len(video_paths)
@@ -716,6 +936,10 @@ class MultiCameraPipeline:
                     capture_factory=lambda source: _open_capture(source, True),
                     recovery=recovery,
                     state_callback=_state_callback(index),
+                    media_clock_factory=kinesis_utils.resolve_hls_media_clock,
+                    capture_position_milliseconds=lambda cap: cap.get(
+                        cv2.CAP_PROP_POS_MSEC
+                    ),
                     frame_identity_history_size=frame_identity_history_size,
                     duplicate_frame_limit=duplicate_frame_limit,
                 )
@@ -779,6 +1003,7 @@ class MultiCameraPipeline:
                 frames_to_process = [None] * num_cams
                 source_epochs = [None] * num_cams
                 source_monotonic = [None] * num_cams
+                frame_media_clocks = [None] * num_cams
                 source_media_msecs = [None] * num_cams
                 if live_mode:
                     for i, reader in enumerate(live_readers):
@@ -789,6 +1014,7 @@ class MultiCameraPipeline:
                         frames_to_process[i] = snapshot["frame"]
                         source_epochs[i] = snapshot["source_epoch"]
                         source_monotonic[i] = snapshot["source_monotonic"]
+                        frame_media_clocks[i] = snapshot.get("media_clock")
 
                     if not any(frame is not None for frame in frames_to_process):
                         time.sleep(0.02)
@@ -852,6 +1078,13 @@ class MultiCameraPipeline:
                     det_3d = detector.compute_3d_detections(
                         det_2d, frame_utc_str, frame_epoch
                     )
+                    if live_mode:
+                        attach_media_clock_metadata(
+                            det_3d,
+                            frame_media_clocks[i],
+                            media_clock_min_latency_ms,
+                            media_clock_max_latency_ms,
+                        )
 
                     for det in det_3d:
                         if det['object_type'] == 'person':
@@ -866,11 +1099,18 @@ class MultiCameraPipeline:
                         annotated = detector.draw_detections_3d(frame, det_3d)
                         annotated = cv2.resize(annotated, (640, 480))
                         if stream_broadcaster:
+                            media_clock_health = assess_media_clock(
+                                frame_media_clocks[i],
+                                source_epochs[i],
+                                media_clock_min_latency_ms,
+                                media_clock_max_latency_ms,
+                            )
                             stream_broadcaster.publish(
                                 camera_ids[i],
                                 annotated,
                                 frame_utc_str,
                                 source_monotonic=source_monotonic[i],
+                                media_clock_health=media_clock_health,
                             )
                         if show_live or writer or output_image:
                             annotated_frames.append(annotated)
@@ -892,13 +1132,16 @@ class MultiCameraPipeline:
                 self.all_clean_detections.extend(clean_batch)
 
                 # Batch Upload
+                uploadable_batch = records_ready_for_upload(
+                    clean_batch, live_mode
+                )
                 if (
                     upload
-                    and clean_batch
+                    and uploadable_batch
                     and upload_rate_limiter.allow()
                 ):
-                    if self.detectors[0].upload_batch(clean_batch):
-                        print(f"Frame {frame_count}: Uploaded {len(clean_batch)} unique objects (merged from {len(raw_buffer)} raw detections).")
+                    if self.detectors[0].upload_batch(uploadable_batch):
+                        print(f"Frame {frame_count}: Uploaded {len(uploadable_batch)} unique objects (merged from {len(raw_buffer)} raw detections).")
 
                 if annotated_frames:
                     if len(annotated_frames) == 1:

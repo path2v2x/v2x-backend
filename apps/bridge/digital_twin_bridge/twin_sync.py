@@ -63,6 +63,9 @@ class TwinTrack:
     __slots__ = (
         "object_id", "object_type", "actor_id", "last_seen",
         "current", "target", "lerp_start", "lerp_duration", "yaw",
+        "event_id", "detection_timestamp_utc", "media_timestamp_utc",
+        "timestamp_schema_version", "media_time_trusted", "media_clock",
+        "device_id", "track_id", "bbox", "gps_location",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -75,6 +78,16 @@ class TwinTrack:
         self.lerp_start = 0.0
         self.lerp_duration = 1.0
         self.yaw = 0.0
+        self.event_id = None
+        self.detection_timestamp_utc = None
+        self.media_timestamp_utc = None
+        self.timestamp_schema_version = None
+        self.media_time_trusted = False
+        self.media_clock = None
+        self.device_id = None
+        self.track_id = None
+        self.bbox = None
+        self.gps_location = None
 
 
 class TwinSync:
@@ -263,6 +276,23 @@ class TwinSync:
             if track is None:
                 track = TwinTrack(object_id, object_type)
                 self._tracks[object_id] = track
+            track.event_id = det.get("event_id")
+            track.detection_timestamp_utc = det.get("timestamp_utc")
+            track.media_timestamp_utc = det.get("media_timestamp_utc")
+            track.timestamp_schema_version = det.get("timestamp_schema_version")
+            track.media_time_trusted = det.get("media_time_trusted") is True
+            track.media_clock = det.get("media_clock")
+            track.device_id = det.get("device_id")
+            track.track_id = det.get("track_id")
+            track.bbox = det.get("bbox") or (
+                (det.get("camera_data") or {})
+                .get("bifocal_metadata", {})
+                .get("bbox")
+            )
+            track.gps_location = {
+                "latitude": float(lat),
+                "longitude": float(lon),
+            }
             if use_detection_ts:
                 det_ts = _parse_utc_epoch(det.get("timestamp_utc"))
                 track.last_seen = det_ts if det_ts is not None else now
@@ -483,16 +513,76 @@ class TwinSync:
     def actor_ids(self) -> set:
         return {t.actor_id for t in self._tracks.values() if t.actor_id is not None}
 
+    def _track_status(self, track: TwinTrack) -> dict:
+        """Return a JSON-safe detection-to-CARLA actor evidence record."""
+        tracked_actor_id = track.actor_id
+        resolved_actor_id = None
+        actor_present = False
+        actor_type = None
+        transform_payload = None
+        if track.actor_id is not None:
+            try:
+                actor = self._world.get_actor(track.actor_id)
+                if actor is not None:
+                    resolved_actor_id = int(actor.id)
+                    actor_present = True
+                    actor_type = getattr(actor, "type_id", None)
+                    transform = actor.get_transform()
+                    transform_payload = {
+                        "location": {
+                            "x": float(transform.location.x),
+                            "y": float(transform.location.y),
+                            "z": float(transform.location.z),
+                        },
+                        "rotation": {
+                            "pitch": float(transform.rotation.pitch),
+                            "yaw": float(transform.rotation.yaw),
+                            "roll": float(transform.rotation.roll),
+                        },
+                    }
+            except Exception:
+                logger.debug(
+                    "Twin status transform unavailable for %s", track.object_id
+                )
+
+        return {
+            "object_id": track.object_id,
+            "object_type": track.object_type,
+            "event_id": track.event_id,
+            "detection_timestamp_utc": track.detection_timestamp_utc,
+            "media_timestamp_utc": track.media_timestamp_utc,
+            "timestamp_schema_version": track.timestamp_schema_version,
+            "media_time_trusted": track.media_time_trusted,
+            "media_clock": track.media_clock,
+            "device_id": track.device_id,
+            "track_id": track.track_id,
+            "bbox": track.bbox,
+            "gps_location": track.gps_location,
+            # ``actor_id`` is acceptance evidence, so expose it only after
+            # resolving the actor and its transform from the live UE5 world.
+            # Keep the track's last ID separately for diagnostics.
+            "tracked_actor_id": tracked_actor_id,
+            "actor_id": resolved_actor_id,
+            "actor_present": actor_present and transform_payload is not None,
+            "actor_type": actor_type,
+            "carla_transform": transform_payload,
+        }
+
     def status(self) -> dict:
         clock = self.replay_clock()
+        objects = [
+            self._track_status(self._tracks[object_id])
+            for object_id in sorted(self._tracks)
+        ]
         return {
             "tracks": len(self._tracks),
-            "actors": len(self.actor_ids()),
+            "actors": sum(1 for item in objects if item["actor_present"]),
             "poll_failures": self._poll_failures,
             "detections_url": self._detections_url,
             "mode": self._mode,
             "replay_supported": self.replay_supported,
             "replay_clock": _epoch_to_iso(clock) if clock is not None else None,
+            "objects": objects,
         }
 
     def clear(self) -> None:

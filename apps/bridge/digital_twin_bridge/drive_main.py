@@ -725,7 +725,7 @@ async def main():
             await websocket.close()
             return
 
-        def mode_payload():
+        def mode_payload(include_objects=False):
             payload = {"type": "twin_mode", "mode": "off", "replay_supported": False}
             if sync is not None:
                 status = sync.status()
@@ -735,6 +735,11 @@ async def main():
                     "replay_clock": status["replay_clock"],
                     "tracks": status["tracks"],
                 })
+                if include_objects:
+                    payload.update({
+                        "actors": status["actors"],
+                        "objects": status["objects"],
+                    })
             return payload
 
         rig_status = rig.status() if rig is not None else {"width": 0, "height": 0, "fps": 1.0, "cameras": []}
@@ -787,7 +792,7 @@ async def main():
                 sync.go_live()
                 return mode_payload()
             if msg_type == "twin_status":
-                return mode_payload()
+                return mode_payload(include_objects=True)
             return {"type": "twin_error", "message": f"Unknown twin message: {msg_type}"}
 
         async def reader():

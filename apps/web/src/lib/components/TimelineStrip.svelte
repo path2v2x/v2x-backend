@@ -220,6 +220,9 @@
 			<span class="text-gray-500">{hovered.event.device_id}</span>
 			<span>{formatClock(Date.parse(hovered.event.first_seen))}</span>
 			<span class="text-gray-500">conf {hovered.event.max_confidence.toFixed(2)}</span>
+			{#if hovered.event.media_time_trusted !== true}
+				<span class="text-rose-300">untrusted pre-fix media time</span>
+			{/if}
 			<span class="text-gray-500">{hovered.event.count} detections</span>
 		</div>
 	{:else}

@@ -2,7 +2,11 @@
 	import { onDestroy } from 'svelte';
 	import Hls from 'hls.js';
 	import { fetchVideoSession } from '$lib/api';
-	import { formatClock } from '$lib/timeline';
+	import {
+		archiveCursorNeedsCorrection,
+		archiveMediaTimeForEpoch,
+		formatClock
+	} from '$lib/timeline';
 
 	interface Props {
 		cameraId: string;
@@ -52,12 +56,9 @@
 	}
 
 	function mediaTimeForEpoch(epochMs: number): number {
-		if (pdtOffsetMs !== null) {
-			return Math.max(0, (epochMs - pdtOffsetMs) / 1000);
-		}
-		// Fallback before the first fragment lands: assume the playlist starts
-		// at the window start.
-		return Math.max(0, (epochMs - windowStartMs) / 1000);
+		// Before the first fragment lands, use the playback window as a
+		// provisional base. FRAG_CHANGED corrects this with the real PDT.
+		return archiveMediaTimeForEpoch(epochMs, pdtOffsetMs, windowStartMs);
 	}
 
 	async function loadWindow() {
@@ -77,6 +78,17 @@
 					const pdt = data.frag.programDateTime;
 					if (pdt) {
 						pdtOffsetMs = pdt - data.frag.start * 1000;
+						// The initial seek runs before HLS has exposed its real PDT
+						// mapping. Correct it as soon as a timestamped fragment is
+						// active; otherwise archive video can remain seconds away from
+						// the replay clock until a later manual scrub.
+						if (videoEl) {
+							const target = mediaTimeForEpoch(cursorMs);
+							const currentEpoch = pdtOffsetMs + videoEl.currentTime * 1000;
+							if (archiveCursorNeedsCorrection(cursorMs, currentEpoch)) {
+								videoEl.currentTime = target;
+							}
+						}
 					}
 				});
 				hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -129,7 +141,7 @@
 	// Followers drift-correct against the shared cursor instead of emitting time.
 	$effect(() => {
 		if (isPrimary || !videoEl || currentEpochMs === null) return;
-		if (Math.abs(cursorMs - currentEpochMs) > 1500) {
+		if (archiveCursorNeedsCorrection(cursorMs, currentEpochMs)) {
 			videoEl.currentTime = mediaTimeForEpoch(cursorMs);
 		}
 	});

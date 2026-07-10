@@ -15,7 +15,7 @@
 		windowForCursor,
 		type PlaybackWindow
 	} from '$lib/timeline';
-	import type { DetectionTimeline, TimelineEvent } from '$lib/types';
+	import type { DetectionTimeline, TimelineEvent, TwinObjectEvidence } from '$lib/types';
 
 	interface Props {
 		/** Drive server WS base URL (the selected tunnel). */
@@ -36,6 +36,8 @@
 	let controlWs: WebSocket | null = null;
 	let controlKey = '';
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let twinObjects = $state<TwinObjectEvidence[]>([]);
+	let lastStatusRequestMs = 0;
 
 	// ── Timeline (markers over the past 24h of recorded detections) ──
 	let timeline = $state<DetectionTimeline | null>(null);
@@ -52,6 +54,20 @@
 
 	let cameraIds = $derived(config?.videoCameraIds ?? ['ch1', 'ch2', 'ch3', 'ch4']);
 	let cursorMs = $derived(mode === 'replay' && replayClockMs !== null ? replayClockMs : nowMs);
+	let selectedTwinObject = $derived(
+		selectedObjectId
+			? (twinObjects.find((object) => object.object_id === selectedObjectId) ?? null)
+			: null
+	);
+	let mappedActorCount = $derived(
+		twinObjects.filter(
+			(object) =>
+				object.actor_present === true &&
+				typeof object.actor_id === 'number' &&
+				object.carla_transform !== null &&
+				object.carla_transform !== undefined
+		).length
+	);
 
 	function perceptionStreamUrl(cameraId: string): string {
 		if (!config) return '';
@@ -94,11 +110,20 @@
 					mode = msg.sync.mode === 'replay' ? 'replay' : 'live';
 					replaySupported = Boolean(msg.sync.replay_supported);
 					replayClockMs = parseIsoMs(msg.sync.replay_clock);
+					twinObjects = Array.isArray(msg.sync.objects) ? msg.sync.objects : [];
 				} else if (msg.type === 'twin_mode' || msg.type === 'twin_clock') {
 					mode = msg.mode === 'replay' ? 'replay' : 'live';
 					replaySupported = Boolean(msg.replay_supported ?? replaySupported);
 					replayClockMs = parseIsoMs(msg.replay_clock);
+					if (Array.isArray(msg.objects)) twinObjects = msg.objects;
 					if (msg.type === 'twin_mode') controlError = null;
+					if (msg.type === 'twin_clock' && msg.mode === 'replay') {
+						const now = Date.now();
+						if (now - lastStatusRequestMs >= 1000) {
+							lastStatusRequestMs = now;
+							controlWs?.send(JSON.stringify({ type: 'twin_status' }));
+						}
+					}
 				} else if (msg.type === 'twin_error') {
 					controlError = msg.message ?? 'Twin control error';
 				}
@@ -130,6 +155,7 @@
 	function goLive() {
 		sendControl({ type: 'twin_live' });
 		selectedObjectId = null;
+		twinObjects = [];
 		playbackWindow = null;
 	}
 
@@ -151,6 +177,11 @@
 
 	function handleSelectEvent(event: TimelineEvent) {
 		selectedObjectId = event.object_id;
+		if (event.media_time_trusted !== true || event.timestamp_schema_version !== 2) {
+			controlError =
+				'This event predates the trusted HLS media clock and cannot be used for twin correlation.';
+			return;
+		}
 		const firstSeen = parseIsoMs(event.first_seen);
 		if (firstSeen !== null) {
 			replayAt(firstSeen - 5_000);
@@ -250,6 +281,9 @@
 			<span class="border border-amber-400/60 bg-amber-400/10 px-3 py-1 font-mono text-[11px] text-amber-200">
 				Replay · {replayClockMs !== null ? formatClock(replayClockMs) : '…'}
 			</span>
+			<span class="border border-gray-700 bg-gray-900 px-3 py-1 font-mono text-[11px] text-gray-300">
+				{mappedActorCount} mapped actor{mappedActorCount === 1 ? '' : 's'}
+			</span>
 		{/if}
 		<div class="ml-2 flex items-center gap-1">
 			{#each cameraIds as cameraId}
@@ -282,6 +316,30 @@
 			Left: CARLA twin · Right: {mode === 'replay' ? 'recorded street video' : 'real street camera'}
 		</span>
 	</div>
+
+	{#if mode === 'replay' && selectedObjectId}
+		<div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-gray-800 bg-gray-950 px-4 py-2 font-mono text-[11px]">
+			<span class="text-amber-300">object {selectedObjectId}</span>
+			{#if selectedTwinObject?.actor_present === true && selectedTwinObject.actor_id && selectedTwinObject.carla_transform}
+				<span class="text-cyan-300">
+					CARLA actor #{selectedTwinObject.actor_id} · {selectedTwinObject.actor_type ?? 'unknown type'}
+				</span>
+				{#if selectedTwinObject.event_id}
+					<span class="text-gray-400">event {selectedTwinObject.event_id}</span>
+				{/if}
+				{#if selectedTwinObject.media_timestamp_utc}
+					<span class="text-gray-400">media {selectedTwinObject.media_timestamp_utc}</span>
+				{/if}
+				{#if selectedTwinObject.media_time_trusted === true && selectedTwinObject.timestamp_schema_version === 2}
+					<span class="text-emerald-300">trusted HLS clock</span>
+				{:else}
+					<span class="text-rose-300">untrusted media clock</span>
+				{/if}
+			{:else}
+				<span class="text-gray-500">waiting for this object at the replay clock</span>
+			{/if}
+		</div>
+	{/if}
 
 	{#if controlError}
 		<p class="border-b border-gray-800 px-4 py-2 text-[11px] text-rose-300">{controlError}</p>
