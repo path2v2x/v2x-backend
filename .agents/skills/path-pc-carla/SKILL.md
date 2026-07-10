@@ -462,6 +462,18 @@ projected 3-D bounding box in each corresponding twin JPEG. The stream's
 FOV, lens values, and camera-config SHA-256 used for projection. Until the
 tracked projection model supports a measured nonzero CARLA `lens_k` or
 `lens_kcube`, fail closed rather than treating pinhole projection as equivalent.
+Each JPEG must also be preceded by hash-matching `twin_frame` metadata with an
+advancing UE5 frame ID and a replay clock no more than 250 ms after the sampled
+object clock. Pin the stream fingerprint to the tracked channel config and the
+advertised camera actor to the live `sensor.camera.*` transform and optical
+attributes. Require before/after capture projection overlap with the same YOLO
+bbox, at least 0.50 matched confidence, 0.15 IoU, 0.50 actor coverage, 75% of
+the raw actor projection in frame, and an allowlisted YOLO model hash. Project
+all live vehicles/walkers and reject foreground occlusion or a neighboring
+actor that explains the detection within the fixed exclusivity margin. Across
+the three samples, require distinct JPEGs and image-space detection motion that
+agrees with the target actor's projected direction and displacement. CLI
+overrides may tighten these floors but must never weaken them.
 
 ## Controlled deployment gate
 

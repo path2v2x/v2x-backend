@@ -30,6 +30,9 @@ DEFAULT_TWIN_YOLO_DETECTOR = (
     / "detect_jpeg_objects.py"
 )
 DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
+ACCEPTED_TWIN_YOLO_MODEL_SHA256 = {
+    "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
+}
 
 
 class VerificationError(RuntimeError):
@@ -245,8 +248,8 @@ def project_world_xyz(point, camera_model):
     )
 
 
-def project_actor_bbox(actor, camera_model):
-    """Project a concrete UE5 actor's 3-D bounding box into its twin JPEG."""
+def project_actor_geometry(actor, camera_model):
+    """Project one UE5 actor with clipping and depth evidence."""
     bounding_box = getattr(actor, "bounding_box", None)
     if bounding_box is None or not hasattr(bounding_box, "get_world_vertices"):
         raise VerificationError("mapped UE5 actor has no projectable bounding box")
@@ -270,10 +273,36 @@ def project_actor_bbox(actor, camera_model):
         max(0.0, min(float(width), raw[2])),
         max(0.0, min(float(height), raw[3])),
     )
+    raw_area = max(0.0, raw[2] - raw[0]) * max(0.0, raw[3] - raw[1])
     area = max(0.0, clipped[2] - clipped[0]) * max(0.0, clipped[3] - clipped[1])
-    if area < 400.0:
-        raise VerificationError("mapped UE5 actor projection is too small or outside the twin frame")
-    return tuple(round(value, 3) for value in clipped)
+    clipped_width = clipped[2] - clipped[0]
+    clipped_height = clipped[3] - clipped[1]
+    visibility_ratio = area / raw_area if raw_area > 0.0 else 0.0
+    if (
+        area < 900.0
+        or clipped_width < 20.0
+        or clipped_height < 20.0
+        or visibility_ratio < 0.75
+    ):
+        raise VerificationError(
+            "mapped UE5 actor projection is too small or too clipped for visual proof"
+        )
+    return {
+        "actor_id": int(actor.id),
+        "bbox": tuple(round(value, 3) for value in clipped),
+        "raw_bbox": tuple(round(value, 3) for value in raw),
+        "area_px": round(area, 3),
+        "visibility_ratio": round(visibility_ratio, 4),
+        "minimum_depth_m": round(min(value[2] for value in projected), 4),
+        "median_depth_m": round(
+            sorted(value[2] for value in projected)[len(projected) // 2], 4
+        ),
+    }
+
+
+def project_actor_bbox(actor, camera_model):
+    """Compatibility wrapper returning only the clipped actor rectangle."""
+    return project_actor_geometry(actor, camera_model)["bbox"]
 
 
 def _bbox_iou(left, right):
@@ -288,6 +317,14 @@ def _bbox_iou(left, right):
     )
 
 
+def _bbox_area(box):
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _bbox_center(box):
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
 def validate_projected_actor_detection(
     projected_bbox,
     detections,
@@ -295,6 +332,8 @@ def validate_projected_actor_detection(
     *,
     minimum_iou=0.15,
     minimum_actor_coverage=0.50,
+    minimum_confidence=0.50,
+    maximum_area_ratio=2.5,
 ):
     """Require a compatible visual detection overlapping the exact actor projection."""
     expected = {
@@ -309,15 +348,28 @@ def validate_projected_actor_detection(
             continue
         bbox = tuple(float(value) for value in detection["bbox"])
         iou, coverage = _bbox_iou(projected_bbox, bbox)
+        confidence = float(detection["confidence"])
+        detection_center = _bbox_center(bbox)
+        area_ratio = _bbox_area(bbox) / max(_bbox_area(projected_bbox), 1e-9)
+        center_inside = (
+            projected_bbox[0] <= detection_center[0] <= projected_bbox[2]
+            and projected_bbox[1] <= detection_center[1] <= projected_bbox[3]
+        )
         candidate = {
             "label": detection["label"],
-            "confidence": round(float(detection["confidence"]), 4),
+            "confidence": round(confidence, 4),
             "bbox": [round(value, 3) for value in bbox],
             "iou_with_projected_actor": round(iou, 4),
             "projected_actor_coverage": round(coverage, 4),
+            "detection_to_actor_area_ratio": round(area_ratio, 4),
+            "detection_center_inside_actor": center_inside,
         }
         candidate["compatible"] = (
-            iou >= minimum_iou and coverage >= minimum_actor_coverage
+            iou >= minimum_iou
+            and coverage >= minimum_actor_coverage
+            and confidence >= minimum_confidence
+            and area_ratio <= maximum_area_ratio
+            and center_inside
         )
         candidates.append(candidate)
     matches = [candidate for candidate in candidates if candidate["compatible"]]
@@ -337,8 +389,71 @@ def validate_projected_actor_detection(
         "projected_bbox": list(projected_bbox),
         "minimum_iou": minimum_iou,
         "minimum_actor_coverage": minimum_actor_coverage,
+        "minimum_confidence": minimum_confidence,
+        "maximum_area_ratio": maximum_area_ratio,
         "best_detection": best,
         "candidate_count": len(candidates),
+    }
+
+
+def project_scene_actor_geometries(world, camera_model, target_actor_id):
+    """Project every potentially confounding vehicle/walker in the UE5 scene."""
+    geometries = {}
+    for actor in world.get_actors():
+        type_id = str(getattr(actor, "type_id", ""))
+        if not type_id.startswith(("vehicle.", "walker.")):
+            continue
+        try:
+            geometry = project_actor_geometry(actor, camera_model)
+        except VerificationError:
+            if int(getattr(actor, "id", -1)) == int(target_actor_id):
+                raise
+            continue
+        geometries[int(actor.id)] = geometry
+    if int(target_actor_id) not in geometries:
+        raise VerificationError("target UE5 actor has no acceptable scene projection")
+    return geometries
+
+
+def validate_target_actor_exclusivity(
+    target_actor_id,
+    scene_geometries,
+    detection_bbox,
+    *,
+    minimum_iou_margin=0.10,
+    maximum_foreground_coverage=0.15,
+):
+    """Reject a detection explained better by another or foreground actor."""
+    target = scene_geometries[int(target_actor_id)]
+    target_iou, _ = _bbox_iou(target["bbox"], detection_bbox)
+    confounders = []
+    for actor_id, geometry in scene_geometries.items():
+        if int(actor_id) == int(target_actor_id):
+            continue
+        detection_iou, _ = _bbox_iou(geometry["bbox"], detection_bbox)
+        _, target_coverage = _bbox_iou(target["bbox"], geometry["bbox"])
+        foreground = geometry["minimum_depth_m"] < target["minimum_depth_m"] - 0.25
+        confounders.append({
+            "actor_id": int(actor_id),
+            "detection_iou": round(detection_iou, 4),
+            "target_coverage": round(target_coverage, 4),
+            "foreground": foreground,
+            "minimum_depth_m": geometry["minimum_depth_m"],
+        })
+        if foreground and target_coverage > maximum_foreground_coverage:
+            raise VerificationError(
+                "foreground UE5 actor occludes the projected target actor"
+            )
+        if detection_iou > 0.0 and target_iou - detection_iou < minimum_iou_margin:
+            raise VerificationError(
+                "visual detection is not exclusive to the target UE5 actor"
+            )
+    return {
+        "target_actor_id": int(target_actor_id),
+        "target_detection_iou": round(target_iou, 4),
+        "minimum_iou_margin": minimum_iou_margin,
+        "maximum_foreground_coverage": maximum_foreground_coverage,
+        "confounders": confounders,
     }
 
 
@@ -899,6 +1014,68 @@ def validate_twin_object_sample(
     }
 
 
+def validate_visual_motion_consistency(
+    samples,
+    *,
+    minimum_projected_motion_px=5.0,
+    minimum_direction_cosine=0.75,
+    maximum_vector_error_px=10.0,
+    maximum_relative_vector_error=0.50,
+):
+    """Tie the YOLO track's image displacement to UE5 projected displacement."""
+    projected_centers = []
+    detection_centers = []
+    try:
+        for sample in samples:
+            visual = sample["visual"]
+            projected_centers.append(
+                _bbox_center(visual["before_capture"]["projected_bbox"])
+            )
+            detection_centers.append(
+                _bbox_center(visual["best_detection"]["bbox"])
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VerificationError("twin visual samples lack motion geometry") from exc
+    projected_vector = (
+        projected_centers[-1][0] - projected_centers[0][0],
+        projected_centers[-1][1] - projected_centers[0][1],
+    )
+    detection_vector = (
+        detection_centers[-1][0] - detection_centers[0][0],
+        detection_centers[-1][1] - detection_centers[0][1],
+    )
+    projected_distance = math.hypot(*projected_vector)
+    detection_distance = math.hypot(*detection_vector)
+    if projected_distance < minimum_projected_motion_px:
+        raise VerificationError(
+            "twin actor projected motion is not visually resolvable"
+        )
+    if detection_distance <= 1e-6:
+        raise VerificationError("twin visual detection did not move with the actor")
+    direction_cosine = sum(
+        left * right for left, right in zip(projected_vector, detection_vector)
+    ) / (projected_distance * detection_distance)
+    vector_error = math.hypot(
+        projected_vector[0] - detection_vector[0],
+        projected_vector[1] - detection_vector[1],
+    )
+    allowed_error = min(
+        maximum_vector_error_px,
+        maximum_relative_vector_error * projected_distance,
+    )
+    if direction_cosine < minimum_direction_cosine or vector_error > allowed_error:
+        raise VerificationError(
+            "twin visual detection motion disagrees with projected UE5 actor motion"
+        )
+    return {
+        "projected_displacement_px": round(projected_distance, 3),
+        "detection_displacement_px": round(detection_distance, 3),
+        "direction_cosine": round(direction_cosine, 4),
+        "vector_error_px": round(vector_error, 3),
+        "allowed_vector_error_px": round(allowed_error, 3),
+    }
+
+
 def validate_twin_object_samples(
     samples,
     *,
@@ -980,6 +1157,7 @@ def validate_twin_object_samples(
         raise VerificationError("twin object visual samples have invalid frame hashes")
     if len(set(frame_hashes)) != len(frame_hashes):
         raise VerificationError("twin object visual samples reused a rendered frame")
+    motion = validate_visual_motion_consistency(samples)
     return {
         "sample_count": len(samples),
         "object_id": next(iter(object_ids)),
@@ -995,6 +1173,7 @@ def validate_twin_object_samples(
         "max_planar_movement_m": round(max_movement, 3),
         "planar_path_length_m": round(path_length, 3),
         "visual_frame_sha256": frame_hashes,
+        "visual_motion": motion,
     }
 
 
@@ -1179,12 +1358,15 @@ async def collect_twin_object_samples(
             status,
             args.twin_object_id,
             world,
-            position_tolerance_m=args.position_tolerance_m,
-            rotation_tolerance_deg=args.yaw_tolerance_deg,
+            position_tolerance_m=args.twin_position_tolerance_m,
+            rotation_tolerance_deg=args.twin_rotation_tolerance_deg,
         )
         validate_live_twin_camera_actor(world, camera_model)
         actor = world.get_actor(sample["actor_id"])
-        projected_before = project_actor_bbox(actor, camera_model)
+        geometry_before = project_actor_geometry(actor, camera_model)
+        scene_before = project_scene_actor_geometries(
+            world, camera_model, sample["actor_id"]
+        )
         jpeg, jpeg_digest, frame_metadata, frame_skew = (
             await receive_twin_frame_packet(
                 stream_socket,
@@ -1204,7 +1386,10 @@ async def collect_twin_object_samples(
         actor_after = world.get_actor(sample["actor_id"])
         if actor_after is None:
             raise VerificationError("mapped UE5 actor disappeared during frame capture")
-        projected_after = project_actor_bbox(actor_after, camera_model)
+        geometry_after = project_actor_geometry(actor_after, camera_model)
+        scene_after = project_scene_actor_geometries(
+            world, camera_model, sample["actor_id"]
+        )
         detections = detect_twin_objects(
             jpeg,
             detector,
@@ -1212,14 +1397,14 @@ async def collect_twin_object_samples(
             device=args.twin_yolo_device,
         )
         before_match = validate_projected_actor_detection(
-            projected_before,
+            geometry_before["bbox"],
             detections,
             sample["object_type"],
             minimum_iou=args.twin_min_iou,
             minimum_actor_coverage=args.twin_min_actor_coverage,
         )
         after_match = validate_projected_actor_detection(
-            projected_after,
+            geometry_after["bbox"],
             detections,
             sample["object_type"],
             minimum_iou=args.twin_min_iou,
@@ -1229,6 +1414,13 @@ async def collect_twin_object_samples(
             raise VerificationError(
                 "different visual detections matched the actor capture bracket"
             )
+        detection_bbox = before_match["best_detection"]["bbox"]
+        exclusivity_before = validate_target_actor_exclusivity(
+            sample["actor_id"], scene_before, detection_bbox
+        )
+        exclusivity_after = validate_target_actor_exclusivity(
+            sample["actor_id"], scene_after, detection_bbox
+        )
         sample["visual"] = {
             "frame_sha256": jpeg_digest,
             "frame_metadata": {
@@ -1239,8 +1431,16 @@ async def collect_twin_object_samples(
                 )
             },
             "frame_replay_skew_seconds": round(frame_skew, 6),
-            "before_capture": before_match,
-            "after_capture": after_match,
+            "before_capture": {
+                **before_match,
+                "actor_geometry": geometry_before,
+                "exclusivity": exclusivity_before,
+            },
+            "after_capture": {
+                **after_match,
+                "actor_geometry": geometry_after,
+                "exclusivity": exclusivity_after,
+            },
             "best_detection": before_match["best_detection"],
         }
         samples.append(sample)
@@ -1259,7 +1459,10 @@ async def verify_twin(args, world=None):
             "script": args.twin_yolo_detector,
             "model": args.twin_yolo_model,
         }
-        evidence["twin_yolo_model_sha256"] = file_sha256(args.twin_yolo_model)
+        model_digest = file_sha256(args.twin_yolo_model)
+        if model_digest not in ACCEPTED_TWIN_YOLO_MODEL_SHA256:
+            raise VerificationError("twin visual proof model hash is not allowlisted")
+        evidence["twin_yolo_model_sha256"] = model_digest
         evidence["twin_yolo_detector_sha256"] = file_sha256(args.twin_yolo_detector)
     control_url = websocket_url(args.ws_url, "/twin", "control=1")
     stream_url = websocket_url(
@@ -1786,6 +1989,8 @@ def build_parser():
     parser.add_argument("--twin-min-iou", type=float, default=0.15)
     parser.add_argument("--twin-min-actor-coverage", type=float, default=0.50)
     parser.add_argument("--twin-frame-max-skew", type=float, default=0.25)
+    parser.add_argument("--twin-position-tolerance-m", type=float, default=0.50)
+    parser.add_argument("--twin-rotation-tolerance-deg", type=float, default=1.0)
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -1833,9 +2038,22 @@ def validate_cli_args(args):
             raise VerificationError(f"{label} must be in (0, 1]")
     if (
         not math.isfinite(args.twin_frame_max_skew)
-        or not 0.0 < args.twin_frame_max_skew <= 1.0
+        or not 0.0 < args.twin_frame_max_skew <= 0.25
     ):
-        raise VerificationError("--twin-frame-max-skew must be in (0, 1]")
+        raise VerificationError("--twin-frame-max-skew must be in (0, 0.25]")
+    if args.twin_min_iou < 0.15:
+        raise VerificationError("--twin-min-iou cannot weaken the 0.15 floor")
+    if args.twin_min_actor_coverage < 0.50:
+        raise VerificationError(
+            "--twin-min-actor-coverage cannot weaken the 0.50 floor"
+        )
+    if (
+        not 0.0 < args.twin_position_tolerance_m <= 0.50
+        or not 0.0 < args.twin_rotation_tolerance_deg <= 1.0
+    ):
+        raise VerificationError(
+            "exact twin actor tolerances cannot exceed 0.50m and 1.0deg"
+        )
     return args
 
 
