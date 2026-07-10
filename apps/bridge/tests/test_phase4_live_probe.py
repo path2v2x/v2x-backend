@@ -608,3 +608,55 @@ async def test_twin_replay_restores_live_when_acceptance_fails(monkeypatch):
         await verify_twin(args)
 
     assert sent_types[-1] == "twin_live"
+
+
+@pytest.mark.asyncio
+async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypatch):
+    actor = FakeActor()
+    world = FakeWorld([actor])
+    statuses = [
+        twin_status(clock="2026-07-10T06:00:00.000Z", x=10.0),
+        twin_status(clock="2026-07-10T06:00:01.000Z", x=10.2),
+        twin_status(clock="2026-07-10T06:00:02.000Z", x=10.5),
+    ]
+    call_order = []
+    sync_frames = iter((101, 102, 103))
+
+    def fake_synchronize(sync_world, timeout):
+        assert sync_world is world
+        assert 0.0 < timeout <= 1.0
+        call_order.append("sync")
+        return next(sync_frames)
+
+    async def fake_request_json(*_args, **_kwargs):
+        call_order.append("request")
+        status = statuses.pop(0)
+        location = status["objects"][0]["carla_transform"]["location"]
+        actor._transform = FakeTransform(
+            location["x"], location["y"], location["z"], yaw=12.0
+        )
+        return status
+
+    monkeypatch.setattr(live_probe, "synchronize_world", fake_synchronize)
+    monkeypatch.setattr(live_probe, "request_json", fake_request_json)
+
+    args = type(
+        "Args",
+        (),
+        {
+            "timeout": 5.0,
+            "twin_object_id": "global_car_run_1",
+            "position_tolerance_m": 0.5,
+            "yaw_tolerance_deg": 1.0,
+        },
+    )()
+    evidence = {}
+
+    result = await live_probe.collect_twin_object_samples(
+        args, object(), world, evidence
+    )
+
+    assert call_order == ["sync", "request"] * 3
+    assert evidence["object_sync_frames"] == [101, 102, 103]
+    assert result["sample_count"] == 3
+    assert result["max_planar_movement_m"] == pytest.approx(0.5)

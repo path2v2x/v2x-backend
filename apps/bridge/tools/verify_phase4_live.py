@@ -713,6 +713,14 @@ async def collect_twin_object_samples(args, control_socket, world, evidence):
             raise VerificationError(
                 f"timed out collecting twin object {args.twin_object_id!r} samples"
             )
+        # RR/CARLA can leave a separately connected client on frame zero (or
+        # an older actor snapshot) until it consumes a real world tick.  The
+        # Drive process reports the live actor transform from its own client,
+        # so synchronize this verifier client immediately before comparing
+        # the two views.  This is read-only and preserves the exact transform
+        # and movement tolerances below.
+        sync_frame = synchronize_world(world, min(1.0, remaining))
+        evidence.setdefault("object_sync_frames", []).append(sync_frame)
         status = await request_json(
             control_socket,
             {"type": "twin_status"},
