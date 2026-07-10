@@ -98,6 +98,27 @@ Only after the canonical clone/build test succeeds should a separate IAM audit
 decide whether Amplify needs a service role. Never reuse or contaminate the
 dedicated V2X API/Lambda deploy role for Amplify.
 
+If organization-admin access is temporarily unavailable, Amplify may instead
+use the owner-controlled `michaelvu1207/v2x-backend-amplify` production mirror.
+The mirror is acceptable only when its `main` commit exactly matches
+`path2v2x/v2x-backend` and its active push webhook is proven before release.
+Pass that repository explicitly rather than changing the reconciliation
+script's canonical default:
+
+```bash
+CANONICAL_REPOSITORY=https://github.com/michaelvu1207/v2x-backend-amplify \
+  ACTION=plan ./reconcile-repository.sh
+```
+
+`.github/workflows/sync-amplify-mirror.yml` runs only in the mirror repository.
+It uses the repository-scoped `GITHUB_TOKEN`, fetches public canonical `main`,
+and permits only a fast-forward of mirror `main`; divergence fails closed and
+never rewrites history. The workflow is tracked in canonical source and must be
+present at the same commit in the mirror, so production does not depend on
+mirror-only source or a separately stored GitHub credential. Direct Amplify
+authorization for the organization repository remains the preferred endpoint
+once an organization owner can grant webhook administration.
+
 ## Runtime endpoints and release gate
 
 Preferred long term, the deployed dashboard can use a named Cloudflare Tunnel hostname for the public Drive WebSocket:
