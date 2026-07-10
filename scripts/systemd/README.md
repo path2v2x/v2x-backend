@@ -208,8 +208,9 @@ exact captured old perception PID. Verify that exactly one cloudflared process
 targets `localhost:8090`. If any gate fails, stop the new supervised service and
 keep the old process/public configuration intact.
 
-The first staged perception start keeps uploads disabled through the tracked
-default and `/etc/v2x-perception.env`:
+The first staged perception start keeps uploads disabled through the required
+tracked `/etc/v2x-perception.env` gate. The unit deliberately does not set the
+same variable, so this file is the single effective source:
 
 ```text
 V2X_PERCEPTION_UPLOAD=false
