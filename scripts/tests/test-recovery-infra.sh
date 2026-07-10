@@ -192,8 +192,11 @@ for argument in "$@"; do
 done
 payload=""
 case "$*" in
+  *drive-config*)
+    payload='{"version":1,"expiresAt":"2099-01-01T00:00:00Z","cloudflareDriveWsUrl":"wss://drive.example.test"}'
+    ;;
   *config.json*)
-    payload='{"perceptionStreamBaseUrl":"https://perception.example.test"}'
+    payload='{"apiBaseUrl":"https://api.example.test","driveConfigPath":"/drive-config","perceptionStreamBaseUrl":"https://perception.example.test"}'
     ;;
   */health*)
     payload='{"status":"ok","ready":true,"cameras":{"ch1":{"fresh":true,"state":"streaming"},"ch2":{"fresh":true,"state":"streaming"},"ch3":{"fresh":true,"state":"streaming"},"ch4":{"fresh":true,"state":"streaming"}}}'
@@ -326,6 +329,36 @@ done
 if grep -Fq '{camera_id' "$MOCK_CURL_LOG"; then
   fail 'Perception link checker emitted an unrendered camera path marker'
 fi
+
+# Secure wss:// checks must let websockets create its default TLS context.
+# Passing ssl=None explicitly is rejected by newer releases before a handshake.
+FAKE_PYTHON_MODULES="$TMP/fake-python-modules"
+mkdir -p "$FAKE_PYTHON_MODULES"
+cat >"$FAKE_PYTHON_MODULES/websockets.py" <<'MOCK_WEBSOCKETS'
+class _Connection:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+def connect(url, **kwargs):
+    if url.startswith("wss://") and kwargs.get("ssl", "omitted") is None:
+        raise ValueError("ssl=None is incompatible with a wss:// URI")
+    return _Connection()
+MOCK_WEBSOCKETS
+
+: >"$MOCK_CURL_LOG"
+PYTHONPATH="$FAKE_PYTHON_MODULES" PATH="$MOCK_BIN:$PATH" \
+PYTHON_BIN="$(command -v python3)" \
+FRONTEND_CONFIG_URL=https://frontend.example.test/config.json \
+DRIVE_CONFIG_URL=https://api.example.test/drive-config \
+DRIVE_LINK_HEALTH_REPAIR=false DRIVE_CONFIG_REQUIRED=true \
+DRIVE_WS_INSECURE_SSL=false \
+  "$ROOT/scripts/check-drive-frontend-link.sh" \
+  >"$TMP/drive-link-check.txt"
+assert_contains "$TMP/drive-link-check.txt" 'Drive frontend link is healthy.'
 
 # Repository reconnection must use the lowercase AWS request schema while the
 # token stays in a mode-0600 file rather than process arguments or logs.

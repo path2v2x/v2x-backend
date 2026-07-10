@@ -198,13 +198,17 @@ if url.startswith("wss://") and insecure:
 
 async def main():
     if websockets is not None:
-        async with websockets.connect(
-            url,
-            open_timeout=timeout,
-            close_timeout=5,
-            ssl=ssl_context,
-            origin=origin,
-        ):
+        connect_kwargs = {
+            "open_timeout": timeout,
+            "close_timeout": 5,
+            "origin": origin,
+        }
+        # Newer websockets releases reject an explicit ssl=None for wss://
+        # URLs. Omit the option for normal certificate verification and only
+        # pass a context when insecure mode explicitly requested one.
+        if ssl_context is not None:
+            connect_kwargs["ssl"] = ssl_context
+        async with websockets.connect(url, **connect_kwargs):
             print("WS_OK")
         return
 
