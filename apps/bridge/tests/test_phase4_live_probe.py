@@ -9,6 +9,7 @@ from tools.verify_phase4_live import (
     binary_digest,
     build_parser,
     choose_teleport_target,
+    project_world_xyz,
     receive_binary_frame,
     receive_json,
     replay_clock_epoch,
@@ -20,6 +21,7 @@ from tools.verify_phase4_live import (
     validate_isolated_ego_roles,
     validate_session_actor_manifest,
     validate_twin_camera_model,
+    validate_projected_actor_detection,
     validate_twin_object_sample,
     validate_twin_object_samples,
     validate_zero_active_sessions,
@@ -182,6 +184,47 @@ def test_rejects_unverifiable_twin_camera_model(mutate, error):
         validate_twin_camera_model(hello, "ch1")
 
 
+def test_projects_world_point_through_fingerprinted_camera_model():
+    model = twin_camera_hello()["camera_model"]
+    model["transform"] = {
+        "location": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+    }
+    model["image"] = {
+        "width": 1000,
+        "height": 500,
+        "horizontal_fov_deg": 90.0,
+    }
+    assert project_world_xyz((10.0, 0.0, 0.0), model) == pytest.approx(
+        (500.0, 250.0, 10.0)
+    )
+    assert project_world_xyz((10.0, 1.0, 1.0), model) == pytest.approx(
+        (550.0, 200.0, 10.0)
+    )
+    model["lens"]["lens_k"] = -0.1
+    with pytest.raises(VerificationError, match="nonzero CARLA lens distortion"):
+        project_world_xyz((10.0, 0.0, 0.0), model)
+
+
+def test_projected_actor_requires_strong_compatible_visual_overlap():
+    result = validate_projected_actor_detection(
+        (100.0, 100.0, 200.0, 200.0),
+        [
+            {"label": "person", "confidence": 0.99, "bbox": [100, 100, 200, 200]},
+            {"label": "car", "confidence": 0.90, "bbox": [110, 110, 195, 195]},
+        ],
+        "car",
+    )
+    assert result["best_detection"]["compatible"] is True
+    assert result["best_detection"]["iou_with_projected_actor"] > 0.7
+    with pytest.raises(VerificationError, match="no compatible visual detection"):
+        validate_projected_actor_detection(
+            (100.0, 100.0, 200.0, 200.0),
+            [{"label": "car", "confidence": 0.9, "bbox": [190, 190, 260, 260]}],
+            "car",
+        )
+
+
 def twin_sample(clock, x, *, actor_id=77):
     return {
         "object_id": "global_car_run_1",
@@ -192,6 +235,10 @@ def twin_sample(clock, x, *, actor_id=77):
         "reported_transform": {
             "location": {"x": x, "y": 20.0, "z": 0.3},
             "rotation": {"pitch": 0.0, "yaw": 12.0, "roll": 0.0},
+        },
+        "visual": {
+            "frame_sha256": f"{int(clock):064x}",
+            "best_detection": {"compatible": True},
         },
     }
 
@@ -501,6 +548,9 @@ def test_twin_samples_require_three_stable_samples_over_two_seconds_with_motion(
         "replay_span_seconds": 2.0,
         "max_planar_movement_m": 0.4,
         "planar_path_length_m": 0.4,
+        "visual_frame_sha256": [
+            f"{value:064x}" for value in (100, 101, 102)
+        ],
     }
 
 
@@ -535,6 +585,18 @@ def test_twin_samples_reject_weak_identity_time_or_motion_proof(samples, message
         validate_twin_object_samples(samples)
 
 
+def test_twin_samples_reject_reused_rendered_frame():
+    samples = [
+        twin_sample(100.0, 10.0),
+        twin_sample(101.0, 10.2),
+        twin_sample(102.0, 10.5),
+    ]
+    for sample in samples:
+        sample["visual"]["frame_sha256"] = "a" * 64
+    with pytest.raises(VerificationError, match="reused a rendered frame"):
+        validate_twin_object_samples(samples)
+
+
 def test_zero_active_session_gate_rejects_busy_or_malformed_status():
     assert validate_zero_active_sessions({"active_sessions": 0}) == {
         "active_sessions": 0
@@ -545,7 +607,9 @@ def test_zero_active_session_gate_rejects_busy_or_malformed_status():
         validate_zero_active_sessions({"active_sessions": False})
 
 
-def test_exact_object_cli_supports_camera_replay_start_and_skip_drive():
+def test_exact_object_cli_supports_camera_replay_start_and_skip_drive(tmp_path):
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"weights")
     args = validate_cli_args(
         build_parser().parse_args(
             [
@@ -557,6 +621,8 @@ def test_exact_object_cli_supports_camera_replay_start_and_skip_drive():
                 "2026-07-10T06:00:00Z",
                 "--twin-camera",
                 "ch4",
+                "--twin-yolo-model",
+                str(model),
             ]
         )
     )
@@ -692,6 +758,24 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
 
     monkeypatch.setattr(live_probe, "synchronize_world", fake_synchronize)
     monkeypatch.setattr(live_probe, "request_json", fake_request_json)
+    monkeypatch.setattr(
+        live_probe, "project_actor_bbox", lambda *_args: (100.0, 100.0, 200.0, 200.0)
+    )
+
+    async def fake_binary(*_args, **_kwargs):
+        fake_binary.count += 1
+        return b"jpeg", f"{fake_binary.count:064x}"
+
+    fake_binary.count = 0
+
+    monkeypatch.setattr(live_probe, "receive_binary_payload", fake_binary)
+    monkeypatch.setattr(
+        live_probe,
+        "detect_twin_objects",
+        lambda *_args, **_kwargs: [
+            {"label": "car", "confidence": 0.9, "bbox": [100, 100, 200, 200]}
+        ],
+    )
 
     args = type(
         "Args",
@@ -701,15 +785,20 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
             "twin_object_id": "global_car_run_1",
             "position_tolerance_m": 0.5,
             "yaw_tolerance_deg": 1.0,
+            "twin_yolo_confidence": 0.25,
+            "twin_yolo_device": "cpu",
+            "twin_min_iou": 0.15,
+            "twin_min_actor_coverage": 0.5,
         },
     )()
     evidence = {}
 
     result = await live_probe.collect_twin_object_samples(
-        args, object(), world, evidence
+        args, object(), object(), world, twin_camera_hello()["camera_model"], object(), evidence
     )
 
     assert call_order == ["sync", "request"] * 3
     assert evidence["object_sync_frames"] == [101, 102, 103]
     assert result["sample_count"] == 3
     assert result["max_planar_movement_m"] == pytest.approx(0.5)
+    assert all(sample["visual"]["best_detection"]["compatible"] for sample in result["samples"])

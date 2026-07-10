@@ -351,7 +351,7 @@ URLs internal, requires trusted persisted provenance, selects the nearest actual
 fMP4 frame, and exits nonzero for timing, bbox, or semantic mismatch:
 
 ```bash
-/home/path/V2XCarla/perception-venv/bin/python \
+/home/path/V2XCarla/carla-venv-310/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_historical_correlation.py \
   https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com \
   --detection-json /path/to/one-sanitized-detection.json \
@@ -445,13 +445,23 @@ verifier, use its exact run-scoped object, replay start, and camera for the
 same-object twin gate without creating a Drive session:
 
 ```bash
-/home/path/V2XCarla/carla-venv-310/bin/python \
+/home/path/V2XCarla/perception-venv/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py \
   --apply --skip-drive \
   --twin-object-id global_car_RUN_ID_TRACK \
   --twin-replay-start 2026-07-10T00:00:00.000Z \
-  --twin-camera ch1
+  --twin-camera ch1 \
+  --twin-yolo-model \
+  /home/path/V2XCarla/v2x-backend/apps/perception/yolov8n.pt
 ```
+
+The exact-object gate must retain one CARLA actor ID over at least three replay
+samples and require a compatible YOLO detection to overlap that actor's
+projected 3-D bounding box in each corresponding twin JPEG. The stream's
+`twin_hello` must carry the exact UE5 camera actor ID, transform, dimensions,
+FOV, lens values, and camera-config SHA-256 used for projection. Until the
+tracked projection model supports a measured nonzero CARLA `lens_k` or
+`lens_kcube`, fail closed rather than treating pinhole projection as equivalent.
 
 ## Controlled deployment gate
 
