@@ -36,6 +36,13 @@ Useful environment variables:
 | `V2X_PERCEPTION_SHOW_LIVE` | `false` | Opens the OpenCV annotated preview window when running interactively. |
 | `V2X_PERCEPTION_STREAM_PORT` | empty | When set, publishes per-camera MJPEG streams on this port. |
 | `V2X_PERCEPTION_STREAM_HOST` | `0.0.0.0` | Bind host for the MJPEG stream server. |
+| `V2X_PERCEPTION_STALE_SECONDS` | `15` | Maximum source-frame age before `/health` marks a camera stale and the service degraded. |
+| `V2X_PERCEPTION_RECONNECT_INITIAL_SEC` | `1` | Initial HLS reconnect delay after a failed open/read. |
+| `V2X_PERCEPTION_RECONNECT_MAX_SEC` | `30` | Maximum HLS reconnect delay; failed cameras remain retryable indefinitely. |
+| `V2X_PERCEPTION_OPEN_TIMEOUT_MS` | `10000` | OpenCV/FFmpeg live-stream open timeout. |
+| `V2X_PERCEPTION_READ_TIMEOUT_MS` | `10000` | OpenCV/FFmpeg live-stream read timeout. |
+| `V2X_PERCEPTION_FRAME_IDENTITY_HISTORY` | `256` | Bounded recent-frame identity window retained across HLS reconnects. |
+| `V2X_PERCEPTION_DUPLICATE_FRAME_LIMIT` | `90` | Consecutive replayed/repeated frames before forcing a renewed HLS session. |
 | `V2X_PERCEPTION_OUTPUT_JSON` | empty | Optional path for writing detection records. |
 | `V2X_PERCEPTION_OUTPUT_VIDEO` | empty | Optional path for writing an annotated video file. |
 | `V2X_PERCEPTION_OUTPUT_IMAGE` | empty | Optional path for writing the latest annotated image. |
@@ -51,6 +58,40 @@ http://<host>:8090/streams/ch2.mjpg
 http://<host>:8090/streams/ch3.mjpg
 http://<host>:8090/streams/ch4.mjpg
 ```
+
+`GET /health` reports service readiness plus per-camera source timestamps,
+frame age, frame count, reconnect state, and the last read/open error. A cached
+frame is never republished as fresh. For live HLS input, detection event
+timestamps come from current UTC wall time and remain monotonic across HLS
+session renewal; recorded files retain media-relative timestamps.
+
+Each live camera is read by an isolated worker, so an FFmpeg open/read timeout
+on one feed cannot block the other feeds. Kinesis stream names are resolved
+again on every reconnect, producing a fresh signed session URL. A literal
+`http://` or `https://` input has no resolver and is therefore retried as-is;
+use stream names plus `V2X_VIDEO_SESSION_API_BASE_URL` for renewable sessions.
+Recent sparse content identities survive reconnects, so replayed terminal HLS
+frames do not advance freshness or event time. Persistent repeats force another
+bounded-backoff reconnect. Source exceptions are sanitized before logging or
+exposure in `/health`; signed URLs and query strings are never included.
+
+Batch upload success requires both an HTTP success status and complete
+item-level acceptance (`ok=true`, `failed=0`, and one successful result per
+item). A partial ingest response is reported as a failed upload, while the
+attempt still consumes the configured rate-limit interval to avoid retry storms.
+
+Use the dependency-light Phase 3 gate against both the local origin and the
+candidate public tunnel. It samples health and detection summaries twice,
+requires advancing/fresh ch1-ch4 capture and event timestamps, parses two
+complete JPEG frames per MJPEG stream, and rejects identical frame hashes:
+
+```bash
+python tools/verify_live_feeds.py http://127.0.0.1:8090
+python tools/verify_live_feeds.py https://<candidate-perception-host>
+```
+
+The verifier refuses base URLs or stream templates containing credentials,
+queries, or fragments and prints only per-camera timestamps and SHA-256 hashes.
 
 ---
 

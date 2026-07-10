@@ -12,11 +12,14 @@ export interface TrackedObject {
 }
 
 export interface BridgeStatus {
-	status: 'connected' | 'disconnected' | 'error';
+	status: 'connected' | 'disconnected' | 'stale' | 'error';
 	carla_fps: number;
 	objects_tracked: number;
 	cameras_active: number;
-	last_heartbeat: number;
+	/** Producer timestamp from bridge_status.last_heartbeat, normalized to ISO-8601. */
+	last_heartbeat: string | null;
+	/** Producer timestamp for the state snapshot itself. */
+	updated_at: string | null;
 }
 
 export interface SnapshotHistoryEntry {
@@ -165,6 +168,27 @@ export interface ActorGeofenceAlert {
 	distance: number;
 }
 
+export type PerceptionClass =
+	| 'vehicle'
+	| 'pedestrian'
+	| 'cone'
+	| 'traffic_sign'
+	| 'traffic_light';
+
+export type PerceptionAlertLevel = 'none' | 'info' | 'warn' | 'critical';
+
+/** Ego-relative perception record sent as part of drive telemetry. */
+export interface Detection {
+	id: string;
+	class: PerceptionClass;
+	pos: [number, number];
+	distance: number;
+	bbox_dim: [number, number];
+	in_path: boolean;
+	alert: PerceptionAlertLevel;
+	velocity?: [number, number];
+}
+
 export interface VehicleTelemetry {
 	speed: number;
 	gear: number;
@@ -175,6 +199,7 @@ export interface VehicleTelemetry {
 	brake: number;
 	nearby_actors?: NearbyActor[];
 	dynamic_actors?: DynamicActor[];
+	detections?: Detection[];
 }
 
 export type TrafficPreset = 'none' | 'light' | 'medium' | 'heavy' | 'chaos';
@@ -251,6 +276,42 @@ export interface V2xZone {
 export interface DriveMessage {
 	type: string;
 	[key: string]: unknown;
+}
+
+/** Client-to-bridge teleport request. Optional values are omitted, never sent as null. */
+export interface TeleportCommand extends DriveMessage {
+	type: 'teleport';
+	request_id: string;
+	x: number;
+	y: number;
+	z?: number;
+	yaw?: number;
+}
+
+/** Bridge acknowledgement after CARLA reports the vehicle's final position. */
+export interface TeleportedMessage extends DriveMessage {
+	type: 'teleported';
+	request_id: string;
+	success: true;
+	pos: [number, number, number];
+	yaw?: number;
+	snapped_to_road?: boolean;
+}
+
+/** Validation/runtime failure returned specifically for a teleport request. */
+export interface TeleportErrorMessage extends DriveMessage {
+	type: 'teleport_error';
+	request_id: string;
+	success: false;
+	message: string;
+}
+
+export type TeleportRequestState = 'idle' | 'pending' | 'succeeded' | 'error';
+
+export interface TeleportStatus {
+	state: TeleportRequestState;
+	message: string | null;
+	pos: [number, number, number] | null;
 }
 
 export interface TrajectoryInfo {

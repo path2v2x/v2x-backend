@@ -115,6 +115,7 @@ class MockActor:
         self._transform = MockTransform()
         self._control = MockVehicleControl()
         self._velocity = MockLocation(x=0, y=0, z=0)
+        self._angular_velocity = MockLocation(x=0, y=0, z=0)
         self._destroyed = False
         self.autopilot_enabled = False
         self.traffic_manager_port: Optional[int] = None
@@ -157,6 +158,12 @@ class MockActor:
 
     def set_transform(self, transform: MockTransform) -> None:
         self._transform = transform
+
+    def set_target_velocity(self, velocity: MockLocation) -> None:
+        self._velocity = velocity
+
+    def set_target_angular_velocity(self, velocity: MockLocation) -> None:
+        self._angular_velocity = velocity
 
     def set_autopilot(self, enabled: bool, tm_port: Optional[int] = None) -> None:
         self.autopilot_enabled = enabled

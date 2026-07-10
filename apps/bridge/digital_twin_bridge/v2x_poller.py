@@ -5,7 +5,6 @@ Periodically fetches recent detections, converts their GPS coordinates to
 CARLA world locations, and upserts them into the shared ObjectRegistry.
 """
 
-import time
 import logging
 import threading
 from typing import Optional
@@ -33,7 +32,7 @@ class V2XPoller:
         self,
         config: Config,
         registry: ObjectRegistry,
-        carla_map: carla.Map,
+        carla_map: Optional[carla.Map],
     ) -> None:
         self._config = config
         self._registry = registry
@@ -44,6 +43,12 @@ class V2XPoller:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _prune_stale(self) -> int:
+        """Expire old registry entries even when an API page is empty/down."""
+        return self._registry.remove_stale(
+            max_age_seconds=max(0.0, float(self._config.V2X_STALE_SECONDS))
+        )
 
     def poll_once(self) -> int:
         """Execute a single poll cycle.
@@ -62,23 +67,39 @@ class V2XPoller:
             )
             resp.raise_for_status()
             data = resp.json()
-        except requests.RequestException as exc:
+        except (requests.RequestException, ValueError) as exc:
             logger.error("V2X API request failed: %s", exc)
+            self._prune_stale()
+            return 0
+
+        if not isinstance(data, dict):
+            logger.error("V2X API returned a non-object response.")
+            self._prune_stale()
             return 0
 
         items = data.get("items", [])
+        if not isinstance(items, list):
+            logger.error("V2X API response 'items' is not a list.")
+            self._prune_stale()
+            return 0
         if not items:
-            logger.debug("V2X API returned 0 detections.")
+            stale_objects = self._prune_stale()
+            logger.debug(
+                "V2X API returned 0 detections; expired %d stale objects.",
+                stale_objects,
+            )
             return 0
 
         # Update the registry (this handles upserting)
         self._registry.update_from_v2x(items)
 
-        # Resolve CARLA locations for objects that need it.
+        # Resolve CARLA locations for objects that need it.  A state-only
+        # registry deliberately passes ``None`` here: publishing detections
+        # does not require or authorize spawning/moving CARLA actors.
         # Note: Prop spawning is handled on the main thread (see __main__.py)
         # because CARLA actor operations are not thread-safe.
         resolved = 0
-        for item in items:
+        for item in (items if self._carla_map is not None else []):
             gps = item.get("gps_location", {})
             lat = gps.get("latitude")
             lon = gps.get("longitude")
@@ -110,7 +131,7 @@ class V2XPoller:
                 )
 
         # Clean up objects that haven't been seen in a while
-        stale_objects = self._registry.remove_stale(max_age_seconds=300)
+        stale_objects = self._prune_stale()
         # Stale actor destruction is handled on the main thread
 
         logger.info(

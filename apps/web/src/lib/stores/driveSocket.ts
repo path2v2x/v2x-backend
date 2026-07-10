@@ -6,7 +6,32 @@
  */
 
 import { writable, get } from 'svelte/store';
-import type { DriveSessionState, VehicleTelemetry, CameraView, DriveMessage, VehicleOption, SpawnableObject, PlacedObject, ScenarioInfo, V2xSignal, V2xAlert, V2xZone, TrajectoryInfo, TrajectoryStatus, XoscScenarioInfo, XoscRunnerStatus, XoscEvent, XoscFinishedEvent, DynamicActor, DriveMapId, DriveMapOption } from '$lib/types';
+import type {
+	DriveSessionState,
+	VehicleTelemetry,
+	CameraView,
+	DriveMessage,
+	VehicleOption,
+	SpawnableObject,
+	PlacedObject,
+	ScenarioInfo,
+	V2xSignal,
+	V2xAlert,
+	V2xZone,
+	TrajectoryInfo,
+	TrajectoryStatus,
+	XoscScenarioInfo,
+	XoscRunnerStatus,
+	XoscEvent,
+	XoscFinishedEvent,
+	DynamicActor,
+	DriveMapId,
+	DriveMapOption,
+	TeleportCommand,
+	TeleportErrorMessage,
+	TeleportedMessage,
+	TeleportStatus
+} from '$lib/types';
 import { v2xZones } from './v2xZones';
 
 // ── Stores ──
@@ -46,6 +71,11 @@ export const v2xAlerts = writable<V2xAlert[]>([]);
 export const trajectoryList = writable<TrajectoryInfo[]>([]);
 export const trajectoryStatus = writable<TrajectoryStatus>({ active: false });
 export const dynamicActors = writable<DynamicActor[]>([]);
+export const teleportStatus = writable<TeleportStatus>({
+	state: 'idle',
+	message: null,
+	pos: null
+});
 // Aspect ratio of the streamed ego camera (updated by CameraSettingsPanel).
 export const cameraAspect = writable<{ w: number; h: number }>({ w: 720, h: 720 });
 
@@ -60,26 +90,93 @@ export const xoscEventLog = writable<XoscEvent[]>([]);
 export const xoscLastResult = writable<XoscFinishedEvent | null>(null);
 
 const XOSC_LOG_MAX = 500;
+const TELEPORT_ACK_TIMEOUT_MS = 10_000;
+export const TELEPORT_COORD_ABS_LIMIT_M = 100_000;
+export const TELEPORT_MIN_Z_M = -20;
+export const TELEPORT_MAX_Z_M = 500;
+export const TELEPORT_MAX_ABS_YAW_DEG = 360;
+let teleportAckTimer: ReturnType<typeof setTimeout> | null = null;
+let activeTeleportRequestId: string | null = null;
+let teleportRequestSequence = 0;
+
+function newTeleportRequestId(): string {
+	if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+	teleportRequestSequence += 1;
+	return `teleport-${Date.now().toString(36)}-${teleportRequestSequence.toString(36)}`;
+}
+
+function clearTeleportAckTimer(): void {
+	if (teleportAckTimer) {
+		clearTimeout(teleportAckTimer);
+		teleportAckTimer = null;
+	}
+}
+
+function setTeleportError(message: string): void {
+	clearTeleportAckTimer();
+	activeTeleportRequestId = null;
+	teleportStatus.set({ state: 'error', message, pos: null });
+}
+
+export function resetTeleportStatus(): void {
+	clearTeleportAckTimer();
+	activeTeleportRequestId = null;
+	teleportStatus.set({ state: 'idle', message: null, pos: null });
+}
+
+function isPosition(value: unknown): value is [number, number, number] {
+	return Array.isArray(value)
+		&& value.length === 3
+		&& value.every((coordinate) => typeof coordinate === 'number' && Number.isFinite(coordinate));
+}
+
+function isTeleportedMessage(msg: DriveMessage): msg is TeleportedMessage {
+	return msg.type === 'teleported'
+		&& typeof msg.request_id === 'string'
+		&& msg.success === true
+		&& isPosition(msg.pos);
+}
+
+function isTeleportErrorMessage(msg: DriveMessage): msg is TeleportErrorMessage {
+	return msg.type === 'teleport_error'
+		&& typeof msg.request_id === 'string'
+		&& msg.success === false
+		&& typeof msg.message === 'string';
+}
 
 // ── WebSocket ──
 
 let ws: WebSocket | null = null;
 
 export function connect(wsUrl: string): void {
-	if (ws && ws.readyState === WebSocket.OPEN) return;
+	if (
+		ws
+		&& (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)
+	) return;
 
 	sessionState.set('connecting');
 	lastError.set(null);
+	resetTeleportStatus();
 
-	ws = new WebSocket(wsUrl);
-	ws.binaryType = 'blob';
+	let socket: WebSocket;
+	try {
+		socket = new WebSocket(wsUrl);
+	} catch {
+		sessionState.set('error');
+		lastError.set('Invalid Drive WebSocket URL');
+		return;
+	}
+	ws = socket;
+	socket.binaryType = 'blob';
 
-	ws.onopen = () => {
+	socket.onopen = () => {
+		if (ws !== socket) return;
 		driveConnected.set(true);
 		console.log('[DriveWS] Connected');
 	};
 
-	ws.onmessage = (event) => {
+	socket.onmessage = (event) => {
+		if (ws !== socket) return;
 		// Binary message = JPEG camera frame
 		if (event.data instanceof Blob) {
 			if (onFrameCallback) {
@@ -97,9 +194,14 @@ export function connect(wsUrl: string): void {
 		}
 	};
 
-	ws.onclose = () => {
+	socket.onclose = () => {
+		if (ws !== socket) return;
+		ws = null;
 		driveConnected.set(false);
 		console.log('[DriveWS] Disconnected');
+		if (get(teleportStatus).state === 'pending') {
+			setTeleportError('Connection closed before the teleport was acknowledged.');
+		}
 
 		// Don't auto-reconnect — it creates zombie state where the frontend
 		// thinks it has a session but the server already cleaned up.
@@ -113,16 +215,21 @@ export function connect(wsUrl: string): void {
 		}
 	};
 
-	ws.onerror = (e) => {
+	socket.onerror = (e) => {
+		if (ws !== socket) return;
 		console.error('[DriveWS] Error:', e);
 		lastError.set('WebSocket connection error');
 	};
 }
 
 export function disconnect(): void {
+	if (get(teleportStatus).state === 'pending') {
+		setTeleportError('Teleport cancelled because the drive connection closed.');
+	}
 	if (ws) {
-		ws.close();
+		const socket = ws;
 		ws = null;
+		socket.close();
 	}
 	driveConnected.set(false);
 	sessionState.set('idle');
@@ -172,6 +279,9 @@ function handleServerMessage(msg: DriveMessage): void {
 			break;
 
 		case 'session_ended':
+			if (get(teleportStatus).state === 'pending') {
+				setTeleportError('Drive session ended before the teleport was acknowledged.');
+			}
 			sessionState.set('idle');
 			vehicleId.set(null);
 			dynamicActors.set([]);
@@ -290,6 +400,43 @@ function handleServerMessage(msg: DriveMessage): void {
 			// Acknowledged — no state change needed
 			break;
 
+		case 'teleported':
+			if (get(teleportStatus).state !== 'pending') {
+				console.warn('[DriveWS] Ignoring unsolicited teleport acknowledgement');
+				break;
+			}
+			if (typeof msg.request_id !== 'string' || msg.request_id !== activeTeleportRequestId) {
+				console.warn('[DriveWS] Ignoring mismatched teleport acknowledgement');
+				break;
+			}
+			if (!isTeleportedMessage(msg)) {
+				setTeleportError('Bridge returned an invalid teleport acknowledgement.');
+				break;
+			}
+			clearTeleportAckTimer();
+			activeTeleportRequestId = null;
+			teleportStatus.set({
+				state: 'succeeded',
+				message: `Teleported to (${msg.pos.map((coordinate) => coordinate.toFixed(1)).join(', ')})`,
+				pos: msg.pos
+			});
+			telemetry.update((current) => ({ ...current, pos: msg.pos }));
+			break;
+
+		case 'teleport_error':
+			if (get(teleportStatus).state !== 'pending') {
+				console.warn('[DriveWS] Ignoring unsolicited teleport error');
+				break;
+			}
+			if (typeof msg.request_id !== 'string' || msg.request_id !== activeTeleportRequestId) {
+				console.warn('[DriveWS] Ignoring mismatched teleport error');
+				break;
+			}
+			setTeleportError(
+				isTeleportErrorMessage(msg) ? msg.message : 'Bridge returned an invalid teleport error.'
+			);
+			break;
+
 		case 'v2x_signal_placed':
 			v2xSignals.update(list => [...list, msg.signal as V2xSignal]);
 			v2xSignalCount.set(msg.signal_count as number);
@@ -369,7 +516,7 @@ function handleServerMessage(msg: DriveMessage): void {
 
 		case 'error':
 			mapSwitching.set(false);
-			lastError.set(msg.message as string);
+			lastError.set(typeof msg.message === 'string' ? msg.message : 'Drive server error');
 			if (get(sessionState) === 'reconstructing') {
 				sessionState.set('error');
 			}
@@ -382,10 +529,16 @@ function handleServerMessage(msg: DriveMessage): void {
 
 // ── Actions ──
 
-function send(msg: DriveMessage): void {
+function send(msg: DriveMessage): boolean {
 	if (ws && ws.readyState === WebSocket.OPEN) {
-		ws.send(JSON.stringify(msg));
+		try {
+			ws.send(JSON.stringify(msg));
+			return true;
+		} catch {
+			return false;
+		}
 	}
+	return false;
 }
 
 export function requestVehicles(): void {
@@ -403,6 +556,7 @@ export function setDriveMap(map: DriveMapId): void {
 }
 
 export function startSession(start: string, end: string, vehicle?: string): void {
+	resetTeleportStatus();
 	sessionState.set('reconstructing');
 	lastError.set(null);
 	send({ type: 'start_session', start, end, vehicle: vehicle ?? 'vehicle.tesla.model3' });
@@ -420,6 +574,67 @@ export function switchCamera(view: CameraView): void {
 
 export function respawnVehicle(): void {
 	send({ type: 'respawn' });
+}
+
+export function teleportVehicle(
+	x: number,
+	y: number,
+	z?: number,
+	yaw?: number
+): boolean {
+	if (get(teleportStatus).state === 'pending') {
+		return false;
+	}
+	if (![x, y].every(Number.isFinite)) {
+		setTeleportError('X and Y must be finite numbers.');
+		return false;
+	}
+	if (Math.abs(x) > TELEPORT_COORD_ABS_LIMIT_M || Math.abs(y) > TELEPORT_COORD_ABS_LIMIT_M) {
+		setTeleportError(`X and Y must be within ±${TELEPORT_COORD_ABS_LIMIT_M} metres.`);
+		return false;
+	}
+	if (z !== undefined && !Number.isFinite(z)) {
+		setTeleportError('Z must be a finite number or left blank.');
+		return false;
+	}
+	if (z !== undefined && (z < TELEPORT_MIN_Z_M || z > TELEPORT_MAX_Z_M)) {
+		setTeleportError(`Z must be between ${TELEPORT_MIN_Z_M} and ${TELEPORT_MAX_Z_M} metres.`);
+		return false;
+	}
+	if (yaw !== undefined && !Number.isFinite(yaw)) {
+		setTeleportError('Yaw must be a finite number or left blank.');
+		return false;
+	}
+	if (yaw !== undefined && Math.abs(yaw) > TELEPORT_MAX_ABS_YAW_DEG) {
+		setTeleportError(`Yaw must be within ±${TELEPORT_MAX_ABS_YAW_DEG} degrees.`);
+		return false;
+	}
+	if (!get(driveConnected) || get(sessionState) !== 'driving') {
+		setTeleportError('Start an active drive session before teleporting.');
+		return false;
+	}
+	const requestId = newTeleportRequestId();
+	const command: TeleportCommand = { type: 'teleport', request_id: requestId, x, y };
+	if (z !== undefined) command.z = z;
+	if (yaw !== undefined) command.yaw = yaw;
+
+	activeTeleportRequestId = requestId;
+	teleportStatus.set({ state: 'pending', message: 'Waiting for bridge acknowledgement…', pos: null });
+	if (!send(command)) {
+		setTeleportError('Drive WebSocket is not available.');
+		return false;
+	}
+
+	clearTeleportAckTimer();
+	teleportAckTimer = setTimeout(() => {
+		if (
+			get(teleportStatus).state === 'pending'
+			&& activeTeleportRequestId === requestId
+		) {
+			setTeleportError('Teleport acknowledgement timed out.');
+		}
+	}, TELEPORT_ACK_TIMEOUT_MS);
+	return true;
 }
 
 export function clearNonEgoVehicles(): void {
@@ -486,6 +701,9 @@ export function stopXoscScenario(): void {
 }
 
 export function endSession(): void {
+	if (get(teleportStatus).state === 'pending') {
+		setTeleportError('Teleport cancelled because the drive session is ending.');
+	}
 	sessionState.set('ending');
 	send({ type: 'end_session' });
 }

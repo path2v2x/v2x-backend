@@ -1,0 +1,20 @@
+[Unit]
+Description=Check V2X Drive frontend WebSocket link
+Wants=network-online.target v2x-cloudflared-drive.service
+After=network-online.target v2x-cloudflared-drive.service
+
+[Service]
+Type=oneshot
+User=path
+Group=path
+WorkingDirectory=/home/path/V2XCarla/v2x-backend
+Environment=AWS_REGION=us-west-1
+Environment=AWS_PROFILE=Path-Emerging-Dev-147229569658
+Environment=DRIVE_LINK_HEALTH_REPAIR=false
+Environment=DRIVE_CONFIG_REQUIRED=true
+Environment=DRIVE_WS_INSECURE_SSL=false
+Environment=PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT=/home/path/V2XCarla/v2x-backend/scripts/publish-drive-tunnel-config.sh
+Environment=PYTHON_BIN=/home/path/venvs/vw-scenario/bin/python
+EnvironmentFile=-/etc/v2x-drive-tunnel.env
+EnvironmentFile=-/etc/v2x-drive-link-health.env
+ExecStart=/home/path/V2XCarla/v2x-backend/scripts/check-drive-frontend-link.sh

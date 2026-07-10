@@ -1,0 +1,21 @@
+[Unit]
+Description=V2X Vite Dashboard
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=path
+Group=path
+WorkingDirectory=/home/path/V2XCarla/v2x-backend/apps/web
+Environment=NODE_ENV=development
+UnsetEnvironment=VITE_DRIVE_WS_URL VITE_CLOUDFLARE_DRIVE_WS_URL
+ExecStart=/usr/bin/npm run dev -- --host 0.0.0.0 --port 5173 --strictPort
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

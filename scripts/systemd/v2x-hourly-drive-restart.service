@@ -9,9 +9,14 @@ WorkingDirectory=/home/path/V2XCarla/v2x-backend
 Environment=CARLA_CONTAINER=carla-rr-maps
 Environment=CARLA_IMAGE=ghcr.io/simforgeinc/carla-rr-maps:0.10.0
 Environment="CARLA_COMMAND=./CarlaUnreal.sh -RenderOffScreen -vulkan -nosound -carla-rpc-port=2000"
+Environment=CARLA_SERVICE=v2x-carla-rr.service
+Environment=ALLOW_CARLA_CREATE=false
+Environment=ALLOW_CARLA_RECREATE=false
 Environment=DRIVE_SERVICE=v2x-drive.service
 Environment=CARLA_WAIT_TIMEOUT=600
 Environment=CARLA_PYTHON=/home/path/V2XCarla/carla-venv-310/bin/python
 Environment=SKIP_RESTART_IF_ACTIVE_SESSION=true
-Environment=PUBLISH_DRIVE_FRONTEND_CONFIG=true
+Environment=PUBLISH_DRIVE_FRONTEND_CONFIG=false
+Environment=PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT=/home/path/V2XCarla/v2x-backend/scripts/publish-drive-tunnel-config.sh
+EnvironmentFile=-/etc/v2x-drive-restart.env
 ExecStart=/home/path/V2XCarla/v2x-backend/scripts/restart-drive-stack.sh

@@ -39,7 +39,7 @@ const DEFAULT_TAILSCALE_DRIVE_WS_URL =
 const DEFAULT_CLOUDFLARE_DRIVE_WS_URL =
 	import.meta.env.VITE_CLOUDFLARE_DRIVE_WS_URL ??
 	import.meta.env.VITE_DRIVE_WS_URL ??
-	'wss://drive.path2v2x.net';
+	'';
 
 export interface DriveTunnel {
 	id: string;
@@ -47,19 +47,48 @@ export interface DriveTunnel {
 	url: string;
 }
 
-function normalizeWsUrl(url: string | undefined): string {
+function isLoopbackHostname(hostname: string): boolean {
+	const normalized = hostname
+		.trim()
+		.toLowerCase()
+		.replace(/^\[|\]$/g, '')
+		.replace(/\.$/, '');
+	return (
+		normalized === 'localhost' ||
+		normalized === '::1' ||
+		/^127(?:\.\d{1,3}){1,3}$/.test(normalized)
+	);
+}
+
+function normalizeWsUrl(url: string | undefined, browserHostname?: string): string {
 	if (!url) return '';
-	return url.trim().replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://');
+	const candidate = url.trim().replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://');
+	try {
+		const parsed = new URL(candidate);
+		if (!['ws:', 'wss:'].includes(parsed.protocol) || parsed.username || parsed.password) return '';
+		const endpointIsLoopback = isLoopbackHostname(parsed.hostname);
+		const browserIsLoopback = browserHostname
+			? isLoopbackHostname(browserHostname)
+			: true;
+		// Browser-local loopback points at the viewer's laptop, not the Path PC.
+		if (endpointIsLoopback && !browserIsLoopback) return '';
+		return parsed.toString().replace(/\/$/, '');
+	} catch {
+		return '';
+	}
 }
 
 export function buildDriveTunnels(
-	config?: Pick<RuntimeConfig, 'cloudflareDriveWsUrl' | 'tailscaleDriveWsUrl'>
+	config?: Pick<RuntimeConfig, 'cloudflareDriveWsUrl' | 'tailscaleDriveWsUrl'>,
+	browserHostname = typeof window === 'undefined' ? undefined : window.location.hostname
 ): DriveTunnel[] {
 	const cloudflareDriveWsUrl = normalizeWsUrl(
-		config?.cloudflareDriveWsUrl || DEFAULT_CLOUDFLARE_DRIVE_WS_URL
+		config ? config.cloudflareDriveWsUrl : DEFAULT_CLOUDFLARE_DRIVE_WS_URL,
+		browserHostname
 	);
 	const tailscaleDriveWsUrl = normalizeWsUrl(
-		config?.tailscaleDriveWsUrl || DEFAULT_TAILSCALE_DRIVE_WS_URL
+		config?.tailscaleDriveWsUrl || DEFAULT_TAILSCALE_DRIVE_WS_URL,
+		browserHostname
 	);
 
 	return [
@@ -72,11 +101,15 @@ export function buildDriveTunnels(
 					}
 				]
 			: []),
-		{
-			id: 'tailscale',
-			label: 'Tailscale',
-			url: tailscaleDriveWsUrl
-		}
+		...(tailscaleDriveWsUrl
+			? [
+					{
+						id: 'tailscale',
+						label: 'Tailscale',
+						url: tailscaleDriveWsUrl
+					}
+				]
+			: [])
 	] satisfies DriveTunnel[];
 }
 
@@ -84,7 +117,7 @@ export const DRIVE_TUNNELS = buildDriveTunnels();
 
 export type TunnelId = DriveTunnel['id'];
 
-export const DRIVE_WS_URL: string = DRIVE_TUNNELS[0].url;
+export const DRIVE_WS_URL: string = DRIVE_TUNNELS[0]?.url ?? '';
 
 export const GAMEPAD_DEADZONE = 0.005;
 

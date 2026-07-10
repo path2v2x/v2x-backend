@@ -11,10 +11,19 @@ import time
 import requests
 import tracking_utils
 import kinesis_utils
-from datetime import datetime, timezone, timedelta
+from live_capture import LiveStreamReader
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import radians, cos, sin, asin, sqrt
 from urllib.parse import urlparse
+from runtime_health import (
+    AttemptRateLimiter,
+    MonotonicEventClock,
+    StreamRecovery,
+    sanitize_source_error,
+    utc_iso,
+    validate_batch_response,
+)
 from tracking_utils import AppearanceExtractor, KalmanTracker
 
 def env_bool(name, default=False):
@@ -81,11 +90,22 @@ def parse_camera_ids(video_paths):
     return camera_ids
 
 class FrameBroadcaster:
-    def __init__(self, camera_ids, jpeg_quality=80):
+    def __init__(self, camera_ids, jpeg_quality=80, stale_seconds=15.0):
         self.camera_ids = list(camera_ids)
         self.jpeg_quality = int(jpeg_quality)
+        self.stale_seconds = float(stale_seconds)
         self.frames = {}
         self.frame_counts = {camera_id: 0 for camera_id in self.camera_ids}
+        self.camera_health = {
+            camera_id: {
+                "state": "starting",
+                "source_updated_at": None,
+                "last_frame_monotonic": None,
+                "last_error": None,
+                "reconnect_attempts": 0,
+            }
+            for camera_id in self.camera_ids
+        }
         self.latest_detections = {
             camera_id: {
                 "updated_at": None,
@@ -96,7 +116,13 @@ class FrameBroadcaster:
         }
         self.condition = threading.Condition()
 
-    def publish(self, camera_id, frame):
+    def publish(
+        self,
+        camera_id,
+        frame,
+        source_updated_at=None,
+        source_monotonic=None,
+    ):
         ok, encoded = cv2.imencode(
             ".jpg",
             frame,
@@ -108,10 +134,28 @@ class FrameBroadcaster:
         with self.condition:
             self.frames[camera_id] = encoded.tobytes()
             self.frame_counts[camera_id] = self.frame_counts.get(camera_id, 0) + 1
+            camera_health = self.camera_health[camera_id]
+            was_reconnecting = camera_health["state"] == "reconnecting"
+            camera_health.update({
+                "source_updated_at": source_updated_at or utc_iso(),
+                "last_frame_monotonic": (
+                    time.monotonic()
+                    if source_monotonic is None
+                    else float(source_monotonic)
+                ),
+            })
+            # A final genuine buffered frame may finish inference after the
+            # reader has already reported its next read failure. Publishing it
+            # must not erase the newer reconnecting state or claim readiness.
+            if not was_reconnecting:
+                camera_health.update({
+                    "state": "streaming",
+                    "last_error": None,
+                    "reconnect_attempts": 0,
+                })
             self.condition.notify_all()
 
-    def publish_detections(self, camera_id, detections):
-        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    def publish_detections(self, camera_id, detections, source_updated_at=None):
         summary = []
         for det in detections:
             metadata = det.get("camera_data", {}).get("bifocal_metadata", {})
@@ -128,25 +172,86 @@ class FrameBroadcaster:
 
         with self.condition:
             self.latest_detections[camera_id] = {
-                "updated_at": now_utc,
+                "updated_at": source_updated_at or utc_iso(),
                 "frame_count": self.frame_counts.get(camera_id, 0),
                 "detections": summary,
             }
             self.condition.notify_all()
 
+    def mark_reconnecting(self, camera_id, error, reconnect_attempts):
+        with self.condition:
+            self.camera_health[camera_id].update({
+                "state": "reconnecting",
+                "last_error": sanitize_source_error(error),
+                "reconnect_attempts": int(reconnect_attempts),
+            })
+            self.condition.notify_all()
+
+    def mark_connected(self, camera_id):
+        """Record source recovery while waiting for its first processed frame."""
+        with self.condition:
+            self.camera_health[camera_id].update({
+                "state": "connected",
+                "last_error": None,
+                "reconnect_attempts": 0,
+            })
+            self.condition.notify_all()
+
+    def snapshot_health(self, now_monotonic=None):
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        with self.condition:
+            cameras = {}
+            ready = True
+            for camera_id in self.camera_ids:
+                entry = self.camera_health[camera_id]
+                last_frame = entry["last_frame_monotonic"]
+                age_seconds = None if last_frame is None else max(0.0, now - last_frame)
+                fresh = age_seconds is not None and age_seconds <= self.stale_seconds
+                state = entry["state"]
+                if state == "streaming" and not fresh:
+                    state = "stale"
+                ready = ready and fresh and state == "streaming"
+                cameras[camera_id] = {
+                    "state": state,
+                    "fresh": fresh,
+                    "age_seconds": None if age_seconds is None else round(age_seconds, 3),
+                    "source_updated_at": entry["source_updated_at"],
+                    "frame_count": self.frame_counts.get(camera_id, 0),
+                    "last_error": sanitize_source_error(entry["last_error"]),
+                    "reconnect_attempts": entry["reconnect_attempts"],
+                }
+            return {
+                "status": "ok" if ready else "degraded",
+                "ready": ready,
+                "generated_at": utc_iso(),
+                "stale_after_seconds": self.stale_seconds,
+                "cameras": cameras,
+                "frames": dict(self.frame_counts),
+            }
+
     def snapshot_detections(self):
         with self.condition:
             return json.loads(json.dumps({
-                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                "generated_at": utc_iso(),
                 "cameras": self.latest_detections,
             }))
 
     def wait_for_frame(self, camera_id, last_count, timeout=5.0):
         with self.condition:
-            self.condition.wait_for(
-                lambda: self.frame_counts.get(camera_id, 0) != last_count,
+            available = self.condition.wait_for(
+                lambda: (
+                    self.frame_counts.get(camera_id, 0) != last_count
+                    and self.camera_health[camera_id]["state"] == "streaming"
+                    and self.camera_health[camera_id]["last_frame_monotonic"]
+                    is not None
+                    and time.monotonic()
+                    - self.camera_health[camera_id]["last_frame_monotonic"]
+                    <= self.stale_seconds
+                ),
                 timeout=timeout,
             )
+            if not available:
+                return None, last_count
             return self.frames.get(camera_id), self.frame_counts.get(camera_id, last_count)
 
 class PerceptionHttpServer:
@@ -187,11 +292,7 @@ class PerceptionHttpServer:
             def do_HEAD(self):
                 path = urlparse(self.path).path
                 if path == "/health":
-                    self._send_json(200, {
-                        "status": "ok",
-                        "cameras": broadcaster.camera_ids,
-                        "frames": broadcaster.frame_counts,
-                    })
+                    self._send_json(200, broadcaster.snapshot_health())
                     return
 
                 if path == "/detections/latest":
@@ -215,11 +316,7 @@ class PerceptionHttpServer:
             def do_GET(self):
                 path = urlparse(self.path).path
                 if path == "/health":
-                    self._send_json(200, {
-                        "status": "ok",
-                        "cameras": broadcaster.camera_ids,
-                        "frames": broadcaster.frame_counts,
-                    })
+                    self._send_json(200, broadcaster.snapshot_health())
                     return
 
                 if path == "/detections/latest":
@@ -549,26 +646,107 @@ class MultiCameraPipeline:
         if camera_ids is None:
             camera_ids = parse_camera_ids(video_paths)
 
-        caps = []
-        is_kinesis = []
-        for path in video_paths:
+        is_kinesis = [
+            "v2x-backend-cam" in str(path)
+            or str(path).startswith(("http://", "https://"))
+            for path in video_paths
+        ]
+        live_mode = bool(is_kinesis) and all(is_kinesis)
+        if any(is_kinesis) and not live_mode:
+            raise ValueError("live HLS streams and recorded files cannot be mixed")
+
+        reconnect_initial = env_float("V2X_PERCEPTION_RECONNECT_INITIAL_SEC", 1.0)
+        reconnect_max = env_float("V2X_PERCEPTION_RECONNECT_MAX_SEC", 30.0)
+        open_timeout_ms = int(env_float("V2X_PERCEPTION_OPEN_TIMEOUT_MS", 10_000))
+        read_timeout_ms = int(env_float("V2X_PERCEPTION_READ_TIMEOUT_MS", 10_000))
+        frame_identity_history_size = int(env_float(
+            "V2X_PERCEPTION_FRAME_IDENTITY_HISTORY", 256
+        ))
+        duplicate_frame_limit = int(env_float(
+            "V2X_PERCEPTION_DUPLICATE_FRAME_LIMIT", 90
+        ))
+        caps = [None] * len(video_paths)
+        buffered_frames = [None] * len(video_paths)
+        buffered_msecs = [-1.0] * len(video_paths)
+        live_readers = []
+        live_sequences = [0] * len(video_paths)
+
+        def _source_for(index):
+            path = str(video_paths[index])
             if "v2x-backend-cam" in path:
-                url = kinesis_utils.get_kvs_hls_url(path)
-                caps.append(cv2.VideoCapture(url))
-                is_kinesis.append(True)
-            else:
-                caps.append(cv2.VideoCapture(str(path)))
-                is_kinesis.append(False)
+                return kinesis_utils.get_kvs_hls_url(path)
+            return path
+
+        def _open_capture(source, live):
+            if not live:
+                return cv2.VideoCapture(source)
+
+            params = []
+            open_timeout_property = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+            read_timeout_property = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+            if open_timeout_property is not None:
+                params.extend([open_timeout_property, open_timeout_ms])
+            if read_timeout_property is not None:
+                params.extend([read_timeout_property, read_timeout_ms])
+            if params:
+                return cv2.VideoCapture(source, cv2.CAP_FFMPEG, params)
+            return cv2.VideoCapture(source)
+
+        if live_mode:
+            def _state_callback(index):
+                def callback(state, error, failures, delay_seconds):
+                    if state == "connected":
+                        if stream_broadcaster:
+                            stream_broadcaster.mark_connected(camera_ids[index])
+                        return
+                    if stream_broadcaster:
+                        stream_broadcaster.mark_reconnecting(
+                            camera_ids[index], error, failures
+                        )
+                    print(
+                        f"Camera {camera_ids[index]} unavailable; retrying in "
+                        f"{delay_seconds:.1f}s ({error})."
+                    )
+                return callback
+
+            for index in range(len(video_paths)):
+                recovery = StreamRecovery(reconnect_initial, reconnect_max)
+                reader = LiveStreamReader(
+                    source_factory=lambda index=index: _source_for(index),
+                    capture_factory=lambda source: _open_capture(source, True),
+                    recovery=recovery,
+                    state_callback=_state_callback(index),
+                    frame_identity_history_size=frame_identity_history_size,
+                    duplicate_frame_limit=duplicate_frame_limit,
+                )
+                live_readers.append(reader)
+        else:
+            for index, path in enumerate(video_paths):
+                cap = _open_capture(str(path), False)
+                caps[index] = cap
+                if cap is None or not cap.isOpened():
+                    continue
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    buffered_frames[index] = frame
+                    buffered_msecs[index] = cap.get(cv2.CAP_PROP_POS_MSEC)
+
         frame_count = 0
-        last_upload_epoch = 0.0
-
-        global_start_time = datetime.now(timezone.utc)
-        global_start_epoch = time.time()
+        upload_rate_limiter = AttemptRateLimiter(upload_min_interval_sec)
+        recorded_start_epoch = time.time()
+        event_clocks = [
+            MonotonicEventClock(
+                live=live_mode,
+                start_epoch=recorded_start_epoch,
+            )
+            for _ in video_paths
+        ]
         fps = 30
-        if len(caps) > 0:
-            fps = int(caps[0].get(cv2.CAP_PROP_FPS)) or 30
+        first_open_cap = next((cap for cap in caps if cap is not None), None)
+        if first_open_cap is not None:
+            fps = int(first_open_cap.get(cv2.CAP_PROP_FPS)) or 30
 
-        num_cams = len(caps)
+        num_cams = len(video_paths)
         if num_cams == 1:
             out_size = (640, 480)
         elif num_cams == 4:
@@ -579,7 +757,7 @@ class MultiCameraPipeline:
 
         # --- NEW: Initialize the Video Writer ---
         writer = None
-        if output_video and len(caps) > 0:
+        if output_video and num_cams > 0:
             # We skip 9/10 frames, so adjust the output framerate so it doesn't play at 10x speed
             out_fps = max(1, fps // 10)
 
@@ -587,47 +765,53 @@ class MultiCameraPipeline:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(output_video, fourcc, out_fps, out_size)
 
-        print(f"Starting Multi-Stream Pipeline for {len(caps)} cameras...")
+        print(f"Starting Multi-Stream Pipeline for {num_cams} cameras...")
 
         try:
-            buffered_frames = [None] * len(caps)
-            buffered_msecs = [-1.0] * len(caps)
-
-            for i, cap in enumerate(caps):
-                ret, frame = cap.read()
-                if ret:
-                    buffered_frames[i] = frame
-                    buffered_msecs[i] = cap.get(cv2.CAP_PROP_POS_MSEC)
-
+            for reader in live_readers:
+                reader.start()
             last_valid_frames = [None] * len(caps)
             for i, f in enumerate(buffered_frames):
                 if f is not None:
                     last_valid_frames[i] = f.copy()
 
             while True:
-                valid_msecs = [m for m in buffered_msecs if m >= 0]
-                if not valid_msecs:
-                    break
+                frames_to_process = [None] * num_cams
+                source_epochs = [None] * num_cams
+                source_monotonic = [None] * num_cams
+                source_media_msecs = [None] * num_cams
+                if live_mode:
+                    for i, reader in enumerate(live_readers):
+                        snapshot = reader.snapshot(live_sequences[i])
+                        if snapshot is None:
+                            continue
+                        live_sequences[i] = snapshot["sequence"]
+                        frames_to_process[i] = snapshot["frame"]
+                        source_epochs[i] = snapshot["source_epoch"]
+                        source_monotonic[i] = snapshot["source_monotonic"]
 
-                global_msec = min(valid_msecs)
+                    if not any(frame is not None for frame in frames_to_process):
+                        time.sleep(0.02)
+                        continue
+                else:
+                    valid_msecs = [m for m in buffered_msecs if m >= 0]
+                    if not valid_msecs:
+                        break
+                    global_msec = min(valid_msecs)
 
-                frames_to_process = [None] * len(caps)
-                for i in range(len(caps)):
-                    if buffered_msecs[i] >= 0 and buffered_msecs[i] <= global_msec + 35.0:
-                        frames_to_process[i] = buffered_frames[i]
-                        ret, frame = caps[i].read()
-                        if ret:
-                            buffered_frames[i] = frame
-                            buffered_msecs[i] = caps[i].get(cv2.CAP_PROP_POS_MSEC)
-                        else:
-                            if is_kinesis[i]:
-                                new_url = kinesis_utils.get_kvs_hls_url(video_paths[i])
-                                caps[i] = cv2.VideoCapture(new_url)
-                                ret, frame = caps[i].read()
-
-                            if ret:
+                    for i in range(len(caps)):
+                        if (
+                            buffered_msecs[i] >= 0
+                            and buffered_msecs[i] <= global_msec + 35.0
+                        ):
+                            frames_to_process[i] = buffered_frames[i]
+                            source_media_msecs[i] = buffered_msecs[i]
+                            ret, frame = caps[i].read()
+                            if ret and frame is not None:
                                 buffered_frames[i] = frame
-                                buffered_msecs[i] = caps[i].get(cv2.CAP_PROP_POS_MSEC)
+                                buffered_msecs[i] = caps[i].get(
+                                    cv2.CAP_PROP_POS_MSEC
+                                )
                             else:
                                 buffered_frames[i] = None
                                 buffered_msecs[i] = -1.0
@@ -639,31 +823,35 @@ class MultiCameraPipeline:
 
                 raw_buffer = []
                 annotated_frames = []
-
-                current_offset = global_msec / 1000.0
-                current_time = global_start_time + timedelta(seconds=current_offset)
-                current_epoch = global_start_epoch + current_offset
-                current_utc_str = current_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                batch_event_epochs = []
 
                 for i, frame in enumerate(frames_to_process):
                     detector = self.detectors[i]
                     if frame is None:
                         if last_valid_frames[i] is not None:
                             fallback = cv2.resize(last_valid_frames[i], (640, 480))
-                            if stream_broadcaster:
-                                stream_broadcaster.publish(camera_ids[i], fallback)
                             if show_live or writer or output_image:
                                 annotated_frames.append(fallback)
                         continue
 
                     last_valid_frames[i] = frame.copy()
 
+                    if live_mode:
+                        frame_epoch, frame_utc_str = event_clocks[i].next(
+                            now_epoch=source_epochs[i]
+                        )
+                    else:
+                        frame_epoch, frame_utc_str = event_clocks[i].next(
+                            media_msec=source_media_msecs[i]
+                        )
+                    batch_event_epochs.append(frame_epoch)
+
                     results = detector.model.track(frame, persist=True, conf=detector.conf, tracker="botsort.yaml", verbose=False)
 
                     det_2d = detector.extract_detections(results[0], frame_count)
-                    det_3d = detector.compute_3d_detections(det_2d, current_utc_str, current_epoch)
-                    if stream_broadcaster:
-                        stream_broadcaster.publish_detections(camera_ids[i], det_3d)
+                    det_3d = detector.compute_3d_detections(
+                        det_2d, frame_utc_str, frame_epoch
+                    )
 
                     for det in det_3d:
                         if det['object_type'] == 'person':
@@ -678,24 +866,39 @@ class MultiCameraPipeline:
                         annotated = detector.draw_detections_3d(frame, det_3d)
                         annotated = cv2.resize(annotated, (640, 480))
                         if stream_broadcaster:
-                            stream_broadcaster.publish(camera_ids[i], annotated)
+                            stream_broadcaster.publish(
+                                camera_ids[i],
+                                annotated,
+                                frame_utc_str,
+                                source_monotonic=source_monotonic[i],
+                            )
                         if show_live or writer or output_image:
                             annotated_frames.append(annotated)
+                    if stream_broadcaster:
+                        stream_broadcaster.publish_detections(
+                            camera_ids[i], det_3d, frame_utc_str
+                        )
 
                 # Deduplicate objects crossing the seams
                 # Using a smaller radius (1.5m) so we don't accidentally merge multiple people in the same frame
-                clean_batch = self.deduplicate(raw_buffer, current_epoch, merge_radius_meters=3.0)
+                batch_event_epoch = (
+                    max(batch_event_epochs)
+                    if batch_event_epochs
+                    else time.time()
+                )
+                clean_batch = self.deduplicate(
+                    raw_buffer, batch_event_epoch, merge_radius_meters=3.0
+                )
                 self.all_clean_detections.extend(clean_batch)
 
                 # Batch Upload
                 if (
                     upload
                     and clean_batch
-                    and current_epoch - last_upload_epoch >= upload_min_interval_sec
+                    and upload_rate_limiter.allow()
                 ):
-                    self.detectors[0].upload_batch(clean_batch)
-                    last_upload_epoch = current_epoch
-                    print(f"Frame {frame_count}: Uploaded {len(clean_batch)} unique objects (merged from {len(raw_buffer)} raw detections).")
+                    if self.detectors[0].upload_batch(clean_batch):
+                        print(f"Frame {frame_count}: Uploaded {len(clean_batch)} unique objects (merged from {len(raw_buffer)} raw detections).")
 
                 if annotated_frames:
                     if len(annotated_frames) == 1:
@@ -722,8 +925,16 @@ class MultiCameraPipeline:
                             break
 
         finally:
+            for reader in live_readers:
+                reader.request_stop()
+            stop_deadline = time.monotonic() + max(
+                1.0, (open_timeout_ms + read_timeout_ms) / 1000.0 + 1.0
+            )
+            for reader in live_readers:
+                reader.join(max(0.0, stop_deadline - time.monotonic()))
             for cap in caps:
-                cap.release()
+                if cap is not None:
+                    cap.release()
             cv2.destroyAllWindows()
             print(f"Multi-Stream complete. Processed {frame_count} frames, found {len(self.all_clean_detections)} total unique objects.")
 
@@ -1061,10 +1272,10 @@ class VideoObjectDetector:
             records: List of detection record dictionaries.
 
         Returns:
-            None
+            True only when every requested item was accepted.
         """
         if not records:
-            return
+            return True
 
         # Prepare payload: strip internal non-serializable fields (like embeddings)
         payload = []
@@ -1083,11 +1294,20 @@ class VideoObjectDetector:
 
             if r.status_code not in (200, 201):
                 print(f"  ⚠️  Batch upload failed ({r.status_code}): {r.text[:120]}")
-            else:
-                print(f"  ✅ Uploaded batch of {len(records)} detections.")
+                return False
+
+            try:
+                validate_batch_response(r.json(), len(payload))
+            except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+                print(f"  ⚠️  Batch upload rejected: {exc}")
+                return False
+
+            print(f"  ✅ Uploaded batch of {len(records)} detections.")
+            return True
 
         except Exception as e:
             print(f"  ❌ Batch upload error: {e}")
+            return False
 
     def upload_all(self):
         """
@@ -1208,6 +1428,7 @@ if __name__ == "__main__":
         stream_broadcaster = FrameBroadcaster(
             camera_ids,
             jpeg_quality=env_float("V2X_PERCEPTION_JPEG_QUALITY", 80),
+            stale_seconds=env_float("V2X_PERCEPTION_STALE_SECONDS", 15.0),
         )
         stream_server = PerceptionHttpServer(stream_host, int(stream_port), stream_broadcaster)
         stream_server.start()

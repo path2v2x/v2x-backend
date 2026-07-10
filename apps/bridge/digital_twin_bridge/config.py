@@ -24,6 +24,17 @@ class Config:
     )
     V2X_POLL_INTERVAL: float = 5.0
     V2X_LIMIT: int = 50
+    V2X_STALE_SECONDS: float = 300.0
+    STATE_OBJECT_MAX_AGE_SECONDS: float = 30.0
+    STATE_SNAPSHOT_MAX_AGE_SECONDS: float = 90.0
+    # Historical Drive reconstruction is HTTP-only in a worker, with CARLA
+    # mutation performed after it returns.  Keep both individual requests and
+    # the complete pagination job bounded so abandoned sessions cannot occupy
+    # the worker pool indefinitely.
+    SCENE_FETCH_REQUEST_TIMEOUT_SECONDS: float = 5.0
+    SCENE_FETCH_TOTAL_TIMEOUT_SECONDS: float = 20.0
+    SCENE_FETCH_MAX_PAGES: int = 20
+    SCENE_FETCH_MAX_ITEMS: int = 10_000
 
     # Camera settings
     NUM_CAMERAS: int = 4
@@ -49,9 +60,17 @@ class Config:
 
     # Drive server settings
     WS_PORT: int = 8765
+    WS_MAX_MESSAGE_BYTES: int = 16 * 1024 * 1024
     VEHICLE_BLUEPRINT: str = "vehicle.tesla.model3"
     WEBRTC_PORT: int = 8766
     SESSION_DIR: str = "sessions/"
+
+    # Legacy HIL/test WebSocket. Disabled by default and requires a bearer
+    # token when explicitly enabled; it shares no implicit trust with /drive.
+    TEST_WS_ENABLED: str = "off"
+    TEST_WS_TOKEN: str = ""
+    TEST_WS_MAX_UPLOAD_BYTES: int = 8 * 1024 * 1024
+    TEST_WS_QUEUE_SIZE: int = 64
 
     # OpenSCENARIO / ScenarioRunner — absolute path to the cloned
     # https://github.com/carla-simulator/scenario_runner repo on the dev PC.

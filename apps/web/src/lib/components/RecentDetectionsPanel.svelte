@@ -1,7 +1,12 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
 	import { fetchDetectionsPage, fetchDetectionsRange } from '$lib/api';
 	import type { DetectionItem } from '$lib/types';
+	import {
+		isProducerTimestampFresh,
+		latestProducerTimestamp
+	} from '$lib/producer-time';
+
+	const RECENT_DETECTIONS_STALE_AFTER_MS = 30_000;
 
 	interface Props {
 		limit?: number;
@@ -16,9 +21,15 @@
 	let items = $state<DetectionItem[]>([]);
 	let isLoading = $state(false);
 	let error = $state<string | null>(null);
-	let lastUpdated = $state<string | null>(null);
+	let latestProducerAt = $state<string | null>(null);
+	let evaluatedAtMs = $state(Date.now());
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
-	let loadedRangeKey = '';
+	let queryGeneration = 0;
+	let latestRequestId = 0;
+
+	type DetectionQuery =
+		| { mode: 'range'; start: string; end: string; limit: number }
+		| { mode: 'recent'; limit: number };
 
 	function displayValue(value: unknown): string {
 		return value == null ? '' : String(value);
@@ -29,28 +40,67 @@
 		return displayValue(value);
 	}
 
-	async function loadItems() {
+	function currentQuery(): DetectionQuery {
+		return range
+			? { mode: 'range', start: range.start, end: range.end, limit }
+			: { mode: 'recent', limit };
+	}
+
+	function invalidateRequests() {
+		queryGeneration += 1;
+		latestRequestId += 1;
+	}
+
+	async function loadItemsFor(
+		query: DetectionQuery,
+		generation: number,
+		showLoading: boolean
+	) {
+		if (generation !== queryGeneration) return;
+		const requestId = ++latestRequestId;
+		evaluatedAtMs = Date.now();
 		error = null;
-		isLoading = items.length === 0;
+		isLoading = showLoading;
 
 		try {
-			const response = range
-				? await fetchDetectionsRange({ start: range.start, end: range.end, limit })
-				: await fetchDetectionsPage({ mode: 'recent', limit });
+			const response = query.mode === 'range'
+				? await fetchDetectionsRange({
+						start: query.start,
+						end: query.end,
+						limit: query.limit
+					})
+				: await fetchDetectionsPage({ mode: 'recent', limit: query.limit });
+			if (generation !== queryGeneration || requestId !== latestRequestId) return;
+			evaluatedAtMs = Date.now();
 			items = response.items || [];
-			lastUpdated = new Date().toLocaleTimeString();
+			latestProducerAt = latestProducerTimestamp(
+				items.map((item) => item.timestamp_utc)
+			);
 		} catch (err) {
+			if (generation !== queryGeneration || requestId !== latestRequestId) return;
 			error = err instanceof Error ? err.message : 'Failed to fetch detections.';
 		} finally {
-			isLoading = false;
+			if (generation === queryGeneration && requestId === latestRequestId) {
+				isLoading = false;
+			}
 		}
 	}
 
-	function startPolling() {
-		stopPolling();
-		refreshTimer = setInterval(() => {
-			void loadItems();
-		}, refreshMs);
+	function loadItems() {
+		return loadItemsFor(currentQuery(), queryGeneration, items.length === 0);
+	}
+
+	let producerCurrent = $derived(
+		isProducerTimestampFresh(
+			latestProducerAt,
+			RECENT_DETECTIONS_STALE_AFTER_MS,
+			evaluatedAtMs
+		)
+	);
+
+	function producerTime(value: string | null): string | null {
+		if (!value) return null;
+		return new Date(value).toLocaleString();
 	}
 
 	function stopPolling() {
@@ -61,23 +111,36 @@
 	}
 
 	$effect(() => {
-		const key = range ? `${range.start}|${range.end}` : 'live';
-		if (key === loadedRangeKey) return;
-		loadedRangeKey = key;
-		void loadItems();
-		if (range) {
-			stopPolling();
-		} else {
-			startPolling();
-		}
-	});
-
-	onMount(() => {
-		if (!range) startPolling();
-	});
-
-	onDestroy(() => {
 		stopPolling();
+		const activeRange = range;
+		const activeLimit = limit;
+		const activeRefreshMs = refreshMs;
+		const query: DetectionQuery = activeRange
+			? {
+					mode: 'range',
+					start: activeRange.start,
+					end: activeRange.end,
+					limit: activeLimit
+				}
+			: { mode: 'recent', limit: activeLimit };
+		invalidateRequests();
+		const generation = queryGeneration;
+		items = [];
+		latestProducerAt = null;
+		error = null;
+		isLoading = true;
+		evaluatedAtMs = Date.now();
+		void loadItemsFor(query, generation, true);
+		if (query.mode === 'recent') {
+			refreshTimer = setInterval(() => {
+				void loadItemsFor(query, generation, false);
+			}, activeRefreshMs);
+		}
+
+		return () => {
+			stopPolling();
+			if (queryGeneration === generation) invalidateRequests();
+		};
 	});
 </script>
 
@@ -90,11 +153,15 @@
 					{#if range}
 						<span class="ml-2 align-middle text-[10px] font-medium tracking-[0.16em] text-amber-300 uppercase">Time-locked</span>
 					{:else}
-						<span class="ml-2 align-middle text-[10px] font-medium tracking-[0.16em] text-emerald-300 uppercase">Live</span>
+						<span class="ml-2 align-middle text-[10px] font-medium tracking-[0.16em] {producerCurrent ? 'text-emerald-300' : 'text-amber-300'} uppercase">
+							{producerCurrent ? 'Current' : 'Stale'}
+						</span>
 					{/if}
 				</h1>
-				{#if lastUpdated}
-					<p class="mt-1 text-xs text-gray-500">Updated {lastUpdated}</p>
+				{#if producerTime(latestProducerAt)}
+					<p class="mt-1 text-xs text-gray-500">
+						Latest producer event {producerTime(latestProducerAt)}
+					</p>
 				{/if}
 			</div>
 			<button

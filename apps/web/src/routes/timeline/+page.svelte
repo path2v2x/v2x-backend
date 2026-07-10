@@ -9,6 +9,7 @@
 	import { loadRuntimeConfig, type RuntimeConfig } from '$lib/runtime-config';
 	import {
 		TIMELINE_SPAN_MS,
+		mergeCoverageIntervals,
 		parseIsoMs,
 		toIsoMillis,
 		windowForCursor,

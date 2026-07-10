@@ -10,18 +10,22 @@ import io
 import json
 import logging
 import math
+import os
+import re
 import time
 import threading
+import weakref
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import websockets
 from PIL import Image
 
 from digital_twin_bridge.scene_reconstructor import SceneReconstructor
-from digital_twin_bridge.camera_streamer import compute_camera_transform
 from digital_twin_bridge.openscenario_runner import list_xosc
+from digital_twin_bridge.perception import PerceptionService
 from digital_twin_bridge.trajectory_player import (
     TrajectoryPlayer,
     list_trajectory_files,
@@ -31,6 +35,37 @@ from digital_twin_bridge.trajectory_player import (
 logger = logging.getLogger(__name__)
 
 VALID_CAMERA_VIEWS = {"chase", "hood", "bird", "free"}
+
+# Teleport is a privileged mutation of this session's ego actor.  Keep the
+# accepted values finite and close to the active map/road so malformed or
+# hostile WS messages cannot fling actors into extreme Unreal coordinates.
+TELEPORT_COORD_ABS_LIMIT_M = 100_000.0
+TELEPORT_MAP_MARGIN_M = 500.0
+TELEPORT_MAX_ROAD_DISTANCE_M = 100.0
+TELEPORT_MIN_Z_M = -20.0
+TELEPORT_MAX_Z_M = 500.0
+TELEPORT_MAX_ROAD_Z_OFFSET_M = 50.0
+TELEPORT_MAX_ABS_YAW_DEG = 360.0
+TELEPORT_REQUEST_ID_MAX_LENGTH = 128
+
+# Historical range reads are isolated from the CARLA event loop.  Limit
+# concurrent workers globally per event loop; a timed-out worker keeps its slot
+# until its current bounded request observes cancellation and exits.
+SCENE_FETCH_MAX_CONCURRENT = 2
+DEFAULT_SCENE_FETCH_TIMEOUT_SECONDS = 20.0
+DEFAULT_SCENE_FETCH_MAX_PAGES = 20
+DEFAULT_SCENE_FETCH_MAX_ITEMS = 10_000
+DEFAULT_PERCEPTION_SCAN_INTERVAL_SECONDS = 0.1
+_scene_fetch_limiters = weakref.WeakKeyDictionary()
+
+
+def _scene_fetch_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    limiter = _scene_fetch_limiters.get(loop)
+    if limiter is None:
+        limiter = asyncio.Semaphore(SCENE_FETCH_MAX_CONCURRENT)
+        _scene_fetch_limiters[loop] = limiter
+    return limiter
 
 # Default vehicle if none specified
 DEFAULT_VEHICLE = "vehicle.tesla.model3"
@@ -280,9 +315,6 @@ def display_name_from_blueprint(blueprint_id: str) -> str:
 
 # ── Scenario file I/O ──
 
-import os
-import re
-
 BRIDGE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 APPS_ROOT = os.path.abspath(os.path.join(BRIDGE_ROOT, ".."))
 SCENARIOS_DIR = os.path.join(BRIDGE_ROOT, "scenes")
@@ -390,10 +422,13 @@ class DriveSession:
         world,
         carla_map,
         api_fetcher: Callable,
-        shared_prop_pool: Optional[dict] = None,
         trajectory_player: Optional[TrajectoryPlayer] = None,
         openscenario_runner=None,
         eva_warning_distance_m: float = 20.0,
+        scene_fetch_timeout_seconds: float = DEFAULT_SCENE_FETCH_TIMEOUT_SECONDS,
+        scene_fetch_max_pages: int = DEFAULT_SCENE_FETCH_MAX_PAGES,
+        scene_fetch_max_items: int = DEFAULT_SCENE_FETCH_MAX_ITEMS,
+        perception_scan_interval_seconds: float = DEFAULT_PERCEPTION_SCAN_INTERVAL_SECONDS,
     ):
         self._world = world
         self._map = carla_map
@@ -415,9 +450,11 @@ class DriveSession:
         # Each session stamps its own ego with a unique role and the runner
         # rewrites the .xosc on launch to reference that exact role.
         self._ego_role = f"ego_vehicle_{id(self):x}"
-        # Shared V2X prop pool across sessions (object_id -> actor_id). Owned by
-        # the server process, not the session. None → session-owned props (legacy).
-        self._shared_prop_pool = shared_prop_pool
+        self._scene_fetch_timeout_seconds = max(
+            0.1, float(scene_fetch_timeout_seconds)
+        )
+        self._scene_fetch_max_pages = max(1, int(scene_fetch_max_pages))
+        self._scene_fetch_max_items = max(1, int(scene_fetch_max_items))
         # Server-owned trajectory player; one playback shared across all sessions
         # in the world. None → trajectory feature disabled.
         self._trajectory_player = trajectory_player
@@ -428,9 +465,22 @@ class DriveSession:
         self.vehicle = None
         self.active_camera: str = "chase"
         self._active = False
+        self._starting = False
         self._camera_sensor = None
         self._latest_frame: Optional[bytes] = None
         self._frame_lock = threading.Lock()
+        # Session-owned perception sensors; never shared across browser egos.
+        self._perception = PerceptionService()
+        self._perception_scan_interval_seconds = max(
+            0.0, float(perception_scan_interval_seconds)
+        )
+        self._last_perception_scan_monotonic: Optional[float] = None
+        self._cached_perception_detections: list[dict] = []
+        self._perception_scan_executor: Optional[ThreadPoolExecutor] = None
+        self._perception_scan_future: Optional[Future] = None
+        self._perception_scan_future_generation: Optional[int] = None
+        self._retired_perception_scan_future: Optional[Future] = None
+        self._perception_scan_generation = 0
         self._accepting_frames = False  # Guard against callbacks after stop
         self._placed_objects: list = []  # User-placed objects (actor, blueprint_id, pos)
         self._dynamic_actors: dict[int, DynamicActorMeta] = {}
@@ -457,21 +507,90 @@ class DriveSession:
         openscenario_runner=None,
     ) -> None:
         """Refresh server-owned CARLA references after an idle map switch."""
-        if self._active:
+        if self._active or self._starting:
             raise RuntimeError("Cannot update session runtime while active")
         self._world = world
         self._map = carla_map
         self._trajectory_player = trajectory_player
         self._openscenario_runner = openscenario_runner
 
+    async def _fetch_scene_result(self, start: str, end: str):
+        """Fetch historical pages off-loop without permitting CARLA mutation."""
+        if self._reconstructor is None:
+            raise RuntimeError("scene reconstructor is not initialized")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._scene_fetch_timeout_seconds
+        limiter = _scene_fetch_limiter()
+        try:
+            await asyncio.wait_for(
+                limiter.acquire(), timeout=self._scene_fetch_timeout_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Historical scene fetch timed out after "
+                f"{self._scene_fetch_timeout_seconds:g} seconds"
+            ) from exc
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            limiter.release()
+            raise RuntimeError(
+                "Historical scene fetch timed out after "
+                f"{self._scene_fetch_timeout_seconds:g} seconds"
+            )
+        cancel_fetch = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._reconstructor.fetch,
+                start,
+                end,
+                should_stop=cancel_fetch.is_set,
+            )
+        )
+        release_when_done = False
+
+        def finish_abandoned_fetch(task: asyncio.Task) -> None:
+            # Retrieve the worker result/exception to avoid an unhandled-task
+            # warning, then return its capacity slot.  No CARLA calls occur in
+            # this task even when it completes after the client timed out.
+            try:
+                task.result()
+            except BaseException:
+                pass
+            limiter.release()
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
+            cancel_fetch.set()
+            worker.add_done_callback(finish_abandoned_fetch)
+            release_when_done = True
+            raise RuntimeError(
+                "Historical scene fetch timed out after "
+                f"{self._scene_fetch_timeout_seconds:g} seconds"
+            ) from exc
+        except asyncio.CancelledError:
+            cancel_fetch.set()
+            worker.add_done_callback(finish_abandoned_fetch)
+            release_when_done = True
+            raise
+        finally:
+            if not release_when_done:
+                limiter.release()
+
     async def start(self, start: str, end: str, vehicle_blueprint: str = DEFAULT_VEHICLE) -> dict:
         """Start a driving session: reconstruct scene, spawn vehicle, attach camera.
 
         If any step fails, _force_cleanup() ensures no actors are leaked.
         """
-        if self._active:
+        if self._active or self._starting:
             raise RuntimeError("Session already active")
 
+        self._starting = True
         try:
             if not any(s.is_active for s in _active_sessions):
                 apply_default_drive_weather(self._world)
@@ -479,9 +598,13 @@ class DriveSession:
                 world=self._world,
                 carla_map=self._map,
                 api_fetcher=self._api_fetcher,
-                shared_pool=self._shared_prop_pool,
+                max_pages=self._scene_fetch_max_pages,
+                max_items=self._scene_fetch_max_items,
             )
-            recon_result = self._reconstructor.reconstruct(start, end)
+            fetched_scene = await self._fetch_scene_result(start, end)
+            # CARLA actor creation remains on this event-loop thread.  A timed
+            # out worker can finish only HTTP/dedup work and can never reach it.
+            recon_result = self._reconstructor.spawn(fetched_scene)
 
             bp_lib = self._world.get_blueprint_library()
             ego_bp = resolve_vehicle_blueprint(bp_lib, vehicle_blueprint)
@@ -543,19 +666,35 @@ class DriveSession:
             # Attach RGB camera sensor to the vehicle
             self._attach_camera(bp_lib)
 
+            # Attach this session's semantic/depth camera pairs to this ego.
+            # Perception is non-critical: control remains usable if a sensor
+            # blueprint is unavailable, and cleanup still detaches partial work.
+            try:
+                self._perception.attach(self._world, self.vehicle)
+            except Exception as e:
+                logger.warning("Perception attach failed: %s", e, exc_info=True)
+
             self._accepting_frames = True
             self._active = True
+            self._starting = False
             self.active_camera = "chase"
+            self._last_perception_scan_monotonic = None
+            self._cached_perception_detections = []
 
             logger.info(
                 "Drive session started: vehicle=%d, objects=%d",
                 self.vehicle.id, len(recon_result.spawned_actors),
             )
 
+            sensor_actor_ids = self.sensor_actor_ids()
+            scene_actor_ids = self._reconstructor.actor_ids()
             return {
                 "type": "session_ready",
                 "vehicle_id": self.vehicle.id,
                 "objects_count": len(recon_result.spawned_actors),
+                "sensor_actor_ids": sensor_actor_ids,
+                "scene_actor_ids": scene_actor_ids,
+                "owned_actor_ids": self.owned_actor_ids(),
             }
         except Exception:
             # If anything fails during startup, clean up whatever was partially created
@@ -581,7 +720,7 @@ class DriveSession:
         from manual_control.py's `_camera_transforms` list (lines 1080-85).
         """
         import carla
-        bx, by, bz = self._bound_x, self._bound_y, self._bound_z
+        bx, _, bz = self._bound_x, self._bound_y, self._bound_z
         if view == "hood":
             # manual_control index 1: dashboard / front-bumper view
             return carla.Transform(carla.Location(x=+0.8 * bx, y=0.0, z=1.3 * bz))
@@ -606,7 +745,6 @@ class DriveSession:
     def _attach_camera(self, bp_lib):
         """Attach an RGB camera sensor to the vehicle for streaming frames."""
         try:
-            import carla
             camera_bp = bp_lib.find("sensor.camera.rgb")
             if camera_bp is None:
                 logger.warning("sensor.camera.rgb blueprint not found")
@@ -660,6 +798,108 @@ class DriveSession:
         with self._frame_lock:
             return self._latest_frame
 
+    def sensor_actor_ids(self) -> list[int]:
+        """Return RGB and perception sensor IDs owned by this session."""
+        actor_ids = []
+        if self._camera_sensor is not None:
+            actor_id = getattr(self._camera_sensor, "id", None)
+            if isinstance(actor_id, int):
+                actor_ids.append(actor_id)
+        actor_ids.extend(self._perception.actor_ids())
+        return sorted(set(actor_ids))
+
+    def owned_actor_ids(self) -> list[int]:
+        """Return every currently known CARLA actor owned by this session."""
+        actor_ids = set(self.sensor_actor_ids())
+        if self.vehicle is not None and isinstance(getattr(self.vehicle, "id", None), int):
+            actor_ids.add(self.vehicle.id)
+        if self._reconstructor is not None:
+            actor_ids.update(self._reconstructor.actor_ids())
+        actor_ids.update(self._dynamic_actors)
+        for entry in self._placed_objects:
+            actor_id = getattr(entry.get("actor"), "id", None)
+            if isinstance(actor_id, int):
+                actor_ids.add(actor_id)
+        return sorted(actor_ids)
+
+    def _scan_perception_at_sensor_cadence(self) -> list[dict]:
+        """Schedule at most one CPU scan and return the latest completed cache.
+
+        Capturing frames and assigning stable IDs stay on the CARLA/event-loop
+        thread.  Only immutable numpy-frame analysis runs in the bounded worker,
+        so dense semantic masks cannot stall control or ``world.tick``.
+        """
+        now = time.monotonic()
+        retired = self._retired_perception_scan_future
+        if retired is not None:
+            if not retired.done():
+                return list(self._cached_perception_detections)
+            try:
+                retired.result()
+            except Exception:
+                pass
+            self._retired_perception_scan_future = None
+
+        future = self._perception_scan_future
+        if future is not None and future.done():
+            generation = self._perception_scan_future_generation
+            self._perception_scan_future = None
+            self._perception_scan_future_generation = None
+            try:
+                analyzed = future.result()
+                if generation == self._perception_scan_generation and self._active:
+                    tracked = self._perception.finalize_scan(analyzed)
+                    self._cached_perception_detections = [
+                        detection.to_dict() for detection in tracked
+                    ]
+            except Exception as e:
+                if generation == self._perception_scan_generation:
+                    logger.warning("Perception scan failed: %s", e, exc_info=True)
+                    self._cached_perception_detections = []
+
+        due = (
+            self._last_perception_scan_monotonic is None
+            or now - self._last_perception_scan_monotonic
+            >= self._perception_scan_interval_seconds
+        )
+        if self._perception_scan_future is None and due:
+            snapshot = self._perception.capture_scan_snapshot()
+            self._last_perception_scan_monotonic = now
+            if snapshot:
+                if self._perception_scan_executor is None:
+                    self._perception_scan_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix=f"v2x-perception-{id(self):x}",
+                    )
+                future = self._perception_scan_executor.submit(
+                    self._perception.analyze_scan_snapshot, snapshot
+                )
+                self._perception_scan_future = future
+                self._perception_scan_future_generation = (
+                    self._perception_scan_generation
+                )
+            else:
+                self._cached_perception_detections = []
+
+        return list(self._cached_perception_detections)
+
+    def _shutdown_perception_scan_worker(self) -> None:
+        """Invalidate queued/results while allowing pure CPU work to wind down."""
+        self._perception_scan_generation += 1
+        future = self._perception_scan_future
+        self._perception_scan_future = None
+        self._perception_scan_future_generation = None
+        if future is not None:
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                # Do not start a new generation's worker until this pure CPU
+                # task winds down; this preserves a strict one-worker bound.
+                self._retired_perception_scan_future = future
+        executor = self._perception_scan_executor
+        self._perception_scan_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def apply_control(self, steer: float, throttle: float, brake: float, reverse: bool = False) -> dict:
         """Apply vehicle control and return telemetry."""
         if not self._active or self.vehicle is None:
@@ -684,6 +924,8 @@ class DriveSession:
         speed_ms = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         speed_kmh = speed_ms * 3.6
 
+        detections = self._scan_perception_at_sensor_cadence()
+
         telemetry = {
             "type": "telemetry",
             "speed": round(speed_kmh, 1),
@@ -703,6 +945,9 @@ class DriveSession:
             "brake": round(brake, 3),
             "nearby_actors": self.get_nearby_actors(),
             "dynamic_actors": self.get_dynamic_actors_snapshot(),
+            # Always include the list so the dashboard can distinguish a
+            # healthy empty scan from the historical missing-payload regression.
+            "detections": detections,
         }
         self._draw_dynamic_actor_geofences()
         eva_alerts = self._check_emergency_vehicle_proximity()
@@ -726,7 +971,6 @@ class DriveSession:
         if self._camera_sensor is None or self.vehicle is None:
             return
         try:
-            import carla
             self._accepting_frames = False
             try:
                 self._camera_sensor.stop()
@@ -790,6 +1034,141 @@ class DriveSession:
                 round(transform.location.y, 2),
                 round(transform.location.z, 2),
             ],
+        }
+
+    @staticmethod
+    def _teleport_number(value, name: str) -> float:
+        """Coerce a protocol number while rejecting booleans/NaN/infinity."""
+        if value is None or isinstance(value, bool):
+            raise ValueError(f"teleport requires finite numeric '{name}'")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"teleport requires finite numeric '{name}'") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"teleport requires finite numeric '{name}'")
+        return number
+
+    @staticmethod
+    def _teleport_request_id(value) -> str:
+        """Validate the correlation id required by the teleport protocol."""
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > TELEPORT_REQUEST_ID_MAX_LENGTH
+        ):
+            raise ValueError(
+                "teleport requires a non-empty string 'request_id' of at most "
+                f"{TELEPORT_REQUEST_ID_MAX_LENGTH} characters"
+            )
+        return value
+
+    def _validate_teleport_map_bounds(self, x: float, y: float) -> None:
+        if abs(x) > TELEPORT_COORD_ABS_LIMIT_M or abs(y) > TELEPORT_COORD_ABS_LIMIT_M:
+            raise ValueError("teleport coordinates exceed the world safety limit")
+
+        # Spawn points provide a cheap map-specific envelope.  A generous
+        # margin permits roads without spawn points while rejecting obviously
+        # unrelated coordinates before CARLA attempts the transform.
+        spawn_points = self._map.get_spawn_points()
+        if not spawn_points:
+            raise RuntimeError("Active map has no spawn points")
+        xs = [float(point.location.x) for point in spawn_points]
+        ys = [float(point.location.y) for point in spawn_points]
+        if not (
+            min(xs) - TELEPORT_MAP_MARGIN_M
+            <= x
+            <= max(xs) + TELEPORT_MAP_MARGIN_M
+            and min(ys) - TELEPORT_MAP_MARGIN_M
+            <= y
+            <= max(ys) + TELEPORT_MAP_MARGIN_M
+        ):
+            raise ValueError("teleport coordinates are outside the active map envelope")
+
+    def teleport(self, x, y, z=None, yaw=None) -> dict:
+        """Move only this session's ego to a validated active-map coordinate."""
+        if not self._active or self.vehicle is None:
+            raise RuntimeError("No active session")
+
+        import carla
+
+        x_value = self._teleport_number(x, "x")
+        y_value = self._teleport_number(y, "y")
+        self._validate_teleport_map_bounds(x_value, y_value)
+
+        current = self.vehicle.get_transform()
+        probe = carla.Location(
+            x=x_value,
+            y=y_value,
+            z=float(current.location.z),
+        )
+        waypoint = self._map.get_waypoint(probe, project_to_road=True)
+        if waypoint is None:
+            raise ValueError("teleport target has no nearby road waypoint")
+        road_location = waypoint.transform.location
+        road_distance = math.hypot(
+            x_value - float(road_location.x),
+            y_value - float(road_location.y),
+        )
+        if road_distance > TELEPORT_MAX_ROAD_DISTANCE_M:
+            raise ValueError("teleport target is too far from a road")
+
+        snapped_to_road = z is None
+        if z is None:
+            z_value = float(road_location.z) + 0.5
+        else:
+            z_value = self._teleport_number(z, "z")
+            if not TELEPORT_MIN_Z_M <= z_value <= TELEPORT_MAX_Z_M:
+                raise ValueError(
+                    f"teleport z must be between {TELEPORT_MIN_Z_M:g} and "
+                    f"{TELEPORT_MAX_Z_M:g} metres"
+                )
+            if abs(z_value - float(road_location.z)) > TELEPORT_MAX_ROAD_Z_OFFSET_M:
+                raise ValueError("teleport z is too far from the road surface")
+
+        if yaw is None:
+            yaw_value = float(current.rotation.yaw)
+        else:
+            yaw_value = self._teleport_number(yaw, "yaw")
+            if abs(yaw_value) > TELEPORT_MAX_ABS_YAW_DEG:
+                raise ValueError(
+                    f"teleport yaw must be within ±{TELEPORT_MAX_ABS_YAW_DEG:g} degrees"
+                )
+            yaw_value = ((yaw_value + 180.0) % 360.0) - 180.0
+
+        target = carla.Transform(
+            carla.Location(x=x_value, y=y_value, z=z_value),
+            carla.Rotation(pitch=0.0, yaw=yaw_value, roll=0.0),
+        )
+        self.vehicle.set_transform(target)
+
+        # Reset both linear and angular momentum.  CARLA 0.9/0.10 expose
+        # these on actors; keep angular reset optional for older test doubles.
+        zero = carla.Vector3D(0.0, 0.0, 0.0)
+        self.vehicle.set_target_velocity(zero)
+        set_angular = getattr(self.vehicle, "set_target_angular_velocity", None)
+        if set_angular is not None:
+            set_angular(carla.Vector3D(0.0, 0.0, 0.0))
+
+        actual = self.vehicle.get_transform()
+        logger.info(
+            "Session %s teleported ego %s to (%.1f, %.1f, %.1f)",
+            self._ego_role,
+            getattr(self.vehicle, "id", "unknown"),
+            actual.location.x,
+            actual.location.y,
+            actual.location.z,
+        )
+        return {
+            "type": "teleported",
+            "success": True,
+            "pos": [
+                round(actual.location.x, 2),
+                round(actual.location.y, 2),
+                round(actual.location.z, 2),
+            ],
+            "yaw": round(actual.rotation.yaw, 2),
+            "snapped_to_road": snapped_to_road,
         }
 
     def spawn_object(self, blueprint_id: str, forward_offset: float = 8.0) -> dict:
@@ -931,13 +1310,12 @@ class DriveSession:
         if not self._active or self._camera_sensor is None:
             raise RuntimeError("No active session or camera")
 
-        import carla
-
         # Stop accepting frames during swap
         self._accepting_frames = False
 
-        # Save current transform
-        current_transform = self._camera_sensor.get_transform()
+        # Attached actors require a vehicle-relative transform.  Feeding the
+        # sensor's world transform back here causes drift after every respawn.
+        local_transform = self._transform_for_view(self.active_camera)
 
         # Stop and destroy old sensor
         try:
@@ -1002,7 +1380,7 @@ class DriveSession:
                 logger.debug("Camera attribute '%s' failed: %s", key, e)
 
         self._camera_sensor = self._world.spawn_actor(
-            camera_bp, current_transform, attach_to=self.vehicle,
+            camera_bp, local_transform, attach_to=self.vehicle,
             attachment_type=self._attachment_for_view(self.active_camera),
         )
         self._camera_sensor.listen(self._on_camera_frame)
@@ -1770,6 +2148,19 @@ class DriveSession:
         # Stop accepting frames first to prevent callback race
         self._accepting_frames = False
         self._active = False
+        self._starting = False
+
+        # Invalidate data-only scan work before detaching CARLA sensors.  A
+        # running worker owns only immutable numpy references and cannot call
+        # back into this session after its generation is discarded.
+        self._shutdown_perception_scan_worker()
+
+        # Perception sensors are children of the ego; destroy them before the
+        # parent actor.  ``detach`` is idempotent for partial start failures.
+        try:
+            self._perception.detach()
+        except Exception as e:
+            logger.warning("Perception detach failed: %s", e, exc_info=True)
 
         # Camera sensor: stop and destroy in separate try blocks
         if self._camera_sensor is not None:
@@ -1813,10 +2204,16 @@ class DriveSession:
             self._reconstructor = None
 
         self._latest_frame = None
+        self._last_perception_scan_monotonic = None
+        self._cached_perception_detections = []
 
     @property
     def is_active(self) -> bool:
         return self._active
+
+    @property
+    def is_starting(self) -> bool:
+        return self._starting
 
 
 async def handle_message(session: DriveSession, msg: dict, map_controller=None) -> dict:
@@ -1948,6 +2345,52 @@ async def handle_message(session: DriveSession, msg: dict, map_controller=None) 
             return session.sync_v2x_zones(msg.get("zones", []))
         elif msg_type == "respawn":
             return session.respawn()
+        elif msg_type == "teleport":
+            raw_request_id = msg.get("request_id")
+            try:
+                request_id = session._teleport_request_id(raw_request_id)
+            except ValueError as exc:
+                # Keep a bounded string when possible so a malformed client can
+                # still correlate its rejection without reflecting large input.
+                rejected_id = (
+                    raw_request_id
+                    if isinstance(raw_request_id, str)
+                    and len(raw_request_id) <= TELEPORT_REQUEST_ID_MAX_LENGTH
+                    else ""
+                )
+                return {
+                    "type": "teleport_error",
+                    "success": False,
+                    "request_id": rejected_id,
+                    "message": str(exc),
+                }
+            try:
+                response = session.teleport(
+                    x=msg.get("x"),
+                    y=msg.get("y"),
+                    z=msg.get("z"),
+                    yaw=msg.get("yaw"),
+                )
+                response["request_id"] = request_id
+                return response
+            except (RuntimeError, TypeError, ValueError) as exc:
+                return {
+                    "type": "teleport_error",
+                    "success": False,
+                    "request_id": request_id,
+                    "message": str(exc),
+                }
+            except Exception:
+                # Preserve the teleport protocol contract for unexpected
+                # CARLA transport/runtime failures without leaking internals
+                # into the browser.  The detailed traceback stays server-side.
+                logger.error("CARLA teleport failed", exc_info=True)
+                return {
+                    "type": "teleport_error",
+                    "success": False,
+                    "request_id": request_id,
+                    "message": "Teleport failed in CARLA",
+                }
         elif msg_type == "list_trajectories":
             if session._trajectory_player is None:
                 return {"type": "trajectory_list", "trajectories": []}
@@ -1996,7 +2439,9 @@ _active_sessions: list[DriveSession] = []
 
 
 def active_session_count() -> int:
-    return sum(1 for session in _active_sessions if session.is_active)
+    return sum(
+        1 for session in _active_sessions if session.is_active or session.is_starting
+    )
 
 
 async def serve_drive(
@@ -2004,11 +2449,13 @@ async def serve_drive(
     world,
     carla_map,
     api_fetcher,
-    shared_prop_pool: Optional[dict] = None,
     trajectory_player: Optional[TrajectoryPlayer] = None,
     openscenario_runner=None,
     eva_warning_distance_m: float = 20.0,
     map_controller=None,
+    scene_fetch_timeout_seconds: float = DEFAULT_SCENE_FETCH_TIMEOUT_SECONDS,
+    scene_fetch_max_pages: int = DEFAULT_SCENE_FETCH_MAX_PAGES,
+    scene_fetch_max_items: int = DEFAULT_SCENE_FETCH_MAX_ITEMS,
 ):
     """
     Handle a single WebSocket connection for driving.
@@ -2016,8 +2463,8 @@ async def serve_drive(
     Multiplayer: each connection gets its own vehicle, camera, and frame stream
     in the same CARLA world. All players see each other's cars.
 
-    ``shared_prop_pool`` is an object_id→actor_id map shared across sessions so
-    V2X props persist even when an individual session ends.
+    Historical V2X props are session-owned.  Concurrent ranges never reuse an
+    actor solely because their source records share an ``object_id``.
 
     ``trajectory_player`` is the server-owned playback singleton; sessions
     issue start/stop/list commands but never own the player.
@@ -2036,10 +2483,12 @@ async def serve_drive(
         world=world,
         carla_map=carla_map,
         api_fetcher=api_fetcher,
-        shared_prop_pool=shared_prop_pool,
         trajectory_player=trajectory_player,
         openscenario_runner=openscenario_runner,
         eva_warning_distance_m=eva_warning_distance_m,
+        scene_fetch_timeout_seconds=scene_fetch_timeout_seconds,
+        scene_fetch_max_pages=scene_fetch_max_pages,
+        scene_fetch_max_items=scene_fetch_max_items,
     )
     frame_task = None
     frame_stop = asyncio.Event()
@@ -2083,6 +2532,7 @@ async def serve_drive(
         except Exception as e:
             logger.debug("OpenSCENARIO subscribe failed: %s", e)
 
+    _active_sessions.append(session)
     try:
         async for raw_message in websocket:
             if isinstance(raw_message, bytes):
@@ -2092,9 +2542,7 @@ async def serve_drive(
             response = await handle_message(session, msg, map_controller=map_controller)
             await websocket.send(json.dumps(response))
 
-            # Track session and start frame streaming once active
-            if session.is_active and session not in _active_sessions:
-                _active_sessions.append(session)
+            # Start frame streaming once the session becomes active.
             if session.is_active and frame_task is None:
                 frame_task = asyncio.create_task(stream_frames())
 

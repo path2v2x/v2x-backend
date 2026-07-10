@@ -132,7 +132,7 @@
 						polygon: { feature: { draggable: true, coordinates: { midpoints: true, draggable: true, deletable: true } } },
 					},
 				}),
-				new TerraDrawRenderMode({ modeName: 'render' }),
+				new TerraDrawRenderMode({ modeName: 'render', styles: {} }),
 			],
 		});
 

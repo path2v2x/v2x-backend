@@ -265,10 +265,19 @@ class PerceptionService:
         with self._frames_lock:
             self._frames.clear()
         self._tracked.clear()
+        self._next_track_ids.clear()
         self._world = None
         self._ego = None
         self._attached = False
         logger.info("PerceptionService detached")
+
+    def actor_ids(self) -> list[int]:
+        """Return the sensor actor IDs currently owned by this service."""
+        return [
+            actor_id
+            for sensor in self._sensors
+            if isinstance((actor_id := getattr(sensor, "id", None)), int)
+        ]
 
     # ─── sensor callbacks ──────────────────────────────────
 
@@ -302,36 +311,56 @@ class PerceptionService:
 
     # ─── scan ──────────────────────────────────────────────
 
-    def scan(self) -> list[Detection]:
-        """Run perception against the latest buffered frames."""
+    def capture_scan_snapshot(self) -> dict[str, tuple[Any, Any, CameraConfig]]:
+        """Capture immutable frame references for data-only worker analysis.
+
+        Sensor callbacks replace whole numpy arrays rather than mutating arrays
+        already stored in ``_frames``.  Holding these references is therefore
+        safe after the lock is released and, importantly, requires no CARLA
+        calls in the worker thread.
+        """
         if not self._attached:
-            return []
+            return {}
 
         with self._frames_lock:
-            snapshot = {
-                name: (f.get("sem"), f.get("depth"))
-                for name, f in self._frames.items()
+            frames = {
+                name: (frame.get("sem"), frame.get("depth"))
+                for name, frame in self._frames.items()
             }
+        cfg_by_name = {config.name: config for config in self._layout}
+        return {
+            name: (sem, depth, cfg_by_name[name])
+            for name, (sem, depth) in frames.items()
+            if name in cfg_by_name and sem is not None and depth is not None
+        }
 
-        cfg_by_name = {c.name: c for c in self._layout}
+    def analyze_scan_snapshot(
+        self,
+        snapshot: dict[str, tuple[Any, Any, CameraConfig]],
+    ) -> list[Detection]:
+        """Perform CPU-only extraction/dedup for a captured frame snapshot."""
         all_dets: list[Detection] = []
-        for cam_name, (sem, depth) in snapshot.items():
-            if sem is None or depth is None:
-                continue
-            cfg = cfg_by_name.get(cam_name)
-            if cfg is None:
-                continue
+        for cam_name, (sem, depth, config) in snapshot.items():
             try:
-                all_dets.extend(self._extract_detections(sem, depth, cfg))
+                all_dets.extend(self._extract_detections(sem, depth, config))
             except Exception:
                 logger.debug(
                     "Extraction failed for camera %s", cam_name, exc_info=True
                 )
+        return self._dedup_across_cameras(all_dets)
 
-        merged = self._dedup_across_cameras(all_dets)
-        tracked = self._assign_ids(merged)
+    def finalize_scan(self, detections: list[Detection]) -> list[Detection]:
+        """Assign stable IDs on the owning event-loop thread."""
+        tracked = self._assign_ids(detections)
         self._tracked = tracked
         return tracked
+
+    def scan(self) -> list[Detection]:
+        """Synchronous compatibility wrapper for offline/unit callers."""
+        snapshot = self.capture_scan_snapshot()
+        if not snapshot:
+            return []
+        return self.finalize_scan(self.analyze_scan_snapshot(snapshot))
 
     # ─── per-camera blob extraction ────────────────────────
 

@@ -97,62 +97,66 @@ class TestSceneReconstructor:
             assert mock_actor is not None
             assert mock_actor.is_destroyed
 
-    def test_shared_pool_skips_already_spawned(self, mock_world, fake_v2x_api):
-        """A second reconstructor sharing the pool should not re-spawn existing objects."""
+    def test_sessions_never_reuse_historical_actor_by_object_id(
+        self, mock_world, fake_v2x_api
+    ):
+        """Each requested range owns distinct actors, even for the same IDs."""
         from digital_twin_bridge.scene_reconstructor import SceneReconstructor
-
-        pool: dict[str, int] = {}
 
         recon_a = SceneReconstructor(
             world=mock_world,
             carla_map=mock_world.get_map(),
             api_fetcher=fake_v2x_api.get_detections_range,
-            shared_pool=pool,
         )
         result_a = recon_a.reconstruct("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
-        spawned_first = len(result_a.spawned_actors)
-        pool_size = len(pool)
-        assert spawned_first > 0
-        assert pool_size == spawned_first
-
-        spawn_counter_before = len([a for a in mock_world._actors.values() if not a.is_destroyed])
 
         recon_b = SceneReconstructor(
             world=mock_world,
             carla_map=mock_world.get_map(),
             api_fetcher=fake_v2x_api.get_detections_range,
-            shared_pool=pool,
         )
         result_b = recon_b.reconstruct("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
 
-        # Second pass reports the same actors (reused) but spawns no new ones.
-        assert len(result_b.spawned_actors) == spawned_first
-        assert len(pool) == pool_size
-        spawn_counter_after = len([a for a in mock_world._actors.values() if not a.is_destroyed])
-        assert spawn_counter_after == spawn_counter_before
+        first_ids = {actor.id for actor in result_a.spawned_actors}
+        second_ids = {actor.id for actor in result_b.spawned_actors}
+        assert first_ids
+        assert second_ids
+        assert first_ids.isdisjoint(second_ids)
 
-    def test_shared_pool_cleanup_is_noop(self, mock_world, fake_v2x_api):
-        """When a shared pool is in use, cleanup() must not destroy pool actors."""
+    def test_session_cleanup_destroys_only_its_historical_actors(
+        self, mock_world, fake_v2x_api
+    ):
+        """Ending one concurrent range must not destroy another range's actors."""
         from digital_twin_bridge.scene_reconstructor import SceneReconstructor
 
-        pool: dict[str, int] = {}
-        recon = SceneReconstructor(
+        first = SceneReconstructor(
             world=mock_world,
             carla_map=mock_world.get_map(),
             api_fetcher=fake_v2x_api.get_detections_range,
-            shared_pool=pool,
         )
-        result = recon.reconstruct("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
-        assert len(pool) > 0
+        second = SceneReconstructor(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        first_result = first.reconstruct(
+            "2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z"
+        )
+        second_result = second.reconstruct(
+            "2026-03-22T18:00:00Z", "2026-03-22T18:30:00Z"
+        )
 
-        destroyed = recon.cleanup()
-        assert destroyed == 0
+        destroyed = first.cleanup()
+        assert destroyed == len(first_result.spawned_actors)
 
-        # Pool actors still alive — a concurrent session would see them.
-        for actor_id in pool.values():
-            actor = mock_world.get_actor(actor_id)
-            assert actor is not None
-            assert not actor.is_destroyed
+        assert all(
+            mock_world.get_actor(actor.id).is_destroyed
+            for actor in first_result.spawned_actors
+        )
+        assert all(
+            not mock_world.get_actor(actor.id).is_destroyed
+            for actor in second_result.spawned_actors
+        )
 
     def test_correct_gps_to_carla_conversion(self, mock_world, fake_v2x_api):
         """Objects should be spawned at CARLA coordinates derived from GPS."""

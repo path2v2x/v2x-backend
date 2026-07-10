@@ -1,0 +1,27 @@
+[Unit]
+Description=V2X RR CARLA 0.10 Simulator
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=path
+Group=path
+SupplementaryGroups=docker
+Environment=CARLA_CONTAINER=carla-rr-maps
+Environment=CARLA_IMAGE=ghcr.io/simforgeinc/carla-rr-maps:0.10.0
+Environment="CARLA_COMMAND=./CarlaUnreal.sh -RenderOffScreen -vulkan -nosound -carla-rpc-port=2000"
+Environment=ALLOW_CARLA_CONFIG_DRIFT=false
+EnvironmentFile=-/etc/v2x-carla-rr.env
+ExecStart=/home/path/V2XCarla/v2x-backend/scripts/run-carla-rr.sh
+ExecStop=/home/path/V2XCarla/v2x-backend/scripts/run-carla-rr.sh stop
+Restart=always
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec=90
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

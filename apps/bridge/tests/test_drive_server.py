@@ -75,14 +75,21 @@ class TestDriveServerSession:
             carla_map=mock_world.get_map(),
             api_fetcher=fake_v2x_api.get_detections_range,
         )
-        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+        ready = await session.start(
+            "2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z"
+        )
         vehicle_id = session.vehicle.id
+        owned_actor_ids = set(ready["owned_actor_ids"])
+        assert vehicle_id in owned_actor_ids
+        assert set(ready["scene_actor_ids"]).issubset(owned_actor_ids)
+        assert set(ready["sensor_actor_ids"]).issubset(owned_actor_ids)
 
         session.end()
 
-        # Vehicle should be destroyed
+        # Every actor in the acceptance manifest should be destroyed.
         vehicle = mock_world.get_actor(vehicle_id)
         assert vehicle.is_destroyed
+        assert all(mock_world.get_actor(actor_id).is_destroyed for actor_id in owned_actor_ids)
         assert session.vehicle is None
         assert mock_world.weather.sun_altitude_angle == 75.0
 

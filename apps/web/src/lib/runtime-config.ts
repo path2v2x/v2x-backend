@@ -22,6 +22,7 @@ export interface RuntimeConfig {
 	driveConfigUpdatedAt?: string;
 	driveConfigExpiresAt?: string;
 	driveConfigSource?: string;
+	driveConfigVersion?: number;
 }
 
 const DEFAULT_CONFIG: RuntimeConfig = {
@@ -46,6 +47,15 @@ const DEFAULT_CONFIG: RuntimeConfig = {
 };
 
 let configPromise: Promise<RuntimeConfig> | null = null;
+
+export interface DriveConfigOverlay {
+	version?: number;
+	cloudflareDriveWsUrl?: string;
+	tailscaleDriveWsUrl?: string;
+	updatedAt?: string;
+	expiresAt?: string;
+	source?: string;
+}
 
 function withDefaultPath(path: string | undefined, fallback: string): string {
 	if (!path) return fallback;
@@ -95,8 +105,59 @@ function normalizeConfig(config: Partial<RuntimeConfig>): RuntimeConfig {
 		tailscaleDriveWsUrl: config.tailscaleDriveWsUrl || DEFAULT_CONFIG.tailscaleDriveWsUrl,
 		driveConfigUpdatedAt: config.driveConfigUpdatedAt,
 		driveConfigExpiresAt: config.driveConfigExpiresAt,
-		driveConfigSource: config.driveConfigSource
+		driveConfigSource: config.driveConfigSource,
+		driveConfigVersion: config.driveConfigVersion
 	};
+}
+
+function validWebSocketUrl(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	try {
+		const url = new URL(value);
+		if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return undefined;
+		if (url.username || url.password) return undefined;
+		return url.toString().replace(/\/$/, '');
+	} catch {
+		return undefined;
+	}
+}
+
+const DRIVE_CONFIG_CLOCK_SKEW_MS = 5 * 60_000;
+const DRIVE_CONFIG_MAX_TTL_MS = 24 * 60 * 60_000;
+const DRIVE_CONFIG_VERSION_KEY = 'v2x-drive-config-version';
+
+function lastObservedDriveConfigVersion(): number | null {
+	if (typeof sessionStorage === 'undefined') return null;
+	try {
+		const value = Number(sessionStorage.getItem(DRIVE_CONFIG_VERSION_KEY));
+		return Number.isSafeInteger(value) && value > 0 ? value : null;
+	} catch {
+		return null;
+	}
+}
+
+function rememberDriveConfigVersion(version: number): void {
+	if (typeof sessionStorage === 'undefined') return;
+	try {
+		sessionStorage.setItem(DRIVE_CONFIG_VERSION_KEY, String(version));
+	} catch {
+		// Storage can be unavailable in privacy modes; expiry validation still applies.
+	}
+}
+
+export function isDriveConfigOverlayFresh(
+	overlay: Pick<DriveConfigOverlay, 'updatedAt' | 'expiresAt'>,
+	nowMs = Date.now()
+): boolean {
+	if (!overlay.updatedAt || !overlay.expiresAt) return false;
+	const updatedAtMs = Date.parse(overlay.updatedAt);
+	const expiresAtMs = Date.parse(overlay.expiresAt);
+	if (!Number.isFinite(updatedAtMs) || !Number.isFinite(expiresAtMs)) return false;
+	const ttlMs = expiresAtMs - updatedAtMs;
+	return updatedAtMs <= nowMs + DRIVE_CONFIG_CLOCK_SKEW_MS
+		&& expiresAtMs > nowMs
+		&& ttlMs > 0
+		&& ttlMs <= DRIVE_CONFIG_MAX_TTL_MS;
 }
 
 async function loadDriveConfigOverlay(config: RuntimeConfig): Promise<Partial<RuntimeConfig>> {
@@ -106,21 +167,32 @@ async function loadDriveConfigOverlay(config: RuntimeConfig): Promise<Partial<Ru
 		return {};
 	}
 
-	const overlay = (await response.json()) as {
-		cloudflareDriveWsUrl?: string;
-		tailscaleDriveWsUrl?: string;
-		updatedAt?: string;
-		expiresAt?: string;
-		source?: string;
-	};
+	const overlay = (await response.json()) as DriveConfigOverlay;
+	const version = typeof overlay.version === 'number' ? overlay.version : Number.NaN;
+	if (
+		!isDriveConfigOverlayFresh(overlay)
+		|| !Number.isSafeInteger(version)
+		|| version < 1
+		|| (lastObservedDriveConfigVersion() ?? version) > version
+	) {
+		return {};
+	}
 
-	return {
-		cloudflareDriveWsUrl: overlay.cloudflareDriveWsUrl,
-		tailscaleDriveWsUrl: overlay.tailscaleDriveWsUrl,
+	const cloudflareDriveWsUrl = validWebSocketUrl(overlay.cloudflareDriveWsUrl);
+	const tailscaleDriveWsUrl = validWebSocketUrl(overlay.tailscaleDriveWsUrl);
+	if (!cloudflareDriveWsUrl && !tailscaleDriveWsUrl) return {};
+
+	const result: Partial<RuntimeConfig> = {
 		driveConfigUpdatedAt: overlay.updatedAt,
 		driveConfigExpiresAt: overlay.expiresAt,
-		driveConfigSource: overlay.source
+		driveConfigSource: overlay.source,
+		driveConfigVersion: version
 	};
+	// Omitted or invalid values must not erase a valid endpoint from config.json.
+	if (cloudflareDriveWsUrl) result.cloudflareDriveWsUrl = cloudflareDriveWsUrl;
+	if (tailscaleDriveWsUrl) result.tailscaleDriveWsUrl = tailscaleDriveWsUrl;
+	rememberDriveConfigVersion(version);
+	return result;
 }
 
 function withBrowserOverrides(config: RuntimeConfig): RuntimeConfig {
@@ -171,6 +243,11 @@ export async function loadRuntimeConfig(): Promise<RuntimeConfig> {
 	}
 
 	return configPromise;
+}
+
+/** Clear the memoized config so an explicit refresh can observe a newly published overlay. */
+export function resetRuntimeConfigCache(): void {
+	configPromise = null;
 }
 
 export function buildAssetUrl(baseUrl: string, path: string): string {

@@ -37,9 +37,9 @@ def lateral_shift(transform: carla.Transform, shift: float) -> carla.Location:
 def extract_road_network_gps(carla_map: carla.Map) -> List[List[List[float]]]:
     """Extract road edges as GPS polylines suitable for map rendering.
 
-    Each polyline is a list of ``[longitude, latitude]`` pairs.  Latitude
-    is corrected for UE4's left-handed Y-axis by mirroring around the
-    geo-reference origin: ``corrected_lat = 2 * origin_lat - raw_lat``.
+    Each polyline is a list of ``[longitude, latitude]`` pairs.  CARLA 0.9
+    needs its historical UE4 latitude mirror, while CARLA 0.10 already emits
+    correct WGS-84 coordinates and must be left unchanged.
 
     Args:
         carla_map: A :class:`carla.Map` obtained from the simulator.
@@ -49,6 +49,12 @@ def extract_road_network_gps(carla_map: carla.Map) -> List[List[List[float]]]:
     """
     origin_geo = carla_map.transform_to_geolocation(carla.Location())
     origin_lat = origin_geo.latitude
+    mirror_latitude = hasattr(carla_map, "geolocation_to_transform")
+
+    def output_latitude(raw_latitude: float) -> float:
+        if mirror_latitude:
+            return 2 * origin_lat - raw_latitude
+        return raw_latitude
 
     topology = [wp_pair[0] for wp_pair in carla_map.get_topology()]
     topology = sorted(topology, key=lambda w: w.transform.location.z)
@@ -79,8 +85,8 @@ def extract_road_network_gps(carla_map: carla.Map) -> List[List[List[float]]]:
             l_geo = carla_map.transform_to_geolocation(l_loc)
             r_geo = carla_map.transform_to_geolocation(r_loc)
 
-            left_edge.append([l_geo.longitude, 2 * origin_lat - l_geo.latitude])
-            right_edge.append([r_geo.longitude, 2 * origin_lat - r_geo.latitude])
+            left_edge.append([l_geo.longitude, output_latitude(l_geo.latitude)])
+            right_edge.append([r_geo.longitude, output_latitude(r_geo.latitude)])
 
         if len(left_edge) > 1:
             road_lines.append(left_edge)
@@ -95,10 +101,10 @@ def gps_to_carla(
 ) -> carla.Location:
     """Convert GPS coordinates to a CARLA world Location.
 
-    Applies the UE4 Y-axis correction before calling
-    :meth:`carla.Map.geolocation_to_transform`: the real-world latitude is
-    mirrored around the map's geo-reference origin so that the resulting
-    CARLA X/Y position is correct.
+    On CARLA 0.9, applies the UE4 Y-axis correction before calling
+    :meth:`carla.Map.geolocation_to_transform`.  On CARLA 0.10, where that
+    inverse API was removed, performs the local inverse projection from the
+    map's georeference origin.
 
     The returned location is snapped to the nearest road surface when
     possible.
@@ -124,7 +130,11 @@ def gps_to_carla(
             longitude=lon,
             altitude=0.0,
         )
-        location = carla_map.geolocation_to_transform(geo)
+        projected = carla_map.geolocation_to_transform(geo)
+        # CARLA 0.9.x returns a Transform here.  Some test doubles and older
+        # PythonAPI builds expose the projected Location directly, so accept
+        # both shapes at this version boundary.
+        location = getattr(projected, "location", projected)
     else:
         # CARLA 0.10 dropped geolocation_to_transform, and its
         # transform_to_geolocation returns correct WGS-84 (x = easting,

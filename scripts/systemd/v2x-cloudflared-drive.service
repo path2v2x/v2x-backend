@@ -1,5 +1,5 @@
 [Unit]
-Description=V2X Cloudflare Drive Quick Tunnel
+Description=V2X Cloudflare Drive Tunnel
 Wants=network-online.target v2x-drive.service
 After=network-online.target v2x-drive.service
 StartLimitIntervalSec=0
@@ -9,7 +9,10 @@ Type=simple
 User=path
 Group=path
 WorkingDirectory=/home/path
+Environment=DRIVE_TUNNEL_MODE=quick
+Environment=LOG_FILE=/tmp/v2x-cloudflared.log
 EnvironmentFile=-/etc/v2x-drive-tunnel.env
+ExecStartPre=/usr/bin/rm -f ${LOG_FILE}
 ExecStart=/home/path/V2XCarla/v2x-backend/scripts/launch-cloudflared-drive-tunnel.sh
 Restart=always
 RestartSec=10

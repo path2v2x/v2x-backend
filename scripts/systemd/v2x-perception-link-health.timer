@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically check V2X perception frontend endpoint parity
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=v2x-perception-link-health.service
+
+[Install]
+WantedBy=timers.target

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER="${CARLA_CONTAINER:-carla-custommaps}"
+CONTAINER="${CARLA_CONTAINER:-carla-rr-maps}"
 CARLA_HOST="${CARLA_HOST:-localhost}"
 CARLA_PORT="${CARLA_PORT:-2000}"
 TIMEOUT_SECONDS="${CARLA_WAIT_TIMEOUT:-600}"
-PYTHON_BIN="${CARLA_PYTHON:-/home/path/V2XCarla/carla-venv/bin/python}"
+PYTHON_BIN="${CARLA_PYTHON:-/home/path/V2XCarla/carla-venv-310/bin/python}"
 
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 

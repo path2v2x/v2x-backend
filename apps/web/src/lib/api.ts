@@ -9,10 +9,16 @@ import type {
 	VideoSession
 } from './types';
 
-interface StateJson {
+export interface StateJson {
 	objects: import('./types').TrackedObject[];
-	bridge_status: import('./types').BridgeStatus;
-	updated_at: string;
+	bridge_status?: {
+		status?: string | null;
+		carla_fps?: number | null;
+		objects_tracked?: number | null;
+		cameras_active?: number | null;
+		last_heartbeat?: string | number | null;
+	};
+	updated_at?: string | null;
 }
 
 interface DemoVideosResponse {

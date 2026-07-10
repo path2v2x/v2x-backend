@@ -1,8 +1,8 @@
 [Unit]
 Description=V2X CARLA Drive Server
-Requires=docker.service
+Requires=docker.service v2x-carla-rr.service
 Wants=network-online.target
-After=docker.service network-online.target
+After=docker.service network-online.target v2x-carla-rr.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -12,11 +12,14 @@ Group=path
 SupplementaryGroups=docker
 WorkingDirectory=/home/path/V2XCarla/v2x-backend
 Environment=AWS_PROFILE=Path-Emerging-Dev-147229569658
-Environment=CARLA_CONTAINER=carla-custommaps
+Environment=CARLA_CONTAINER=carla-rr-maps
+Environment=CARLA_IMAGE=ghcr.io/simforgeinc/carla-rr-maps:0.10.0
+Environment="CARLA_COMMAND=./CarlaUnreal.sh -RenderOffScreen -vulkan -nosound -carla-rpc-port=2000"
 Environment=DTB_CARLA_MAP=Richmond_Field_Station_Richmond_CA
 Environment=CARLA_PORT=2000
 Environment=WS_PORT=8765
-Environment=VENV=/home/path/V2XCarla/carla-venv/bin/activate
+Environment=VENV=/home/path/V2XCarla/carla-venv-310/bin/activate
+Environment=CARLA_PYTHON=/home/path/V2XCarla/carla-venv-310/bin/python
 Environment=DTB_SCENARIO_RUNNER_PATH=/home/path/scenario_runner
 Environment=DTB_SCENARIO_RUNNER_PYTHON=/home/path/V2XCarla/carla-venv-310/bin/python
 Environment=DTB_SCENARIO_RUNNER_PYTHONPATH=/home/path/V2XCarla/Carla/PythonAPI/carla

@@ -21,17 +21,21 @@ Architecture:
 """
 
 import asyncio
+import hmac
+import json
 import logging
 import os
 import sys
 import time
+from typing import Mapping
 
 import requests
 import websockets
 
 from digital_twin_bridge.config import Config
 from digital_twin_bridge.carla_connection import CarlaConnection, drive_map_status
-from digital_twin_bridge.drive_server import serve_drive, _active_sessions, active_session_count
+from digital_twin_bridge.drive_server import serve_drive, active_session_count
+from digital_twin_bridge.object_registry import ObjectRegistry
 from digital_twin_bridge.trajectory_player import TrajectoryPlayer
 from digital_twin_bridge.openscenario_runner import OpenScenarioRunner
 from digital_twin_bridge.twin_camera_rig import (
@@ -40,6 +44,7 @@ from digital_twin_bridge.twin_camera_rig import (
     load_cameras_config,
 )
 from digital_twin_bridge.twin_sync import TwinSync
+from digital_twin_bridge.v2x_poller import V2XPoller
 
 logger = logging.getLogger(__name__)
 
@@ -71,36 +76,133 @@ def fetch_v2x_snapshot(config: Config) -> list[dict]:
 # ── State publisher ─────────────────────────────────────────────────
 
 
+def _producer_epoch(value) -> float | None:
+    """Parse a producer timestamp without substituting receipt time."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        epoch = float(value)
+        if epoch > 1_000_000_000_000:
+            epoch /= 1000.0
+        return epoch if epoch >= 0 and epoch < float("inf") else None
+
+    from datetime import datetime, timezone
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.replace(".", "", 1).isdigit():
+            return _producer_epoch(float(text))
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (OverflowError, ValueError):
+        return None
+
+
+def _producer_is_fresh(
+    value,
+    *,
+    now: float,
+    max_age_seconds: float,
+    future_tolerance_seconds: float = 5.0,
+) -> bool:
+    epoch = _producer_epoch(value)
+    if epoch is None:
+        return False
+    age = now - epoch
+    return -future_tolerance_seconds <= age <= max(0.0, max_age_seconds)
+
+
+def build_state_snapshot(
+    registry,
+    health,
+    *,
+    now: float | None = None,
+    max_object_age_seconds: float | None = None,
+    max_snapshot_age_seconds: float | None = None,
+):
+    """Build the state payload from the actor-free detection registry.
+
+    Registry timestamps describe when each detection was actually refreshed;
+    they must not be replaced with the publisher's current time, which made
+    stale detections appear live.  This registry is metadata-only in drive
+    mode and does not authorize PropSpawner or road-cone creation.
+    """
+    published_at = time.time() if now is None else now
+    state_objects = []
+    for obj in registry.get_all():
+        producer_epoch = _producer_epoch(obj.timestamp_utc)
+        if max_object_age_seconds is not None and not _producer_is_fresh(
+            obj.timestamp_utc,
+            now=published_at,
+            max_age_seconds=max_object_age_seconds,
+        ):
+            continue
+
+        snapshot_url = getattr(obj, "snapshot_url", None)
+        snapshot_timestamp = getattr(obj, "snapshot_timestamp", None)
+        if (
+            snapshot_url
+            and max_snapshot_age_seconds is not None
+            and not _producer_is_fresh(
+                snapshot_timestamp,
+                now=published_at,
+                max_age_seconds=max_snapshot_age_seconds,
+            )
+        ):
+            # Preserve the source timestamp for diagnostics, but never expose
+            # an old image URL as the current view of a fresh object.
+            snapshot_url = None
+
+        state_objects.append({
+            "object_id": obj.object_id,
+            "object_type": obj.object_type,
+            "lat": obj.lat,
+            "lon": obj.lon,
+            "confidence": obj.confidence,
+            "street_name": obj.street_name,
+            "timestamp_utc": obj.timestamp_utc,
+            "snapshot_url": snapshot_url,
+            "snapshot_timestamp": snapshot_timestamp,
+            "last_updated": (
+                int(producer_epoch * 1000) if producer_epoch is not None else 0
+            ),
+        })
+
+    status = health.get_status()
+    bridge_status = {
+        "status": "connected",
+        "carla_fps": status.get("effective_fps", 0),
+        "objects_tracked": len(state_objects),
+        "cameras_active": 0,
+        "state_source": "v2x_api_registry",
+        "road_props_spawned": 0,
+        "last_heartbeat": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(published_at)
+        ),
+    }
+    return state_objects, bridge_status
+
+
 async def state_publisher(config, registry, health, uplink, interval=5.0):
     """Periodically publish state.json to S3 so the dashboard stays live."""
     loop = asyncio.get_running_loop()
 
     while True:
         try:
-            status = health.get_status()
-            state_objects = []
-            for obj in registry.get_all():
-                state_objects.append({
-                    "object_id": obj.object_id,
-                    "object_type": obj.object_type,
-                    "lat": obj.lat,
-                    "lon": obj.lon,
-                    "confidence": obj.confidence,
-                    "street_name": obj.street_name,
-                    "timestamp_utc": obj.timestamp_utc,
-                    "snapshot_url": getattr(obj, "snapshot_url", None),
-                    "snapshot_timestamp": getattr(obj, "snapshot_timestamp", None),
-                    "last_updated": int(time.time() * 1000),
-                })
-            bridge_status = {
-                "status": "connected",
-                "carla_fps": status.get("effective_fps", 0),
-                "objects_tracked": registry.count,
-                "cameras_active": 0,
-                "last_heartbeat": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                ),
-            }
+            state_objects, bridge_status = build_state_snapshot(
+                registry,
+                health,
+                max_object_age_seconds=config.STATE_OBJECT_MAX_AGE_SECONDS,
+                max_snapshot_age_seconds=config.STATE_SNAPSHOT_MAX_AGE_SECONDS,
+            )
             await loop.run_in_executor(
                 None, uplink.publish_state, state_objects, bridge_status
             )
@@ -117,17 +219,59 @@ def make_api_fetcher(config: Config):
     """Create an API fetcher for SceneReconstructor (per-session use)."""
     base_url = config.V2X_API_URL.rsplit("/detections/", 1)[0]
 
-    def fetch(start: str, end: str, limit: int = 500) -> dict:
+    def fetch(
+        start: str,
+        end: str,
+        limit: int = 500,
+        *,
+        next_token: str | None = None,
+    ) -> dict:
         url = f"{base_url}/detections/range"
         params = {"start": start, "end": end, "limit": limit}
-        resp = requests.get(url, params=params, timeout=30)
+        if next_token:
+            params["next"] = next_token
+        resp = requests.get(
+            url,
+            params=params,
+            timeout=max(0.5, float(config.SCENE_FETCH_REQUEST_TIMEOUT_SECONDS)),
+        )
         resp.raise_for_status()
         return resp.json()
 
     return fetch
 
 
-def cleanup_drive_world(world, shared_prop_pool: dict[str, int] | None = None, registry=None) -> None:
+def test_ws_access(config: Config, headers: Mapping[str, str] | None) -> tuple[bool, str]:
+    """Authorize the legacy HIL/test socket on a separate opt-in boundary."""
+    if str(config.TEST_WS_ENABLED).strip().lower() not in {"1", "true", "yes", "on"}:
+        return False, "test WebSocket is disabled"
+    expected = str(config.TEST_WS_TOKEN or "")
+    if not expected:
+        return False, "test WebSocket token is not configured"
+    authorization = "" if headers is None else str(headers.get("Authorization", ""))
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return False, "bearer token required"
+    if not hmac.compare_digest(authorization[len(prefix):], expected):
+        return False, "invalid bearer token"
+    return True, "authorized"
+
+
+def enqueue_bounded(queue: asyncio.Queue, event: dict) -> None:
+    """Keep subscriber queues bounded by dropping the oldest log event."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        # A racing consumer/producer should never make logging block control.
+        pass
+
+
+def cleanup_drive_world(world) -> None:
     """Remove drive-owned actors from the current world."""
     for actor in world.get_actors().filter("vehicle.*"):
         logger.info("Cleaning up leftover vehicle: %s (id=%d)", actor.type_id, actor.id)
@@ -149,10 +293,6 @@ def cleanup_drive_world(world, shared_prop_pool: dict[str, int] | None = None, r
                 actor.destroy()
             except Exception as e:
                 logger.debug("Prop destroy failed (id=%d): %s", actor.id, e)
-    if shared_prop_pool is not None:
-        shared_prop_pool.clear()
-
-
 def create_openscenario_runner(config: Config, world):
     return OpenScenarioRunner(
         scenario_runner_path=config.SCENARIO_RUNNER_PATH,
@@ -188,13 +328,11 @@ class DriveMapController:
         conn: CarlaConnection,
         config: Config,
         runtime: dict,
-        shared_prop_pool: dict[str, int],
         uplink,
     ) -> None:
         self._conn = conn
         self._config = config
         self._runtime = runtime
-        self._shared_prop_pool = shared_prop_pool
         self._uplink = uplink
         self._lock = asyncio.Lock()
 
@@ -245,7 +383,7 @@ class DriveMapController:
                 except Exception:
                     logger.warning("Twin stop before map switch failed", exc_info=True)
 
-            cleanup_drive_world(self._conn.world, self._shared_prop_pool)
+            cleanup_drive_world(self._conn.world)
             self._runtime["world"] = self._conn.world
             self._runtime["carla_map"] = self._conn.carla_map
             self._runtime["trajectory_player"] = TrajectoryPlayer(
@@ -292,14 +430,12 @@ async def main():
 
     cleanup_drive_world(world)
 
-    # ── V2X props: boot spawn disabled ──
-    # PropSpawner is intentionally not invoked here. Production V2X
-    # detections were landing traffic cones on the road in the firetruck
-    # scenarios' paths. To re-enable, restore the fetch_v2x_snapshot() +
-    # PropSpawner(world, carla_map).sync(registry) block from git history;
-    # the spawner module (prop_spawner.py) is still available unchanged.
-    shared_prop_pool: dict[str, int] = {}
-    registry = None
+    # ── V2X state registry: metadata polling only, no boot-time props ──
+    # PropSpawner remains intentionally absent.  The registry keeps state.json
+    # truthful and current, while the poller receives no CARLA map and therefore
+    # cannot resolve/spawn the road cones that disrupted drive scenarios.
+    registry = ObjectRegistry()
+    state_poller = V2XPoller(config, registry, carla_map=None)
 
     # ── Map data: export road network to S3 ──
     uplink = None
@@ -327,7 +463,7 @@ async def main():
         "trajectory_player": trajectory_player,
         "openscenario_runner": openscenario_runner,
     }
-    map_controller = DriveMapController(conn, config, runtime, shared_prop_pool, uplink)
+    map_controller = DriveMapController(conn, config, runtime, uplink)
 
     # ── Digital twin: mirrored street cameras + live detection sync ──
     # Server-owned like the trajectory player; only active on the
@@ -399,10 +535,7 @@ async def main():
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         def _broadcast(event):
             for q in list(_test_log_subscribers):
-                try:
-                    q.put_nowait(event)
-                except Exception:
-                    pass
+                enqueue_bounded(q, event)
         def _tlog(line):
             full = f"{datetime.now().isoformat(timespec='seconds')} {line}"
             try:
@@ -450,7 +583,9 @@ async def main():
             files = []
         await websocket.send(json.dumps({"type": "uploads_listing", "files": files}))
 
-        log_q: asyncio.Queue = asyncio.Queue()
+        log_q: asyncio.Queue = asyncio.Queue(
+            maxsize=max(1, config.TEST_WS_QUEUE_SIZE)
+        )
         _test_log_subscribers.append(log_q)
         async def _log_pump():
             try:
@@ -469,6 +604,20 @@ async def main():
             async for msg in websocket:
                 if isinstance(msg, bytes):
                     if pending_upload is not None:
+                        expected_size = pending_upload["size"]
+                        if (
+                            len(msg) > config.TEST_WS_MAX_UPLOAD_BYTES
+                            or len(msg) != expected_size
+                        ):
+                            await websocket.send(json.dumps({
+                                "type": "upload_error",
+                                "message": (
+                                    "upload payload size does not match the bounded "
+                                    "upload_start declaration"
+                                ),
+                            }))
+                            pending_upload = None
+                            continue
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                         saved_name = f"{ts}_{_safe_name(pending_upload.get('filename'))}"
                         saved_path = os.path.join(UPLOAD_DIR, saved_name)
@@ -502,13 +651,31 @@ async def main():
                         _tlog(f"IN    {addr} (binary, {len(msg)}B) {hex_preview}")
                         await websocket.send(msg)
                 else:
-                    _tlog(f"IN    {addr} (text) {msg!r}")
+                    _tlog(f"IN    {addr} (text) {msg[:4096]!r}")
                     try:
                         parsed = json.loads(msg)
                     except Exception:
                         parsed = None
                     if isinstance(parsed, dict) and parsed.get("type") == "upload_start":
-                        pending_upload = parsed
+                        try:
+                            declared_size = int(parsed.get("size"))
+                        except (TypeError, ValueError):
+                            declared_size = -1
+                        if not 0 <= declared_size <= config.TEST_WS_MAX_UPLOAD_BYTES:
+                            pending_upload = None
+                            await websocket.send(json.dumps({
+                                "type": "upload_error",
+                                "message": (
+                                    "upload size must be between 0 and "
+                                    f"{config.TEST_WS_MAX_UPLOAD_BYTES} bytes"
+                                ),
+                            }))
+                            continue
+                        pending_upload = {
+                            "filename": _safe_name(parsed.get("filename")),
+                            "mime": str(parsed.get("mime") or "application/octet-stream")[:120],
+                            "size": declared_size,
+                        }
                         _tlog(
                             f"UPLOAD_START {addr} filename={parsed.get('filename')!r} "
                             f"size={parsed.get('size')} mime={parsed.get('mime')!r}"
@@ -662,17 +829,36 @@ async def main():
             logger.info("Twin %s closed for %s", "control" if control_only else "stream", camera_id)
 
     async def handler(websocket):
-        if websocket.request.path == "/test":
+        from urllib.parse import urlparse
+
+        request_path = websocket.request.path
+        route = urlparse(request_path).path
+        if route == "/test":
+            allowed, reason = test_ws_access(config, websocket.request.headers)
+            if not allowed:
+                await websocket.send(json.dumps({
+                    "type": "test_error",
+                    "message": reason,
+                }))
+                await websocket.close(code=1008, reason=reason)
+                return
             await _serve_test(websocket)
             return
-        if websocket.request.path.startswith("/twin"):
+        if route == "/twin":
             await _serve_twin(websocket)
             return
         await serve_drive(
-            websocket, runtime["world"], runtime["carla_map"], api_fetcher,
-            shared_prop_pool, runtime["trajectory_player"], runtime["openscenario_runner"],
+            websocket,
+            runtime["world"],
+            runtime["carla_map"],
+            api_fetcher,
+            trajectory_player=runtime["trajectory_player"],
+            openscenario_runner=runtime["openscenario_runner"],
             eva_warning_distance_m=config.EVA_WARNING_DISTANCE_M,
             map_controller=map_controller,
+            scene_fetch_timeout_seconds=config.SCENE_FETCH_TOTAL_TIMEOUT_SECONDS,
+            scene_fetch_max_pages=config.SCENE_FETCH_MAX_PAGES,
+            scene_fetch_max_items=config.SCENE_FETCH_MAX_ITEMS,
         )
 
     async def tick_loop():
@@ -749,12 +935,10 @@ async def main():
                 sensors = [s for s in world.get_actors().filter("sensor.*")
                            if s.id not in rig_ids
                            and s.attributes.get("role_name") != "twin_rig"]
-                # Boot-time V2X props are intentional; only sweep if we find a
-                # runaway count (>2x the tracked snapshot), which indicates
-                # stacked spawns from prior sessions.
+                # Historical props are session-owned and must be gone when no
+                # sessions are active.  Any remaining static prop is orphaned.
                 props = list(world.get_actors().filter("static.prop.*"))
-                baseline = len(registry.get_all()) if registry else 0
-                props_to_clean = props if baseline and len(props) > baseline * 2 else []
+                props_to_clean = props
                 orphaned = len(vehicles) + len(sensors) + len(props_to_clean)
                 if orphaned > 0:
                     logger.warning(
@@ -790,7 +974,8 @@ async def main():
     logger.info("=" * 60)
     logger.info("  CARLA       : %s:%d (sync mode, 20 Hz)", config.CARLA_HOST, config.CARLA_PORT)
     logger.info("  Drive WS    : ws://0.0.0.0:%d", port)
-    logger.info("  V2X objects : %d tracked", len(shared_prop_pool))
+    logger.info("  V2X props   : session-owned historical reconstruction")
+    logger.info("  State source: metadata-only V2X registry (no prop spawning)")
     logger.info("  State pub   : %s", "active" if uplink else "disabled (no AWS)")
     logger.info(
         "  Twin        : rig=%s sync=%s (cameras config %s)",
@@ -814,7 +999,8 @@ async def main():
             logger.warning("Twin startup failed (non-fatal)", exc_info=True)
 
         # Publish state.json to S3 so the web dashboard stays live
-        if uplink is not None and registry is not None:
+        if uplink is not None:
+            state_poller.start()
             publish_task = asyncio.create_task(
                 state_publisher(config, registry, health, uplink)
             )
@@ -826,11 +1012,17 @@ async def main():
             ping_interval=5,
             ping_timeout=15,
             close_timeout=5,
-            max_size=128 * 1024 * 1024,
+            max_size=max(1024, config.WS_MAX_MESSAGE_BYTES),
         ):
             logger.info("Unified server ready. Waiting for connections...")
             await asyncio.Future()
     finally:
+        # Metadata polling owns no CARLA actors and can stop independently.
+        try:
+            state_poller.stop()
+        except Exception as e:
+            logger.debug("State poller stop failed: %s", e)
+
         for task in [tick_task, audit_task, publish_task]:
             if task is not None:
                 try:
@@ -855,20 +1047,6 @@ async def main():
             runtime["openscenario_runner"].stop()
         except Exception as e:
             logger.debug("OpenSCENARIO stop on shutdown failed: %s", e)
-
-        # Destroy shared V2X props (owned by the server, not any session).
-        if shared_prop_pool:
-            destroyed = 0
-            for actor_id in list(shared_prop_pool.values()):
-                try:
-                    actor = runtime["world"].get_actor(actor_id)
-                    if actor is not None:
-                        actor.destroy()
-                        destroyed += 1
-                except Exception as e:
-                    logger.debug("Shared prop destroy failed (id=%d): %s", actor_id, e)
-            shared_prop_pool.clear()
-            logger.info("Destroyed %d shared V2X props at shutdown", destroyed)
 
         conn.disconnect()
         logger.info("Unified server stopped")

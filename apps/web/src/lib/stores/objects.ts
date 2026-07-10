@@ -1,5 +1,61 @@
 import { writable, derived } from 'svelte/store';
 import type { TrackedObject, BridgeStatus } from '$lib/types';
+import { producerEpochMs } from '$lib/producer-time';
+
+function metadataProducerEpochMs(obj: TrackedObject): number {
+	if (Number.isFinite(obj.last_updated) && obj.last_updated >= 0) return obj.last_updated;
+	return producerEpochMs(obj.timestamp_utc) ?? 0;
+}
+
+function normalizedObject(obj: TrackedObject): TrackedObject {
+	return { ...obj, last_updated: metadataProducerEpochMs(obj) };
+}
+
+function snapshotProducerEpochMs(obj: TrackedObject): number | null {
+	return producerEpochMs(obj.snapshot_timestamp);
+}
+
+/**
+ * Object metadata and camera snapshots are produced by independent pipelines.
+ * Compare their clocks separately so a fresh update from one pipeline cannot
+ * roll back (or be rejected by) the other pipeline.
+ */
+function mergeTrackedObject(
+	existing: TrackedObject,
+	candidate: TrackedObject
+): TrackedObject {
+	const incoming = normalizedObject(candidate);
+	const useIncomingMetadata =
+		metadataProducerEpochMs(incoming) >= metadataProducerEpochMs(existing);
+	const incomingSnapshotMs = snapshotProducerEpochMs(incoming);
+	const existingSnapshotMs = snapshotProducerEpochMs(existing);
+	const useIncomingSnapshot =
+		incomingSnapshotMs !== null
+			? existingSnapshotMs === null || incomingSnapshotMs >= existingSnapshotMs
+			: existingSnapshotMs === null;
+
+	const metadata = useIncomingMetadata ? incoming : existing;
+	const snapshot = useIncomingSnapshot ? incoming : existing;
+	return {
+		...metadata,
+		snapshot_url: snapshot.snapshot_url,
+		snapshot_timestamp: snapshot.snapshot_timestamp
+	};
+}
+
+function trackedObjectChanged(existing: TrackedObject, incoming: TrackedObject): boolean {
+	return (
+		existing.object_type !== incoming.object_type ||
+		existing.lat !== incoming.lat ||
+		existing.lon !== incoming.lon ||
+		existing.confidence !== incoming.confidence ||
+		existing.street_name !== incoming.street_name ||
+		existing.timestamp_utc !== incoming.timestamp_utc ||
+		existing.snapshot_url !== incoming.snapshot_url ||
+		existing.snapshot_timestamp !== incoming.snapshot_timestamp ||
+		existing.last_updated !== incoming.last_updated
+	);
+}
 
 /**
  * Store holding all tracked objects keyed by object_id.
@@ -18,18 +74,13 @@ function createObjectsStore() {
 				const incoming = new Set<string>();
 				let changed = false;
 
-				for (const obj of objectList) {
-					incoming.add(obj.object_id);
+				for (const candidate of objectList) {
+					incoming.add(candidate.object_id);
+					const obj = normalizedObject(candidate);
 					const existing = prev.get(obj.object_id);
-					if (
-						!existing ||
-						existing.snapshot_url !== obj.snapshot_url ||
-						existing.snapshot_timestamp !== obj.snapshot_timestamp ||
-						existing.lat !== obj.lat ||
-						existing.lon !== obj.lon ||
-						existing.confidence !== obj.confidence
-					) {
-						prev.set(obj.object_id, obj);
+					const merged = existing ? mergeTrackedObject(existing, obj) : obj;
+					if (!existing || trackedObjectChanged(existing, merged)) {
+						prev.set(obj.object_id, merged);
 						changed = true;
 					}
 				}
@@ -50,11 +101,14 @@ function createObjectsStore() {
 		/** Add or update a single object. */
 		upsert(obj: TrackedObject) {
 			update((map) => {
+				const normalized = normalizedObject(obj);
+				const existing = map.get(obj.object_id);
+				const merged = existing
+					? mergeTrackedObject(existing, normalized)
+					: normalized;
+				if (existing && !trackedObjectChanged(existing, merged)) return map;
 				const updated = new Map(map);
-				updated.set(obj.object_id, {
-					...obj,
-					last_updated: Date.now()
-				});
+				updated.set(obj.object_id, merged);
 				return updated;
 			});
 		},
@@ -73,13 +127,20 @@ function createObjectsStore() {
 			update((map) => {
 				const existing = map.get(objectId);
 				if (!existing) return map;
+				const incomingSnapshotMs = producerEpochMs(snapshotTimestamp);
+				const existingSnapshotMs = producerEpochMs(existing.snapshot_timestamp);
+				if (
+					existingSnapshotMs !== null &&
+					(incomingSnapshotMs === null || incomingSnapshotMs < existingSnapshotMs)
+				) {
+					return map;
+				}
 
 				const updated = new Map(map);
 				updated.set(objectId, {
 					...existing,
 					snapshot_url: snapshotUrl,
-					snapshot_timestamp: snapshotTimestamp,
-					last_updated: Date.now()
+					snapshot_timestamp: snapshotTimestamp
 				});
 				return updated;
 			});
@@ -104,7 +165,8 @@ export const bridgeStatus = writable<BridgeStatus>({
 	carla_fps: 0,
 	objects_tracked: 0,
 	cameras_active: 0,
-	last_heartbeat: 0
+	last_heartbeat: null,
+	updated_at: null
 });
 
 /**

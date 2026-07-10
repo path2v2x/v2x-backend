@@ -7,7 +7,10 @@ Reuses geo_utils for GPS-to-CARLA coordinate conversion.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Callable
+
+from digital_twin_bridge.detection_pages import fetch_all_detection_pages
+from digital_twin_bridge.geo_utils import gps_to_carla
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +40,13 @@ class ReconstructionResult:
 
 class SceneReconstructor:
     """
-    Queries the V2X detection API for a time range and spawns
-    all detected objects in the CARLA world.
+    Fetches one historical V2X range and owns the CARLA actors created from it.
 
-    When a ``shared_pool`` is passed, spawns are recorded by ``object_id`` and
-    shared across concurrent driving sessions. In that mode the reconstructor
-    skips objects already spawned by any session and ``cleanup()`` becomes a
-    no-op — the server owns pool lifetime and destroys them at shutdown.
+    ``fetch`` is deliberately free of CARLA calls so DriveSession may execute
+    bounded HTTP pagination in a worker thread.  ``spawn`` and ``cleanup`` must
+    run on the bridge event-loop/CARLA thread.  Actors are never shared by
+    ``object_id`` across sessions because two historical ranges may describe
+    the same object at different positions.
     """
 
     def __init__(
@@ -51,26 +54,37 @@ class SceneReconstructor:
         world,
         carla_map,
         api_fetcher: Callable,
-        shared_pool: Optional[dict] = None,
+        *,
+        max_pages: int = 20,
+        max_items: int = 10_000,
     ):
         self._world = world
         self._map = carla_map
         self._api_fetcher = api_fetcher
+        self._max_pages = max(1, int(max_pages))
+        self._max_items = max(1, int(max_items))
         self._spawned_actors: list[SpawnedActor] = []
-        # object_id -> actor_id. Caller-owned when provided (shared across sessions).
-        self._shared_pool = shared_pool
-        self._owns_actors = shared_pool is None
 
-    def reconstruct(self, start: str, end: str, limit: int = 500) -> ReconstructionResult:
-        """
-        Fetch detections for [start, end] and spawn them in CARLA.
-        Deduplicates by object_id keeping the latest detection per object.
-        Raises on API failure (no silent swallowing).
-        """
+    def fetch(
+        self,
+        start: str,
+        end: str,
+        limit: int = 500,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ReconstructionResult:
+        """Fetch and deduplicate a range without touching CARLA state."""
         result = ReconstructionResult()
 
-        # 1. Fetch detections
-        api_response = self._api_fetcher(start, end, limit)
+        api_response = fetch_all_detection_pages(
+            self._api_fetcher,
+            start,
+            end,
+            page_size=limit,
+            max_pages=self._max_pages,
+            max_items=self._max_items,
+            should_stop=should_stop,
+        )
         items = api_response.get("items", [])
         result.total_detections = len(items)
 
@@ -78,7 +92,7 @@ class SceneReconstructor:
             logger.info("No detections found for %s to %s", start, end)
             return result
 
-        # 2. Deduplicate by object_id — keep latest timestamp
+        # Deduplicate by object_id within this requested range only.
         deduped: dict[str, dict] = {}
         for item in items:
             oid = item["object_id"]
@@ -87,29 +101,21 @@ class SceneReconstructor:
 
         result.objects = list(deduped.values())
         logger.info(
-            "Reconstructing scene: %d unique objects from %d detections",
+            "Fetched scene: %d unique objects from %d detections",
             len(deduped), len(items),
         )
+        return result
 
-        # 3. Spawn each object in CARLA
+    def spawn(self, result: ReconstructionResult) -> ReconstructionResult:
+        """Spawn a fetched result on the caller's CARLA thread."""
+        if self._spawned_actors:
+            raise RuntimeError("scene reconstructor already owns spawned actors")
+
         bp_lib = self._world.get_blueprint_library()
-        reused = 0
 
         for obj in result.objects:
             oid = obj["object_id"]
             obj_type = obj.get("object_type", "unknown")
-
-            # Skip if another session (or boot) already spawned this object.
-            if self._shared_pool is not None and oid in self._shared_pool:
-                result.spawned_actors.append(SpawnedActor(
-                    id=self._shared_pool[oid],
-                    object_id=oid,
-                    object_type=obj_type,
-                    lat=obj.get("gps_location", {}).get("latitude", 0.0),
-                    lon=obj.get("gps_location", {}).get("longitude", 0.0),
-                ))
-                reused += 1
-                continue
 
             bp_id = OBJECT_TYPE_TO_BLUEPRINT.get(obj_type, DEFAULT_BLUEPRINT)
             blueprints = bp_lib.filter(bp_id)
@@ -136,54 +142,47 @@ class SceneReconstructor:
                 lat=lat,
                 lon=lon,
             )
-            if self._shared_pool is not None:
-                self._shared_pool[oid] = actor.id
-            else:
-                self._spawned_actors.append(spawned)
+            self._spawned_actors.append(spawned)
             result.spawned_actors.append(spawned)
 
         logger.info(
-            "Scene reconstruction complete: %d actors (%d newly spawned, %d reused from pool)",
-            len(result.spawned_actors), len(result.spawned_actors) - reused, reused,
+            "Scene reconstruction complete: %d session-owned actors",
+            len(result.spawned_actors),
         )
         return result
 
-    def cleanup(self) -> int:
-        """Destroy actors owned by this reconstructor.
+    def reconstruct(self, start: str, end: str, limit: int = 500) -> ReconstructionResult:
+        """Synchronous compatibility wrapper used by offline/unit callers."""
+        return self.spawn(self.fetch(start, end, limit))
 
-        No-op when a shared pool is in use — the server is responsible for
-        destroying shared props at shutdown so in-flight sessions aren't
-        disrupted when another session ends.
-        """
-        if not self._owns_actors:
-            return 0
+    def actor_ids(self) -> list[int]:
+        """Return the CARLA actor IDs owned by this historical scene."""
+        return [spawned.id for spawned in self._spawned_actors]
+
+    def cleanup(self) -> int:
+        """Destroy every historical actor owned by this session."""
         destroyed = 0
         for spawned in self._spawned_actors:
             actor = self._world.get_actor(spawned.id)
             if actor is not None:
-                actor.destroy()
-                destroyed += 1
+                try:
+                    actor.destroy()
+                    destroyed += 1
+                except Exception:
+                    logger.warning(
+                        "Failed to destroy historical actor %d", spawned.id,
+                        exc_info=True,
+                    )
         self._spawned_actors.clear()
         return destroyed
 
     def _gps_to_transform(self, lat: float, lon: float):
-        """Convert GPS lat/lon to a CARLA Transform using map geo-reference."""
-        # Mirror latitude for UE4 left-handed coordinate system
-        origin_geo = self._map.transform_to_geolocation(
-            type("L", (), {"x": 0, "y": 0, "z": 0})()
-        )
-        corrected_lat = 2 * origin_geo.latitude - lat
+        """Convert GPS coordinates through the version-aware shared helper.
 
-        geo = type("G", (), {
-            "latitude": corrected_lat,
-            "longitude": lon,
-            "altitude": 0.0,
-        })()
-        transform = self._map.geolocation_to_transform(geo)
+        CARLA 0.10 removed ``Map.geolocation_to_transform``.  ``gps_to_carla``
+        supports both the 0.9.x API and the 0.10 inverse-projection fallback,
+        and already snaps the resulting location to the road surface.
+        """
+        import carla
 
-        # Snap to road surface
-        waypoint = self._map.get_waypoint(transform.location, project_to_road=True)
-        if waypoint:
-            transform.location = waypoint.transform.location
-
-        return transform
+        return carla.Transform(gps_to_carla(self._map, lat, lon))

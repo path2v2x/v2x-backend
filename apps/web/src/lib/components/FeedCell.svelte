@@ -16,7 +16,14 @@
 	// new image has finished loading in the background, so there is
 	// never a blank flash between snapshots.
 	let displayUrl = $state<string | null>(null);
-	let preloadingUrl = $state<string | null>(null);
+	let displaySnapshotTimestamp = $state<string | null>(null);
+	let displayUrlValue: string | null = null;
+	let displaySnapshotMs: number | null = null;
+	let preloadingUrl: string | null = null;
+	let preloadingSnapshotMs: number | null = null;
+	let desiredUrl: string | null = null;
+	let desiredSnapshotTimestamp: string | null = null;
+	let preloadGeneration = 0;
 
 	// Tick every second to update freshness
 	$effect(() => {
@@ -27,32 +34,99 @@
 		return () => clearInterval(interval);
 	});
 
-	// Preload new snapshot in the background before swapping
+	function timestampMs(value: string | null): number | null {
+		if (!value) return null;
+		const parsed = Date.parse(value);
+		return Number.isFinite(parsed) ? parsed : null;
+	}
+
+	function invalidatePreload() {
+		preloadGeneration += 1;
+		preloadingUrl = null;
+		preloadingSnapshotMs = null;
+	}
+
+	// Preload a new snapshot before swapping it into view. The producer clock
+	// and generation guard prevent a late load event from restoring a URL that
+	// has since been cleared or superseded.
 	$effect(() => {
 		const newUrl = object.snapshot_url;
-		if (!newUrl || newUrl === displayUrl || newUrl === preloadingUrl) return;
+		const newTimestamp = object.snapshot_timestamp;
+		const newSnapshotMs = timestampMs(newTimestamp);
 
+		if (!newUrl) {
+			desiredUrl = null;
+			desiredSnapshotTimestamp = null;
+			invalidatePreload();
+			displayUrlValue = null;
+			displaySnapshotMs = null;
+			displayUrl = null;
+			displaySnapshotTimestamp = null;
+			imageError = false;
+			return;
+		}
+
+		const newestKnownMs = Math.max(
+			displaySnapshotMs ?? Number.NEGATIVE_INFINITY,
+			preloadingSnapshotMs ?? Number.NEGATIVE_INFINITY
+		);
+		if (
+			newestKnownMs !== Number.NEGATIVE_INFINITY &&
+			(newSnapshotMs === null || newSnapshotMs < newestKnownMs)
+		) {
+			return;
+		}
+
+		desiredUrl = newUrl;
+		desiredSnapshotTimestamp = newTimestamp;
+		if (newUrl === displayUrlValue) {
+			invalidatePreload();
+			displaySnapshotMs = newSnapshotMs;
+			displaySnapshotTimestamp = newTimestamp;
+			imageError = false;
+			return;
+		}
+		if (newUrl === preloadingUrl && newSnapshotMs === preloadingSnapshotMs) return;
+
+		const generation = ++preloadGeneration;
 		preloadingUrl = newUrl;
+		preloadingSnapshotMs = newSnapshotMs;
 		imageError = false;
 
 		const img = new Image();
 		img.onload = () => {
-			// Only swap if this is still the URL we want
-			if (preloadingUrl === newUrl) {
-				displayUrl = newUrl;
+			if (
+				generation !== preloadGeneration ||
+				desiredUrl !== newUrl ||
+				desiredSnapshotTimestamp !== newTimestamp
+			) {
+				return;
 			}
+			displayUrlValue = newUrl;
+			displaySnapshotMs = newSnapshotMs;
+			displayUrl = newUrl;
+			displaySnapshotTimestamp = newTimestamp;
+			preloadingUrl = null;
+			preloadingSnapshotMs = null;
+			imageError = false;
 		};
 		img.onerror = () => {
-			if (preloadingUrl === newUrl) {
-				imageError = true;
-			}
+			if (generation !== preloadGeneration || desiredUrl !== newUrl) return;
+			preloadingUrl = null;
+			preloadingSnapshotMs = null;
+			imageError = displayUrlValue === null;
 		};
 		img.src = newUrl;
 	});
 
+	$effect(() => () => {
+		desiredUrl = null;
+		invalidatePreload();
+	});
+
 	let freshnessMs = $derived(
-		object.snapshot_timestamp
-			? now - new Date(object.snapshot_timestamp).getTime()
+		displaySnapshotTimestamp
+			? now - new Date(displaySnapshotTimestamp).getTime()
 			: Infinity
 	);
 
@@ -65,7 +139,7 @@
 	);
 
 	let freshnessText = $derived(
-		object.snapshot_timestamp
+		displaySnapshotTimestamp
 			? freshnessMs < 1000
 				? 'just now'
 				: freshnessMs < 60_000

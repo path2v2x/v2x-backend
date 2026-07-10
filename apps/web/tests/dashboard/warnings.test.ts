@@ -64,6 +64,7 @@ function mkZone(overrides: Partial<V2xZone> = {}): V2xZone {
 		id: 'z1',
 		name: 'Test Zone',
 		message: 'Zone alert',
+		zone_kind: 'geofence',
 		signal_type: 'warning',
 		polygon: [
 			[0, 0],

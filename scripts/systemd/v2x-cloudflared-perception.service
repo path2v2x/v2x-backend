@@ -1,0 +1,28 @@
+[Unit]
+Description=V2X Cloudflare Perception Tunnel
+Wants=network-online.target v2x-perception.service
+After=network-online.target v2x-perception.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=path
+Group=path
+WorkingDirectory=/home/path
+Environment=DRIVE_TUNNEL_MODE=quick
+Environment=TUNNEL_LABEL=Perception
+Environment=ENV_FILE=/etc/v2x-perception-tunnel.env
+Environment=CONFIG_FILE=/etc/cloudflared/v2x-perception.yml
+Environment=PUBLIC_HOSTNAME=perception.path2v2x.net
+Environment=ORIGIN_SERVICE=http://localhost:8090
+Environment=LOG_FILE=/tmp/v2x-perception-cloudflared.log
+EnvironmentFile=-/etc/v2x-perception-tunnel.env
+ExecStartPre=/usr/bin/rm -f ${LOG_FILE}
+ExecStart=/home/path/V2XCarla/v2x-backend/scripts/launch-cloudflared-drive-tunnel.sh
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

@@ -294,15 +294,15 @@
 		<!-- Weather sliders -->
 		<div class="flex-1 overflow-y-auto p-2 flex flex-col gap-2">
 			{#each weatherSliders as s}
-				<div>
+				<label>
 					<div class="flex justify-between mb-0.5">
-						<label class="text-[10px] text-gray-500">{s.label}</label>
+						<span class="text-[10px] text-gray-500">{s.label}</span>
 						<span class="text-[10px] text-gray-400 font-mono">{s.get().toFixed(s.step < 1 ? 2 : 0)}</span>
 					</div>
 					<input type="range" min={s.min} max={s.max} step={s.step} value={s.get()}
 						oninput={(e) => { s.set(Number((e.target as HTMLInputElement).value)); }}
 						class="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500" />
-				</div>
+				</label>
 			{/each}
 		</div>
 
@@ -354,15 +354,15 @@
 		<!-- Graphics sliders -->
 		<div class="flex-1 overflow-y-auto p-2 flex flex-col gap-2">
 			{#each graphicsSliders as s}
-				<div>
+				<label>
 					<div class="flex justify-between mb-0.5">
-						<label class="text-[10px] text-gray-500">{s.label}</label>
+						<span class="text-[10px] text-gray-500">{s.label}</span>
 						<span class="text-[10px] text-gray-400 font-mono">{s.get().toFixed(s.step < 1 ? (s.step < 0.01 ? 3 : 2) : 0)}</span>
 					</div>
 					<input type="range" min={s.min} max={s.max} step={s.step} value={s.get()}
 						oninput={(e) => { s.set(Number((e.target as HTMLInputElement).value)); }}
 						class="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500" />
-				</div>
+				</label>
 			{/each}
 		</div>
 

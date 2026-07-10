@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 
 import requests
 
+from digital_twin_bridge.detection_pages import fetch_all_detection_pages
 from digital_twin_bridge.geo_utils import gps_to_carla
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,7 @@ class TwinSync:
         poll_interval: float = 1.0,
         despawn_after: float = 12.0,
         detection_max_age: float = 8.0,
+        detection_future_tolerance: float = 5.0,
         range_fetcher=None,
     ) -> None:
         self._world = world
@@ -100,6 +102,9 @@ class TwinSync:
         self._poll_interval = poll_interval
         self._despawn_after = despawn_after
         self._detection_max_age = detection_max_age
+        self._detection_future_tolerance = max(
+            0.0, float(detection_future_tolerance)
+        )
         # Callable (start_iso, end_iso, limit) -> {"items": [...]} against the
         # detections DB; enables replaying the twin at past timestamps.
         self._range_fetcher = range_fetcher
@@ -113,6 +118,10 @@ class TwinSync:
         self._mode = "live"
         self._replay: Optional[dict] = None
         self._pending_replay = None
+        # Results from a previous replay request must never be applied after a
+        # second replay (or go-live) supersedes it while HTTP is still in the
+        # executor.  The generation travels with every fetched chunk.
+        self._replay_generation = 0
 
     # ------------------------------------------------------------------
     # Blueprint selection
@@ -213,18 +222,23 @@ class TwinSync:
         detections = []
         now = time.time()
         for camera in (payload.get("cameras") or {}).values():
-            updated_at = camera.get("updated_at")
-            if updated_at:
-                # Skip cameras whose summary has gone stale (feed stalled).
-                try:
-                    from datetime import datetime, timezone
-
-                    updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                    if now - updated.timestamp() > self._detection_max_age:
-                        continue
-                except ValueError:
-                    pass
-            detections.extend(camera.get("detections") or [])
+            if not isinstance(camera, dict):
+                continue
+            # A camera summary is usable only when its producer time is
+            # trustworthy and current.  Missing/malformed timestamps used to
+            # fail open and could resurrect a frozen feed indefinitely.
+            updated_epoch = _parse_utc_epoch(camera.get("updated_at"))
+            if updated_epoch is None:
+                continue
+            age = now - updated_epoch
+            if (
+                age < -self._detection_future_tolerance
+                or age > self._detection_max_age
+            ):
+                continue
+            camera_detections = camera.get("detections") or []
+            if isinstance(camera_detections, list):
+                detections.extend(camera_detections)
         return detections
 
     def _apply(self, detections: list, now: Optional[float] = None,
@@ -344,6 +358,8 @@ class TwinSync:
         if self._range_fetcher is None:
             raise RuntimeError("Replay unavailable: no detections range fetcher")
         self.clear()
+        self._replay_generation += 1
+        self._pending_replay = None
         self._mode = "replay"
         self._replay = {
             "start": start_epoch,
@@ -359,6 +375,8 @@ class TwinSync:
         if self._mode != "live":
             logger.info("Twin returning to live mode")
         self.clear()
+        self._replay_generation += 1
+        self._pending_replay = None
         self._mode = "live"
         self._replay = None
 
@@ -394,20 +412,30 @@ class TwinSync:
     def _fetch_replay_chunk(self) -> None:
         """Blocking part of a replay step: fetch the next detections chunk."""
         replay = self._replay
+        generation = self._replay_generation
         if replay is None:
             return
         clock = self.replay_clock()
         cursor = replay["cursor"]
         if clock is None or clock <= cursor:
-            self._pending_replay = ([], clock)
+            if self._replay is replay and self._replay_generation == generation:
+                self._pending_replay = (generation, [], clock)
             return
         chunk_end = min(clock, cursor + 30.0)
-        result = self._range_fetcher(
-            _epoch_to_iso(cursor), _epoch_to_iso(chunk_end), 200
+        result = fetch_all_detection_pages(
+            self._range_fetcher,
+            _epoch_to_iso(cursor),
+            _epoch_to_iso(chunk_end),
+            page_size=200,
         )
         items = result.get("items", []) or []
         items.sort(key=lambda item: item.get("timestamp_utc") or "")
-        self._pending_replay = (items, clock)
+        # The event loop may have accepted a newer replay command while this
+        # blocking fetch was in flight.  Discard rather than contaminating the
+        # new replay with the old range.
+        if self._replay is not replay or self._replay_generation != generation:
+            return
+        self._pending_replay = (generation, items, clock)
         replay["cursor"] = chunk_end
 
     def _apply_pending_replay(self) -> None:
@@ -416,7 +444,9 @@ class TwinSync:
         self._pending_replay = None
         if pending is None or self._replay is None:
             return
-        items, clock = pending
+        generation, items, clock = pending
+        if generation != self._replay_generation:
+            return
         if clock is None:
             return
         self._apply(items, now=clock, use_detection_ts=True)
@@ -474,5 +504,8 @@ class TwinSync:
     def stop(self) -> None:
         """Stop polling and destroy all twin actors."""
         self._stopped = True
+        self._replay_generation += 1
+        self._pending_replay = None
+        self._replay = None
         self.clear()
         logger.info("Twin sync stopped")

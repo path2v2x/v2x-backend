@@ -1,0 +1,21 @@
+[Unit]
+Description=Check V2X perception frontend endpoint parity
+Wants=network-online.target v2x-cloudflared-perception.service
+After=network-online.target v2x-cloudflared-perception.service
+
+[Service]
+Type=oneshot
+User=path
+Group=path
+WorkingDirectory=/home/path/V2XCarla/v2x-backend
+StateDirectory=v2x-perception-link-health
+StateDirectoryMode=0700
+Environment=AWS_REGION=us-west-2
+Environment=AWS_PROFILE=Path-Emerging-Dev-147229569658
+Environment=PERCEPTION_LINK_HEALTH_REPAIR=false
+Environment=AMPLIFY_RELEASE_ENABLED=false
+Environment=MIN_RELEASE_INTERVAL_SECONDS=1800
+Environment=PUBLISHER=/home/path/V2XCarla/v2x-backend/scripts/publish-amplify-runtime-config.sh
+EnvironmentFile=-/etc/v2x-perception-tunnel.env
+EnvironmentFile=-/etc/v2x-perception-link-health.env
+ExecStart=/home/path/V2XCarla/v2x-backend/scripts/check-perception-frontend-link.sh

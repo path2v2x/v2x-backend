@@ -68,6 +68,7 @@
 	import WeatherPanel from '$lib/components/WeatherPanel.svelte';
 	import TrafficPanel from '$lib/components/TrafficPanel.svelte';
 	import TrajectoryPanel from '$lib/components/TrajectoryPanel.svelte';
+	import TeleportPanel from '$lib/components/TeleportPanel.svelte';
 	import CameraSettingsPanel from '$lib/components/CameraSettingsPanel.svelte';
 	import ScenarioPicker from '$lib/components/ScenarioPicker.svelte';
 	import TwinPanel from '$lib/components/TwinPanel.svelte';
@@ -107,6 +108,7 @@
 	let showTrafficPanel = $state(false);
 	let showCameraPanel = $state(false);
 	let showTrajectoryPanel = $state(false);
+	let showTeleportPanel = $state(false);
 	let showXoscPicker = $state(false);
 
 	// Split-panel width for the right-side map (px). Persisted in localStorage.
@@ -213,17 +215,21 @@
 	}
 
 	let connected = $derived($driveConnected);
-	let state = $derived($sessionState);
+	// Do not name this value `state`: Svelte's type checker then interprets the
+	// `$state` rune above as an auto-subscription to the local value.
+	let driveState = $derived($sessionState);
 	let currentTelemetry = $derived($telemetry);
 	let gamepad = $derived($gamepadConnected);
 	let isCalibrated = $derived($calibrated);
 	let wheelReady = $derived(inputMode === 'keyboard' || isCalibrated);
 	let error = $derived($lastError);
-	let canSwitchMap = $derived(state === 'idle' || state === 'connecting');
+	let canSwitchMap = $derived(driveState === 'idle' || driveState === 'connecting');
 
 	$effect(() => {
 		if ($sessionState === 'driving') {
 			startControlLoop();
+		} else {
+			showTeleportPanel = false;
 		}
 	});
 
@@ -233,7 +239,7 @@
 		stopKeyboardInput();
 		setOnFrame(null);
 		resetActorGeofenceProximity();
-		if (state === 'driving' || state === 'ready' || state === 'reconstructing') {
+		if (driveState === 'driving' || driveState === 'ready' || driveState === 'reconstructing') {
 			endSession();
 		}
 		disconnect();
@@ -448,11 +454,11 @@
 				showObjectPlacer = false;
 			} else if (showV2xPlacer) {
 				showV2xPlacer = false;
-			} else if (state === 'driving' || state === 'ready') {
+			} else if (driveState === 'driving' || driveState === 'ready') {
 				handleEndSession();
 			}
 		}
-		if (state !== 'driving') return;
+		if (driveState !== 'driving') return;
 		if (e.key === 'r') {
 			respawnVehicle();
 		}
@@ -517,7 +523,7 @@
 		</div>
 	{/if}
 
-	{#if state === 'idle' || state === 'connecting'}
+	{#if driveState === 'idle' || driveState === 'connecting'}
 		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
 			<!-- Subtle radial glow behind card -->
 			<div class="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -550,7 +556,7 @@
 
 					<!-- Input mode toggle -->
 					<div class="mb-5">
-						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Input</label>
+						<p class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Input</p>
 						<div class="flex gap-2">
 							<button onclick={() => setInputMode('keyboard')}
 								class="flex-1 group relative px-4 py-3 rounded-xl text-sm font-body tracking-wide transition-all duration-200 cursor-pointer
@@ -563,19 +569,21 @@
 								</svg>
 								KEYBOARD
 							</button>
-							<button onclick={() => setInputMode('wheel')}
+							<div
 								class="flex-1 group relative px-4 py-3 rounded-xl text-sm font-body tracking-wide transition-all duration-200 cursor-pointer
 								{inputMode === 'wheel'
 									? 'bg-gray-800 text-white border border-accent/50 shadow-[0_0_15px_rgba(220,38,38,0.15)]'
 									: 'bg-gray-800/50 text-gray-500 border border-gray-800 hover:border-gray-700 hover:text-gray-300'}
 								{!gamepad ? 'opacity-40' : ''}">
-								<!-- Wheel icon -->
-								<svg class="w-5 h-5 mx-auto mb-1.5 {inputMode === 'wheel' ? 'text-accent' : 'text-gray-600 group-hover:text-gray-400'} transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
-									<circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="3" /><path d="M12 3v6M12 15v6M3 12h6M15 12h6" />
-								</svg>
-								WHEEL {gamepad ? '' : '(N/A)'}
+								<button type="button" onclick={() => setInputMode('wheel')} class="w-full cursor-pointer">
+									<!-- Wheel icon -->
+									<svg class="w-5 h-5 mx-auto mb-1.5 {inputMode === 'wheel' ? 'text-accent' : 'text-gray-600 group-hover:text-gray-400'} transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+										<circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="3" /><path d="M12 3v6M12 15v6M3 12h6M15 12h6" />
+									</svg>
+									WHEEL {gamepad ? '' : '(N/A)'}
+								</button>
 								{#if inputMode === 'wheel' && gamepad}
-									<button onclick={(e) => { e.stopPropagation(); showCalibration = true; }}
+									<button type="button" onclick={() => { showCalibration = true; }}
 										class="absolute -top-1 -right-1 w-5 h-5 bg-gray-700 hover:bg-gray-600 rounded-full flex items-center justify-center cursor-pointer transition-colors"
 										title="Calibrate">
 										<svg class="w-3 h-3 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -584,13 +592,13 @@
 										</svg>
 									</button>
 								{/if}
-							</button>
+							</div>
 						</div>
 					</div>
 
 					<!-- Tunnel selector -->
 					<div class="mb-4">
-						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Tunnel</label>
+						<p class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Tunnel</p>
 						<div class="flex bg-gray-800/50 rounded-xl p-1 border border-gray-800">
 							{#each driveTunnels as tunnel}
 								<button onclick={() => switchTunnel(tunnel.id)}
@@ -606,7 +614,7 @@
 
 					<!-- Vehicle picker -->
 					<div class="mb-3">
-						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Map</label>
+						<p class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Map</p>
 						<div class="flex bg-gray-800/50 rounded-xl p-1 border border-gray-800">
 							{#each maps as map}
 								<button
@@ -625,7 +633,7 @@
 
 					<!-- Vehicle picker -->
 					<div class="mb-3">
-						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Vehicle</label>
+						<p class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Vehicle</p>
 						{#if vehicles.length > 0}
 							<div class="relative">
 								<select
@@ -652,7 +660,7 @@
 
 					<!-- Scenario preset -->
 					<div class="mb-5">
-						<label class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Scenario</label>
+						<p class="block text-left text-[10px] font-body text-gray-600 tracking-widest uppercase mb-1.5">Scenario</p>
 						<div class="flex gap-2">
 							<div class="relative flex-1">
 								<select
@@ -753,7 +761,7 @@
 			</div>
 		</div>
 
-	{:else if state === 'reconstructing'}
+	{:else if driveState === 'reconstructing'}
 		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
 			<div class="text-center">
 				<div class="relative w-16 h-16 mx-auto mb-5">
@@ -765,7 +773,7 @@
 			</div>
 		</div>
 
-	{:else if state === 'driving'}
+	{:else if driveState === 'driving'}
 		<!-- Tesla-style split layout: camera left, map right -->
 		<div class="flex h-full w-full">
 			<!-- Left: Camera feed + HUD -->
@@ -816,35 +824,43 @@
 				<!-- Bottom action bar -->
 				<div class="absolute bottom-4 left-4 z-20 flex flex-col items-stretch gap-0.5 bg-black/40 backdrop-blur-md rounded-xl border border-white/10 p-1 shadow-lg pointer-events-auto">
 					<!-- Panel toggles -->
-					<button onclick={() => { showWeatherPanel = !showWeatherPanel; showTrafficPanel = false; showCameraPanel = false; showTrajectoryPanel = false; }}
+					<button onclick={() => { showWeatherPanel = !showWeatherPanel; showTrafficPanel = false; showCameraPanel = false; showTrajectoryPanel = false; showTeleportPanel = false; }}
 						aria-pressed={showWeatherPanel}
 						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showWeatherPanel
 							? 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.45)]'
 							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Weather
 					</button>
-					<button onclick={() => { showTrafficPanel = !showTrafficPanel; showWeatherPanel = false; showCameraPanel = false; showTrajectoryPanel = false; }}
+					<button onclick={() => { showTrafficPanel = !showTrafficPanel; showWeatherPanel = false; showCameraPanel = false; showTrajectoryPanel = false; showTeleportPanel = false; }}
 						aria-pressed={showTrafficPanel}
 						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showTrafficPanel
 							? 'bg-amber-600 text-white shadow-[0_0_8px_rgba(217,119,6,0.45)]'
 							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Traffic
 					</button>
-					<button onclick={() => { showCameraPanel = !showCameraPanel; showWeatherPanel = false; showTrafficPanel = false; showTrajectoryPanel = false; }}
+					<button onclick={() => { showCameraPanel = !showCameraPanel; showWeatherPanel = false; showTrafficPanel = false; showTrajectoryPanel = false; showTeleportPanel = false; }}
 						aria-pressed={showCameraPanel}
 						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showCameraPanel
 							? 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.45)]'
 							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Camera
 					</button>
-					<button onclick={() => { showTrajectoryPanel = !showTrajectoryPanel; showWeatherPanel = false; showTrafficPanel = false; showCameraPanel = false; }}
+					<button onclick={() => { showTrajectoryPanel = !showTrajectoryPanel; showWeatherPanel = false; showTrafficPanel = false; showCameraPanel = false; showTeleportPanel = false; }}
 						aria-pressed={showTrajectoryPanel}
 						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showTrajectoryPanel
 							? 'bg-blue-600 text-white shadow-[0_0_8px_rgba(37,99,235,0.45)]'
 							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Trajectory
 					</button>
-					<button onclick={() => { showXoscPicker = !showXoscPicker; }}
+					<button onclick={() => { showTeleportPanel = !showTeleportPanel; showWeatherPanel = false; showTrafficPanel = false; showCameraPanel = false; showTrajectoryPanel = false; }}
+						aria-pressed={showTeleportPanel}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showTeleportPanel
+							? 'bg-emerald-600 text-white shadow-[0_0_8px_rgba(5,150,105,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}"
+						title="Teleport this session's ego to a coordinate">
+						Teleport
+					</button>
+					<button onclick={() => { showXoscPicker = !showXoscPicker; showTeleportPanel = false; }}
 						aria-pressed={showXoscPicker}
 						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showXoscPicker
 							? 'bg-purple-600 text-white shadow-[0_0_8px_rgba(147,51,234,0.45)]'
@@ -900,6 +916,11 @@
 				<!-- Trajectory Panel -->
 				{#if showTrajectoryPanel}
 					<TrajectoryPanel onClose={() => { showTrajectoryPanel = false; }} />
+				{/if}
+
+				<!-- Teleport Panel -->
+				{#if showTeleportPanel}
+					<TeleportPanel onClose={() => { showTeleportPanel = false; }} />
 				{/if}
 			</div>
 
@@ -1069,7 +1090,7 @@
 			</div>
 		{/if}
 
-	{:else if state === 'error'}
+	{:else if driveState === 'error'}
 		<div class="absolute inset-0 flex items-center justify-center bg-gray-950">
 			<div class="text-center max-w-md px-8">
 				<div class="w-12 h-12 mx-auto mb-4 rounded-full border-2 border-accent/50 flex items-center justify-center">

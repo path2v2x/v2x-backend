@@ -1,5 +1,6 @@
 """Tests for TwinSync: detections -> CARLA actor lifecycle."""
 
+import threading
 import time
 
 import pytest
@@ -224,6 +225,39 @@ class TestReplay:
         for actor_id in actor_ids:
             assert mock_world.get_actor(actor_id).is_destroyed
 
+    def test_superseded_replay_fetch_cannot_apply_to_new_generation(self, sync):
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+
+        def fetcher(_start, _end, _limit=200):
+            fetch_started.set()
+            assert release_fetch.wait(1.0)
+            return {"items": [{"object_id": "old-replay-result"}]}
+
+        sync._range_fetcher = fetcher
+        first_start = time.time() - 120.0
+        sync.start_replay(first_start)
+        sync._replay["wall0"] = time.time() - 1.0
+        worker = threading.Thread(target=sync._fetch_replay_chunk)
+        worker.start()
+        try:
+            assert fetch_started.wait(1.0)
+            sync.start_replay(first_start + 60.0)
+            release_fetch.set()
+            worker.join(timeout=1.0)
+            assert not worker.is_alive()
+
+            applied = []
+            sync._apply = lambda items, **_kwargs: applied.extend(items)
+            sync._apply_pending_replay()
+
+            assert applied == []
+            assert sync._pending_replay is None
+            assert sync._replay["start"] == pytest.approx(first_start + 60.0)
+        finally:
+            release_fetch.set()
+            worker.join(timeout=1.0)
+
 
 class TestFetchParsing:
     def test_flattens_cameras_and_skips_stale(self, sync, monkeypatch):
@@ -251,3 +285,55 @@ class TestFetchParsing:
         )
         detections = sync._fetch_detections()
         assert [d["object_id"] for d in detections] == ["global_car_1"]
+
+    def test_missing_malformed_future_and_stale_camera_times_fail_closed(
+        self, sync, monkeypatch
+    ):
+        now = 2_000_000_000.0
+        monkeypatch.setattr(twin_sync_module.time, "time", lambda: now)
+        iso = twin_sync_module._epoch_to_iso
+        payload = {
+            "cameras": {
+                "fresh": {
+                    "updated_at": iso(now - 1.0),
+                    "detections": [make_detection(object_id="fresh")],
+                },
+                "future-within-tolerance": {
+                    "updated_at": iso(now + 4.0),
+                    "detections": [make_detection(object_id="tolerated")],
+                },
+                "missing": {
+                    "detections": [make_detection(object_id="missing")],
+                },
+                "malformed": {
+                    "updated_at": "not-a-time",
+                    "detections": [make_detection(object_id="malformed")],
+                },
+                "future": {
+                    "updated_at": iso(now + 6.0),
+                    "detections": [make_detection(object_id="future")],
+                },
+                "stale": {
+                    "updated_at": iso(now - 9.0),
+                    "detections": [make_detection(object_id="stale")],
+                },
+            }
+        }
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        monkeypatch.setattr(
+            twin_sync_module.requests, "get", lambda *_args, **_kwargs: FakeResponse()
+        )
+
+        detections = sync._fetch_detections()
+
+        assert [item["object_id"] for item in detections] == [
+            "fresh",
+            "tolerated",
+        ]

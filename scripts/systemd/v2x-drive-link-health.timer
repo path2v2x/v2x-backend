@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically check V2X Drive frontend WebSocket link
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=v2x-drive-link-health.service
+
+[Install]
+WantedBy=timers.target

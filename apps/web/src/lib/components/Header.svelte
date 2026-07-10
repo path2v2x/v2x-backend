@@ -9,17 +9,39 @@
 	let statusColor = $derived(
 		status.status === 'connected'
 			? 'bg-green-500'
+			: status.status === 'stale'
+				? 'bg-amber-500'
 			: status.status === 'error'
-				? 'bg-red-500'
-				: 'bg-gray-500'
+					? 'bg-red-500'
+					: 'bg-gray-500'
 	);
 
 	let statusLabel = $derived(
 		status.status === 'connected'
 			? 'Connected'
+			: status.status === 'stale'
+				? 'Stale data'
 			: status.status === 'error'
-				? 'Error'
-				: 'Disconnected'
+					? 'Error'
+					: 'Disconnected'
+	);
+
+	function producerTime(value: string | null): string | null {
+		if (!value) return null;
+		const timestamp = Date.parse(value);
+		return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleTimeString() : null;
+	}
+
+	let sourceTimestamp = $derived(status.updated_at ?? status.last_heartbeat);
+	let sourceTimeLabel = $derived(producerTime(sourceTimestamp));
+	let statusTextColor = $derived(
+		status.status === 'connected'
+			? 'text-green-400'
+			: status.status === 'stale'
+				? 'text-amber-300'
+				: status.status === 'error'
+					? 'text-red-400'
+					: 'text-gray-400'
 	);
 
 	let pathname = $derived(page.url.pathname);
@@ -119,16 +141,24 @@
 		</div>
 
 		<!-- Connection badge -->
-		<div class="flex items-center gap-2 rounded-full border border-gray-700/50 bg-gray-900 px-3 py-1.5">
+			<div
+				class="flex items-center gap-2 rounded-full border border-gray-700/50 bg-gray-900 px-3 py-1.5"
+				title={sourceTimestamp ? `Producer update: ${sourceTimestamp}` : 'No producer timestamp'}
+			>
 			<span class="relative flex h-2 w-2">
 				{#if connected}
 					<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75"></span>
 				{/if}
 				<span class="relative inline-flex h-2 w-2 rounded-full {statusColor}"></span>
 			</span>
-			<span class="text-xs font-medium {connected ? 'text-green-400' : 'text-gray-400'}">
-				{statusLabel}
-			</span>
-		</div>
+				<span class="text-xs font-medium {statusTextColor}">
+					{statusLabel}
+				</span>
+				{#if sourceTimeLabel}
+					<span class="border-l border-gray-700 pl-2 font-mono text-[10px] text-gray-500">
+						Source {sourceTimeLabel}
+					</span>
+				{/if}
+			</div>
 	</div>
 </header>

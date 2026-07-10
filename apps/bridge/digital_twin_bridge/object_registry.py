@@ -8,12 +8,41 @@ scene.  The V2X poller writes into it; the camera scheduler reads from it.
 import time
 import logging
 import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import carla
 
 logger = logging.getLogger(__name__)
+PRODUCER_FUTURE_TOLERANCE_SECONDS = 5.0
+
+
+def _producer_epoch(value) -> Optional[float]:
+    """Return a valid producer epoch, never a local receipt-time fallback."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        epoch = float(value)
+        if epoch > 1_000_000_000_000:
+            epoch /= 1000.0
+        return epoch if 0.0 <= epoch < float("inf") else None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.replace(".", "", 1).isdigit():
+            return _producer_epoch(float(text))
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        epoch = parsed.timestamp()
+        return epoch if 0.0 <= epoch < float("inf") else None
+    except (OverflowError, ValueError):
+        return None
 
 
 @dataclass
@@ -76,26 +105,51 @@ class ObjectRegistry:
         are preserved across updates so that they are not lost.
         """
         now = time.time()
-        with self._lock:
-            seen_ids: set = set()
-            for det in detections:
-                gps = det.get("gps_location", {})
-                lat = gps.get("latitude")
-                lon = gps.get("longitude")
-                if lat is None or lon is None:
-                    continue
-
-                base_id = det.get("object_id", "")
-                if not base_id:
-                    continue
-
+        # `/detections/recent` is newest-first today, but registry correctness
+        # must not depend on API order.  Collapse each exact registry key to its
+        # newest valid producer record before touching shared state.
+        newest: Dict[str, tuple[float, dict, float, float]] = {}
+        for det in detections:
+            if not isinstance(det, dict):
+                continue
+            gps = det.get("gps_location", {})
+            if not isinstance(gps, dict):
+                continue
+            lat = gps.get("latitude")
+            lon = gps.get("longitude")
+            base_id = det.get("object_id", "")
+            producer_epoch = _producer_epoch(det.get("timestamp_utc"))
+            if (
+                lat is None
+                or lon is None
+                or not base_id
+                or producer_epoch is None
+                or producer_epoch > now + PRODUCER_FUTURE_TOLERANCE_SECONDS
+            ):
+                continue
+            try:
                 lat_f = float(lat)
                 lon_f = float(lon)
-                uid = self._make_unique_id(base_id, lat_f, lon_f)
+            except (TypeError, ValueError):
+                continue
+            uid = self._make_unique_id(str(base_id), lat_f, lon_f)
+            prior = newest.get(uid)
+            if prior is None or producer_epoch > prior[0]:
+                newest[uid] = (producer_epoch, det, lat_f, lon_f)
+
+        with self._lock:
+            seen_ids: set = set()
+            for uid, (producer_epoch, det, lat_f, lon_f) in newest.items():
                 seen_ids.add(uid)
 
                 existing = self._objects.get(uid)
                 if existing is not None:
+                    existing_epoch = _producer_epoch(existing.timestamp_utc)
+                    # Seeing the key still refreshes receipt-time liveness, but
+                    # an older producer event can never roll its fields back.
+                    existing.last_seen = now
+                    if existing_epoch is not None and producer_epoch < existing_epoch:
+                        continue
                     # Update mutable fields, keep camera state
                     existing.lat = lat_f
                     existing.lon = lon_f
@@ -103,7 +157,6 @@ class ObjectRegistry:
                     existing.confidence = float(det.get("confidence_score", existing.confidence))
                     existing.street_name = det.get("street_name_normalized", existing.street_name)
                     existing.timestamp_utc = det.get("timestamp_utc", existing.timestamp_utc)
-                    existing.last_seen = now
                 else:
                     self._objects[uid] = TrackedObject(
                         object_id=uid,

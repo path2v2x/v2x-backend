@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE_DIR="${REPO_ROOT}/apps/bridge"
 
 # ── Configurable ──
-VENV="${VENV:-/home/path/V2XCarla/carla-venv/bin/activate}"
+VENV="${VENV:-/home/path/V2XCarla/carla-venv-310/bin/activate}"
 AWS_PROFILE="${AWS_PROFILE:-Path-Emerging-Dev-147229569658}"
 CARLA_PORT="${CARLA_PORT:-2000}"
 WS_PORT="${WS_PORT:-8765}"
@@ -71,6 +71,8 @@ if [ ! -f "$VENV" ]; then
     echo "  Set VENV env var to point to your carla venv activate script."
     exit 1
 fi
+# Deployment selects the absolute VENV path.
+# shellcheck disable=SC1090
 source "$VENV"
 
 # ─────────────────────────────────────────────────────────────

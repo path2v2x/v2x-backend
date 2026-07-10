@@ -17,12 +17,15 @@ frontend:
           const env = process.env;
           const apiBaseUrl = env.API_BASE_URL || 'https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com';
 
-          function parseJsonEnv(name, fallback) {
+          function parseJsonEnv(name, fallback, validate) {
+            let parsed;
             try {
-              return JSON.parse(env[name] || fallback);
-            } catch {
-              return JSON.parse(fallback);
+              parsed = JSON.parse(env[name] || fallback);
+            } catch (error) {
+              throw new Error(`${name} must contain valid JSON: ${error.message}`);
             }
+            if (!validate(parsed)) throw new Error(`${name} has the wrong JSON shape`);
+            return parsed;
           }
 
           const config = {
@@ -38,8 +41,17 @@ frontend:
             mapDataPath: env.MAP_DATA_PATH || '/map-data',
             driveConfigPath: env.DRIVE_CONFIG_PATH || '/drive-config',
             demoVideosPath: env.DEMO_VIDEOS_PATH || '/demo-videos',
-            videoCameraIds: parseJsonEnv('VIDEO_CAMERA_IDS', '["ch1","ch2","ch3","ch4"]'),
-            perceptionStreamUrls: parseJsonEnv('PERCEPTION_STREAM_URLS', '{}'),
+            videoCameraIds: parseJsonEnv(
+              'VIDEO_CAMERA_IDS',
+              '["ch1","ch2","ch3","ch4"]',
+              (value) => Array.isArray(value) && value.every((item) => typeof item === 'string')
+            ),
+            perceptionStreamUrls: parseJsonEnv(
+              'PERCEPTION_STREAM_URLS',
+              '{}',
+              (value) => value !== null && !Array.isArray(value) && typeof value === 'object'
+                && Object.values(value).every((item) => typeof item === 'string')
+            ),
             perceptionStreamBaseUrl: env.PERCEPTION_STREAM_BASE_URL || '',
             perceptionStreamPathTemplate: env.PERCEPTION_STREAM_PATH_TEMPLATE || '/streams/{camera_id}.mjpg',
             cloudflareDriveWsUrl: env.VITE_CLOUDFLARE_DRIVE_WS_URL || '',

@@ -6,19 +6,31 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-CARLA_CONTAINER="${CARLA_CONTAINER:-carla-custommaps}"
-CARLA_IMAGE="${CARLA_IMAGE:-}"
-CARLA_COMMAND="${CARLA_COMMAND:-./CarlaUE4.sh -RenderOffScreen -vulkan -nosound -carla-rpc-port=2000}"
+CARLA_CONTAINER="${CARLA_CONTAINER:-carla-rr-maps}"
+CARLA_IMAGE="${CARLA_IMAGE:-ghcr.io/simforgeinc/carla-rr-maps:0.10.0}"
+CARLA_COMMAND="${CARLA_COMMAND:-./CarlaUnreal.sh -RenderOffScreen -vulkan -nosound -carla-rpc-port=2000}"
+CARLA_SERVICE="${CARLA_SERVICE:-v2x-carla-rr.service}"
 DRIVE_SERVICE="${DRIVE_SERVICE:-v2x-drive.service}"
 WS_PORT="${WS_PORT:-8765}"
-CARLA_PYTHON="${CARLA_PYTHON:-/home/path/V2XCarla/carla-venv/bin/python}"
+CARLA_PYTHON="${CARLA_PYTHON:-/home/path/V2XCarla/carla-venv-310/bin/python}"
+ALLOW_CARLA_CREATE="${ALLOW_CARLA_CREATE:-false}"
+ALLOW_CARLA_RECREATE="${ALLOW_CARLA_RECREATE:-false}"
 SKIP_RESTART_IF_ACTIVE_SESSION="${SKIP_RESTART_IF_ACTIVE_SESSION:-false}"
 PUBLISH_DRIVE_FRONTEND_CONFIG="${PUBLISH_DRIVE_FRONTEND_CONFIG:-false}"
 PUBLISH_DRIVE_FRONTEND_CONFIG_REQUIRED="${PUBLISH_DRIVE_FRONTEND_CONFIG_REQUIRED:-false}"
-PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT="${PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT:-${REPO_ROOT}/scripts/publish-drive-amplify-config.sh}"
+PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT="${PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT:-${REPO_ROOT}/scripts/publish-drive-tunnel-config.sh}"
 WAIT_SCRIPT="${WAIT_SCRIPT:-${REPO_ROOT}/scripts/wait-for-carla.sh}"
 CARLA_WAIT_TIMEOUT="${CARLA_WAIT_TIMEOUT:-600}"
 CARLA_WAIT_USER="${CARLA_WAIT_USER:-path}"
+
+for boolean_name in ALLOW_CARLA_CREATE ALLOW_CARLA_RECREATE SKIP_RESTART_IF_ACTIVE_SESSION \
+    PUBLISH_DRIVE_FRONTEND_CONFIG PUBLISH_DRIVE_FRONTEND_CONFIG_REQUIRED; do
+    boolean_value="${!boolean_name}"
+    if [[ "$boolean_value" != "true" && "$boolean_value" != "false" ]]; then
+        printf '%s must be true or false (got: %s)\n' "$boolean_name" "$boolean_value" >&2
+        exit 2
+    fi
+done
 
 log() {
     printf '%s %s\n' "$(date -Is)" "$*"
@@ -35,8 +47,10 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 create_carla_container() {
-    if [[ -z "$CARLA_IMAGE" ]]; then
-        log "ERROR: CARLA container '$CARLA_CONTAINER' does not exist and CARLA_IMAGE is not set."
+    local -a command_parts=()
+    read -r -a command_parts <<<"$CARLA_COMMAND"
+    if (( ${#command_parts[@]} == 0 )); then
+        log "ERROR: CARLA_COMMAND is empty."
         exit 1
     fi
 
@@ -49,8 +63,9 @@ create_carla_container() {
         --publish 2002:2002 \
         --env NVIDIA_VISIBLE_DEVICES=all \
         --env NVIDIA_DRIVER_CAPABILITIES=all \
+        --label com.simforge.v2x.managed-by=v2x-backend \
         "$CARLA_IMAGE" \
-        /bin/bash -lc "$CARLA_COMMAND" >/dev/null
+        "${command_parts[@]}" >/dev/null
 }
 
 active_drive_session_count() {
@@ -98,8 +113,32 @@ if [[ "$SKIP_RESTART_IF_ACTIVE_SESSION" == "true" ]]; then
     fi
 fi
 
+container_exists=false
+image_mismatch=false
+if docker inspect "$CARLA_CONTAINER" >/dev/null 2>&1; then
+    container_exists=true
+    current_image="$(docker inspect -f '{{.Config.Image}}' "$CARLA_CONTAINER")"
+    if [[ "$current_image" != "$CARLA_IMAGE" ]]; then
+        image_mismatch=true
+    fi
+fi
+
+if [[ "$container_exists" != "true" && "$ALLOW_CARLA_CREATE" != "true" ]]; then
+    log "ERROR: CARLA container '$CARLA_CONTAINER' is absent. Set ALLOW_CARLA_CREATE=true only in a controlled deployment window."
+    exit 1
+fi
+if [[ "$image_mismatch" == "true" && "$ALLOW_CARLA_RECREATE" != "true" ]]; then
+    log "ERROR: $CARLA_CONTAINER uses '$current_image', expected '$CARLA_IMAGE'. Refusing an automatic replacement; set ALLOW_CARLA_RECREATE=true only after rollback capture."
+    exit 1
+fi
+
+carla_service_installed=false
+if [[ -n "$CARLA_SERVICE" ]] && systemctl cat "$CARLA_SERVICE" >/dev/null 2>&1; then
+    carla_service_installed=true
+fi
+
 log "Stopping drive service: $DRIVE_SERVICE"
-systemctl stop "$DRIVE_SERVICE" || true
+systemctl stop "$DRIVE_SERVICE"
 
 # Clean up manually-started bridge processes so the service can bind :8765.
 if pgrep -f 'python -m digital_twin_bridge.drive_main' >/dev/null 2>&1; then
@@ -109,12 +148,20 @@ if pgrep -f 'python -m digital_twin_bridge.drive_main' >/dev/null 2>&1; then
     pkill -KILL -f 'python -m digital_twin_bridge.drive_main' || true
 fi
 
-if ! docker inspect "$CARLA_CONTAINER" >/dev/null 2>&1; then
+if [[ "$container_exists" != "true" ]]; then
     create_carla_container
-elif [[ -n "$CARLA_IMAGE" ]] && [[ "$(docker inspect -f '{{.Config.Image}}' "$CARLA_CONTAINER")" != "$CARLA_IMAGE" ]]; then
+elif [[ "$image_mismatch" == "true" ]]; then
     log "Recreating CARLA container $CARLA_CONTAINER for image $CARLA_IMAGE"
+    if [[ "$carla_service_installed" == "true" ]]; then
+        systemctl stop "$CARLA_SERVICE"
+    fi
     docker rm -f "$CARLA_CONTAINER" >/dev/null
     create_carla_container
+fi
+
+if [[ "$carla_service_installed" == "true" ]]; then
+    log "Restarting CARLA supervisor: $CARLA_SERVICE"
+    systemctl restart "$CARLA_SERVICE"
 elif docker inspect -f '{{.State.Running}}' "$CARLA_CONTAINER" 2>/dev/null | grep -qx true; then
     log "Restarting CARLA container: $CARLA_CONTAINER"
     docker restart "$CARLA_CONTAINER" >/dev/null
@@ -147,7 +194,7 @@ systemctl start "$DRIVE_SERVICE"
 
 if [[ "$PUBLISH_DRIVE_FRONTEND_CONFIG" == "true" ]]; then
     log "Publishing current drive frontend tunnel config"
-    if ! "$PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT"; then
+    if ! ACTION=publish "$PUBLISH_DRIVE_FRONTEND_CONFIG_SCRIPT"; then
         if [[ "$PUBLISH_DRIVE_FRONTEND_CONFIG_REQUIRED" == "true" ]]; then
             log "ERROR: drive frontend tunnel config publish failed."
             exit 1
