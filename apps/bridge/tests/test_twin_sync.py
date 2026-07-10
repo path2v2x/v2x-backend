@@ -53,6 +53,17 @@ def sync(mock_world, monkeypatch):
 
 
 class TestSpawn:
+    def test_blueprint_selection_is_stable_across_instances(self, sync, mock_world):
+        sync._load_blueprints()
+        first = sync._blueprint_for(twin_sync_module.TwinTrack("global_car_42", "car")).id
+        other = TwinSync(mock_world, mock_world.get_map())
+        other._vehicle_blueprints = list(sync._vehicle_blueprints)
+        other._truck_blueprints = list(sync._truck_blueprints)
+        other._walker_blueprints = list(sync._walker_blueprints)
+        other._blueprints_loaded = True
+        second = other._blueprint_for(twin_sync_module.TwinTrack("global_car_42", "car")).id
+        assert second == first
+
     def test_car_detection_spawns_vehicle(self, sync, mock_world):
         sync._apply([make_detection()])
         assert len(sync.actor_ids()) == 1
@@ -98,6 +109,12 @@ class TestSpawn:
             "track_id": 13,
             "bbox": {"x1": 488.0, "y1": 122.0, "x2": 836.0, "y2": 336.0},
             "gps_location": {"latitude": 37.9155, "longitude": -122.3348},
+            "raw_carla_location": {
+                "x": pytest.approx(15.5),
+                "y": pytest.approx(-34.8),
+                "z": pytest.approx(0.0),
+            },
+            "lane_snap_distance_m": pytest.approx(0.1),
             "tracked_actor_id": actor.id,
             "actor_id": actor.id,
             "actor_present": True,
@@ -138,6 +155,16 @@ class TestSpawn:
             {"object_type": "car", "gps_location": {"latitude": 1, "longitude": 2}},  # no id
         ])
         assert sync.actor_ids() == set()
+
+    def test_vehicle_far_from_driving_lane_fails_closed(self, sync, mock_world):
+        waypoint = mock_world.get_map().get_waypoint(MockLocation())
+        waypoint.transform.location = MockLocation(100.0, 100.0, 0.0)
+        mock_world.get_map().get_waypoint = lambda *_args, **_kwargs: waypoint
+        sync._apply([make_detection()])
+        assert sync.actor_ids() == set()
+        status = sync.status()["objects"][0]
+        assert status["actor_present"] is False
+        assert status["lane_snap_distance_m"] > 4.0
 
     def test_firetruck_never_selected(self, sync, mock_world):
         pools = {

@@ -292,6 +292,30 @@ class RunScopedIdentityTests(unittest.TestCase):
         self.assertEqual(result["media_timestamp_utc"], "winner")
         self.assertEqual(result["event_id"], "event-ch2")
 
+    def test_distinct_vehicles_seven_meters_apart_are_not_merged(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")
+        second = self.detection("ch2", 0.9, "2026-07-10T00:00:00.100Z")
+        second["gps_location"]["latitude"] += 7.0 / 111_320.0
+        result = pipeline.deduplicate([first, second], 1_000.0)
+        self.assertEqual(len(result), 2)
+        self.assertNotEqual(result[0]["object_id"], result[1]["object_id"])
+
+    def test_cross_camera_observations_outside_media_window_are_not_merged(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")
+        second = self.detection("ch2", 0.9, "2026-07-10T00:00:04.000Z")
+        result = pipeline.deduplicate([first, second], 1_000.0)
+        self.assertEqual(len(result), 2)
+
+    def test_stale_tracks_and_local_aliases_are_pruned(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        pipeline.deduplicate([self.detection()], 1_000.0)
+        self.assertTrue(pipeline.global_tracks)
+        pipeline.deduplicate([], 1_000.0 + pipeline.TRACK_MAX_IDLE_SEC + 0.1)
+        self.assertEqual(pipeline.global_tracks, {})
+        self.assertEqual(pipeline.local_to_global, {})
+
 
 class BatchUploadTests(unittest.TestCase):
     def setUp(self):
