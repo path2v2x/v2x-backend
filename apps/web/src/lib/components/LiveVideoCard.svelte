@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, tick } from 'svelte';
 	import Hls from 'hls.js';
 	import { fetchVideoSession } from '$lib/api';
 
@@ -19,6 +19,8 @@
 	let mjpegUrl = $state('');
 	let hls: Hls | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	let connectionKey = '';
+	let connectionRevision = 0;
 
 	function clearRefreshTimer() {
 		if (refreshTimer) {
@@ -63,9 +65,14 @@
 	}
 
 	async function connect() {
+		const revision = ++connectionRevision;
 		loading = true;
 		error = null;
 		destroyPlayer();
+		// MJPEG renders an <img> while HLS needs a <video>. Let Svelte apply
+		// that element swap before attaching a newly selected HLS source.
+		await tick();
+		if (revision !== connectionRevision) return;
 
 		try {
 			const sourceUrl = streamUrl.trim();
@@ -75,11 +82,13 @@
 				scheduleRefresh(null);
 			} else {
 				const session = await fetchVideoSession(cameraId);
+				if (revision !== connectionRevision) return;
 				hlsUrl = session.hlsUrl;
 				sessionExpiresIn = session.expiresIn;
 				scheduleRefresh(session.expiresIn);
 			}
 
+			if (revision !== connectionRevision) return;
 			if (sourceUrl && isImageStream(sourceUrl)) {
 				mjpegUrl = sourceUrl;
 				connected = true;
@@ -104,21 +113,27 @@
 			}
 
 			await videoEl.play().catch(() => {});
+			if (revision !== connectionRevision) return;
 			connected = true;
 		} catch (err) {
+			if (revision !== connectionRevision) return;
 			error = err instanceof Error ? err.message : 'Unknown playback error';
 			destroyPlayer();
 		} finally {
-			loading = false;
+			if (revision === connectionRevision) loading = false;
 		}
 	}
 
-	onDestroy(() => {
-		destroyPlayer();
+	$effect(() => {
+		const key = `${cameraId}|${streamUrl}`;
+		if (key === connectionKey) return;
+		connectionKey = key;
+		void connect();
 	});
 
-	onMount(() => {
-		void connect();
+	onDestroy(() => {
+		connectionRevision += 1;
+		destroyPlayer();
 	});
 </script>
 
