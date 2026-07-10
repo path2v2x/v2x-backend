@@ -25,8 +25,10 @@ from tools.verify_phase4_live import (
     validate_session_actor_manifest,
     validate_twin_camera_model,
     validate_projected_actor_detection,
+    validate_target_actor_exclusivity,
     validate_twin_object_sample,
     validate_twin_object_samples,
+    validate_visual_motion_consistency,
     validate_zero_active_sessions,
     verify_twin,
     websocket_url,
@@ -306,7 +308,55 @@ def test_projected_actor_requires_strong_compatible_visual_overlap():
         )
 
 
+def test_projected_actor_rejects_low_confidence_or_oversized_detection():
+    projected = (100.0, 100.0, 200.0, 200.0)
+    for detection in (
+        {"label": "car", "confidence": 0.49, "bbox": [105, 105, 195, 195]},
+        {"label": "car", "confidence": 0.90, "bbox": [0, 0, 400, 400]},
+    ):
+        with pytest.raises(VerificationError, match="no compatible visual detection"):
+            validate_projected_actor_detection(projected, [detection], "car")
+
+
+def test_target_actor_exclusivity_rejects_occluder_and_ambiguous_neighbor():
+    target = {
+        "actor_id": 77,
+        "bbox": (100.0, 100.0, 200.0, 200.0),
+        "minimum_depth_m": 20.0,
+    }
+    foreground = {
+        "actor_id": 88,
+        "bbox": (110.0, 110.0, 190.0, 190.0),
+        "minimum_depth_m": 10.0,
+    }
+    with pytest.raises(VerificationError, match="occludes"):
+        validate_target_actor_exclusivity(
+            77, {77: target, 88: foreground}, [105, 105, 195, 195]
+        )
+    neighbor = {
+        "actor_id": 89,
+        "bbox": (105.0, 100.0, 205.0, 200.0),
+        "minimum_depth_m": 20.5,
+    }
+    with pytest.raises(VerificationError, match="not exclusive"):
+        validate_target_actor_exclusivity(
+            77, {77: target, 89: neighbor}, [105, 100, 200, 200]
+        )
+
+
+def test_visual_motion_rejects_detection_moving_against_actor_projection():
+    samples = [
+        twin_sample(100.0, 10.0),
+        twin_sample(101.0, 10.2),
+        twin_sample(102.0, 10.5),
+    ]
+    samples[-1]["visual"]["best_detection"]["bbox"] = [100, 100, 200, 200]
+    with pytest.raises(VerificationError, match="motion disagrees"):
+        validate_visual_motion_consistency(samples)
+
+
 def twin_sample(clock, x, *, actor_id=77):
+    bbox = [x * 20.0, 100.0, x * 20.0 + 100.0, 200.0]
     return {
         "object_id": "global_car_run_1",
         "actor_id": actor_id,
@@ -319,7 +369,8 @@ def twin_sample(clock, x, *, actor_id=77):
         },
         "visual": {
             "frame_sha256": f"{int(clock):064x}",
-            "best_detection": {"compatible": True},
+            "best_detection": {"compatible": True, "bbox": list(bbox)},
+            "before_capture": {"projected_bbox": list(bbox)},
         },
     }
 
@@ -632,6 +683,13 @@ def test_twin_samples_require_three_stable_samples_over_two_seconds_with_motion(
         "visual_frame_sha256": [
             f"{value:064x}" for value in (100, 101, 102)
         ],
+        "visual_motion": {
+            "projected_displacement_px": 8.0,
+            "detection_displacement_px": 8.0,
+            "direction_cosine": 1.0,
+            "vector_error_px": 0.0,
+            "allowed_vector_error_px": 4.0,
+        },
     }
 
 
@@ -842,8 +900,23 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
     monkeypatch.setattr(
         live_probe, "validate_live_twin_camera_actor", lambda *_args: {"actor_id": 33}
     )
+    def fake_geometry(projected_actor, _camera):
+        x = projected_actor.get_transform().location.x * 20.0
+        return {
+            "actor_id": projected_actor.id,
+            "bbox": (x, 100.0, x + 100.0, 200.0),
+            "raw_bbox": (x, 100.0, x + 100.0, 200.0),
+            "area_px": 10000.0,
+            "visibility_ratio": 1.0,
+            "minimum_depth_m": 10.0,
+            "median_depth_m": 11.0,
+        }
+
+    monkeypatch.setattr(live_probe, "project_actor_geometry", fake_geometry)
     monkeypatch.setattr(
-        live_probe, "project_actor_bbox", lambda *_args: (100.0, 100.0, 200.0, 200.0)
+        live_probe,
+        "project_scene_actor_geometries",
+        lambda _world, camera, target_id: {target_id: fake_geometry(actor, camera)},
     )
 
     async def fake_packet(*_args, **_kwargs):
@@ -869,9 +942,16 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
     monkeypatch.setattr(
         live_probe,
         "detect_twin_objects",
-        lambda *_args, **_kwargs: [
-            {"label": "car", "confidence": 0.9, "bbox": [100, 100, 200, 200]}
-        ],
+        lambda *_args, **_kwargs: [{
+            "label": "car",
+            "confidence": 0.9,
+            "bbox": [
+                actor.get_transform().location.x * 20.0,
+                100,
+                actor.get_transform().location.x * 20.0 + 100.0,
+                200,
+            ],
+        }],
     )
 
     args = type(
@@ -880,8 +960,10 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         {
             "timeout": 5.0,
             "twin_object_id": "global_car_run_1",
-            "position_tolerance_m": 0.5,
-            "yaw_tolerance_deg": 1.0,
+                "position_tolerance_m": 0.5,
+                "yaw_tolerance_deg": 1.0,
+                "twin_position_tolerance_m": 0.5,
+                "twin_rotation_tolerance_deg": 1.0,
             "twin_yolo_confidence": 0.25,
             "twin_yolo_device": "cpu",
             "twin_min_iou": 0.15,
