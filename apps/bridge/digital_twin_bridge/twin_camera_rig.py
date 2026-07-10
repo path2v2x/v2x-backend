@@ -195,6 +195,7 @@ class TwinCameraRig:
         image_height: int = 960,
         fps: float = 12.0,
         jpeg_quality: int = 70,
+        frame_context_provider=None,
     ) -> None:
         self._world = world
         self._map = carla_map
@@ -207,8 +208,10 @@ class TwinCameraRig:
         self._image_height = int(image_height)
         self._fps = float(fps)
         self._jpeg_quality = int(jpeg_quality)
+        self._frame_context_provider = frame_context_provider
         self._cameras: Dict[str, object] = {}
         self._frames: Dict[str, bytes] = {}
+        self._frame_metadata: Dict[str, dict] = {}
         self._frame_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
         self._accepting_frames = False
@@ -271,12 +274,30 @@ class TwinCameraRig:
                 return
             try:
                 jpeg = encode_jpeg(image, quality=self._jpeg_quality)
+                carla_frame = int(image.frame)
+                sensor_timestamp = float(image.timestamp)
             except Exception as exc:
                 logger.debug("Twin frame encode error (%s): %s", camera_id, exc)
                 return
+            context = {}
+            if self._frame_context_provider is not None:
+                try:
+                    context = self._frame_context_provider() or {}
+                except Exception:
+                    logger.debug("Twin frame context unavailable (%s)", camera_id)
             with self._lock:
                 self._frames[camera_id] = jpeg
-                self._frame_counts[camera_id] = self._frame_counts.get(camera_id, 0) + 1
+                count = self._frame_counts.get(camera_id, 0) + 1
+                self._frame_counts[camera_id] = count
+                self._frame_metadata[camera_id] = {
+                    "camera_id": camera_id,
+                    "frame_count": count,
+                    "carla_frame": carla_frame,
+                    "sensor_timestamp": sensor_timestamp,
+                    "jpeg_sha256": hashlib.sha256(jpeg).hexdigest(),
+                    "mode": context.get("mode"),
+                    "replay_clock": context.get("replay_clock"),
+                }
 
         return _on_frame
 
@@ -294,6 +315,7 @@ class TwinCameraRig:
         self._cameras.clear()
         with self._lock:
             self._frames.clear()
+            self._frame_metadata.clear()
         logger.info("Twin camera rig destroyed")
 
     # ------------------------------------------------------------------
@@ -313,6 +335,15 @@ class TwinCameraRig:
     def get_latest_frame(self, camera_id: str) -> Optional[bytes]:
         with self._lock:
             return self._frames.get(camera_id)
+
+    def get_latest_frame_packet(self, camera_id: str):
+        """Return an atomically paired JPEG and render/replay metadata."""
+        with self._lock:
+            frame = self._frames.get(camera_id)
+            metadata = self._frame_metadata.get(camera_id)
+            if frame is None or metadata is None:
+                return None
+            return frame, dict(metadata)
 
     def camera_model(self, camera_id: str) -> Optional[dict]:
         """Return the exact, fingerprinted UE5 camera model behind a stream.

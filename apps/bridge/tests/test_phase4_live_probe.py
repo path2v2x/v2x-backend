@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 import pytest
 import tools.verify_phase4_live as live_probe
@@ -11,6 +12,7 @@ from tools.verify_phase4_live import (
     choose_teleport_target,
     project_world_xyz,
     receive_binary_frame,
+    receive_twin_frame_packet,
     receive_json,
     replay_clock_epoch,
     session_candidate_actor_ids,
@@ -19,6 +21,7 @@ from tools.verify_phase4_live import (
     validate_actor_delta,
     validate_cli_args,
     validate_isolated_ego_roles,
+    validate_live_twin_camera_actor,
     validate_session_actor_manifest,
     validate_twin_camera_model,
     validate_projected_actor_detection,
@@ -39,7 +42,9 @@ def twin_camera_hello(camera_id="ch1"):
         "camera_model": {
             "camera_id": camera_id,
             "actor_id": 33,
-            "config_sha256": "a" * 64,
+            "config_sha256": live_probe.camera_config_fingerprint(
+                live_probe.DEFAULT_CAMERAS_JSON, camera_id
+            ),
             "transform": {
                 "location": {"x": 1.0, "y": 2.0, "z": 8.0},
                 "rotation": {"pitch": -35.0, "yaw": 90.0, "roll": 0.0},
@@ -88,6 +93,60 @@ class FakeWebSocket:
 
     async def recv(self):
         return next(self.messages)
+
+
+def frame_packet_metadata(jpeg, replay_clock, frame_count):
+    return json.dumps({
+        "type": "twin_frame",
+        "camera_id": "ch1",
+        "frame_count": frame_count,
+        "carla_frame": 1000 + frame_count,
+        "sensor_timestamp": 50.0 + frame_count,
+        "jpeg_sha256": hashlib.sha256(jpeg).hexdigest(),
+        "mode": "replay",
+        "replay_clock": replay_clock,
+    })
+
+
+@pytest.mark.asyncio
+async def test_twin_frame_packet_discards_stale_and_hash_binds_current_jpeg():
+    old, current = b"old", b"current"
+    websocket = FakeWebSocket([
+        frame_packet_metadata(old, "2026-07-10T06:00:00.000Z", 1),
+        old,
+        frame_packet_metadata(current, "2026-07-10T06:00:01.100Z", 2),
+        current,
+    ])
+    jpeg, digest, metadata, skew = await receive_twin_frame_packet(
+        websocket,
+        1.0,
+        camera_id="ch1",
+        minimum_replay_epoch=live_probe.replay_clock_epoch(
+            "2026-07-10T06:00:01.000Z"
+        ),
+        maximum_skew_seconds=0.25,
+    )
+    assert jpeg == current
+    assert digest == hashlib.sha256(current).hexdigest()
+    assert metadata["frame_count"] == 2
+    assert skew == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_twin_frame_packet_rejects_metadata_jpeg_mismatch():
+    websocket = FakeWebSocket([
+        frame_packet_metadata(b"expected", "2026-07-10T06:00:01.000Z", 2),
+        b"different",
+    ])
+    with pytest.raises(VerificationError, match="hash mismatch"):
+        await receive_twin_frame_packet(
+            websocket,
+            1.0,
+            camera_id="ch1",
+            minimum_replay_epoch=live_probe.replay_clock_epoch(
+                "2026-07-10T06:00:01.000Z"
+            ),
+        )
 
 
 class FakeActor:
@@ -182,6 +241,28 @@ def test_rejects_unverifiable_twin_camera_model(mutate, error):
     mutate(hello)
     with pytest.raises(VerificationError, match=error):
         validate_twin_camera_model(hello, "ch1")
+
+
+def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
+    model = validate_twin_camera_model(twin_camera_hello(), "ch1")
+    actor = FakeActor(
+        actor_id=33,
+        type_id="sensor.camera.rgb",
+        role_name="twin_rig",
+        transform=FakeTransform(1.0, 2.0, 8.0, pitch=-35.0, yaw=90.0),
+    )
+    actor.attributes.update({
+        "image_size_x": "1280",
+        "image_size_y": "960",
+        "fov": "90.0",
+        "lens_k": "0.0",
+        "lens_kcube": "0.0",
+    })
+    evidence = validate_live_twin_camera_actor(FakeWorld([actor]), model)
+    assert evidence["actor_id"] == 33
+    actor._transform = FakeTransform(1.5, 2.0, 8.0, pitch=-35.0, yaw=90.0)
+    with pytest.raises(VerificationError, match="transform drifted"):
+        validate_live_twin_camera_actor(FakeWorld([actor]), model)
 
 
 def test_projects_world_point_through_fingerprinted_camera_model():
@@ -739,7 +820,7 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         twin_status(clock="2026-07-10T06:00:02.000Z", x=10.5),
     ]
     call_order = []
-    sync_frames = iter((101, 102, 103))
+    sync_frames = iter((101, 102, 103, 104, 105, 106))
 
     def fake_synchronize(sync_world, timeout):
         assert sync_world is world
@@ -759,16 +840,32 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
     monkeypatch.setattr(live_probe, "synchronize_world", fake_synchronize)
     monkeypatch.setattr(live_probe, "request_json", fake_request_json)
     monkeypatch.setattr(
+        live_probe, "validate_live_twin_camera_actor", lambda *_args: {"actor_id": 33}
+    )
+    monkeypatch.setattr(
         live_probe, "project_actor_bbox", lambda *_args: (100.0, 100.0, 200.0, 200.0)
     )
 
-    async def fake_binary(*_args, **_kwargs):
-        fake_binary.count += 1
-        return b"jpeg", f"{fake_binary.count:064x}"
+    async def fake_packet(*_args, **_kwargs):
+        fake_packet.count += 1
+        digest = f"{fake_packet.count:064x}"
+        return (
+            b"jpeg",
+            digest,
+            {
+                "camera_id": "ch1",
+                "frame_count": fake_packet.count,
+                "carla_frame": 100 + fake_packet.count,
+                "sensor_timestamp": 10.0 + fake_packet.count,
+                "replay_clock": f"2026-07-10T06:00:0{fake_packet.count - 1}.000Z",
+                "jpeg_sha256": digest,
+            },
+            0.0,
+        )
 
-    fake_binary.count = 0
+    fake_packet.count = 0
 
-    monkeypatch.setattr(live_probe, "receive_binary_payload", fake_binary)
+    monkeypatch.setattr(live_probe, "receive_twin_frame_packet", fake_packet)
     monkeypatch.setattr(
         live_probe,
         "detect_twin_objects",
@@ -788,7 +885,9 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
             "twin_yolo_confidence": 0.25,
             "twin_yolo_device": "cpu",
             "twin_min_iou": 0.15,
-            "twin_min_actor_coverage": 0.5,
+                "twin_min_actor_coverage": 0.5,
+                "twin_frame_max_skew": 0.25,
+                "twin_camera": "ch1",
         },
     )()
     evidence = {}
@@ -797,8 +896,8 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         args, object(), object(), world, twin_camera_hello()["camera_model"], object(), evidence
     )
 
-    assert call_order == ["sync", "request"] * 3
-    assert evidence["object_sync_frames"] == [101, 102, 103]
+    assert call_order == ["sync", "request", "sync"] * 3
+    assert evidence["object_sync_frames"] == [101, 102, 103, 104, 105, 106]
     assert result["sample_count"] == 3
     assert result["max_planar_movement_m"] == pytest.approx(0.5)
     assert all(sample["visual"]["best_detection"]["compatible"] for sample in result["samples"])

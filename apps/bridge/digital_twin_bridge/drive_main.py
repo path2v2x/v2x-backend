@@ -486,6 +486,11 @@ async def main():
                 image_width=config.TWIN_CAM_WIDTH,
                 image_height=config.TWIN_CAM_HEIGHT,
                 fps=config.TWIN_CAM_FPS,
+                frame_context_provider=lambda: (
+                    runtime["twin_sync"].status()
+                    if runtime.get("twin_sync") is not None
+                    else {"mode": "off", "replay_clock": None}
+                ),
             )
             if rig.spawn() > 0:
                 runtime["twin_rig"] = rig
@@ -816,8 +821,13 @@ async def main():
                     rig = runtime.get("twin_rig")
                     if rig is None:
                         break
-                    frame = rig.get_latest_frame(camera_id)
-                    if frame is not None and frame is not last_frame:
+                    packet = rig.get_latest_frame_packet(camera_id)
+                    if packet is not None and packet[0] is not last_frame:
+                        frame, frame_metadata = packet
+                        await websocket.send(json.dumps({
+                            "type": "twin_frame",
+                            **frame_metadata,
+                        }))
                         await websocket.send(frame)
                         last_frame = frame
                 now = asyncio.get_running_loop().time()

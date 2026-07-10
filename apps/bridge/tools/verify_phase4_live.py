@@ -29,6 +29,7 @@ DEFAULT_TWIN_YOLO_DETECTOR = (
     / "tools"
     / "detect_jpeg_objects.py"
 )
+DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
 
 
 class VerificationError(RuntimeError):
@@ -130,6 +131,77 @@ async def receive_binary_payload(websocket, timeout, *, evidence=None):
         if evidence is not None:
             evidence["binary_frames"] = evidence.get("binary_frames", 0) + 1
         return raw, binary_digest(raw)
+
+
+async def receive_twin_frame_packet(
+    websocket,
+    timeout,
+    *,
+    camera_id,
+    minimum_replay_epoch,
+    maximum_skew_seconds=0.5,
+    previous_frame_count=None,
+    evidence=None,
+):
+    """Receive a hash-bound JPEG whose server replay clock is current enough."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    metadata = None
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise VerificationError("timed out waiting for a current twin frame packet")
+        raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        if not isinstance(raw, bytes):
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if evidence is not None:
+                evidence.setdefault("json_types", []).append(payload.get("type"))
+            if payload.get("type") == "twin_frame":
+                metadata = payload
+            continue
+        if evidence is not None:
+            evidence["binary_frames"] = evidence.get("binary_frames", 0) + 1
+        if metadata is None:
+            continue
+        digest = binary_digest(raw)
+        if metadata.get("jpeg_sha256") != digest:
+            raise VerificationError("twin frame metadata/JPEG hash mismatch")
+        if metadata.get("camera_id") != camera_id:
+            raise VerificationError("twin frame metadata identifies the wrong camera")
+        if metadata.get("mode") != "replay":
+            metadata = None
+            continue
+        frame_count = metadata.get("frame_count")
+        carla_frame = metadata.get("carla_frame")
+        sensor_timestamp = metadata.get("sensor_timestamp")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (frame_count, carla_frame)
+        ) or (
+            isinstance(sensor_timestamp, bool)
+            or not isinstance(sensor_timestamp, (int, float))
+            or not math.isfinite(float(sensor_timestamp))
+            or float(sensor_timestamp) < 0.0
+        ):
+            raise VerificationError("twin frame metadata has invalid UE5 frame identity")
+        if previous_frame_count is not None and frame_count <= previous_frame_count:
+            metadata = None
+            continue
+        frame_epoch = replay_clock_epoch(metadata.get("replay_clock"))
+        if frame_epoch is None:
+            raise VerificationError("twin frame metadata has no replay clock")
+        skew = frame_epoch - minimum_replay_epoch
+        if skew < 0.0:
+            metadata = None
+            continue
+        if skew > maximum_skew_seconds:
+            raise VerificationError(
+                f"twin frame replay clock skew is {skew:.3f}s; "
+                f"maximum is {maximum_skew_seconds:.3f}s"
+            )
+        return raw, digest, metadata, skew
 
 
 def _carla_rotation_axes(rotation):
@@ -543,7 +615,25 @@ def _object_from_twin_status(status, object_id):
     return matches[0]
 
 
-def validate_twin_camera_model(hello, expected_camera_id):
+def camera_config_fingerprint(path, camera_id):
+    try:
+        payload = json.loads(Path(path).read_text())
+        camera = next(
+            camera
+            for camera in payload.get("cameras", [])
+            if camera.get("id") == camera_id
+        )
+    except (OSError, ValueError, StopIteration, TypeError) as exc:
+        raise VerificationError("tracked camera configuration is unavailable") from exc
+    canonical = json.dumps(
+        camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_twin_camera_model(
+    hello, expected_camera_id, expected_config_sha256=None
+):
     """Validate the exact calibrated UE5 sensor that produced twin frames."""
     if hello.get("camera_id") != expected_camera_id:
         raise VerificationError("twin stream camera does not match the request")
@@ -559,6 +649,8 @@ def validate_twin_camera_model(hello, expected_camera_id):
         and all(character in "0123456789abcdef" for character in fingerprint)
     ):
         raise VerificationError("twin camera model has no valid config fingerprint")
+    if expected_config_sha256 is not None and fingerprint != expected_config_sha256:
+        raise VerificationError("twin camera model does not match tracked camera config")
     transform = _finite_transform_payload(model.get("transform"), "twin camera model")
     image = model.get("image")
     if not isinstance(image, dict):
@@ -601,6 +693,58 @@ def validate_twin_camera_model(hello, expected_camera_id):
             "horizontal_fov_deg": float(fov),
         },
         "lens": {key: float(value) for key, value in lens.items()},
+    }
+
+
+def validate_live_twin_camera_actor(world, camera_model):
+    """Pin advertised camera evidence to the concrete live UE5 sensor actor."""
+    actor = world.get_actor(camera_model["actor_id"])
+    if actor is None or not str(getattr(actor, "type_id", "")).startswith(
+        "sensor.camera."
+    ):
+        raise VerificationError("advertised twin camera UE5 actor does not exist")
+    attributes = getattr(actor, "attributes", None) or {}
+    if attributes.get("role_name") != "twin_rig":
+        raise VerificationError("advertised twin camera actor has unexpected role")
+    observed = _actor_transform_payload(actor)
+    expected = camera_model["transform"]
+    position_error = math.sqrt(sum(
+        (observed["location"][axis] - expected["location"][axis]) ** 2
+        for axis in ("x", "y", "z")
+    ))
+    rotation_error = max(
+        _angular_error(
+            observed["rotation"][axis], expected["rotation"][axis]
+        )
+        for axis in ("pitch", "yaw", "roll")
+    )
+    if position_error > 0.01 or rotation_error > 0.05:
+        raise VerificationError("advertised twin camera transform drifted from UE5 actor")
+    image = camera_model["image"]
+    expected_attributes = {
+        "image_size_x": float(image["width"]),
+        "image_size_y": float(image["height"]),
+        "fov": float(image["horizontal_fov_deg"]),
+        "lens_k": float(camera_model["lens"]["lens_k"]),
+        "lens_kcube": float(camera_model["lens"]["lens_kcube"]),
+    }
+    for key, expected_value in expected_attributes.items():
+        try:
+            observed_value = float(attributes[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VerificationError(
+                f"advertised twin camera actor lacks {key}"
+            ) from exc
+        tolerance = 0.01 if key == "fov" else 1e-6
+        if abs(observed_value - expected_value) > tolerance:
+            raise VerificationError(
+                f"advertised twin camera actor {key} does not match stream model"
+            )
+    return {
+        "actor_id": int(actor.id),
+        "type_id": str(actor.type_id),
+        "position_error_m": round(position_error, 6),
+        "rotation_error_deg": round(rotation_error, 6),
     }
 
 
@@ -997,6 +1141,7 @@ async def collect_twin_object_samples(
     samples = []
     deadline = asyncio.get_running_loop().time() + args.timeout
     next_sample_clock = None
+    previous_frame_count = None
     while len(samples) < 3:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -1037,26 +1182,66 @@ async def collect_twin_object_samples(
             position_tolerance_m=args.position_tolerance_m,
             rotation_tolerance_deg=args.yaw_tolerance_deg,
         )
+        validate_live_twin_camera_actor(world, camera_model)
         actor = world.get_actor(sample["actor_id"])
-        projected_bbox = project_actor_bbox(actor, camera_model)
-        jpeg, jpeg_digest = await receive_binary_payload(
-            stream_socket, min(args.timeout, remaining), evidence=evidence
+        projected_before = project_actor_bbox(actor, camera_model)
+        jpeg, jpeg_digest, frame_metadata, frame_skew = (
+            await receive_twin_frame_packet(
+                stream_socket,
+                min(args.timeout, remaining),
+                camera_id=args.twin_camera,
+                minimum_replay_epoch=replay_epoch,
+                maximum_skew_seconds=args.twin_frame_max_skew,
+                previous_frame_count=previous_frame_count,
+                evidence=evidence,
+            )
         )
+        previous_frame_count = frame_metadata["frame_count"]
+        evidence.setdefault("object_sync_frames", []).append(
+            synchronize_world(world, min(1.0, remaining))
+        )
+        validate_live_twin_camera_actor(world, camera_model)
+        actor_after = world.get_actor(sample["actor_id"])
+        if actor_after is None:
+            raise VerificationError("mapped UE5 actor disappeared during frame capture")
+        projected_after = project_actor_bbox(actor_after, camera_model)
         detections = detect_twin_objects(
             jpeg,
             detector,
             confidence=args.twin_yolo_confidence,
             device=args.twin_yolo_device,
         )
+        before_match = validate_projected_actor_detection(
+            projected_before,
+            detections,
+            sample["object_type"],
+            minimum_iou=args.twin_min_iou,
+            minimum_actor_coverage=args.twin_min_actor_coverage,
+        )
+        after_match = validate_projected_actor_detection(
+            projected_after,
+            detections,
+            sample["object_type"],
+            minimum_iou=args.twin_min_iou,
+            minimum_actor_coverage=args.twin_min_actor_coverage,
+        )
+        if before_match["best_detection"]["bbox"] != after_match["best_detection"]["bbox"]:
+            raise VerificationError(
+                "different visual detections matched the actor capture bracket"
+            )
         sample["visual"] = {
             "frame_sha256": jpeg_digest,
-            **validate_projected_actor_detection(
-                projected_bbox,
-                detections,
-                sample["object_type"],
-                minimum_iou=args.twin_min_iou,
-                minimum_actor_coverage=args.twin_min_actor_coverage,
-            ),
+            "frame_metadata": {
+                key: frame_metadata[key]
+                for key in (
+                    "camera_id", "frame_count", "carla_frame",
+                    "sensor_timestamp", "replay_clock", "jpeg_sha256",
+                )
+            },
+            "frame_replay_skew_seconds": round(frame_skew, 6),
+            "before_capture": before_match,
+            "after_capture": after_match,
+            "best_detection": before_match["best_detection"],
         }
         samples.append(sample)
         next_sample_clock = replay_epoch + 1.0
@@ -1090,8 +1275,14 @@ async def verify_twin(args, world=None):
         if evidence["stream_hello"]["type"] == "twin_error":
             raise VerificationError(evidence["stream_hello"].get("message", "twin error"))
         evidence["validated_camera_model"] = validate_twin_camera_model(
-            evidence["stream_hello"], args.twin_camera
+            evidence["stream_hello"],
+            args.twin_camera,
+            camera_config_fingerprint(args.cameras_json, args.twin_camera),
         )
+        if world is not None:
+            evidence["validated_camera_actor"] = validate_live_twin_camera_actor(
+                world, evidence["validated_camera_model"]
+            )
         live_digest = await receive_binary_frame(
             stream_socket, args.timeout, evidence=evidence
         )
@@ -1568,6 +1759,12 @@ def build_parser():
         help="twin camera whose replay frames must visibly change",
     )
     parser.add_argument(
+        "--cameras-json",
+        type=Path,
+        default=DEFAULT_CAMERAS_JSON,
+        help="tracked camera config whose channel fingerprint must match the stream",
+    )
+    parser.add_argument(
         "--twin-yolo-model",
         type=Path,
         help="local YOLO weights required for exact projected-actor visual proof",
@@ -1588,6 +1785,7 @@ def build_parser():
     parser.add_argument("--twin-yolo-confidence", type=float, default=0.25)
     parser.add_argument("--twin-min-iou", type=float, default=0.15)
     parser.add_argument("--twin-min-actor-coverage", type=float, default=0.50)
+    parser.add_argument("--twin-frame-max-skew", type=float, default=0.25)
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -1622,6 +1820,8 @@ def validate_cli_args(args):
             raise VerificationError("--twin-yolo-python does not exist")
         if not args.twin_yolo_detector.is_file():
             raise VerificationError("--twin-yolo-detector does not exist")
+        if not args.cameras_json.is_file():
+            raise VerificationError("--cameras-json does not exist")
     elif args.twin_yolo_model is not None:
         raise VerificationError("--twin-yolo-model requires --twin-object-id")
     for value, label in (
@@ -1631,6 +1831,11 @@ def validate_cli_args(args):
     ):
         if not math.isfinite(value) or not 0.0 < value <= 1.0:
             raise VerificationError(f"{label} must be in (0, 1]")
+    if (
+        not math.isfinite(args.twin_frame_max_skew)
+        or not 0.0 < args.twin_frame_max_skew <= 1.0
+    ):
+        raise VerificationError("--twin-frame-max-skew must be in (0, 1]")
     return args
 
 

@@ -158,7 +158,15 @@ class TestTwinCameraRig:
         monkeypatch.setattr(
             twin_camera_rig, "gps_to_carla", lambda m, lat, lon: MockLocation(0.0, 0.0, 0.0)
         )
-        rig = TwinCameraRig(mock_world, mock_world.get_map(), make_config())
+        rig = TwinCameraRig(
+            mock_world,
+            mock_world.get_map(),
+            make_config(),
+            frame_context_provider=lambda: {
+                "mode": "replay",
+                "replay_clock": "2026-07-10T18:23:19.735Z",
+            },
+        )
         assert rig.spawn() == 1
         assert rig.camera_ids == ["ch1"]
         assert rig.has_camera("ch1")
@@ -171,8 +179,20 @@ class TestTwinCameraRig:
         # Push a frame through the listener path (bypassing JPEG encoding)
         monkeypatch.setattr(twin_camera_rig, "encode_jpeg", lambda image, quality=70: b"jpeg")
         listener = rig._cameras["ch1"]._listener
-        listener(object())
+        image = type("Image", (), {"frame": 123, "timestamp": 45.25})()
+        listener(image)
         assert rig.get_latest_frame("ch1") == b"jpeg"
+        frame, metadata = rig.get_latest_frame_packet("ch1")
+        assert frame == b"jpeg"
+        assert metadata == {
+            "camera_id": "ch1",
+            "frame_count": 1,
+            "carla_frame": 123,
+            "sensor_timestamp": 45.25,
+            "jpeg_sha256": "41e5787e9f28562d07b891b1816b492309d646c0f2829743fa4963a9f9cc1d61",
+            "mode": "replay",
+            "replay_clock": "2026-07-10T18:23:19.735Z",
+        }
         assert rig.status()["frame_counts"]["ch1"] == 1
         model = rig.camera_model("ch1")
         assert model["camera_id"] == "ch1"
@@ -200,5 +220,5 @@ class TestTwinCameraRig:
         rig.spawn()
         listener = rig._cameras["ch1"]._listener
         rig.destroy()
-        listener(object())
+        listener(type("Image", (), {"frame": 124, "timestamp": 46.25})())
         assert rig.get_latest_frame("ch1") is None
