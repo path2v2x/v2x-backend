@@ -13,6 +13,7 @@ Disable entirely with DTB_TWIN_SYNC=off.
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import time
@@ -66,6 +67,7 @@ class TwinTrack:
         "event_id", "detection_timestamp_utc", "media_timestamp_utc",
         "timestamp_schema_version", "media_time_trusted", "media_clock",
         "device_id", "track_id", "bbox", "gps_location",
+        "raw_carla_location", "lane_snap_distance_m",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -88,6 +90,8 @@ class TwinTrack:
         self.track_id = None
         self.bbox = None
         self.gps_location = None
+        self.raw_carla_location = None
+        self.lane_snap_distance_m = None
 
 
 class TwinSync:
@@ -182,7 +186,11 @@ class TwinSync:
         if not pool:
             return None
         # Stable per-track pick so a track keeps its car across updates.
-        bp = pool[hash(track.object_id) % len(pool)]
+        # Python's hash() is randomized per process.  Stable selection keeps a
+        # replayed physical track represented by the same UE5 vehicle across
+        # service restarts and makes visual evidence reproducible.
+        digest = hashlib.sha256(track.object_id.encode("utf-8")).digest()
+        bp = pool[int.from_bytes(digest[:8], "big") % len(pool)]
         try:
             bp.set_attribute("role_name", "twin_object")
         except (IndexError, RuntimeError):
@@ -198,17 +206,35 @@ class TwinSync:
         import carla
 
         location = gps_to_carla(self._map, lat, lon)
+        track.raw_carla_location = {
+            "x": float(location.x),
+            "y": float(location.y),
+            "z": float(location.z),
+        }
+        track.lane_snap_distance_m = None
         if track.object_type in VEHICLE_TYPES:
             waypoint = self._map.get_waypoint(location, project_to_road=True)
             if waypoint is not None:
                 snapped = waypoint.transform.location
+                track.lane_snap_distance_m = float(snapped.distance(location))
                 # Keep the real-world position along the lane, only adopt the
                 # lane height/yaw when the detection is near the road.
-                if snapped.distance(location) < 4.0:
+                if track.lane_snap_distance_m < 4.0:
                     track.yaw = waypoint.transform.rotation.yaw
                     location = carla.Location(x=snapped.x, y=snapped.y, z=snapped.z)
                 else:
-                    location.z = snapped.z
+                    logger.warning(
+                        "Twin placement rejected for %s: %.2fm from driving lane",
+                        track.object_id,
+                        track.lane_snap_distance_m,
+                    )
+                    return None
+            else:
+                logger.warning(
+                    "Twin placement rejected for %s: no driving waypoint",
+                    track.object_id,
+                )
+                return None
         else:
             try:
                 sidewalk = self._map.get_waypoint(
@@ -300,6 +326,8 @@ class TwinSync:
                 track.last_seen = now
 
             location = self._location_for(track, float(lat), float(lon))
+            if location is None:
+                continue
 
             if track.actor_id is None:
                 bp = self._blueprint_for(track)
@@ -558,6 +586,8 @@ class TwinSync:
             "track_id": track.track_id,
             "bbox": track.bbox,
             "gps_location": track.gps_location,
+            "raw_carla_location": track.raw_carla_location,
+            "lane_snap_distance_m": track.lane_snap_distance_m,
             # ``actor_id`` is acceptance evidence, so expose it only after
             # resolving the actor and its transform from the live UE5 world.
             # Keep the track's last ID separately for diagnostics.

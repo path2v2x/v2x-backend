@@ -645,6 +645,12 @@ def compute_geohash(lat, lon, precision=5):
     return "".join(geohash)
 
 class MultiCameraPipeline:
+    VEHICLE_CLASSES = {'car', 'truck', 'bus'}
+    CROSS_CAMERA_MAX_TIME_DELTA_SEC = 2.5
+    TRACK_MAX_IDLE_SEC = 15.0
+    TRACK_CLOSE_DISTANCE_M = 3.0
+    TRACK_MAX_DISTANCE_M = 8.0
+    TRACK_MIN_APPEARANCE_SIMILARITY = 0.65
     def __init__(self, detectors, perception_run_id=None):
         """
         Initialize the MultiCameraPipeline.
@@ -690,6 +696,43 @@ class MultiCameraPipeline:
         c = 2 * asin(sqrt(a))
         return R * c
 
+    @staticmethod
+    def _event_epoch(detection):
+        value = detection.get('media_timestamp_utc') or detection.get('timestamp_utc')
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        return parsed.timestamp() if parsed.tzinfo is not None else None
+
+    @staticmethod
+    def _localization_uncertainty(detection):
+        value = (
+            detection.get('camera_data', {})
+            .get('bifocal_metadata', {})
+            .get('world_position', {})
+            .get('uncertainty_meters', 0.0)
+        )
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return min(1.5, max(0.0, value)) if math.isfinite(value) else 0.0
+
+    def _prune_tracks(self, current_time_epoch):
+        stale = {
+            gid for gid, track in self.global_tracks.items()
+            if current_time_epoch - track['last_seen'] > self.TRACK_MAX_IDLE_SEC
+        }
+        for gid in stale:
+            self.global_tracks.pop(gid, None)
+        if stale:
+            self.local_to_global = {
+                key: gid for key, gid in self.local_to_global.items() if gid not in stale
+            }
+
     def deduplicate(self, raw_buffer, current_time_epoch, merge_radius_meters=1.5):
         """
         Takes a list of V2X JSON records and removes duplicates that are
@@ -703,6 +746,7 @@ class MultiCameraPipeline:
         Returns:
             List of deduplicated and tracked detection records.
         """
+        self._prune_tracks(current_time_epoch)
         clean_buffer = []
 
         for new_det in raw_buffer:
@@ -722,7 +766,24 @@ class MultiCameraPipeline:
                     existing_det['gps_location']['longitude']
                 )
 
-                radius = 8.0 if new_det['object_type'] in {'car', 'truck', 'bus'} else 1.5
+                new_epoch = self._event_epoch(new_det)
+                existing_epoch = self._event_epoch(existing_det)
+                if (
+                    new_epoch is not None
+                    and existing_epoch is not None
+                    and abs(new_epoch - existing_epoch) > self.CROSS_CAMERA_MAX_TIME_DELTA_SEC
+                ):
+                    continue
+
+                if new_det['object_type'] in self.VEHICLE_CLASSES:
+                    radius = min(
+                        5.0,
+                        2.0
+                        + self._localization_uncertainty(new_det)
+                        + self._localization_uncertainty(existing_det),
+                    )
+                else:
+                    radius = float(merge_radius_meters)
 
                 if dist < radius:
                     is_duplicate = True
@@ -740,7 +801,7 @@ class MultiCameraPipeline:
         # 2. Temporal Tracking (Cross frames)
         tracked_buffer = []
         claimed_gids = set() # Prevent multiple detections in the same frame from claiming the same track
-        vehicle_classes = {'car', 'truck', 'bus'}
+        vehicle_classes = self.VEHICLE_CLASSES
         for det in clean_buffer:
             best_match_id = None
             min_dist = float('inf')
@@ -750,7 +811,7 @@ class MultiCameraPipeline:
             if local_key in self.local_to_global:
                 gid = self.local_to_global[local_key]
                 if gid in self.global_tracks and gid not in claimed_gids:
-                    if current_time_epoch - self.global_tracks[gid]['last_seen'] <= 40.0:
+                    if current_time_epoch - self.global_tracks[gid]['last_seen'] <= self.TRACK_MAX_IDLE_SEC:
                         best_match_id = gid
 
             # 2. Slow Path: Spatial Math Search
@@ -767,7 +828,7 @@ class MultiCameraPipeline:
                             continue
 
                     dt = current_time_epoch - track['last_seen']
-                    if dt > 40.0:
+                    if dt > self.TRACK_MAX_IDLE_SEC:
                         continue
 
                     pred_lat, pred_lon = track['kf'].get_prediction(dt=dt if dt > 0 else 0.1)
@@ -787,10 +848,18 @@ class MultiCameraPipeline:
                     if track.get('embedding') is not None and det.get('embedding') is not None:
                         emb_sim = np.dot(track['embedding'], det['embedding'])
 
-                    # Match to track if within 40m
-                    if dist < 40.0 and dist < min_dist:
-                        # Allow match if very close physically OR if visually similar
-                        if dist < 30.0 or emb_sim > 0.50:
+                    uncertainty = min(
+                        2.0,
+                        self._localization_uncertainty(det)
+                        + float(track.get('uncertainty_meters', 0.0)),
+                    )
+                    close_gate = self.TRACK_CLOSE_DISTANCE_M + uncertainty
+                    max_gate = self.TRACK_MAX_DISTANCE_M + uncertainty
+                    if dist < max_gate and dist < min_dist:
+                        if (
+                            dist < close_gate
+                            or emb_sim >= self.TRACK_MIN_APPEARANCE_SIMILARITY
+                        ):
                             best_match_id = gid
                             min_dist = dist
 
@@ -809,6 +878,7 @@ class MultiCameraPipeline:
                         self.global_tracks[best_match_id]['embedding'] = det['embedding']
 
                 self.global_tracks[best_match_id]['last_seen'] = current_time_epoch
+                self.global_tracks[best_match_id]['uncertainty_meters'] = self._localization_uncertainty(det)
                 det['object_id'] = (
                     f"global_{self.global_tracks[best_match_id]['type']}_"
                     f"{self.perception_run_prefix}_{best_match_id}"
@@ -823,6 +893,7 @@ class MultiCameraPipeline:
                     'kf': KalmanTracker(det['gps_location']['latitude'], det['gps_location']['longitude']),
                     'embedding': det.get('embedding'),
                     'last_seen': current_time_epoch
+                    , 'uncertainty_meters': self._localization_uncertainty(det)
                 }
                 det['object_id'] = (
                     f"global_{det['object_type']}_"
