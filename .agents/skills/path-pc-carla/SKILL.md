@@ -378,6 +378,28 @@ four untouched holdouts spanning 50% of image width and 30% of height. Record
 the source frame hash and measured intrinsics/distortion. Then require held-out
 RMSE/P95/max of 75/125/175 pixels at 1280x960 and all four retained renders.
 
+Fit, deploy, and verify must all call the same tracked camera-transform and
+optical-model functions. A missing translation offset means zero; never hide a
+default pole displacement in one path. Resolve candidate landmarks directly
+from the UE5 map/depth buffer with `build_twin_camera_landmarks.py`; legacy
+camera-local XZ converted through the heading under test is circular evidence.
+Reject sparse, collinear, clustered, or non-global datasets before fitting.
+
+Feature matchers (SIFT, LoFTR, RoMa, or successors) may propose landmarks but
+cannot themselves certify held-out truth. Repeated lane/crosswalk markings can
+produce a low numerical loss for the wrong correspondence. Retain the real and
+twin source frames, manually/geometrically identify each held-out landmark, and
+require an independent road-geometry gate for road edges, lane markings,
+horizon, vanishing points, curb/crosswalk topology, and stable map landmarks.
+If the retained render visibly contradicts the real view, fail the candidate
+even when a point-only threshold passes; do not weaken thresholds or relabel
+matcher-generated points to make it green.
+
+Actor visual proof must also be reproducible across bridge restarts: choose UE5
+blueprints with a stable digest rather than Python's randomized `hash()`. For a
+same-car gate, require the projected actor bbox/centroid in the matched twin
+camera over multiple replay timestamps, not merely `actor_present=true`.
+
 Useful logs:
 
 ```bash
