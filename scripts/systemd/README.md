@@ -3,9 +3,22 @@
 These definitions describe the accepted Path PC runtime. They are deployment
 artifacts, not evidence that the installed units already match them.
 
+The production simulator is the packaged Unreal Engine 5.5 worker container
+`carla-rr-maps`; its runtime reports `5.5.0-0+UE5`. Unreal Engine 6 work is a
+separate task and must not supply code, processes, ports, or acceptance evidence
+to this V2X deployment. UE6 work must never stop, hold, delay, restart, or
+reconfigure V2X services or timers; if it cannot coexist, stop the UE6 task and
+use a separately authorized maintenance task.
+
+Until the image is published with an immutable registry digest and engine OCI
+labels, the Path PC gate pins local image ID
+`sha256:8e7c7152f86a9e26878de5f280514f224290f70aad7b28d00d5087709504118e`
+and shipping-binary SHA-256
+`d9d8cafc10def42557cdfc2897f9581da45c4900dc82c3ff37f2c5e2e7b98b23`.
+
 | Unit | Responsibility | Accepted origin/runtime |
 |---|---|---|
-| `v2x-carla-rr.service` | supervises the pre-provisioned simulator container | `carla-rr-maps`, `ghcr.io/simforgeinc/carla-rr-maps:0.10.0`, NVIDIA runtime, bridge ports 2000-2002 |
+| `v2x-carla-rr.service` | supervises the pre-provisioned UE5.5 simulator worker | `carla-rr-maps`, `ghcr.io/simforgeinc/carla-rr-maps:0.10.0`, `5.5.0-0+UE5`, NVIDIA runtime, bridge ports 2000-2002 |
 | `v2x-drive.service` | Drive WebSocket bridge | CARLA Python 3.10, `0.0.0.0:8765` |
 | `v2x-web.service` | Vite dashboard | `0.0.0.0:5173`; runtime config only, no browser-local Drive override |
 | `v2x-perception.service` | four-camera HLS inference and MJPEG/health API | `0.0.0.0:8090` |
@@ -16,7 +29,9 @@ artifacts, not evidence that the installed units already match them.
 | `v2x-hourly-drive-restart.timer` | guarded simulator/bridge restart | skips healthy active sessions; never creates/replaces the container by default |
 
 Do not use the retired `carla-custommaps`, `carla-rfs`, CARLA 0.9.16,
-`CarlaUE4.sh`, or `/home/path/V2XCarla/carla-venv` definitions.
+`CarlaUE4.sh`, or `/home/path/V2XCarla/carla-venv` definitions. Do not use
+`/home/path/V2XCarla/CarlaUE6`, `/home/path/V2XCarla/UnrealEngine_6`, `ue6-*`
+user units, or ports 2100-2102 from this deployment workflow.
 
 ## Controlled deployment gate
 

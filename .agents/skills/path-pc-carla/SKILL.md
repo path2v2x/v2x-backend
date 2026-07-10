@@ -1,6 +1,6 @@
 ---
 name: path-pc-carla
-description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252.40, including the RR CARLA 0.10 simulator, drive WebSocket bridge, Vite dashboard, perception/HLS pipeline, Cloudflare and Tailscale transport, systemd supervision, and controlled deployment/rollback gates. Use for any work that reads, tests, changes, deploys, or recovers the Path PC V2X environment.
+description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252.40, including the production Unreal Engine 5.5 RR/CARLA 0.10 worker container, drive WebSocket bridge, Vite dashboard, perception/HLS pipeline, Cloudflare and Tailscale transport, systemd supervision, and controlled deployment/rollback gates. Use for any work that reads, tests, changes, deploys, or recovers the Path PC V2X environment; exclude Unreal Engine 6 experiments, which belong to a separate task and runtime namespace.
 ---
 
 # Path PC CARLA/V2X
@@ -14,7 +14,10 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 - Make source changes only in a clean Codex worktree. Treat `/home/path/V2XCarla/v2x-backend-dev` as a reference candidate, not as proof that it is clean; verify its status and fail the deployment gate if it is dirty.
 - Do not overwrite `/home/path/V2XCarla/v2x-backend` until a controlled deployment gate. It may run active services and contain live-only work.
 - Preserve `/home/path/V2XCarla/v2x-backend-backups/` and take a fresh rollback snapshot before deployment.
-- Never use the retired `carla-rfs`/CARLA 0.9.16 restart recipe. The accepted simulator is RR/CARLA 0.10.
+- Use only the packaged Unreal Engine 5.5 worker container `carla-rr-maps` for production V2X simulator work. The accepted image is RR/CARLA 0.10 and its runtime reports `5.5.0-0+UE5`.
+- Never use the retired `carla-rfs`/CARLA 0.9.16 restart recipe.
+- Do not build, launch, debug, authorize, retry, coordinate, or accept evidence from `/home/path/V2XCarla/CarlaUE6`, `/home/path/V2XCarla/UnrealEngine_6`, `ue6-*` user units, or ports `2100-2102` in a V2X task. A separate UE6 task owns those paths, processes, changes, and acceptance criteria.
+- UE6 work must not stop, hold, delay, restart, or reconfigure V2X services or timers. A V2X task may detect UE6 resources and fail closed, but must not operate them. If UE6 cannot run without affecting V2X, the UE6 task must stop and await a separately authorized maintenance task.
 - Before service or tunnel changes, stop every mutation-capable timer in the maintenance window, snapshot its state, and restore it only after validation:
 
 ```bash
@@ -28,12 +31,15 @@ The link-health units can repair/publish public runtime configuration when their
 
 ## Revalidate the live topology
 
-Observed on 2026-07-10; verify rather than assume:
+Observed on 2026-07-10 UTC; verify rather than assume:
 
 | Layer | Expected live value |
 |---|---|
+| Simulator engine | packaged Unreal Engine `5.5.0-0+UE5`; never UE6 |
 | CARLA container | `carla-rr-maps` |
 | CARLA image | `ghcr.io/simforgeinc/carla-rr-maps:0.10.0` |
+| CARLA image ID | `sha256:8e7c7152f86a9e26878de5f280514f224290f70aad7b28d00d5087709504118e` |
+| Shipping binary SHA-256 | `d9d8cafc10def42557cdfc2897f9581da45c4900dc82c3ff37f2c5e2e7b98b23` |
 | CARLA command | `./CarlaUnreal.sh -RenderOffScreen -vulkan -nosound -carla-rpc-port=2000` |
 | CARLA runtime/network | NVIDIA runtime, Docker bridge, host ports `2000-2002` |
 | Map | `Richmond_Field_Station_Richmond_CA` |
@@ -63,6 +69,45 @@ test -z "$(git -C /home/path/V2XCarla/v2x-backend-dev status --porcelain=v1)" ||
 docker ps -a --filter name=carla-rr-maps --no-trunc
 docker inspect carla-rr-maps --format \
   'image={{.Config.Image}} runtime={{.HostConfig.Runtime}} network={{.HostConfig.NetworkMode}} restart={{.HostConfig.RestartPolicy.Name}} ports={{json .HostConfig.PortBindings}} cmd={{json .Config.Cmd}}'
+expected_image_id='sha256:8e7c7152f86a9e26878de5f280514f224290f70aad7b28d00d5087709504118e'
+actual_image_id="$(docker inspect -f '{{.Image}}' carla-rr-maps)"
+test "$actual_image_id" = "$expected_image_id" || {
+  echo "Production CARLA image ID drifted: $actual_image_id" >&2
+  exit 1
+}
+container_pid="$(docker inspect -f '{{.State.Pid}}' carla-rr-maps)"
+ue5_binary="/proc/$container_pid/root/home/carla/CarlaUnreal/Binaries/Linux/CarlaUnreal-Linux-Shipping"
+expected_binary_sha256='d9d8cafc10def42557cdfc2897f9581da45c4900dc82c3ff37f2c5e2e7b98b23'
+actual_binary_sha256="$(sudo sha256sum "$ue5_binary" | awk '{print $1}')"
+test "$actual_binary_sha256" = "$expected_binary_sha256" || {
+  echo "Production CARLA UE5 worker binary drifted: $actual_binary_sha256" >&2
+  exit 1
+}
+sudo strings -a "$ue5_binary" \
+  | awk 'index($0, "/UnrealEngine5/") {found=1} END {exit !found}' || {
+  echo 'Production CARLA binary lacks the UnrealEngine5 marker; stop.' >&2
+  exit 1
+}
+if systemctl cat v2x-carla-rr.service \
+  | grep -Eqi 'CarlaUE6|UnrealEngine_6|carla-rpc-port=2100'; then
+  echo 'Production V2X service references the separate UE6 runtime; stop.' >&2
+  exit 1
+fi
+if find /home/path/V2XCarla/v2x-backend \
+  \( -path '*/.git' -o -path '*/node_modules' -o -path '*/.svelte-kit' \) \
+  -prune -o -iname '*ue6*' -print -quit | grep -q .; then
+  echo 'A UE6 artifact exists inside the production V2X checkout; stop.' >&2
+  exit 1
+fi
+if systemctl --user list-units --all --no-legend --no-pager \
+  | awk 'tolower($1) ~ /ue6|carlaue6/ {found=1; print} END {exit !found}'; then
+  echo 'A separate UE6 unit is loaded; do not mutate V2X while it is present.' >&2
+  exit 1
+fi
+if ss -ltnH | awk '$4 ~ /:(2100|2101|2102)$/ {found=1} END {exit !found}'; then
+  echo 'A separate UE6 listener is active; do not mutate V2X while it is present.' >&2
+  exit 1
+fi
 ss -ltnp | awk 'NR==1 || /:(2000|2001|2002|8765|5173|8090)( |$)/'
 ps -eo pid=,ppid=,lstart=,args= | awk '/[c]loudflared/'
 systemctl show \
@@ -145,7 +190,7 @@ done
 
 Keep these layers separate:
 
-1. CARLA RPC on `2000`.
+1. The UE5.5 `carla-rr-maps` worker container and CARLA RPC on `2000`.
 2. Drive WebSocket bridge on `8765`.
 3. Supervised frontend dev server on `5173`.
 4. Perception health/MJPEG on `8090`.
@@ -165,8 +210,8 @@ A healthy CARLA container does not prove a healthy bridge, tunnel, frontend, or 
 
 ## Drive diagnosis order
 
-1. Confirm `carla-rr-maps` is running with the expected image/command.
-2. Confirm CARLA 0.10 accepts a client and has the Richmond map loaded.
+1. Confirm `carla-rr-maps` is running with the expected image/command and reports `5.5.0-0+UE5`.
+2. Confirm RR/CARLA 0.10 in that UE5.5 worker accepts a client and has the Richmond map loaded.
 3. Confirm `v2x-drive.service` and listener `8765`.
 4. Perform a WebSocket handshake/protocol health check.
 5. Inspect the tunnel process and its local origin.
@@ -353,15 +398,16 @@ up owned actors in `finally`:
 Before changing live services:
 
 1. Confirm the clean worktree commit and successful web/bridge/perception tests.
-2. Confirm no active drive session.
-3. Stop both repair timers and the hourly restart timer.
-4. Capture installed unit hashes, process commands, container image ID, live Git status, tunnel/runtime config, ignored-model/cache hashes, perception Python/pip state, and service logs.
-5. Preserve rollback copies of installed units, ignored runtime assets, and the live repository changes.
-6. Let `v2x-carla-rr.service` adopt an already-running validated container through `docker wait`; do not restart or recreate it merely to add supervision.
-7. Install one layer at a time and refresh UI/API evidence after each action.
-8. Start perception with `/etc/v2x-perception.env` keeping `V2X_PERCEPTION_UPLOAD=false`; require four fresh/changing feeds before enabling production uploads and proving a current DynamoDB record.
-9. Restore the previous artifact immediately when its acceptance gate fails. For Quick Tunnels, restore variables around the currently healthy endpoint, never a dead saved URL.
-10. Re-enable timers only after the final public/runtime checks pass.
+2. Confirm all simulator operations target only the UE5.5 `carla-rr-maps` worker on ports `2000-2002`; reject UE6 paths, units, ports, or evidence.
+3. Confirm no active drive session.
+4. Stop both repair timers and the hourly restart timer.
+5. Capture installed unit hashes, process commands, container image ID, live Git status, tunnel/runtime config, ignored-model/cache hashes, perception Python/pip state, and service logs.
+6. Preserve rollback copies of installed units, ignored runtime assets, and the live repository changes.
+7. Let `v2x-carla-rr.service` adopt an already-running validated container through `docker wait`; do not restart or recreate it merely to add supervision.
+8. Install one layer at a time and refresh UI/API evidence after each action.
+9. Start perception with `/etc/v2x-perception.env` keeping `V2X_PERCEPTION_UPLOAD=false`; require four fresh/changing feeds before enabling production uploads and proving a current DynamoDB record.
+10. Restore the previous artifact immediately when its acceptance gate fails. For Quick Tunnels, restore variables around the currently healthy endpoint, never a dead saved URL.
+11. Re-enable timers only after the final public/runtime checks pass.
 
 API route reconciliation is plan-first and exact-resource only. The normal service user cannot write API Gateway directly. A separately authorized principal must apply `infra/aws-cli/bootstrap-v2x-deploy-role.sh`; then assume `V2XBackendDeployRole` and run `provision-read-api.sh` with the reviewed API ID, `RECONCILE_LAMBDA=false`, IAM attachment disabled, explicit `PLAN_ONLY=false`, and the plan's `EXPECTED_CURRENT_STATE_HASH`. Do not add API privileges to the Amplify service role.
 
