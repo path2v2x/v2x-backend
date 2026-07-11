@@ -624,6 +624,7 @@ def verify_external_evidence(
                 "split": feature["split"],
                 "provenance": feature["provenance"],
                 "category": str(feature.get("category") or "").strip(),
+                "description": str(feature.get("description") or "").strip(),
                 "twin": [float(value) for value in feature["twin"]],
                 "image": [float(value) for value in feature["image"]],
             })
@@ -634,6 +635,7 @@ def verify_external_evidence(
                 "split": feature["split"],
                 "provenance": feature["provenance"],
                 "category": str(feature.get("category") or "").strip(),
+                "description": str(feature.get("description") or "").strip(),
                 "twin_polyline": [
                     [float(value) for value in pixel]
                     for pixel in feature["twin_polyline"]
@@ -646,10 +648,13 @@ def verify_external_evidence(
         actual_features = []
         for feature in manifest.get("features", []):
             keys = (
-                ("id", "type", "split", "provenance", "category", "twin", "image")
+                (
+                    "id", "type", "split", "provenance", "category",
+                    "description", "twin", "image",
+                )
                 if feature.get("type") == "point"
                 else (
-                    "id", "type", "split", "provenance", "category",
+                    "id", "type", "split", "provenance", "category", "description",
                     "twin_polyline", "image_polyline",
                 )
             )

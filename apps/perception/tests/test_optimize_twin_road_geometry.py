@@ -2,11 +2,13 @@
 
 import hashlib
 import importlib.util
+from io import BytesIO
 import json
 from pathlib import Path
 import unittest
 
 import numpy as np
+from PIL import Image
 
 TOOL = Path(__file__).resolve().parents[2] / "bridge" / "tools" / "optimize_twin_road_geometry.py"
 SPEC = importlib.util.spec_from_file_location("optimize_twin_road_geometry", TOOL)
@@ -19,6 +21,15 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         return MODULE.optimize_manifest(
             manifest, external_evidence_verified=True, **kwargs
         )
+
+    @staticmethod
+    def intrinsics_source_images():
+        payloads = []
+        for index in range(24):
+            output = BytesIO()
+            Image.new("RGB", (8, 8), (index, 0, 0)).save(output, format="PNG")
+            payloads.append(output.getvalue())
+        return payloads
 
     def synthetic_manifest(self):
         width, height = 1280, 960
@@ -39,7 +50,9 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "world": world, "image": pixel.tolist(),
                 "twin": pixel.tolist(),
                 "category": "static_landmark",
+                "description": f"Unique synthetic landmark number {index}",
                 "provenance": "manually_verified_unique",
+                "depth_neighborhood": {"center_depth_m": float(depth[index])},
             })
         line_specs = [
             ("a", [[-10, 12, 0], [0, 12, 0], [10, 12, 0]]),
@@ -57,7 +70,11 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "twin_polyline": projected.tolist(),
                 "image_polyline": projected.tolist(),
                 "category": "road_edge",
+                "description": f"Unique synthetic road edge named {name}",
                 "provenance": "manually_traced_geometry",
+                "depth_neighborhoods": [
+                    {"center_depth_m": 10.0} for _point in world
+                ],
             })
         return {
             "schema_version": 1,
@@ -105,8 +122,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "artifact_sha256": hashlib.sha256(b"intrinsics").hexdigest(),
                 "image_count": 24,
                 "source_images_sha256": [
-                    hashlib.sha256(f"intrinsics-{index}".encode()).hexdigest()
-                    for index in range(24)
+                    hashlib.sha256(payload).hexdigest()
+                    for payload in self.intrinsics_source_images()
                 ],
                 "rms_reprojection_error_px": 0.3,
                 "resolution": [width, height],
@@ -306,7 +323,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 annotations_payload["points"].append({
                     key: feature[key]
                     for key in (
-                        "id", "split", "provenance", "category", "twin", "image"
+                        "id", "split", "provenance", "category", "description",
+                        "twin", "image",
                     )
                 })
             else:
@@ -314,6 +332,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                     key: feature[key]
                     for key in (
                         "id", "split", "provenance", "category",
+                        "description",
                         "twin_polyline", "image_polyline",
                     )
                 })
@@ -366,6 +385,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             "twin_frame_bytes": twin_frame,
             "cameras_bytes": cameras,
             "intrinsics_artifact_bytes": artifact,
+            "intrinsics_source_image_bytes": self.intrinsics_source_images(),
             "depth_frame_bytes": depth_frame,
             "runtime_evidence": {
                 "ue5_map": manifest["ue5_map"],
