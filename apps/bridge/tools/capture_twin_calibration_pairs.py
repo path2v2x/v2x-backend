@@ -160,11 +160,34 @@ async def capture(args):
     )
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
+    cameras_bytes = None
+    cameras_sha256 = None
+    camera_hashes = {}
+    if not args.real_only:
+        if not args.cameras_json:
+            raise CaptureError("--cameras-json is required for twin capture")
+        cameras_bytes = Path(args.cameras_json).read_bytes()
+        cameras_sha256 = hashlib.sha256(cameras_bytes).hexdigest()
+        try:
+            cameras_payload = json.loads(cameras_bytes)
+            cameras = cameras_payload["cameras"]
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CaptureError("cameras JSON is invalid") from exc
+        for camera_id in CAMERAS:
+            try:
+                camera = next(item for item in cameras if item.get("id") == camera_id)
+            except StopIteration as exc:
+                raise CaptureError(f"cameras JSON lacks {camera_id}") from exc
+            canonical = json.dumps(
+                camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+            camera_hashes[camera_id] = hashlib.sha256(canonical).hexdigest()
     manifest = {
         "schema": "v2x-observational-calibration-pairs/v1",
         "captured_at_utc": utc_now(),
         "real_base_origin": real_base,
         "twin_ws_origin": ws_base,
+        "cameras_file_sha256": cameras_sha256,
         "mutation_log": [],
         "cameras": {},
     }
@@ -215,6 +238,7 @@ async def capture(args):
                 "sha256": hashlib.sha256(twin).hexdigest(),
                 "frame_metadata": twin_metadata,
                 "camera_model": (hello or {}).get("camera_model"),
+                "camera_config_sha256": camera_hashes[camera_id],
             }
         manifest["cameras"][camera_id] = camera_manifest
     manifest_path = output / "manifest.json"
@@ -227,6 +251,10 @@ def main():
     parser.add_argument("--real-base-url", default="http://127.0.0.1:8090")
     parser.add_argument("--ws-base-url", default="ws://127.0.0.1:8765")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--cameras-json",
+        help="exact config used by the active twin render; required unless --real-only",
+    )
     parser.add_argument(
         "--real-only",
         action="store_true",

@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS_DIR))
@@ -16,23 +17,39 @@ sys.path.insert(0, str(TOOLS_DIR))
 from build_twin_calibration_manifest import (  # noqa: E402
     build_deployment_model,
     decoded_image_size,
+    depth_neighborhood_evidence,
     stable_depth_meters,
+    resolve_manifest,
     validate_intrinsics_artifact,
     validate_intrinsics_calibration,
+    validate_intrinsics_source_images,
     validate_annotations,
 )
 
 
 def annotation_payload():
+    train_real = [
+        [200, 200], [800, 230], [1500, 250], [2300, 220],
+        [250, 700], [900, 900], [1600, 1050], [2250, 800],
+    ]
+    holdout_real = [[300, 350], [2200, 420], [400, 1500], [2150, 1450]]
+    train_twin = [
+        [100, 100], [400, 115], [750, 125], [1150, 110],
+        [125, 350], [450, 450], [800, 525], [1125, 400],
+    ]
+    holdout_twin = [[150, 175], [1100, 210], [200, 750], [1075, 725]]
     points = []
-    for index in range(12):
+    for index, (image, twin) in enumerate(zip(
+        train_real + holdout_real, train_twin + holdout_twin
+    )):
         points.append({
             "id": f"landmark-{index}",
             "split": "train" if index < 8 else "holdout",
             "provenance": "manually_verified_unique",
             "category": "signal_corner",
-            "twin": [100.0 + index * 20.0, 100.0 + index * 10.0],
-            "image": [200.0 + index * 40.0, 200.0 + index * 20.0],
+            "description": f"Unique signal cabinet corner number {index}",
+            "twin": twin,
+            "image": image,
         })
     roads = []
     for index in range(5):
@@ -41,6 +58,7 @@ def annotation_payload():
             "split": "train" if index < 3 else "holdout",
             "provenance": "manually_traced_geometry",
             "category": "curb_edge",
+            "description": f"Unique finite curb edge segment number {index}",
             "twin_polyline": [[100, 500 + index * 10], [1100, 400 + index * 10]],
             "image_polyline": [[200, 1000 + index * 20], [2200, 800 + index * 20]],
         })
@@ -48,6 +66,7 @@ def annotation_payload():
         "camera_id": "ch1",
         "real_frame_sha256": "a" * 64,
         "twin_frame_sha256": "b" * 64,
+        "cameras_file_sha256": "c" * 64,
         "points": points,
         "roads": roads,
     }
@@ -199,9 +218,44 @@ def depth_buffer(width, height, default_depth, overrides=None):
 def test_depth_neighborhood_rejects_geometry_edges():
     stable = depth_buffer(5, 5, 10.0)
     assert stable_depth_meters(stable, 5, 5, 2, 2) == pytest.approx(10.0, abs=0.001)
+    evidence = depth_neighborhood_evidence(stable, 5, 5, 2, 2)
+    assert evidence["center_depth_m"] == pytest.approx(10.0, abs=0.001)
+    assert evidence["minimum_depth_m"] == pytest.approx(10.0, abs=0.001)
+    assert evidence["maximum_deviation_m"] == pytest.approx(0.0)
+    assert evidence["allowed_deviation_m"] == pytest.approx(0.25)
     discontinuous = depth_buffer(5, 5, 10.0, {(2, 2): 40.0})
     with pytest.raises(ValueError, match="depth discontinuity"):
         stable_depth_meters(discontinuous, 5, 5, 2, 2)
+
+
+def test_resolve_manifest_rejects_wrong_depth_resolution_before_backprojection():
+    depth = SimpleNamespace(width=4, height=4, raw_data=b"\0" * 64, frame=1, timestamp=1.0)
+    with pytest.raises(ValueError, match="depth resolution"):
+        resolve_manifest(
+            [], camera_id="ch1", camera={}, transform=SimpleNamespace(),
+            depth_image=depth, depth_raw=depth.raw_data, expected_twin_size=(5, 5),
+            real_frame_sha256="a" * 64, twin_frame_sha256="b" * 64,
+            annotation_sha256="c" * 64, cameras_file_sha256="d" * 64,
+            camera_config_sha256="e" * 64, depth_raw_sha256="f" * 64,
+        )
+
+
+def test_intrinsics_sources_are_bound_to_retained_images(tmp_path):
+    camera = measured_camera()
+    images = []
+    hashes = []
+    for index in range(10):
+        path = tmp_path / f"source-{index}.png"
+        image = Image.new("RGB", (16, 12), (index, 0, 0))
+        image.save(path)
+        images.append(path)
+        hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    camera["intrinsics_calibration"]["source_images_sha256"] = hashes
+    camera["intrinsics_calibration"]["image_count"] = len(hashes)
+    assert validate_intrinsics_source_images(camera, images) == sorted(hashes)
+    images[-1] = images[0]
+    with pytest.raises(ValueError, match="count or uniqueness"):
+        validate_intrinsics_source_images(camera, images)
 
 
 @pytest.mark.parametrize(
@@ -257,10 +311,55 @@ def test_rejects_missing_or_untrusted_intrinsics_evidence(mutate, message):
             ),
             "unique",
         ),
+        (
+            lambda payload: payload["points"][0].update(description=""),
+            "semantic description",
+        ),
+        (
+            lambda payload: payload["points"][8].update(
+                image=payload["points"][0]["image"]
+            ),
+            "distinct across train and holdout",
+        ),
+        (
+            lambda payload: payload["roads"][0].update(
+                image_polyline=[[200, 1000], [200, 1000]]
+            ),
+            "zero-length segment",
+        ),
+        (
+            lambda payload: payload["roads"][3].update(
+                image_polyline=payload["roads"][0]["image_polyline"]
+            ),
+            "geometrically unique",
+        ),
     ],
 )
 def test_rejects_unverified_sparse_or_malformed_evidence(mutate, message):
     payload = copy.deepcopy(annotation_payload())
     mutate(payload)
     with pytest.raises(ValueError, match=message):
+        validate_annotations(payload, "ch1", (2560, 1920), (1280, 960))
+
+
+def test_rejects_collinear_or_fit_line_copied_holdouts():
+    payload = annotation_payload()
+    train_line = [
+        [100, 200], [400, 400], [700, 600], [1000, 800],
+        [1300, 1000], [1600, 1200], [1900, 1400], [2350, 1700],
+    ]
+    holdout_line = [[100, 200], [850, 700], [1600, 1200], [2350, 1700]]
+    for point, pixel in zip(payload["points"], train_line + holdout_line):
+        point["image"] = pixel
+    with pytest.raises(ValueError, match="collinear or clustered"):
+        validate_annotations(payload, "ch1", (2560, 1920), (1280, 960))
+
+    payload = annotation_payload()
+    payload["points"][8]["image"] = [300, 350]
+    payload["points"][9]["image"] = [2200, 350]
+    payload["points"][10]["image"] = [400, 1500]
+    payload["points"][11]["image"] = [2150, 1500]
+    payload["roads"][0]["image_polyline"] = [[100, 350], [2400, 350]]
+    payload["roads"][1]["image_polyline"] = [[100, 1500], [2400, 1500]]
+    with pytest.raises(ValueError, match="not independent of fit roads"):
         validate_annotations(payload, "ch1", (2560, 1920), (1280, 960))
