@@ -1008,9 +1008,16 @@ def expected_twin_camera_transform(world, path, camera_id):
         location.z += float(camera["height_m"]) + float(
             pose.get("height_offset_m", 0.0)
         )
-        forward = float(pose.get("forward_offset_m", 0.5))
-        location.x += forward * math.cos(math.radians(yaw))
-        location.y += forward * math.sin(math.radians(yaw))
+        yaw_radians = math.radians(yaw)
+        forward = float(pose.get("forward_offset_m", 0.0))
+        right = float(pose.get("right_offset_m", 0.0))
+        location.x += forward * math.cos(yaw_radians)
+        location.y += forward * math.sin(yaw_radians)
+        location.x -= right * math.sin(yaw_radians)
+        location.y += right * math.cos(yaw_radians)
+        roll = float(camera.get("roll_deg", 0.0)) + float(
+            pose.get("roll_offset_deg", 0.0)
+        )
     except (KeyError, OSError, StopIteration, TypeError, ValueError) as exc:
         raise VerificationError(
             "tracked camera transform cannot be independently recomputed"
@@ -1021,7 +1028,7 @@ def expected_twin_camera_transform(world, path, camera_id):
             "y": float(location.y),
             "z": float(location.z),
         },
-        "rotation": {"pitch": pitch, "yaw": yaw, "roll": 0.0},
+        "rotation": {"pitch": pitch, "yaw": yaw, "roll": roll},
     }
     return _finite_transform_payload(expected, "tracked camera transform")
 
@@ -1094,6 +1101,15 @@ def validate_twin_camera_model(
         for value in lens.values()
     ):
         raise VerificationError("twin camera model lens geometry is invalid")
+    if any(
+        not math.isclose(
+            float(lens[key]), expected, rel_tol=0.0, abs_tol=1e-9
+        )
+        for key, expected in CARLA_DEFAULT_PINHOLE_LENS.items()
+    ):
+        raise VerificationError(
+            "twin camera model rejects a non-default CARLA lens model"
+        )
     return {
         "camera_id": expected_camera_id,
         "actor_id": actor_id,
