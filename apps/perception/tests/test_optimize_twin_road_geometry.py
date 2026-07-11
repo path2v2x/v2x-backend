@@ -50,8 +50,20 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "provenance": "manually_traced_geometry",
             })
         return {
-            "camera_id": "synthetic", "width": width, "height": height,
+            "schema_version": 1,
+            "camera_id": "ch1", "width": width, "height": height,
             "source_frame_sha256": hashlib.sha256(b"frame").hexdigest(),
+            "twin_frame_sha256": hashlib.sha256(b"twin").hexdigest(),
+            "annotation_sha256": hashlib.sha256(b"annotations").hexdigest(),
+            "cameras_file_sha256": hashlib.sha256(b"cameras").hexdigest(),
+            "camera_config_sha256": hashlib.sha256(b"camera").hexdigest(),
+            "ue5_map": "Carla/Maps/Richmond_Field_Station_Richmond_CA",
+            "depth_frame": {
+                "carla_frame": 123,
+                "sensor_timestamp": 45.5,
+                "width": 1280,
+                "height": 960,
+            },
             "baseline": {
                 "location": location, "pitch_deg": -33.0, "yaw_deg": 88.0,
                 "roll_deg": 0.0, "fov_deg": 92.0, "cx": 640.0,
@@ -72,6 +84,19 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         report = MODULE.optimize_manifest(manifest)
         self.assertFalse(report["passed"])
         self.assertEqual(report["reason"], "dataset_gate")
+
+    def test_rejects_hand_authored_manifest_without_builder_fingerprints(self):
+        manifest = self.synthetic_manifest()
+        manifest.pop("annotation_sha256")
+        manifest.pop("depth_frame")
+        report = MODULE.optimize_manifest(manifest)
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "missing_annotation_sha256", report["dataset_gate"]["reasons"]
+        )
+        self.assertIn(
+            "missing_depth_frame_identity", report["dataset_gate"]["reasons"]
+        )
 
     def test_polyline_distance_follows_segments_not_infinite_extension(self):
         points = np.array([[0.5, 1.0], [3.0, 0.0]])

@@ -93,9 +93,45 @@ def point_metrics(errors):
 
 def manifest_gate(manifest):
     reasons = []
+    if manifest.get("schema_version") != 1:
+        reasons.append("invalid_manifest_schema")
+    if manifest.get("camera_id") not in {"ch1", "ch2", "ch3", "ch4"}:
+        reasons.append("invalid_camera_id")
     source_hash = str(manifest.get("source_frame_sha256") or "")
     if not (len(source_hash) == 64 and all(ch in "0123456789abcdef" for ch in source_hash)):
         reasons.append("missing_source_frame_hash")
+    for field in (
+        "twin_frame_sha256",
+        "annotation_sha256",
+        "cameras_file_sha256",
+        "camera_config_sha256",
+    ):
+        value = str(manifest.get(field) or "")
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            reasons.append(f"missing_{field}")
+    if not str(manifest.get("ue5_map") or "").lower().endswith(
+        "richmond_field_station_richmond_ca"
+    ):
+        reasons.append("invalid_ue5_map")
+    depth = manifest.get("depth_frame")
+    if not isinstance(depth, dict):
+        reasons.append("missing_depth_frame_identity")
+    else:
+        carla_frame = depth.get("carla_frame")
+        timestamp = depth.get("sensor_timestamp")
+        depth_width, depth_height = depth.get("width"), depth.get("height")
+        if (
+            isinstance(carla_frame, bool)
+            or not isinstance(carla_frame, int)
+            or carla_frame <= 0
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(float(timestamp))
+            or float(timestamp) < 0.0
+            or depth_width != 1280
+            or depth_height != 960
+        ):
+            reasons.append("invalid_depth_frame_identity")
     features = manifest.get("features") or []
     ids = [feature.get("id") for feature in features]
     if any(not value for value in ids) or len(set(ids)) != len(ids):
