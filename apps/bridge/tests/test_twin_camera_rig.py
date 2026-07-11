@@ -7,6 +7,7 @@ import pytest
 from digital_twin_bridge import twin_camera_rig
 from digital_twin_bridge.twin_camera_rig import (
     TwinCameraRig,
+    absolute_twin_model,
     camera_with_twin_pose,
     configure_twin_camera_blueprint,
     compute_twin_camera_transform,
@@ -15,6 +16,7 @@ from digital_twin_bridge.twin_camera_rig import (
     is_twin_supported_map,
     load_cameras_config,
     twin_horizontal_fov_deg,
+    twin_pose_from_absolute,
 )
 
 from tests.conftest import MockLocation
@@ -151,6 +153,25 @@ class TestComputeTransform:
         transform = compute_twin_camera_transform(mock_world.get_map(), SITE, camera)
         assert transform.location.x == pytest.approx(10.0)
         assert transform.location.y == pytest.approx(20.0)
+
+    def test_absolute_fit_roundtrips_through_shared_production_math(self):
+        base = {
+            "pitch_deg": -39.2,
+            "yaw_deg": 63.94,
+            "roll_deg": 0.0,
+            "fov_deg": 88.0,
+        }
+        anchor = [10.0, 20.0, 8.5]
+        target = [11.3, 19.2, 9.1]
+        pose = twin_pose_from_absolute(
+            anchor, base, target, -35.0, 71.0, 2.0, 91.0
+        )
+        absolute = absolute_twin_model(anchor, base, pose)
+        assert absolute["location"] == pytest.approx(target)
+        assert absolute["pitch_deg"] == pytest.approx(-35.0)
+        assert absolute["yaw_deg"] == pytest.approx(71.0)
+        assert absolute["roll_deg"] == pytest.approx(2.0)
+        assert absolute["fov_deg"] == pytest.approx(91.0)
 
 
 class TestTwinCameraRig:

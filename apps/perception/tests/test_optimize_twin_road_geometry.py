@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -14,6 +15,11 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RoadGeometryOptimizerTests(unittest.TestCase):
+    def optimize(self, manifest, **kwargs):
+        return MODULE.optimize_manifest(
+            manifest, external_evidence_verified=True, **kwargs
+        )
+
     def synthetic_manifest(self):
         width, height = 1280, 960
         truth = [-35.0, 90.0, 2.0, 90.0, 640.0, 480.0, 0.0]
@@ -31,6 +37,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "id": f"point-{index}", "type": "point",
                 "split": "train" if index < 8 else "holdout",
                 "world": world, "image": pixel.tolist(),
+                "twin": pixel.tolist(),
+                "category": "static_landmark",
                 "provenance": "manually_verified_unique",
             })
         line_specs = [
@@ -43,10 +51,12 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         for index, (name, world) in enumerate(line_specs):
             projected, _ = MODULE.project_world_points(world, location, truth, width, height)
             features.append({
-                "id": f"line-{name}", "type": "line",
+                "id": f"line-{name}", "type": "polyline",
                 "split": "train" if index < 3 else "holdout",
                 "world": world,
-                "image_line": [*projected[0], *projected[-1]],
+                "twin_polyline": projected.tolist(),
+                "image_polyline": projected.tolist(),
+                "category": "road_edge",
                 "provenance": "manually_traced_geometry",
             })
         return {
@@ -76,12 +86,15 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                     "pitch_deg": -33.0,
                     "yaw_deg": 88.0,
                     "roll_deg": 0.0,
-                    "fov_deg": 92.0,
+                    "fov_deg": 90.0,
                 },
                 "lens": {
                     "lens_k": 0.0,
                     "lens_kcube": 0.0,
+                    "lens_circle_falloff": 5.0,
                     "lens_circle_multiplier": 0.0,
+                    "lens_x_size": 0.08,
+                    "lens_y_size": 0.08,
                 },
             },
             "intrinsics_calibration": {
@@ -111,7 +124,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         }
 
     def test_recovers_synthetic_camera_and_passes_holdout(self):
-        report = MODULE.optimize_manifest(self.synthetic_manifest())
+        report = self.optimize(self.synthetic_manifest())
         self.assertTrue(report["passed"], report)
         self.assertLess(report["heldout"]["points"]["rmse_px"], 1.0)
         self.assertLess(report["heldout"]["lines"]["rmse_px"], 1.0)
@@ -133,8 +146,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             if feature["type"] == "point":
                 feature["image"] = pixels[0].tolist()
             else:
-                feature["image_line"] = [*pixels[0], *pixels[-1]]
-        report = MODULE.optimize_manifest(manifest)
+                feature["image_polyline"] = pixels.tolist()
+        report = self.optimize(manifest)
         self.assertTrue(report["passed"], report)
         self.assertLess(report["deployability"]["transform_roundtrip_max"], 1e-6)
         fitted = report["parameters"]
@@ -154,8 +167,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             if feature["type"] == "point":
                 feature["image"] = pixels[0].tolist()
             else:
-                feature["image_line"] = [*pixels[0], *pixels[-1]]
-        report = MODULE.optimize_manifest(manifest)
+                feature["image_polyline"] = pixels.tolist()
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"], report)
         self.assertFalse(report["deployability"]["passed"])
         self.assertIn(
@@ -174,21 +187,21 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
     def test_rejects_missing_independent_evidence(self):
         manifest = self.synthetic_manifest()
         manifest["features"] = manifest["features"][:4]
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"])
         self.assertEqual(report["reason"], "dataset_gate")
 
     def test_rejects_manifest_without_frozen_deployment_model(self):
         manifest = self.synthetic_manifest()
         manifest.pop("deployment_model")
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"])
         self.assertIn("missing_deployment_model", report["dataset_gate"]["reasons"])
 
     def test_rejects_manifest_without_measured_intrinsics(self):
         manifest = self.synthetic_manifest()
         manifest.pop("intrinsics_calibration")
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"])
         self.assertIn(
             "missing_measured_intrinsics_calibration",
@@ -198,7 +211,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
     def test_rejects_untraceable_intrinsics_source_images(self):
         manifest = self.synthetic_manifest()
         manifest["intrinsics_calibration"]["source_images_sha256"] = ["a" * 64] * 24
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"])
         self.assertIn(
             "invalid_measured_intrinsics_calibration",
@@ -208,7 +221,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
     def test_measured_distortion_blocks_otherwise_deployable_fit(self):
         manifest = self.synthetic_manifest()
         manifest["intrinsics_calibration"]["distortion"]["k1"] = -0.1
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"], report)
         self.assertIn(
             "measured_physical_optics_not_representable_in_ue5",
@@ -217,7 +230,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
 
     def test_identifiability_rejects_rank_deficient_geometry(self):
         manifest = self.synthetic_manifest()
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         params = np.array([report["parameters"][key] for key in MODULE.PARAMETER_NAMES])
         for feature in manifest["features"]:
             if feature["split"] != "train":
@@ -236,7 +249,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         manifest = self.synthetic_manifest()
         manifest.pop("annotation_sha256")
         manifest.pop("depth_frame")
-        report = MODULE.optimize_manifest(manifest)
+        report = self.optimize(manifest)
         self.assertFalse(report["passed"])
         self.assertIn(
             "missing_annotation_sha256", report["dataset_gate"]["reasons"]
@@ -250,6 +263,115 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         polyline = np.array([[0.0, 0.0], [1.0, 0.0]])
         distances = MODULE.point_to_polyline_distances(points, polyline)
         self.assertTrue(np.allclose(distances, [1.0, 2.0]))
+
+    def test_heldout_polyline_behind_camera_fails_closed(self):
+        manifest = self.synthetic_manifest()
+        heldout = next(
+            feature for feature in manifest["features"]
+            if feature["type"] == "polyline" and feature["split"] == "holdout"
+        )
+        heldout["world"] = [[0.0, -10.0, 8.0], [1.0, -10.0, 8.0]]
+        report = self.optimize(manifest)
+        self.assertFalse(report["passed"], report)
+        self.assertGreaterEqual(report["heldout"]["lines"]["max_px"], 5000.0)
+        self.assertIn("heldout_line_max", report["reasons"])
+
+    def test_nonfinite_metrics_are_replaced_by_fail_closed_sentinel(self):
+        metrics = MODULE.point_metrics([1.0, float("nan")])
+        self.assertEqual(metrics["nonfinite_count"], 1)
+        self.assertEqual(metrics["max_px"], 5000.0)
+
+    def test_infinite_line_manifest_is_rejected(self):
+        manifest = self.synthetic_manifest()
+        road = next(feature for feature in manifest["features"] if feature["type"] == "polyline")
+        road["type"] = "line"
+        road["image_line"] = [*road.pop("image_polyline")[0], *[0.0, 0.0]]
+        report = self.optimize(manifest)
+        self.assertFalse(report["passed"])
+        self.assertIn("infinite_line_evidence_not_allowed", report["dataset_gate"]["reasons"])
+
+    def test_optimizer_refuses_unbound_direct_manifest(self):
+        report = MODULE.optimize_manifest(self.synthetic_manifest())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["reason"], "external_evidence_not_verified")
+
+    def test_external_evidence_rebinds_every_retained_artifact(self):
+        manifest = self.synthetic_manifest()
+        annotations_payload = {"points": [], "roads": []}
+        for feature in manifest["features"]:
+            if feature["type"] == "point":
+                annotations_payload["points"].append({
+                    key: feature[key]
+                    for key in (
+                        "id", "split", "provenance", "category", "twin", "image"
+                    )
+                })
+            else:
+                annotations_payload["roads"].append({
+                    key: feature[key]
+                    for key in (
+                        "id", "split", "provenance", "category",
+                        "twin_polyline", "image_polyline",
+                    )
+                })
+        annotations = json.dumps(annotations_payload).encode()
+        real_frame = b"real-frame"
+        twin_frame = b"twin-frame"
+        artifact_payload = {
+            key: value
+            for key, value in manifest["intrinsics_calibration"].items()
+            if key != "artifact_sha256"
+        }
+        artifact = json.dumps(artifact_payload).encode()
+        manifest["intrinsics_calibration"]["artifact_sha256"] = hashlib.sha256(
+            artifact
+        ).hexdigest()
+        camera = {
+            "id": manifest["camera_id"],
+            "pitch_deg": -33.0,
+            "yaw_deg": 0.0,
+            "heading_deg": 178.0,
+            "roll_deg": 0.0,
+            "intrinsics": {
+                "fx": 640.0,
+                "fy": 640.0,
+                "cx": 640.0,
+                "cy": 480.0,
+                "width": 1280,
+                "height": 960,
+            },
+            "twin_pose": {"fov_offset_deg": 2.0},
+            "intrinsics_calibration": manifest["intrinsics_calibration"],
+        }
+        cameras = json.dumps({"cameras": [camera]}).encode()
+        manifest.update({
+            "annotation_sha256": hashlib.sha256(annotations).hexdigest(),
+            "source_frame_sha256": hashlib.sha256(real_frame).hexdigest(),
+            "twin_frame_sha256": hashlib.sha256(twin_frame).hexdigest(),
+            "cameras_file_sha256": hashlib.sha256(cameras).hexdigest(),
+            "camera_config_sha256": hashlib.sha256(json.dumps(
+                camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode()).hexdigest(),
+        })
+        kwargs = {
+            "annotations_bytes": annotations,
+            "real_frame_bytes": real_frame,
+            "twin_frame_bytes": twin_frame,
+            "cameras_bytes": cameras,
+            "intrinsics_artifact_bytes": artifact,
+        }
+        valid_gate = MODULE.verify_external_evidence(manifest, **kwargs)
+        self.assertTrue(valid_gate["passed"], valid_gate)
+        tampered = json.loads(json.dumps(manifest))
+        tampered["intrinsics_calibration"]["distortion"]["k1"] = 0.123
+        gate = MODULE.verify_external_evidence(tampered, **kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn("intrinsics_calibration_config_mismatch", gate["reasons"])
+        tampered_feature = json.loads(json.dumps(manifest))
+        tampered_feature["features"][0]["image"][0] += 20.0
+        gate = MODULE.verify_external_evidence(tampered_feature, **kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn("manifest_features_annotation_mismatch", gate["reasons"])
 
 
 if __name__ == "__main__":
