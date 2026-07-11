@@ -93,6 +93,18 @@ class TestComputeTransform:
 
 
 class TestTwinCameraRig:
+    def test_invalid_lens_configuration_fails_closed(self, mock_world):
+        config = make_config()
+        config["cameras"][0]["twin_lens"] = {"lens_k": "not-a-number"}
+        rig = TwinCameraRig(mock_world, mock_world.get_map(), config)
+
+        assert rig.spawn() == 0
+        assert rig.camera_ids == []
+
+    def test_nonpositive_fps_is_rejected(self, mock_world):
+        with pytest.raises(ValueError, match="finite and positive"):
+            TwinCameraRig(mock_world, mock_world.get_map(), make_config(), fps=0)
+
     def test_spawn_frames_destroy(self, mock_world, monkeypatch):
         monkeypatch.setattr(
             twin_camera_rig, "gps_to_carla", lambda m, lat, lon: MockLocation(0.0, 0.0, 0.0)
@@ -137,12 +149,20 @@ class TestTwinCameraRig:
         assert model["camera_id"] == "ch1"
         assert model["actor_id"] in rig.actor_ids()
         assert len(model["config_sha256"]) == 64
+        assert len(model["cameras_config_sha256"]) == 64
         assert model["image"]["width"] == 1280
         assert model["image"]["height"] == 960
         assert model["image"]["horizontal_fov_deg"] == pytest.approx(
             horizontal_fov_deg(CAMERA["intrinsics"])
         )
-        assert model["lens"] == {"lens_k": 0.0, "lens_kcube": 0.0}
+        assert model["lens"] == {
+            "lens_k": 0.0,
+            "lens_kcube": 0.0,
+            "lens_circle_falloff": 5.0,
+            "lens_circle_multiplier": 0.0,
+            "lens_x_size": 0.08,
+            "lens_y_size": 0.08,
+        }
         assert model["transform"]["location"]["z"] == pytest.approx(7.0)
         assert rig.camera_model("ch9") is None
 

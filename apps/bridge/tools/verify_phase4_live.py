@@ -248,7 +248,14 @@ def project_world_xyz(point, camera_model):
     )
 
 
-def project_actor_geometry(actor, camera_model):
+def project_actor_geometry(
+    actor,
+    camera_model,
+    *,
+    minimum_area_px=900.0,
+    minimum_dimension_px=20.0,
+    minimum_visibility_ratio=0.75,
+):
     """Project one UE5 actor with clipping and depth evidence."""
     bounding_box = getattr(actor, "bounding_box", None)
     if bounding_box is None or not hasattr(bounding_box, "get_world_vertices"):
@@ -279,10 +286,10 @@ def project_actor_geometry(actor, camera_model):
     clipped_height = clipped[3] - clipped[1]
     visibility_ratio = area / raw_area if raw_area > 0.0 else 0.0
     if (
-        area < 900.0
-        or clipped_width < 20.0
-        or clipped_height < 20.0
-        or visibility_ratio < 0.75
+        area < minimum_area_px
+        or clipped_width < minimum_dimension_px
+        or clipped_height < minimum_dimension_px
+        or visibility_ratio < minimum_visibility_ratio
     ):
         raise VerificationError(
             "mapped UE5 actor projection is too small or too clipped for visual proof"
@@ -404,7 +411,14 @@ def project_scene_actor_geometries(world, camera_model, target_actor_id):
         if not type_id.startswith(("vehicle.", "walker.")):
             continue
         try:
-            geometry = project_actor_geometry(actor, camera_model)
+            is_target = int(getattr(actor, "id", -1)) == int(target_actor_id)
+            geometry = project_actor_geometry(
+                actor,
+                camera_model,
+                minimum_area_px=900.0 if is_target else 1.0,
+                minimum_dimension_px=20.0 if is_target else 1.0,
+                minimum_visibility_ratio=0.75 if is_target else 0.0,
+            )
         except VerificationError:
             if int(getattr(actor, "id", -1)) == int(target_actor_id):
                 raise
@@ -746,10 +760,24 @@ def camera_config_fingerprint(path, camera_id):
     return hashlib.sha256(canonical).hexdigest()
 
 
+def cameras_config_fingerprint(path):
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, ValueError, TypeError) as exc:
+        raise VerificationError("tracked camera configuration is unavailable") from exc
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def validate_twin_camera_model(
-    hello, expected_camera_id, expected_config_sha256=None
+    hello,
+    expected_camera_id,
+    expected_config_sha256=None,
+    expected_cameras_config_sha256=None,
 ):
-    """Validate the exact calibrated UE5 sensor that produced twin frames."""
+    """Validate the exact configured and fingerprinted UE5 stream sensor."""
     if hello.get("camera_id") != expected_camera_id:
         raise VerificationError("twin stream camera does not match the request")
     model = hello.get("camera_model")
@@ -766,6 +794,19 @@ def validate_twin_camera_model(
         raise VerificationError("twin camera model has no valid config fingerprint")
     if expected_config_sha256 is not None and fingerprint != expected_config_sha256:
         raise VerificationError("twin camera model does not match tracked camera config")
+    whole_fingerprint = str(model.get("cameras_config_sha256") or "")
+    if not (
+        len(whole_fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in whole_fingerprint)
+    ):
+        raise VerificationError("twin camera model has no valid whole-config fingerprint")
+    if (
+        expected_cameras_config_sha256 is not None
+        and whole_fingerprint != expected_cameras_config_sha256
+    ):
+        raise VerificationError(
+            "twin camera model does not match the tracked site/camera config"
+        )
     transform = _finite_transform_payload(model.get("transform"), "twin camera model")
     image = model.get("image")
     if not isinstance(image, dict):
@@ -788,7 +829,15 @@ def validate_twin_camera_model(
     ):
         raise VerificationError("twin camera model image geometry is invalid")
     lens = model.get("lens")
-    if not isinstance(lens, dict) or set(lens) != {"lens_k", "lens_kcube"}:
+    expected_lens_keys = {
+        "lens_k",
+        "lens_kcube",
+        "lens_circle_falloff",
+        "lens_circle_multiplier",
+        "lens_x_size",
+        "lens_y_size",
+    }
+    if not isinstance(lens, dict) or set(lens) != expected_lens_keys:
         raise VerificationError("twin camera model lens geometry is invalid")
     if any(
         isinstance(value, bool)
@@ -801,6 +850,7 @@ def validate_twin_camera_model(
         "camera_id": expected_camera_id,
         "actor_id": actor_id,
         "config_sha256": fingerprint,
+        "cameras_config_sha256": whole_fingerprint,
         "transform": transform,
         "image": {
             "width": width,
@@ -842,6 +892,14 @@ def validate_live_twin_camera_actor(world, camera_model):
         "fov": float(image["horizontal_fov_deg"]),
         "lens_k": float(camera_model["lens"]["lens_k"]),
         "lens_kcube": float(camera_model["lens"]["lens_kcube"]),
+        "lens_circle_falloff": float(
+            camera_model["lens"]["lens_circle_falloff"]
+        ),
+        "lens_circle_multiplier": float(
+            camera_model["lens"]["lens_circle_multiplier"]
+        ),
+        "lens_x_size": float(camera_model["lens"]["lens_x_size"]),
+        "lens_y_size": float(camera_model["lens"]["lens_y_size"]),
     }
     for key, expected_value in expected_attributes.items():
         try:
@@ -1105,8 +1163,10 @@ def validate_twin_object_samples(
         for value in media_clocks
     ):
         raise VerificationError("twin object samples have invalid media timestamps")
-    if any(right < left for left, right in zip(media_clocks, media_clocks[1:])):
-        raise VerificationError("twin object media timestamps regressed")
+    if any(right <= left for left, right in zip(media_clocks, media_clocks[1:])):
+        raise VerificationError("twin object media timestamps did not advance")
+    if len(set(event_ids)) < 2:
+        raise VerificationError("twin object samples reuse one detection event")
     clocks = [sample.get("replay_clock_epoch") for sample in samples]
     if any(
         isinstance(value, bool)
@@ -1481,6 +1541,7 @@ async def verify_twin(args, world=None):
             evidence["stream_hello"],
             args.twin_camera,
             camera_config_fingerprint(args.cameras_json, args.twin_camera),
+            cameras_config_fingerprint(args.cameras_json),
         )
         if world is not None:
             evidence["validated_camera_actor"] = validate_live_twin_camera_actor(
@@ -1579,15 +1640,32 @@ async def verify_twin(args, world=None):
                     second_clock - first_clock, 3
                 )
             finally:
-                live = await request_json(
-                    control_socket,
-                    {"type": "twin_live"},
-                    {"twin_mode", "twin_error"},
-                    args.timeout,
-                    evidence,
-                )
-                evidence["restored_mode"] = live
-                restored = live.get("mode") == "live"
+                try:
+                    live = await request_json(
+                        control_socket,
+                        {"type": "twin_live"},
+                        {"twin_mode", "twin_error"},
+                        args.timeout,
+                        evidence,
+                    )
+                    evidence["restored_mode"] = live
+                    confirmed = await request_json(
+                        control_socket,
+                        {"type": "twin_status"},
+                        {"twin_mode", "twin_error"},
+                        args.timeout,
+                        evidence,
+                    )
+                    evidence["restored_status"] = confirmed
+                    restored = (
+                        live.get("mode") == "live"
+                        and confirmed.get("mode") == "live"
+                        and confirmed.get("replay_clock") is None
+                    )
+                except Exception as exc:
+                    evidence["restore_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if not restored:
                 raise VerificationError("failed to restore twin live mode")
     return evidence

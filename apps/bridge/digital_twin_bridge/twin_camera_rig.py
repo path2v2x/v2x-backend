@@ -3,8 +3,8 @@ Twin Camera Rig — CARLA RGB sensors mirroring the real street cameras.
 
 Spawns one static camera per real camera at the exact real-world pose
 (shared pole GPS + per-channel height/pitch/yaw/heading from
-config/cameras.json) so the digital twin renders the same view the
-physical camera sees. Frames are kept as latest-JPEG buffers for the
+config/cameras.json) so the digital twin renders the configured candidate
+view. Physical-camera equivalence remains a separate calibration gate. Frames are kept as latest-JPEG buffers for the
 /twin WebSocket stream.
 
 Pose conversion notes:
@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -31,6 +32,15 @@ from digital_twin_bridge.frame_encoder import encode_jpeg
 from digital_twin_bridge.geo_utils import gps_to_carla
 
 logger = logging.getLogger(__name__)
+
+TWIN_LENS_DEFAULTS = {
+    "lens_k": 0.0,
+    "lens_kcube": 0.0,
+    "lens_circle_falloff": 5.0,
+    "lens_circle_multiplier": 0.0,
+    "lens_x_size": 0.08,
+    "lens_y_size": 0.08,
+}
 
 DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
 
@@ -139,6 +149,8 @@ class TwinCameraRig:
         self._image_width = int(image_width)
         self._image_height = int(image_height)
         self._fps = float(fps)
+        if not math.isfinite(self._fps) or self._fps <= 0.0:
+            raise ValueError("twin camera fps must be finite and positive")
         self._jpeg_quality = int(jpeg_quality)
         self._frame_context_provider = frame_context_provider
         self._cameras: Dict[str, object] = {}
@@ -168,6 +180,25 @@ class TwinCameraRig:
             camera_bp.set_attribute("image_size_y", str(self._image_height))
             camera_bp.set_attribute("fov", f"{horizontal_fov_deg(camera['intrinsics']):.2f}")
             camera_bp.set_attribute("sensor_tick", f"{1.0 / self._fps:.4f}")
+            lens = dict(TWIN_LENS_DEFAULTS)
+            lens.update(camera.get("twin_lens") or {})
+            try:
+                lens = {key: float(lens[key]) for key in TWIN_LENS_DEFAULTS}
+                if not all(math.isfinite(value) for value in lens.values()):
+                    raise ValueError("non-finite lens value")
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Twin camera %s has invalid lens configuration", camera_id)
+                continue
+            lens_applied = True
+            for key, value in lens.items():
+                try:
+                    camera_bp.set_attribute(key, str(value))
+                except (IndexError, RuntimeError, TypeError, ValueError):
+                    logger.warning("Twin camera %s has invalid %s", camera_id, key)
+                    lens_applied = False
+                    break
+            if not lens_applied:
+                continue
             try:
                 camera_bp.set_attribute("role_name", "twin_rig")
             except (IndexError, RuntimeError):
@@ -287,15 +318,19 @@ class TwinCameraRig:
         if actor is None or camera is None:
             return None
         transform = actor.get_transform()
-        lens = {"lens_k": 0.0, "lens_kcube": 0.0}
+        lens = dict(TWIN_LENS_DEFAULTS)
         lens.update(camera.get("twin_lens") or {})
         canonical = json.dumps(
             camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        canonical_config = json.dumps(
+            self._config, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("utf-8")
         return {
             "camera_id": camera_id,
             "actor_id": int(actor.id),
             "config_sha256": hashlib.sha256(canonical).hexdigest(),
+            "cameras_config_sha256": hashlib.sha256(canonical_config).hexdigest(),
             "transform": {
                 "location": {
                     "x": float(transform.location.x),
@@ -311,13 +346,9 @@ class TwinCameraRig:
             "image": {
                 "width": self._image_width,
                 "height": self._image_height,
-                "horizontal_fov_deg": float(twin_horizontal_fov_deg(camera)),
+                "horizontal_fov_deg": float(horizontal_fov_deg(camera["intrinsics"])),
             },
-            "lens": {
-                key: float(value)
-                for key, value in lens.items()
-                if key in {"lens_k", "lens_kcube"}
-            },
+            "lens": {key: float(value) for key, value in lens.items()},
         }
 
     def status(self) -> dict:
