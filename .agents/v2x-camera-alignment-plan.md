@@ -40,7 +40,12 @@
   minutes but was also rolled back because expiry caused 6–7 second health
   outages, above the fixed 5-second bound. The next candidate proactively
   rotates at 240 seconds, before the 300-second URL expiry, while keeping the
-  last trusted frame subject to the existing freshness gate.
+  last trusted frame subject to the existing freshness gate. That candidate is
+  now deployed as remote-backed live commit `c0be1f4`: 660 one-second samples
+  across two rotations passed with zero outage/request failure and per-channel
+  maximum latency 5.75/5.59/5.43/5.30 seconds. Local and public changing-JPEG
+  verifiers pass. Durable evidence SHA-256 is
+  `3679863792bb113c013120834a473c0744e1050617e5bbc09edb25858a95837f`.
 - A dimensioned 9x6-inner-corner, 25 mm checkerboard is retained at
   `/home/path/V2XCarla/v2x-evidence/intrinsics/board/` with SHA-256
   `9fc88b316e318068d46e2bfa267ae22609b2f47c78b30fdd7ef0907ce00dde08`.
