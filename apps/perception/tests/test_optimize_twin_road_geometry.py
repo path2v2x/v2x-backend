@@ -68,11 +68,14 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             "cameras_file_sha256": hashlib.sha256(b"cameras").hexdigest(),
             "camera_config_sha256": hashlib.sha256(b"camera").hexdigest(),
             "ue5_map": "Carla/Maps/Richmond_Field_Station_Richmond_CA",
+            "ue5_map_opendrive_sha256": hashlib.sha256(b"opendrive").hexdigest(),
             "depth_frame": {
                 "carla_frame": 123,
                 "sensor_timestamp": 45.5,
                 "width": 1280,
                 "height": 960,
+                "raw_data_sha256": hashlib.sha256(b"depth-frame").hexdigest(),
+                "raw_data_size": 1280 * 960 * 4,
             },
             "baseline": {
                 "location": location, "pitch_deg": -33.0, "yaw_deg": 88.0,
@@ -344,6 +347,10 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             "intrinsics_calibration": manifest["intrinsics_calibration"],
         }
         cameras = json.dumps({"cameras": [camera]}).encode()
+        depth_frame = b"\0" * manifest["depth_frame"]["raw_data_size"]
+        manifest["depth_frame"]["raw_data_sha256"] = hashlib.sha256(
+            depth_frame
+        ).hexdigest()
         manifest.update({
             "annotation_sha256": hashlib.sha256(annotations).hexdigest(),
             "source_frame_sha256": hashlib.sha256(real_frame).hexdigest(),
@@ -359,6 +366,25 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             "twin_frame_bytes": twin_frame,
             "cameras_bytes": cameras,
             "intrinsics_artifact_bytes": artifact,
+            "depth_frame_bytes": depth_frame,
+            "runtime_evidence": {
+                "ue5_map": manifest["ue5_map"],
+                "ue5_map_opendrive_sha256": manifest[
+                    "ue5_map_opendrive_sha256"
+                ],
+                "endpoint": {"host": "127.0.0.1", "port": 2000},
+                "fresh_depth_frame": {
+                    "carla_frame": 124,
+                    "sensor_timestamp": 46.0,
+                    "raw_data_sha256": hashlib.sha256(b"fresh").hexdigest(),
+                },
+                "baseline": manifest["baseline"],
+                "deployment_model": manifest["deployment_model"],
+                "feature_worlds": {
+                    feature["id"]: feature["world"]
+                    for feature in manifest["features"]
+                },
+            },
         }
         valid_gate = MODULE.verify_external_evidence(manifest, **kwargs)
         self.assertTrue(valid_gate["passed"], valid_gate)
@@ -372,6 +398,27 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         gate = MODULE.verify_external_evidence(tampered_feature, **kwargs)
         self.assertFalse(gate["passed"])
         self.assertIn("manifest_features_annotation_mismatch", gate["reasons"])
+        tampered_world = json.loads(json.dumps(manifest))
+        tampered_world["features"][0]["world"][0] += 1.0
+        gate = MODULE.verify_external_evidence(tampered_world, **kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertTrue(any(
+            reason.startswith("runtime_feature_world_mismatch:")
+            for reason in gate["reasons"]
+        ))
+        bad_runtime_kwargs = dict(kwargs)
+        bad_runtime_kwargs["runtime_evidence"] = json.loads(json.dumps(
+            kwargs["runtime_evidence"]
+        ))
+        bad_runtime_kwargs["runtime_evidence"]["ue5_map_opendrive_sha256"] = "f" * 64
+        gate = MODULE.verify_external_evidence(manifest, **bad_runtime_kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn("runtime_ue5_map_content_mismatch", gate["reasons"])
+        bad_depth_kwargs = dict(kwargs)
+        bad_depth_kwargs["depth_frame_bytes"] = kwargs["depth_frame_bytes"][:-4]
+        gate = MODULE.verify_external_evidence(manifest, **bad_depth_kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn("depth_frame_sha256_mismatch", gate["reasons"])
 
 
 if __name__ == "__main__":
