@@ -25,12 +25,150 @@ from build_twin_camera_landmarks import (  # noqa: E402
 from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
     compute_twin_camera_transform,
     configure_twin_camera_blueprint,
+    heading_to_carla_yaw,
+    horizontal_fov_deg,
     load_cameras_config,
     twin_horizontal_fov_deg,
 )
 
 
 CAMERAS = {"ch1", "ch2", "ch3", "ch4"}
+INTRINSICS_METHODS = {"checkerboard", "charuco"}
+DISTORTION_KEYS = ("k1", "k2", "p1", "p2", "k3")
+
+
+def validate_intrinsics_calibration(camera):
+    """Validate independently measured physical-camera optical evidence."""
+    calibration = camera.get("intrinsics_calibration")
+    intrinsics = camera.get("intrinsics") or {}
+    if not isinstance(calibration, dict):
+        raise ValueError("camera lacks measured intrinsics_calibration evidence")
+    if calibration.get("method") not in INTRINSICS_METHODS:
+        raise ValueError("intrinsics calibration method must be checkerboard or charuco")
+    artifact_hash = str(calibration.get("artifact_sha256") or "")
+    if len(artifact_hash) != 64 or any(char not in "0123456789abcdef" for char in artifact_hash):
+        raise ValueError("intrinsics calibration artifact SHA-256 is invalid")
+    image_count = calibration.get("image_count")
+    rms = calibration.get("rms_reprojection_error_px")
+    if isinstance(image_count, bool) or not isinstance(image_count, int) or image_count < 10:
+        raise ValueError("intrinsics calibration requires at least 10 accepted images")
+    source_hashes = calibration.get("source_images_sha256")
+    if (
+        not isinstance(source_hashes, list)
+        or len(source_hashes) != image_count
+        or len(set(source_hashes)) != len(source_hashes)
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in source_hashes
+        )
+    ):
+        raise ValueError("intrinsics calibration requires one unique SHA-256 per accepted image")
+    if (
+        isinstance(rms, bool)
+        or not isinstance(rms, (int, float))
+        or not math.isfinite(float(rms))
+        or not 0.0 <= float(rms) <= 2.0
+    ):
+        raise ValueError("intrinsics calibration RMS must be finite and no worse than 2 px")
+    resolution = calibration.get("resolution")
+    if resolution != [intrinsics.get("width"), intrinsics.get("height")]:
+        raise ValueError("intrinsics calibration resolution does not match camera intrinsics")
+    matrix = calibration.get("camera_matrix")
+    expected = [
+        [intrinsics.get("fx"), 0.0, intrinsics.get("cx")],
+        [0.0, intrinsics.get("fy"), intrinsics.get("cy")],
+        [0.0, 0.0, 1.0],
+    ]
+    try:
+        matrix_matches = all(
+            math.isclose(float(actual), float(wanted), rel_tol=0.0, abs_tol=1e-6)
+            for actual_row, expected_row in zip(matrix, expected)
+            for actual, wanted in zip(actual_row, expected_row)
+        ) and len(matrix) == 3 and all(len(row) == 3 for row in matrix)
+    except (TypeError, ValueError):
+        matrix_matches = False
+    if not matrix_matches:
+        raise ValueError("intrinsics calibration matrix does not match camera intrinsics")
+    distortion = calibration.get("distortion")
+    if not isinstance(distortion, dict) or any(key not in distortion for key in DISTORTION_KEYS):
+        raise ValueError("intrinsics calibration lacks Brown-Conrady distortion coefficients")
+    if not all(
+        isinstance(distortion[key], (int, float))
+        and not isinstance(distortion[key], bool)
+        and math.isfinite(float(distortion[key]))
+        for key in DISTORTION_KEYS
+    ):
+        raise ValueError("intrinsics calibration distortion coefficients are invalid")
+    return {
+        "method": calibration["method"],
+        "artifact_sha256": artifact_hash,
+        "image_count": image_count,
+        "source_images_sha256": list(source_hashes),
+        "rms_reprojection_error_px": float(rms),
+        "resolution": [int(value) for value in resolution],
+        "camera_matrix": [[float(value) for value in row] for row in matrix],
+        "distortion": {key: float(distortion[key]) for key in DISTORTION_KEYS},
+    }
+
+
+def validate_intrinsics_artifact(camera, artifact_bytes):
+    """Bind the declared calibration values to a real, retained JSON artifact."""
+    normalized = validate_intrinsics_calibration(camera)
+    actual_hash = hashlib.sha256(artifact_bytes).hexdigest()
+    if actual_hash != normalized["artifact_sha256"]:
+        raise ValueError("intrinsics calibration artifact hash does not match camera config")
+    try:
+        payload = json.loads(artifact_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("intrinsics calibration artifact is not valid JSON") from exc
+    declared_payload = {
+        key: value for key, value in normalized.items() if key != "artifact_sha256"
+    }
+    if payload != declared_payload:
+        raise ValueError("intrinsics calibration artifact contents do not match camera config")
+    return normalized
+
+
+def build_deployment_model(camera, transform):
+    """Freeze the exact rig anchor/base needed to round-trip an absolute fit."""
+    intrinsics = camera["intrinsics"]
+    twin_pose = camera.get("twin_pose") or {}
+    final_yaw = math.radians(float(transform.rotation.yaw))
+    forward = float(twin_pose.get("forward_offset_m", 0.0))
+    right = float(twin_pose.get("right_offset_m", 0.0))
+    anchor_location = [
+        float(transform.location.x)
+        - forward * math.cos(final_yaw)
+        + right * math.sin(final_yaw),
+        float(transform.location.y)
+        - forward * math.sin(final_yaw)
+        - right * math.cos(final_yaw),
+        float(transform.location.z) - float(twin_pose.get("height_offset_m", 0.0)),
+    ]
+    lens = {
+        "lens_k": 0.0,
+        "lens_kcube": 0.0,
+        "lens_circle_falloff": 5.0,
+        "lens_circle_multiplier": 0.0,
+        "lens_x_size": 0.08,
+        "lens_y_size": 0.08,
+    }
+    lens.update(camera.get("twin_lens") or {})
+    return {
+        "type": "twin_camera_rig_v1",
+        "anchor_location": anchor_location,
+        "base": {
+            "pitch_deg": float(camera["pitch_deg"]),
+            "yaw_deg": heading_to_carla_yaw(
+                float(camera["heading_deg"]), float(camera["yaw_deg"])
+            ),
+            "roll_deg": float(camera.get("roll_deg", 0.0)),
+            "fov_deg": horizontal_fov_deg(intrinsics),
+        },
+        "lens": {key: float(value) for key, value in lens.items()},
+    }
 
 
 def _pixel(value, label, width, height):
@@ -178,6 +316,7 @@ def resolve_manifest(
             })
         features.append(base)
     intrinsics = camera["intrinsics"]
+    intrinsics_calibration = validate_intrinsics_calibration(camera)
     return {
         "schema_version": 1,
         "camera_id": camera_id,
@@ -208,6 +347,8 @@ def resolve_manifest(
             "cy": float(intrinsics["cy"]),
             "k1": 0.0,
         },
+        "deployment_model": build_deployment_model(camera, transform),
+        "intrinsics_calibration": intrinsics_calibration,
         "features": features,
     }
 
@@ -224,6 +365,11 @@ def main():
     parser.add_argument("--twin-width", type=int, default=1280)
     parser.add_argument("--twin-height", type=int, default=960)
     parser.add_argument("--cameras-json")
+    parser.add_argument(
+        "--intrinsics-artifact",
+        required=True,
+        help="retained measured intrinsics JSON whose SHA-256 is frozen in cameras.json",
+    )
     args = parser.parse_args()
 
     annotation_bytes = Path(args.annotations).read_bytes()
@@ -243,6 +389,9 @@ def main():
     cameras_bytes = cameras_path.read_bytes()
     config = load_cameras_config(str(cameras_path))
     camera = next(item for item in config["cameras"] if item["id"] == args.camera)
+    # Fail before connecting to or spawning anything in UE5 if the physical
+    # camera's optical model has no independent measurement evidence.
+    validate_intrinsics_artifact(camera, Path(args.intrinsics_artifact).read_bytes())
     annotations = validate_annotations(
         payload,
         args.camera,

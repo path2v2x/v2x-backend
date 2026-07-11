@@ -1658,6 +1658,8 @@ frame, board, measurement, map, and render hashes. At 1280x960 require held-out
 point RMSE/P95/max at most 10/16/24 pixels and finite road-geometry RMSE/max at
 most 6/12 pixels for every camera, plus correct road/lane/crosswalk topology,
 horizon, vanishing directions, stable landmarks, and all four retained renders.
+The former 75/125/175 point limits were framing diagnostics and must never be
+used as calibration acceptance.
 
 Fit, deploy, and verify must all call the same tracked camera-transform and
 optical-model functions. A missing translation offset means zero; never hide a
@@ -1684,6 +1686,19 @@ and two holdout polylines. Include the exact real/twin frame SHA-256 values;
 never translate `manual_verified_static`, matcher proposals, or vague repeated
 line points into the accepted provenance labels.
 
+Do not treat repeated nominal `fx/fy/cx/cy` values in `cameras.json` as
+measured intrinsics. Each camera requires an `intrinsics_calibration` block
+backed by a retained checkerboard or ChArUco JSON result artifact: exact
+SHA-256, one unique SHA-256 per accepted source image, at least 10 accepted
+calibration images, no more than 2 px calibration RMS, matching image
+resolution and camera matrix, and finite Brown-Conrady `k1/k2/p1/p2/k3`. Pass
+the actual result with `--intrinsics-artifact`; the manifest builder must hash,
+parse, and compare its normalized contents to `cameras.json` before it connects
+to CARLA or spawns a depth sensor. Quantify the full measured physical
+model against the deployed UE5 centered-pinhole render over the image; an
+optical mismatch above 0.25 px keeps deployment closed until a shared render
+distortion or physical-feed undistortion path is implemented and verified.
+
 Only in an authorized mutation window with zero Drive sessions, resolve those
 twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
 
@@ -1694,13 +1709,32 @@ twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
   --camera ch1 \
   --real-frame /path/to/real-ch1.jpg \
   --twin-frame /path/to/twin-ch1.jpg \
+  --intrinsics-artifact /path/to/ch1-intrinsics.json \
   --cameras-json /home/path/V2XCarla/v2x-backend/config/cameras.json
 ```
 
 The builder must destroy its owned depth sensor in `finally`. Preserve the
 manifest's annotation, camera-file, per-camera, real-frame, twin-frame, depth
-frame, and map fingerprints. Run `optimize_twin_road_geometry.py` only on this
-generated manifest; a hand-converted CSV is not acceptance evidence.
+frame, map, and deployment-model fingerprints. The deployment model must freeze
+the surveyed anchor, unadjusted pitch/yaw/roll/FOV, and all six UE5 lens
+attributes so the fitted absolute camera can be translated back into tracked
+`twin_pose` fields without relying on live state. Run
+`optimize_twin_road_geometry.py` only on this generated manifest; a
+hand-converted CSV is not acceptance evidence.
+
+The optimizer must fit true 6-DoF extrinsics (CARLA x/y/z plus
+pitch/yaw/roll), FOV, principal point, and radial distortion. Preserve the
+fully unconstrained solution as diagnostic optical evidence, but never deploy
+it directly: pose, principal point, and distortion are partly degenerate. Run
+a second bounded optimization through the exact production UE5/verifier model
+(currently centered principal point and zero modeled radial distortion), emit
+the candidate `twin_pose`, and prove a sub-pixel optical plus exact transform
+round trip. If the independently measured principal point or distortion cannot
+be represented by that shared model, keep deployment closed; never copy the
+optimizer's `k1` into CARLA `lens_k`, because those coefficients are not known
+to be equivalent. A parameter at its search bound, an underconstrained fit, or
+a green unconstrained fit paired with a failing deployable held-out fit is a
+failure, not a calibration result.
 
 Actor visual proof must also be reproducible across bridge restarts: choose UE5
 blueprints with a stable digest rather than Python's randomized `hash()`. For a
