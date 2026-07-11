@@ -1717,6 +1717,7 @@ twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
   --real-frame /path/to/real-ch1.jpg \
   --twin-frame /path/to/twin-ch1.jpg \
   --intrinsics-artifact /path/to/ch1-intrinsics.json \
+  --depth-frame-output /path/to/ch1-depth.bgra \
   --cameras-json /home/path/V2XCarla/v2x-backend/config/cameras.json
 ```
 
@@ -1728,6 +1729,8 @@ attributes so the fitted absolute camera can be translated back into tracked
 `twin_pose` fields without relying on live state. Run
 `optimize_twin_road_geometry.py` only on this generated manifest; a
 hand-converted CSV is not acceptance evidence.
+Retain the exact raw BGRA depth buffer, including its SHA-256 and byte count;
+the manifest alone is insufficient evidence for depth-derived world points.
 
 At optimization time, pass the exact retained annotations, real frame, twin
 frame, cameras file, and intrinsics artifact again. The optimizer must re-hash
@@ -1736,15 +1739,26 @@ calibration block with both `cameras.json` and the parsed artifact; a direct
 `optimize_manifest()` call without this binding is non-acceptable:
 
 ```bash
-python3 apps/bridge/tools/optimize_twin_road_geometry.py \
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  apps/bridge/tools/optimize_twin_road_geometry.py \
   /path/to/ch1-calibration-manifest.json \
   --output /path/to/ch1-calibration-report.json \
   --annotations /path/to/ch1-annotations.json \
   --real-frame /path/to/real-ch1.jpg \
   --twin-frame /path/to/twin-ch1.jpg \
   --cameras-json /path/to/cameras.json \
-  --intrinsics-artifact /path/to/ch1-intrinsics.json
+  --intrinsics-artifact /path/to/ch1-intrinsics.json \
+  --depth-frame /path/to/ch1-depth.bgra
 ```
+
+The optimizer must reconnect read-only to the UE5.5 worker, verify the active
+map name and OpenDRIVE SHA-256, record the host/port endpoint, and recompute the
+absolute camera anchor from the verified config. In the same authorized
+zero-session mutation window, spawn one temporary depth sensor at that exact
+transform, compare fresh and retained depth at every annotated pixel, derive
+world truth from the fresh render, and destroy the sensor in `finally`. Any
+baseline, deployment-model, map-content, retained-depth, or feature-world
+mismatch is a hard failure. No other actor or service mutation is allowed.
 
 The optimizer must fit true 6-DoF extrinsics (CARLA x/y/z plus
 pitch/yaw/roll), FOV, principal point, and radial distortion. Preserve the

@@ -21,12 +21,27 @@ from scipy.optimize import least_squares
 BRIDGE_DIR = Path(__file__).resolve().parents[1]
 if str(BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_DIR))
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
     absolute_twin_model,
+    compute_twin_camera_transform,
+    configure_twin_camera_blueprint,
     heading_to_carla_yaw,
     horizontal_fov_deg,
+    load_cameras_config,
     normalize_angle_degrees,
     twin_pose_from_absolute,
+    twin_horizontal_fov_deg,
+)
+from build_twin_calibration_manifest import (  # noqa: E402
+    build_deployment_model,
+    stable_depth_meters,
+)
+from build_twin_camera_landmarks import (  # noqa: E402
+    depth_pixel_to_world,
+    wait_for_frame,
 )
 
 
@@ -294,6 +309,9 @@ def manifest_gate(manifest):
         "richmond_field_station_richmond_ca"
     ):
         reasons.append("invalid_ue5_map")
+    map_hash = str(manifest.get("ue5_map_opendrive_sha256") or "")
+    if len(map_hash) != 64 or any(char not in "0123456789abcdef" for char in map_hash):
+        reasons.append("missing_ue5_map_opendrive_sha256")
     deployment = manifest.get("deployment_model")
     if not isinstance(deployment, dict) or deployment.get("type") != "twin_camera_rig_v1":
         reasons.append("missing_deployment_model")
@@ -363,6 +381,8 @@ def manifest_gate(manifest):
         carla_frame = depth.get("carla_frame")
         timestamp = depth.get("sensor_timestamp")
         depth_width, depth_height = depth.get("width"), depth.get("height")
+        raw_hash = str(depth.get("raw_data_sha256") or "")
+        raw_size = depth.get("raw_data_size")
         if (
             isinstance(carla_frame, bool)
             or not isinstance(carla_frame, int)
@@ -373,6 +393,11 @@ def manifest_gate(manifest):
             or float(timestamp) < 0.0
             or depth_width != 1280
             or depth_height != 960
+            or len(raw_hash) != 64
+            or any(char not in "0123456789abcdef" for char in raw_hash)
+            or isinstance(raw_size, bool)
+            or not isinstance(raw_size, int)
+            or raw_size != depth_width * depth_height * 4
         ):
             reasons.append("invalid_depth_frame_identity")
     features = manifest.get("features") or []
@@ -447,6 +472,8 @@ def verify_external_evidence(
     twin_frame_bytes,
     cameras_bytes,
     intrinsics_artifact_bytes,
+    depth_frame_bytes,
+    runtime_evidence,
 ):
     """Re-bind a mutable optimizer manifest to every retained source artifact."""
     reasons = []
@@ -459,6 +486,13 @@ def verify_external_evidence(
     for field, payload in bindings:
         if hashlib.sha256(payload).hexdigest() != manifest.get(field):
             reasons.append(f"{field}_mismatch")
+    depth_identity = manifest.get("depth_frame") or {}
+    if hashlib.sha256(depth_frame_bytes).hexdigest() != depth_identity.get(
+        "raw_data_sha256"
+    ):
+        reasons.append("depth_frame_sha256_mismatch")
+    if len(depth_frame_bytes) != depth_identity.get("raw_data_size"):
+        reasons.append("depth_frame_size_mismatch")
     try:
         cameras_payload = json.loads(cameras_bytes)
         camera = next(
@@ -581,7 +615,136 @@ def verify_external_evidence(
             reasons.append("manifest_features_annotation_mismatch")
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         reasons.append("annotations_unreadable_for_feature_binding")
+    if not isinstance(runtime_evidence, dict):
+        reasons.append("runtime_calibration_evidence_missing")
+    else:
+        if runtime_evidence.get("ue5_map") != manifest.get("ue5_map"):
+            reasons.append("runtime_ue5_map_mismatch")
+        if runtime_evidence.get("ue5_map_opendrive_sha256") != manifest.get(
+            "ue5_map_opendrive_sha256"
+        ):
+            reasons.append("runtime_ue5_map_content_mismatch")
+        if runtime_evidence.get("baseline") != manifest.get("baseline"):
+            reasons.append("runtime_baseline_mismatch")
+        if runtime_evidence.get("deployment_model") != manifest.get(
+            "deployment_model"
+        ):
+            reasons.append("runtime_deployment_model_mismatch")
+        runtime_worlds = runtime_evidence.get("feature_worlds") or {}
+        for feature in manifest.get("features", []):
+            expected_world = runtime_worlds.get(feature.get("id"))
+            actual_world = feature.get("world")
+            try:
+                equal = np.allclose(
+                    np.asarray(actual_world, dtype=float),
+                    np.asarray(expected_world, dtype=float),
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+            except (TypeError, ValueError):
+                equal = False
+            if not equal:
+                reasons.append(f"runtime_feature_world_mismatch:{feature.get('id')}")
     return {"passed": not reasons, "reasons": reasons}
+
+
+def collect_runtime_calibration_evidence(
+    manifest, cameras_json_path, depth_frame_bytes, host="127.0.0.1", port=2000
+):
+    """Re-derive the absolute anchor and every depth-backed world coordinate."""
+    import carla
+
+    config = load_cameras_config(cameras_json_path)
+    if config is None:
+        raise RuntimeError("cameras config is unavailable for runtime revalidation")
+    camera = next(
+        item for item in config["cameras"]
+        if item["id"] == manifest["camera_id"]
+    )
+    client = carla.Client(host, int(port))
+    client.set_timeout(20.0)
+    world = client.get_world()
+    carla_map = world.get_map()
+    transform = compute_twin_camera_transform(carla_map, config["site"], camera)
+    fov = twin_horizontal_fov_deg(camera)
+    intrinsics = camera["intrinsics"]
+    baseline = {
+        "location": [
+            float(transform.location.x),
+            float(transform.location.y),
+            float(transform.location.z),
+        ],
+        "pitch_deg": float(transform.rotation.pitch),
+        "yaw_deg": float(transform.rotation.yaw),
+        "roll_deg": float(transform.rotation.roll),
+        "fov_deg": float(fov),
+        "cx": float(intrinsics["cx"]),
+        "cy": float(intrinsics["cy"]),
+        "k1": 0.0,
+    }
+    depth = manifest["depth_frame"]
+    width, height = int(depth["width"]), int(depth["height"])
+    if len(depth_frame_bytes) != width * height * 4:
+        raise RuntimeError("retained depth buffer dimensions are inconsistent")
+
+    blueprint = world.get_blueprint_library().find("sensor.camera.depth")
+    configure_twin_camera_blueprint(blueprint, camera, width, height)
+    frames = []
+    actor = world.spawn_actor(blueprint, transform)
+    try:
+        actor.listen(frames.append)
+        fresh_image = wait_for_frame(world, frames)
+        if fresh_image is None:
+            raise RuntimeError("no fresh UE5 depth frame received for revalidation")
+        fresh_depth_bytes = bytes(fresh_image.raw_data)
+    finally:
+        try:
+            actor.stop()
+        finally:
+            actor.destroy()
+    if len(fresh_depth_bytes) != width * height * 4:
+        raise RuntimeError("fresh UE5 depth buffer dimensions are inconsistent")
+
+    def world_at(pixel):
+        retained_value = stable_depth_meters(
+            depth_frame_bytes, width, height, pixel[0], pixel[1]
+        )
+        fresh_value = stable_depth_meters(
+            fresh_depth_bytes, width, height, pixel[0], pixel[1]
+        )
+        tolerance = max(0.25, 0.02 * retained_value)
+        if abs(fresh_value - retained_value) > tolerance:
+            raise RuntimeError(
+                "fresh UE5 depth disagrees with retained calibration depth"
+            )
+        location = depth_pixel_to_world(
+            transform, pixel[0], pixel[1], fresh_value, fov, width, height
+        )
+        return [float(location.x), float(location.y), float(location.z)]
+
+    feature_worlds = {}
+    for feature in manifest["features"]:
+        if feature["type"] == "point":
+            feature_worlds[feature["id"]] = world_at(feature["twin"])
+        elif feature["type"] == "polyline":
+            feature_worlds[feature["id"]] = [
+                world_at(pixel) for pixel in feature["twin_polyline"]
+            ]
+    return {
+        "ue5_map": str(carla_map.name),
+        "ue5_map_opendrive_sha256": hashlib.sha256(
+            carla_map.to_opendrive().encode("utf-8")
+        ).hexdigest(),
+        "endpoint": {"host": str(host), "port": int(port)},
+        "fresh_depth_frame": {
+            "carla_frame": int(fresh_image.frame),
+            "sensor_timestamp": float(fresh_image.timestamp),
+            "raw_data_sha256": hashlib.sha256(fresh_depth_bytes).hexdigest(),
+        },
+        "baseline": baseline,
+        "deployment_model": build_deployment_model(camera, transform),
+        "feature_worlds": feature_worlds,
+    }
 
 
 def feature_residuals(manifest, params, split):
@@ -810,6 +973,9 @@ def main():
     parser.add_argument("--twin-frame", required=True)
     parser.add_argument("--cameras-json", required=True)
     parser.add_argument("--intrinsics-artifact", required=True)
+    parser.add_argument("--depth-frame", required=True)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=2000)
     parser.add_argument(
         "--diagnostic-incomplete",
         action="store_true",
@@ -818,6 +984,14 @@ def main():
     args = parser.parse_args()
     manifest_bytes = Path(args.manifest).read_bytes()
     manifest = json.loads(manifest_bytes)
+    depth_frame_bytes = Path(args.depth_frame).read_bytes()
+    runtime_evidence = collect_runtime_calibration_evidence(
+        manifest,
+        args.cameras_json,
+        depth_frame_bytes,
+        host=args.host,
+        port=args.port,
+    )
     external_evidence = verify_external_evidence(
         manifest,
         annotations_bytes=Path(args.annotations).read_bytes(),
@@ -825,6 +999,8 @@ def main():
         twin_frame_bytes=Path(args.twin_frame).read_bytes(),
         cameras_bytes=Path(args.cameras_json).read_bytes(),
         intrinsics_artifact_bytes=Path(args.intrinsics_artifact).read_bytes(),
+        depth_frame_bytes=depth_frame_bytes,
+        runtime_evidence=runtime_evidence,
     )
     if external_evidence["passed"]:
         report = optimize_manifest(
@@ -839,6 +1015,10 @@ def main():
             "reasons": list(external_evidence["reasons"]),
         }
     report["external_evidence"] = external_evidence
+    report["runtime_calibration_evidence"] = {
+        key: value for key, value in runtime_evidence.items()
+        if key != "feature_worlds"
+    }
     report["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
     Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
