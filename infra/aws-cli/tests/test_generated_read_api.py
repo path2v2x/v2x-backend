@@ -180,6 +180,44 @@ class RecentDetectionsTest(unittest.TestCase):
         )
 
 
+class LiveVideoSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_generated_lambda(FakeTable())
+        self.archived = types.SimpleNamespace()
+        self.archived.calls = []
+
+        def session(**kwargs):
+            self.archived.calls.append(kwargs)
+            return {"HLSStreamingSessionURL": "signed-session"}
+
+        self.archived.get_hls_streaming_session_url = session
+        self.module["_archived_media_client"] = lambda *_args: self.archived
+
+    def invoke(self, value):
+        response = self.module["handler"](
+            {
+                "rawPath": "/video/session/ch1",
+                "queryStringParameters": {"max_fragments": value},
+            },
+            None,
+        )
+        return response, json.loads(response["body"])
+
+    def test_perception_can_request_two_fragment_live_edge(self):
+        response, body = self.invoke("2")
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
+        self.assertEqual(
+            self.archived.calls[-1]["MaxMediaPlaylistFragmentResults"], 2
+        )
+
+    def test_live_fragment_count_is_bounded(self):
+        response, body = self.invoke("1")
+        self.assertEqual(response["statusCode"], 400)
+        self.assertEqual(body["error"], "invalid_max_fragments")
+        self.assertEqual(self.archived.calls, [])
+
+
 class DetectionTimelineTrustTest(unittest.TestCase):
     def setUp(self):
         self.table = FakeTable()

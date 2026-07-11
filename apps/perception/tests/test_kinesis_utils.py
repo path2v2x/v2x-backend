@@ -8,7 +8,11 @@ from unittest.mock import Mock, patch
 PERCEPTION_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_DIR))
 
-from kinesis_utils import get_kvs_hls_url, resolve_hls_media_clock  # noqa: E402
+from kinesis_utils import (  # noqa: E402
+    get_kvs_hls_url,
+    get_video_session_hls_url,
+    resolve_hls_media_clock,
+)
 
 
 class Response:
@@ -191,8 +195,37 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
             ContainerFormat="FRAGMENTED_MP4",
             DiscontinuityMode="ALWAYS",
             DisplayFragmentTimestamp="ALWAYS",
-            MaxMediaPlaylistFragmentResults=5,
+            MaxMediaPlaylistFragmentResults=2,
         )
+
+    @patch("kinesis_utils.requests.get")
+    def test_read_api_live_session_requests_bounded_low_latency_playlist(self, get):
+        get.return_value.json.return_value = {"hlsUrl": "signed-session"}
+        with patch.dict(
+            "kinesis_utils.os.environ",
+            {"V2X_VIDEO_SESSION_API_BASE_URL": "https://api.invalid"},
+            clear=False,
+        ):
+            self.assertEqual(
+                get_video_session_hls_url("v2x-backend-cam-ch1", 2),
+                "signed-session",
+            )
+        get.assert_called_once_with(
+            "https://api.invalid/video/session/ch1",
+            params={"max_fragments": "2"},
+            headers={"accept": "application/json"},
+            timeout=10,
+        )
+        get.return_value.raise_for_status.assert_called_once_with()
+
+    def test_live_fragment_count_rejects_latency_weakening(self):
+        with patch.dict(
+            "kinesis_utils.os.environ",
+            {"V2X_VIDEO_SESSION_API_BASE_URL": "https://api.invalid"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "between 2 and 5"):
+                get_video_session_hls_url("v2x-backend-cam-ch1", 1)
 
 
 if __name__ == "__main__":

@@ -898,6 +898,13 @@ def _get_hls_session(camera_id, qs):
     start_dt = _parse_ts(qs.get("start"))
     end_dt = _parse_ts(qs.get("end"))
     on_demand = start_dt is not None or end_dt is not None
+    raw_live_fragments = qs.get("max_fragments")
+    try:
+        live_fragments = 5 if raw_live_fragments is None else int(raw_live_fragments)
+    except (TypeError, ValueError):
+        return _resp(400, {"error": "invalid_max_fragments", "detail": "must be an integer from 2 through 5"})
+    if not 2 <= live_fragments <= 5:
+        return _resp(400, {"error": "invalid_max_fragments", "detail": "must be an integer from 2 through 5"})
 
     if on_demand:
         if start_dt is None or end_dt is None:
@@ -946,7 +953,7 @@ def _get_hls_session(camera_id, qs):
             ContainerFormat="FRAGMENTED_MP4",
             DiscontinuityMode="ALWAYS",
             DisplayFragmentTimestamp="ALWAYS",
-            MaxMediaPlaylistFragmentResults=5,
+            MaxMediaPlaylistFragmentResults=live_fragments,
         )["HLSStreamingSessionURL"]
         return _resp(
             200,
@@ -955,7 +962,8 @@ def _get_hls_session(camera_id, qs):
                 "streamName": stream_name,
                 "playbackMode": "LIVE",
                 "hlsUrl": hls_url,
-                "expiresIn": VIDEO_HLS_EXPIRES_SECONDS,
+                    "expiresIn": VIDEO_HLS_EXPIRES_SECONDS,
+                    "maxMediaPlaylistFragmentResults": live_fragments,
                 "region": VIDEO_AWS_REGION,
             },
         )
