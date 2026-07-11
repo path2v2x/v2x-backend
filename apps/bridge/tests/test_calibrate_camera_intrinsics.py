@@ -42,3 +42,20 @@ def test_artifact_matches_manifest_schema_and_rejects_weak_evidence():
             resolution=(640, 480), matrix=np.eye(3), distortion=np.zeros(5),
             source_hashes=hashes, rms=2.1,
         )
+
+
+def test_board_coverage_rejects_center_only_observations():
+    centered = [
+        np.array([[[250 + x, 180 + y]] for y in range(6) for x in range(9)])
+        for _index in range(10)
+    ]
+    with pytest.raises(MODULE.CalibrationError, match="edge/corner coverage"):
+        MODULE.validate_board_coverage(centered, (640, 480))
+
+
+def test_pose_diversity_rejects_frontal_single_distance(monkeypatch):
+    monkeypatch.setattr(MODULE.cv2, "Rodrigues", lambda _rotation: (np.eye(3), None))
+    rotations = [np.zeros((3, 1)) for _index in range(10)]
+    translations = [np.array([[0.0], [0.0], [2.0]]) for _index in range(10)]
+    with pytest.raises(MODULE.CalibrationError, match="tilt spread"):
+        MODULE.validate_pose_diversity(rotations, translations)

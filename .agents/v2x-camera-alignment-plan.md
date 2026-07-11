@@ -26,7 +26,20 @@
   about 642/133/199/50 px for ch1/ch2/ch3/ch4; none is acceptance evidence.
 - Production stores trusted schema-v2 detections, but no accepted record has
   the required explicit cross-camera ConvNeXt association evidence.
-- Four-feed history has not yet reached 24 hours on every channel.
+- At the 2026-07-11T02:54:49Z persistence audit, trusted spans were
+  13.78/14.35/12.34/16.31 hours for ch1/ch2/ch3/ch4; none passes the 23-hour
+  minimum inside the 24-hour query window.
+- All four feeds were fresh and clock-matched, but decode latency was roughly
+  14.8–19.7 seconds and failed the 10-second gate. Source commit `0c989fe`
+  adds a bounded two-fragment perception-only HLS request; it is tested but
+  not deployed. Five-minute read endings align with signed-session expiry and
+  reconnect successfully.
+- A dimensioned 9x6-inner-corner, 25 mm checkerboard is retained at
+  `/home/path/V2XCarla/v2x-evidence/intrinsics/board/` with SHA-256
+  `9fc88b316e318068d46e2bfa267ae22609b2f47c78b30fdd7ef0907ce00dde08`.
+- The latest native Computer Use run is durably retained at
+  `/home/path/V2XCarla/v2x-evidence/computer-use/20260711T023533Z/`; Dia access
+  was denied before UI state, so it proves no visual acceptance claim.
 - Canonical Amplify attachment is blocked by the organization policy disabling
   deploy keys; the mirror remains the unchanged production source.
 
@@ -40,8 +53,15 @@
    both capture instants and prove mounts are fixed; dynamic same-car evidence
    later requires a trusted replay-clock match, not sequential capture.
 2. **Measure physical intrinsics.** For each physical camera, retain at least
-   ten unique checkerboard or ChArUco source images and a parsed calibration
-   artifact with RMS no worse than 2 px. Exit only when the full measured lens
+   ten unique checkerboard or ChArUco fit images plus at least two untouched
+   board holdouts. Bind channel/camera identity, native resolution, crop,
+   focus/zoom state, board hash, source hashes, and capture times. Require board
+   coverage at every image edge/corner, at least 15 degrees of pose-tilt spread,
+   and at least 1.3x distance spread. Require fit and holdout RMS no worse than
+   2 px and held-out per-corner max error no worse than 5 px. Obtain explicit
+   site-access and traffic-safety authorization before placing the board in a
+   roadside FOV. Re-capture frozen landmarks afterward to prove no mount moved.
+   Exit only when the full measured lens
    model round-trips through the deployable render/undistortion path within
    0.25 px. Existing repeated nominal intrinsics do not pass this phase.
 3. **Build independent static truth.** For each channel, manually/geometrically
@@ -69,6 +89,13 @@
    automatically roll back on any feed/clock/session failure or more than five
    minutes of unavailable service. Restore all supervisors in success and
    failure paths.
+   The independent HLS low-latency change uses the same snapshot/canary/
+   rollback discipline before calibration deployment: canary one channel,
+   verify route/Lambda/source fingerprints, then require trusted decode latency
+   at most 10 seconds on all channels continuously across at least two complete
+   five-minute session-expiry/reconnect boundaries. Any upstream rejection,
+   feed drop, legacy-latency fallback, or persistence regression fails and
+   rolls back.
 6. **Detection, localization, and tracking.** Persist schema-v2 trusted clocks,
    localization uncertainty at most 2.0 m, deterministic tracking, explicit
    `cross_camera_spatiotemporal_convnext` association evidence, plausible
@@ -89,6 +116,12 @@
    only with organization-owner authorization, release the verified commit,
    then record deployed versions, rollback, remaining debt, and prove no
    live-only source remains.
+   Computer Use artifacts must be timestamped, hash-manifested, bound in the
+   same session to a deployed-version endpoint, and free of cookies, tokens,
+   signed URLs, or other secrets. It must not bypass GitHub organization policy.
+   If direct Dia state remains denied, keep this phase blocked and move the
+   exact native validation to a fresh normal user-owned task with the approval
+   bridge; do not substitute non-native automation.
 9. **Drift monitoring.** Reproject the frozen semantic holdouts on a schedule
    and after any mount/config/map change. Invalidate calibration and alert when
    any Phase 4 held-out threshold fails; never silently keep a stale pose.
@@ -114,3 +147,12 @@
 6. In parallel, request the `path2v2x` organization owner decision required to
    enable canonical-repository Amplify attachment; do not weaken repository
    policy or use personal credentials to bypass that decision.
+7. Diagnose persistence gaps before re-auditing. Any perception/session-source
+   deployment resets the evidence window: require a new post-deploy 24-hour
+   query with at least 23 hours trusted span per camera, latest event age at
+   most 6 hours, no single trusted-event gap above 30 minutes during periods
+   where the feed health reports streaming, and consume the pass within six
+   hours of the later release gate.
+8. Before staging, delete or quarantine the rejected exploratory CSVs and
+   reconcile the dirty `config/cameras.json` against its known rejected origin;
+   never add ignore rules that could hide future calibration evidence drift.
