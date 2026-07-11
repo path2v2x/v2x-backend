@@ -1658,6 +1658,9 @@ frame, board, measurement, map, and render hashes. At 1280x960 require held-out
 point RMSE/P95/max at most 10/16/24 pixels and finite road-geometry RMSE/max at
 most 6/12 pixels for every camera, plus correct road/lane/crosswalk topology,
 horizon, vanishing directions, stable landmarks, and all four retained renders.
+Scale these limits by `manifest.width/1280` when residuals use the native
+real-camera pixel space; do not apply 1280-wide limits unchanged to 2560-wide
+evidence.
 The former 75/125/175 point limits were framing diagnostics and must never be
 used as calibration acceptance.
 
@@ -1682,9 +1685,13 @@ Manual four-camera evidence must use one JSON annotation artifact per channel.
 Points require `provenance="manually_verified_unique"`, at least eight frozen
 train and four untouched holdouts. Road edges, lane markings, and crosswalk
 geometry require `provenance="manually_traced_geometry"`, at least three train
-and two holdout polylines. Include the exact real/twin frame SHA-256 values;
-never translate `manual_verified_static`, matcher proposals, or vague repeated
-line points into the accepted provenance labels.
+and two holdout polylines; infinite-line evidence is not accepted. Include the
+exact real/twin frame SHA-256 values and decode both retained images to verify
+their actual dimensions. Reject annotated twin pixels whose 3x3 depth
+neighborhood crosses a geometry discontinuity; a plausible center depth alone
+does not establish frozen world truth. Never translate
+`manual_verified_static`, matcher proposals, or vague repeated line points into
+the accepted provenance labels.
 
 Do not treat repeated nominal `fx/fy/cx/cy` values in `cameras.json` as
 measured intrinsics. Each camera requires an `intrinsics_calibration` block
@@ -1721,6 +1728,23 @@ attributes so the fitted absolute camera can be translated back into tracked
 `twin_pose` fields without relying on live state. Run
 `optimize_twin_road_geometry.py` only on this generated manifest; a
 hand-converted CSV is not acceptance evidence.
+
+At optimization time, pass the exact retained annotations, real frame, twin
+frame, cameras file, and intrinsics artifact again. The optimizer must re-hash
+all five, re-hash the selected canonical camera object, and compare the
+calibration block with both `cameras.json` and the parsed artifact; a direct
+`optimize_manifest()` call without this binding is non-acceptable:
+
+```bash
+python3 apps/bridge/tools/optimize_twin_road_geometry.py \
+  /path/to/ch1-calibration-manifest.json \
+  --output /path/to/ch1-calibration-report.json \
+  --annotations /path/to/ch1-annotations.json \
+  --real-frame /path/to/real-ch1.jpg \
+  --twin-frame /path/to/twin-ch1.jpg \
+  --cameras-json /path/to/cameras.json \
+  --intrinsics-artifact /path/to/ch1-intrinsics.json
+```
 
 The optimizer must fit true 6-DoF extrinsics (CARLA x/y/z plus
 pitch/yaw/roll), FOV, principal point, and radial distortion. Preserve the

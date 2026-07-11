@@ -8,11 +8,14 @@ sensor at the baseline rig pose. The output is accepted directly by
 """
 
 import argparse
+from io import BytesIO
 import hashlib
 import json
 import math
 from pathlib import Path
 import sys
+
+from PIL import Image, UnidentifiedImageError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,6 +38,36 @@ from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
 CAMERAS = {"ch1", "ch2", "ch3", "ch4"}
 INTRINSICS_METHODS = {"checkerboard", "charuco"}
 DISTORTION_KEYS = ("k1", "k2", "p1", "p2", "k3")
+
+
+def decoded_image_size(image_bytes, label):
+    """Return retained image dimensions, rejecting corrupt/truncated evidence."""
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            image.verify()
+        with Image.open(BytesIO(image_bytes)) as image:
+            return tuple(int(value) for value in image.size)
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ValueError(f"{label} frame is not a valid retained image") from exc
+
+
+def stable_depth_meters(raw_data, width, height, u, v):
+    """Reject annotations on depth discontinuities before freezing world truth."""
+    center_u, center_v = int(round(float(u))), int(round(float(v)))
+    if not (1 <= center_u < width - 1 and 1 <= center_v < height - 1):
+        raise ValueError("annotated twin pixel lacks a full depth neighborhood")
+    samples = [
+        encoded_depth_meters(raw_data, width, center_u + du, center_v + dv)
+        for dv in (-1, 0, 1)
+        for du in (-1, 0, 1)
+    ]
+    if any(not 0.25 <= value <= 250.0 for value in samples):
+        raise ValueError("annotated twin pixel has implausible neighborhood depth")
+    median = sorted(samples)[len(samples) // 2]
+    tolerance = max(0.25, 0.02 * median)
+    if max(abs(value - median) for value in samples) > tolerance:
+        raise ValueError("annotated twin pixel lies on a depth discontinuity")
+    return samples[4]
 
 
 def validate_intrinsics_calibration(camera):
@@ -285,8 +318,12 @@ def resolve_manifest(
     fov = twin_horizontal_fov_deg(camera)
 
     def world_at(pixel):
-        depth = encoded_depth_meters(
-            depth_image.raw_data, depth_image.width, pixel[0], pixel[1]
+        depth = stable_depth_meters(
+            depth_image.raw_data,
+            depth_image.width,
+            depth_image.height,
+            pixel[0],
+            pixel[1],
         )
         if not 0.25 <= depth <= 250.0:
             raise ValueError(f"implausible UE5 depth {depth:.3f}m")
@@ -308,10 +345,15 @@ def resolve_manifest(
             for key in ("id", "type", "split", "provenance", "category")
         }
         if feature["type"] == "point":
-            base.update({"world": world_at(feature["twin"]), "image": feature["image"]})
+            base.update({
+                "world": world_at(feature["twin"]),
+                "twin": feature["twin"],
+                "image": feature["image"],
+            })
         else:
             base.update({
                 "world": [world_at(pixel) for pixel in feature["twin_polyline"]],
+                "twin_polyline": feature["twin_polyline"],
                 "image_polyline": feature["image_polyline"],
             })
         features.append(base)
@@ -392,6 +434,21 @@ def main():
     # Fail before connecting to or spawning anything in UE5 if the physical
     # camera's optical model has no independent measurement evidence.
     validate_intrinsics_artifact(camera, Path(args.intrinsics_artifact).read_bytes())
+    real_size = decoded_image_size(real_bytes, "real")
+    twin_size = decoded_image_size(twin_bytes, "twin")
+    expected_real_size = (
+        int(camera["intrinsics"]["width"]),
+        int(camera["intrinsics"]["height"]),
+    )
+    if real_size != expected_real_size:
+        raise SystemExit(
+            f"real frame dimensions {real_size} do not match intrinsics {expected_real_size}"
+        )
+    if twin_size != (args.twin_width, args.twin_height):
+        raise SystemExit(
+            f"twin frame dimensions {twin_size} do not match depth render "
+            f"{(args.twin_width, args.twin_height)}"
+        )
     annotations = validate_annotations(
         payload,
         args.camera,
