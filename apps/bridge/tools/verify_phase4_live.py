@@ -248,10 +248,20 @@ def project_world_xyz(point, camera_model):
     )
 
 
+def actor_world_transform(world, actor):
+    """Prefer a tick-bound world snapshot over a transient actor proxy."""
+    try:
+        snapshot = world.get_snapshot().find(int(actor.id))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        snapshot = None
+    return snapshot.get_transform() if snapshot is not None else actor.get_transform()
+
+
 def project_actor_geometry(
     actor,
     camera_model,
     *,
+    actor_transform=None,
     minimum_area_px=900.0,
     minimum_dimension_px=20.0,
     minimum_visibility_ratio=0.75,
@@ -261,7 +271,9 @@ def project_actor_geometry(
     if bounding_box is None or not hasattr(bounding_box, "get_world_vertices"):
         raise VerificationError("mapped UE5 actor has no projectable bounding box")
     try:
-        vertices = bounding_box.get_world_vertices(actor.get_transform())
+        vertices = bounding_box.get_world_vertices(
+            actor_transform if actor_transform is not None else actor.get_transform()
+        )
     except Exception as exc:
         raise VerificationError("failed to obtain mapped UE5 actor bounding box") from exc
     projected = []
@@ -415,6 +427,7 @@ def project_scene_actor_geometries(world, camera_model, target_actor_id):
             geometry = project_actor_geometry(
                 actor,
                 camera_model,
+                actor_transform=actor_world_transform(world, actor),
                 minimum_area_px=900.0 if is_target else 1.0,
                 minimum_dimension_px=20.0 if is_target else 1.0,
                 minimum_visibility_ratio=0.75 if is_target else 0.0,
@@ -1599,6 +1612,28 @@ async def collect_twin_object_samples(
         evidence.setdefault("object_status_sync_frames", []).append(
             status_sync_frame
         )
+        status = await request_json(
+            control_socket,
+            {"type": "twin_status"},
+            {"twin_mode", "twin_error"},
+            min(args.timeout, remaining),
+            evidence,
+        )
+        if status.get("type") == "twin_error":
+            raise VerificationError(status.get("message", "twin status failed"))
+        item = _object_from_twin_status(status, args.twin_object_id)
+        if item is None:
+            await asyncio.sleep(min(0.1, max(0.0, remaining)))
+            continue
+        replay_epoch = replay_clock_epoch(status.get("replay_clock"))
+        if replay_epoch is None:
+            raise VerificationError("twin_status has no valid replay clock")
+        if next_sample_clock is not None and replay_epoch < next_sample_clock:
+            await asyncio.sleep(min(0.1, max(0.0, remaining)))
+            continue
+        evidence["object_status_refreshes"] = (
+            evidence.get("object_status_refreshes", 0) + 1
+        )
         sample = validate_twin_object_sample(
             status,
             args.twin_object_id,
@@ -1608,7 +1643,11 @@ async def collect_twin_object_samples(
         )
         validate_live_twin_camera_actor(world, camera_model)
         actor = world.get_actor(sample["actor_id"])
-        geometry_before = project_actor_geometry(actor, camera_model)
+        geometry_before = project_actor_geometry(
+            actor,
+            camera_model,
+            actor_transform=actor_world_transform(world, actor),
+        )
         scene_before = project_scene_actor_geometries(
             world, camera_model, sample["actor_id"]
         )
@@ -1631,7 +1670,11 @@ async def collect_twin_object_samples(
         actor_after = world.get_actor(sample["actor_id"])
         if actor_after is None:
             raise VerificationError("mapped UE5 actor disappeared during frame capture")
-        geometry_after = project_actor_geometry(actor_after, camera_model)
+        geometry_after = project_actor_geometry(
+            actor_after,
+            camera_model,
+            actor_transform=actor_world_transform(world, actor_after),
+        )
         scene_after = project_scene_actor_geometries(
             world, camera_model, sample["actor_id"]
         )

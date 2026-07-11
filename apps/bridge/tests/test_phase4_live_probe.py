@@ -967,7 +967,10 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
     world = FakeWorld([actor])
     statuses = [
         twin_status(clock="2026-07-10T06:00:00.000Z", x=10.0),
+        twin_status(clock="2026-07-10T06:00:00.000Z", x=10.0),
         twin_status(clock="2026-07-10T06:00:01.000Z", x=10.2),
+        twin_status(clock="2026-07-10T06:00:01.000Z", x=10.2),
+        twin_status(clock="2026-07-10T06:00:02.000Z", x=10.5),
         twin_status(clock="2026-07-10T06:00:02.000Z", x=10.5),
     ]
     call_order = []
@@ -993,7 +996,7 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
     monkeypatch.setattr(
         live_probe, "validate_live_twin_camera_actor", lambda *_args: {"actor_id": 33}
     )
-    def fake_geometry(projected_actor, _camera):
+    def fake_geometry(projected_actor, _camera, **_kwargs):
         x = projected_actor.get_transform().location.x * 20.0
         return {
             "actor_id": projected_actor.id,
@@ -1071,9 +1074,10 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         args, object(), object(), world, twin_camera_hello()["camera_model"], object(), evidence
     )
 
-    assert call_order == ["sync", "request", "sync", "sync"] * 3
+    assert call_order == ["sync", "request", "sync", "request", "sync"] * 3
     assert evidence["object_sync_frames"] == [101, 103, 104, 106, 107, 109]
     assert evidence["object_status_sync_frames"] == [102, 105, 108]
+    assert evidence["object_status_refreshes"] == 3
     assert result["sample_count"] == 3
     assert result["max_planar_movement_m"] == pytest.approx(0.5)
     assert all(sample["visual"]["best_detection"]["compatible"] for sample in result["samples"])
