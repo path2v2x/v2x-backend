@@ -980,6 +980,7 @@ def validate_live_twin_camera_actor(world, camera_model):
             )
 
     observed = _actor_transform_payload(actor)
+    transform_source = "carla_actor_rpc"
     snapshot = None
     try:
         snapshot = world.get_snapshot().find(camera_model["actor_id"])
@@ -1184,7 +1185,33 @@ def validate_twin_object_sample(
     reported = _finite_transform_payload(
         item.get("carla_transform"), "twin_status object"
     )
-    observed = _actor_transform_payload(actor)
+    try:
+        snapshot = world.get_snapshot().find(actor_id)
+    except (AttributeError, RuntimeError):
+        snapshot = None
+    if snapshot is not None:
+        observed = _actor_transform_payload(snapshot)
+        transform_source = "carla_world_snapshot"
+    else:
+        observed = _actor_transform_payload(actor)
+        transform_source = "carla_actor_rpc"
+        observed_numbers = [
+            number
+            for group in observed.values()
+            for number in group.values()
+        ]
+        reported_numbers = [
+            number
+            for group in reported.values()
+            for number in group.values()
+        ]
+        if (
+            all(abs(number) <= 1e-9 for number in observed_numbers)
+            and any(abs(number) > 1e-9 for number in reported_numbers)
+        ):
+            raise VerificationError(
+                "mapped UE5 CARLA actor transform is not yet observable"
+            )
     reported_location = reported["location"]
     observed_location = observed["location"]
     position_error = math.sqrt(
@@ -1220,6 +1247,7 @@ def validate_twin_object_sample(
         "role_name": role_name,
         "reported_transform": reported,
         "observed_transform": observed,
+        "transform_source": transform_source,
         "position_error_m": round(position_error, 3),
         "rotation_error_deg": round(rotation_error, 3),
     }
@@ -1567,6 +1595,10 @@ async def collect_twin_object_samples(
         if next_sample_clock is not None and replay_epoch < next_sample_clock:
             await asyncio.sleep(min(0.1, max(0.0, remaining)))
             continue
+        status_sync_frame = synchronize_world(world, min(1.0, remaining))
+        evidence.setdefault("object_status_sync_frames", []).append(
+            status_sync_frame
+        )
         sample = validate_twin_object_sample(
             status,
             args.twin_object_id,
