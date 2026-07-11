@@ -31,9 +31,11 @@
   minimum inside the 24-hour query window.
 - All four feeds were fresh and clock-matched, but decode latency was roughly
   14.8–19.7 seconds and failed the 10-second gate. Source commit `0c989fe`
-  adds a bounded two-fragment perception-only HLS request; it is tested but
-  not deployed. Five-minute read endings align with signed-session expiry and
-  reconnect successfully.
+  initially tested a two-fragment request, which was correctly rolled back
+  because exact clock anchoring failed. An observational four-fragment session
+  matched ch1 at 6.8 seconds; the revised 4–5-fragment implementation remains
+  a canary until all channels survive reconnect boundaries. Five-minute read
+  endings align with signed-session expiry and reconnect successfully.
 - A dimensioned 9x6-inner-corner, 25 mm checkerboard is retained at
   `/home/path/V2XCarla/v2x-evidence/intrinsics/board/` with SHA-256
   `9fc88b316e318068d46e2bfa267ae22609b2f47c78b30fdd7ef0907ce00dde08`.
