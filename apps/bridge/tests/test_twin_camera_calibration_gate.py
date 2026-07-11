@@ -28,7 +28,7 @@ def point(index, split="train"):
         "carla_xyz": [float(index), float(index + 1), 0.0],
         "landmark_id": f"landmark-{index}",
         "source_frame_sha256": "a" * 64,
-        "provenance": "manual_verified_static",
+        "provenance": "surveyed",
         "category": "road_edge",
     }
 
@@ -75,7 +75,7 @@ def test_dataset_gate_accepts_distributed_frozen_split():
 
 def test_gate_requires_independent_spatially_distributed_landmarks():
     points = [point(index, "train" if index < 8 else "holdout") for index in range(12)]
-    result = heldout_calibration_gate(points, [25.0] * 12, 2560, 1920)
+    result = heldout_calibration_gate(points, [8.0] * 12, 2560, 1920)
     assert result["passed"] is True
     assert result["heldout_landmarks"] == 4
 
