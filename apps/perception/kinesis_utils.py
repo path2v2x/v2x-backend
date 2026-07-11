@@ -326,7 +326,7 @@ def _camera_id_from_stream_name(stream_name):
         return match.group(1)
     return stream_name
 
-def get_video_session_hls_url(stream_name):
+def get_video_session_hls_url(stream_name, max_fragments=2):
     """
     Fetch a live HLS URL through the V2X read API instead of direct Kinesis credentials.
     """
@@ -335,8 +335,15 @@ def get_video_session_hls_url(stream_name):
         return None
 
     camera_id = _camera_id_from_stream_name(stream_name)
+    try:
+        max_fragments = int(max_fragments)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("live HLS fragment count must be an integer") from exc
+    if not 2 <= max_fragments <= 5:
+        raise ValueError("live HLS fragment count must be between 2 and 5")
     response = requests.get(
         f"{api_base_url}/video/session/{camera_id}",
+        params={"max_fragments": str(max_fragments)},
         headers={"accept": "application/json"},
         timeout=10,
     )
@@ -348,7 +355,10 @@ def get_kvs_hls_url(stream_name, region_name="us-west-2"):
     """
     Fetches a live HLS streaming session URL for a given Kinesis Video Stream.
     """
-    api_hls_url = get_video_session_hls_url(stream_name)
+    max_fragments = int(os.getenv("V2X_PERCEPTION_LIVE_HLS_FRAGMENTS", "2"))
+    if not 2 <= max_fragments <= 5:
+        raise ValueError("V2X_PERCEPTION_LIVE_HLS_FRAGMENTS must be between 2 and 5")
+    api_hls_url = get_video_session_hls_url(stream_name, max_fragments)
     if api_hls_url:
         return api_hls_url
 
@@ -382,7 +392,7 @@ def get_kvs_hls_url(stream_name, region_name="us-west-2"):
         ContainerFormat='FRAGMENTED_MP4',
         DiscontinuityMode='ALWAYS',
         DisplayFragmentTimestamp='ALWAYS',
-        MaxMediaPlaylistFragmentResults=5,
+        MaxMediaPlaylistFragmentResults=max_fragments,
     )
 
     return url_response['HLSStreamingSessionURL']
