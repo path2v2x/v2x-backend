@@ -439,6 +439,51 @@ class RunScopedIdentityTests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertNotEqual(result[0]["object_id"], result[1]["object_id"])
 
+    def test_equally_plausible_adjacent_vehicles_fail_identity_closed(self):
+        first = self.detection("ch1")
+        second = self.detection("ch2")
+        third = self.detection("ch3")
+        second["gps_location"]["latitude"] += 4.0 / 111_320.0
+        third["gps_location"]["latitude"] += 2.0 / 111_320.0
+        for detection in (first, second, third):
+            detection["embedding"] = np.array([1.0, 0.0])
+        result = self.pipeline(
+            "123e4567-e89b-12d3-a456-426614174000"
+        ).deduplicate([first, second, third], 1_000.0)
+        self.assertEqual(len(result), 3)
+        ambiguous = next(item for item in result if item["device_id"] == "ch3")
+        self.assertEqual(
+            ambiguous["identity_ambiguity"]["method"],
+            "ambiguous_spatiotemporal_convnext",
+        )
+        self.assertEqual(
+            ambiguous["identity_association"]["method"], "new_track"
+        )
+
+    def test_ambiguous_temporal_reattachment_starts_distinct_track(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1")
+        second = self.detection("ch2")
+        second["gps_location"]["latitude"] += 4.0 / 111_320.0
+        first["embedding"] = second["embedding"] = np.array([1.0, 0.0])
+        initial = pipeline.deduplicate([first, second], 1_000.0)
+        self.assertEqual(len({item["object_id"] for item in initial}), 2)
+
+        third = self.detection(
+            "ch3", media_timestamp="2026-07-10T00:00:01.000Z"
+        )
+        third["track_id"] = 99
+        third["gps_location"]["latitude"] += 2.0 / 111_320.0
+        third["embedding"] = np.array([1.0, 0.0])
+        result = pipeline.deduplicate([third], 1_001.0)[0]
+        self.assertNotIn(result["object_id"], {
+            item["object_id"] for item in initial
+        })
+        self.assertEqual(
+            result["identity_ambiguity"]["method"],
+            "ambiguous_track_reattachment",
+        )
+
     def test_cross_camera_observations_outside_media_window_are_not_merged(self):
         pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
         first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")

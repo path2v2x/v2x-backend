@@ -398,6 +398,9 @@ Live vehicle association must also require exact trusted schema-v2 HLS media
 time and reject missing, non-finite, or combined localization uncertainty above
 2.0 m. Never clamp a large uncertainty into the accepted association radius,
 and record rather than silently overwrite a car/truck/bus class conflict.
+When two vehicle candidates have insufficient spatial/appearance separation,
+reject association, persist bounded ambiguity evidence, and start a distinct
+track. Never let greedy input order choose between adjacent plausible cars.
 Every tracked camera must provide finite measured `localization.pixel_sigma`
 and `localization.calibration_uncertainty_m` no greater than 2.0 m. Missing
 values block perception startup; never fill them from rejected exploratory or
