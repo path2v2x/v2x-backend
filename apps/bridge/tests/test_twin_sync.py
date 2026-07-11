@@ -114,7 +114,13 @@ class TestSpawn:
                 "y": pytest.approx(-34.8),
                 "z": pytest.approx(0.0),
             },
-            "lane_snap_distance_m": pytest.approx(0.1),
+            "target_carla_location": {
+                "x": pytest.approx(15.5),
+                "y": pytest.approx(-34.8),
+                "z": pytest.approx(0.4),
+            },
+            "lane_snap_distance_m": pytest.approx(0.0),
+            "placement_planar_error_m": pytest.approx(0.0),
             "tracked_actor_id": actor.id,
             "actor_id": actor.id,
             "actor_present": True,
@@ -165,6 +171,22 @@ class TestSpawn:
         status = sync.status()["objects"][0]
         assert status["actor_present"] is False
         assert status["lane_snap_distance_m"] > 4.0
+
+    def test_nearby_lane_supplies_only_height_and_yaw(self, sync, mock_world):
+        waypoint = mock_world.get_map().get_waypoint(MockLocation())
+        waypoint.transform.location = MockLocation(18.5, -34.8, 1.25)
+        waypoint.transform.rotation.yaw = 73.0
+        mock_world.get_map().get_waypoint = lambda *_args, **_kwargs: waypoint
+        sync._apply([make_detection()])
+        actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+        transform = actor.get_transform()
+        assert transform.location.x == pytest.approx(15.5)
+        assert transform.location.y == pytest.approx(-34.8)
+        assert transform.location.z == pytest.approx(1.55)
+        assert transform.rotation.yaw == pytest.approx(73.0)
+        status = sync.status()["objects"][0]
+        assert status["lane_snap_distance_m"] == pytest.approx(3.0)
+        assert status["placement_planar_error_m"] == pytest.approx(0.0)
 
     def test_firetruck_never_selected(self, sync, mock_world):
         pools = {

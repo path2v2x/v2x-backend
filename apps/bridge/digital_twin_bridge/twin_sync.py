@@ -68,6 +68,7 @@ class TwinTrack:
         "timestamp_schema_version", "media_time_trusted", "media_clock",
         "device_id", "track_id", "bbox", "gps_location",
         "raw_carla_location", "lane_snap_distance_m",
+        "placement_planar_error_m",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -92,6 +93,7 @@ class TwinTrack:
         self.gps_location = None
         self.raw_carla_location = None
         self.lane_snap_distance_m = None
+        self.placement_planar_error_m = None
 
 
 class TwinSync:
@@ -212,16 +214,24 @@ class TwinSync:
             "z": float(location.z),
         }
         track.lane_snap_distance_m = None
+        track.placement_planar_error_m = None
         if track.object_type in VEHICLE_TYPES:
             waypoint = self._map.get_waypoint(location, project_to_road=True)
             if waypoint is not None:
                 snapped = waypoint.transform.location
-                track.lane_snap_distance_m = float(snapped.distance(location))
+                track.lane_snap_distance_m = math.hypot(
+                    float(snapped.x) - float(location.x),
+                    float(snapped.y) - float(location.y),
+                )
                 # Keep the real-world position along the lane, only adopt the
                 # lane height/yaw when the detection is near the road.
                 if track.lane_snap_distance_m < 4.0:
                     track.yaw = waypoint.transform.rotation.yaw
-                    location = carla.Location(x=snapped.x, y=snapped.y, z=snapped.z)
+                    location = carla.Location(
+                        x=location.x,
+                        y=location.y,
+                        z=snapped.z,
+                    )
                 else:
                     logger.warning(
                         "Twin placement rejected for %s: %.2fm from driving lane",
@@ -247,6 +257,10 @@ class TwinSync:
         # Lift above the surface or try_spawn_actor fails on ground collision;
         # walkers are placed by their capsule centre so they need ~1 m.
         location.z += 1.1 if track.object_type == "person" else 0.3
+        track.placement_planar_error_m = math.hypot(
+            float(location.x) - float(track.raw_carla_location["x"]),
+            float(location.y) - float(track.raw_carla_location["y"]),
+        )
         return location
 
     # ------------------------------------------------------------------
@@ -587,7 +601,16 @@ class TwinSync:
             "bbox": track.bbox,
             "gps_location": track.gps_location,
             "raw_carla_location": track.raw_carla_location,
+            "target_carla_location": (
+                {
+                    "x": float(track.target.x),
+                    "y": float(track.target.y),
+                    "z": float(track.target.z),
+                }
+                if track.target is not None else None
+            ),
             "lane_snap_distance_m": track.lane_snap_distance_m,
+            "placement_planar_error_m": track.placement_planar_error_m,
             # ``actor_id`` is acceptance evidence, so expose it only after
             # resolving the actor and its transform from the live UE5 world.
             # Keep the track's last ID separately for diagnostics.

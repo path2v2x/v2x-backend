@@ -1377,6 +1377,26 @@ def validate_twin_object_sample(
     reported = _finite_transform_payload(
         item.get("carla_transform"), "twin_status object"
     )
+    raw_location = item.get("raw_carla_location")
+    target_location = item.get("target_carla_location")
+    if not isinstance(raw_location, dict) or not isinstance(target_location, dict):
+        raise VerificationError(
+            "twin object has no raw/target CARLA placement evidence"
+        )
+    try:
+        raw_x = float(raw_location["x"])
+        raw_y = float(raw_location["y"])
+        target_x = float(target_location["x"])
+        target_y = float(target_location["y"])
+        reported_planar_error = float(item.get("placement_planar_error_m"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VerificationError(
+            "twin object raw placement evidence is invalid"
+        ) from exc
+    if not all(math.isfinite(value) for value in (
+        raw_x, raw_y, target_x, target_y, reported_planar_error
+    )):
+        raise VerificationError("twin object raw placement evidence is invalid")
     try:
         snapshot = world.get_snapshot().find(actor_id)
     except (AttributeError, RuntimeError):
@@ -1419,6 +1439,15 @@ def validate_twin_object_sample(
         for axis in ("pitch", "yaw", "roll")
     }
     rotation_error = max(rotation_errors.values())
+    raw_planar_error = math.hypot(target_x - raw_x, target_y - raw_y)
+    if (
+        raw_planar_error > 0.10
+        or reported_planar_error > 0.10
+        or abs(raw_planar_error - reported_planar_error) > 0.01
+    ):
+        raise VerificationError(
+            "twin actor planar placement diverges from GPS-derived CARLA location"
+        )
     if position_error > position_tolerance_m or rotation_error > rotation_tolerance_deg:
         raise VerificationError(
             "twin_status transform does not match the mapped UE5 CARLA actor: "
@@ -1442,6 +1471,8 @@ def validate_twin_object_sample(
         "transform_source": transform_source,
         "position_error_m": round(position_error, 3),
         "rotation_error_deg": round(rotation_error, 3),
+        "raw_planar_error_m": round(raw_planar_error, 3),
+        "target_location": {"x": target_x, "y": target_y},
     }
 
 
