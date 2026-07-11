@@ -351,7 +351,7 @@ URLs internal, requires trusted persisted provenance, selects the nearest actual
 fMP4 frame, and exits nonzero for timing, bbox, or semantic mismatch:
 
 ```bash
-/home/path/V2XCarla/perception-venv/bin/python \
+/home/path/V2XCarla/carla-venv-310/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_historical_correlation.py \
   https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com \
   --detection-json /path/to/one-sanitized-detection.json \
@@ -423,13 +423,35 @@ verifier, use its exact run-scoped object, replay start, and camera for the
 same-object twin gate without creating a Drive session:
 
 ```bash
-/home/path/V2XCarla/carla-venv-310/bin/python \
+/home/path/V2XCarla/perception-venv/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py \
   --apply --skip-drive \
   --twin-object-id global_car_RUN_ID_TRACK \
   --twin-replay-start 2026-07-10T00:00:00.000Z \
-  --twin-camera ch1
+  --twin-camera ch1 \
+  --twin-yolo-model \
+  /home/path/V2XCarla/v2x-backend/apps/perception/yolov8n.pt
 ```
+
+The exact-object gate must retain one CARLA actor ID over at least three replay
+samples and require a compatible YOLO detection to overlap that actor's
+projected 3-D bounding box in each corresponding twin JPEG. The stream's
+`twin_hello` must carry the exact UE5 camera actor ID, transform, dimensions,
+FOV, lens values, and camera-config SHA-256 used for projection. Until the
+tracked projection model supports a measured nonzero CARLA `lens_k` or
+`lens_kcube`, fail closed rather than treating pinhole projection as equivalent.
+Each JPEG must also be preceded by hash-matching `twin_frame` metadata with an
+advancing UE5 frame ID and a replay clock no more than 250 ms after the sampled
+object clock. Pin the stream fingerprint to the tracked channel config and the
+advertised camera actor to the live `sensor.camera.*` transform and optical
+attributes. Require before/after capture projection overlap with the same YOLO
+bbox, at least 0.50 matched confidence, 0.15 IoU, 0.50 actor coverage, 75% of
+the raw actor projection in frame, and an allowlisted YOLO model hash. Project
+all live vehicles/walkers and reject foreground occlusion or a neighboring
+actor that explains the detection within the fixed exclusivity margin. Across
+the three samples, require distinct JPEGs and image-space detection motion that
+agrees with the target actor's projected direction and displacement. CLI
+overrides may tighten these floors but must never weaken them.
 
 ## Controlled deployment gate
 

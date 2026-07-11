@@ -379,7 +379,7 @@ class DriveMapController:
             stop_twin = self._runtime.get("stop_twin")
             if stop_twin is not None:
                 try:
-                    stop_twin()
+                    await stop_twin()
                 except Exception:
                     logger.warning("Twin stop before map switch failed", exc_info=True)
 
@@ -471,6 +471,7 @@ async def main():
     cameras_config = load_cameras_config(config.CAMERAS_JSON or None)
     runtime["twin_rig"] = None
     runtime["twin_sync"] = None
+    runtime["twin_replay_owner"] = None
     twin_sync_task: dict = {"task": None}
 
     def start_twin() -> None:
@@ -486,6 +487,11 @@ async def main():
                 image_width=config.TWIN_CAM_WIDTH,
                 image_height=config.TWIN_CAM_HEIGHT,
                 fps=config.TWIN_CAM_FPS,
+                frame_context_provider=lambda: (
+                    runtime["twin_sync"].status()
+                    if runtime.get("twin_sync") is not None
+                    else {"mode": "off", "replay_clock": None}
+                ),
             )
             if rig.spawn() > 0:
                 runtime["twin_rig"] = rig
@@ -503,15 +509,20 @@ async def main():
             runtime["twin_sync"] = sync
             twin_sync_task["task"] = asyncio.get_running_loop().create_task(sync.run())
 
-    def stop_twin() -> None:
+    async def stop_twin() -> None:
         task = twin_sync_task.get("task")
-        if task is not None:
-            task.cancel()
-            twin_sync_task["task"] = None
         sync = runtime.get("twin_sync")
         if sync is not None:
             sync.stop()
-            runtime["twin_sync"] = None
+        if task is not None:
+            task.cancel()
+            twin_sync_task["task"] = None
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        runtime["twin_sync"] = None
+        runtime["twin_replay_owner"] = None
         rig = runtime.get("twin_rig")
         if rig is not None:
             rig.destroy()
@@ -715,7 +726,7 @@ async def main():
         camera_id = (query.get("cam") or ["ch1"])[0]
         control_only = (query.get("control") or ["0"])[0] in ("1", "true")
         rig = runtime.get("twin_rig")
-        sync = runtime.get("twin_sync")
+        connection_token = object()
         if not control_only and (rig is None or not rig.has_camera(camera_id)):
             await websocket.send(json.dumps({
                 "type": "twin_error",
@@ -727,6 +738,7 @@ async def main():
 
         def mode_payload(include_objects=False):
             payload = {"type": "twin_mode", "mode": "off", "replay_supported": False}
+            sync = runtime.get("twin_sync")
             if sync is not None:
                 status = sync.status()
                 payload.update({
@@ -746,11 +758,18 @@ async def main():
         await websocket.send(json.dumps({
             "type": "twin_hello",
             "camera_id": None if control_only else camera_id,
+            "camera_model": (
+                None if control_only or rig is None
+                else rig.camera_model(camera_id)
+            ),
             "width": rig_status["width"],
             "height": rig_status["height"],
             "fps": rig_status["fps"],
             "cameras": rig_status["cameras"],
-            "sync": sync.status() if sync is not None else None,
+            "sync": (
+                runtime["twin_sync"].status()
+                if runtime.get("twin_sync") is not None else None
+            ),
         }))
         logger.info(
             "Twin %s opened for %s (%s)",
@@ -772,9 +791,21 @@ async def main():
             except (TypeError, ValueError):
                 return {"type": "twin_error", "message": "Invalid JSON"}
             msg_type = msg.get("type", "")
+            sync = runtime.get("twin_sync")
             if sync is None:
                 return {"type": "twin_error", "message": "Twin sync is disabled"}
             if msg_type == "twin_replay":
+                if active_session_count() > 0:
+                    return {
+                        "type": "twin_error",
+                        "message": "End active Drive sessions before twin replay",
+                    }
+                owner = runtime.get("twin_replay_owner")
+                if owner is not None and owner is not connection_token:
+                    return {
+                        "type": "twin_error",
+                        "message": "Twin replay is controlled by another connection",
+                    }
                 try:
                     start_epoch = parse_iso_epoch(msg.get("start"))
                 except ValueError:
@@ -787,9 +818,11 @@ async def main():
                     sync.start_replay(start_epoch, float(msg.get("speed") or 1.0))
                 except RuntimeError as exc:
                     return {"type": "twin_error", "message": str(exc)}
+                runtime["twin_replay_owner"] = connection_token
                 return mode_payload()
             if msg_type == "twin_live":
                 sync.go_live()
+                runtime["twin_replay_owner"] = None
                 return mode_payload()
             if msg_type == "twin_status":
                 return mode_payload(include_objects=True)
@@ -812,8 +845,13 @@ async def main():
                     rig = runtime.get("twin_rig")
                     if rig is None:
                         break
-                    frame = rig.get_latest_frame(camera_id)
-                    if frame is not None and frame is not last_frame:
+                    packet = rig.get_latest_frame_packet(camera_id)
+                    if packet is not None and packet[0] is not last_frame:
+                        frame, frame_metadata = packet
+                        await websocket.send(json.dumps({
+                            "type": "twin_frame",
+                            **frame_metadata,
+                        }))
                         await websocket.send(frame)
                         last_frame = frame
                 now = asyncio.get_running_loop().time()
@@ -831,6 +869,14 @@ async def main():
                 await reader_task
             except (asyncio.CancelledError, Exception):
                 pass
+            if runtime.get("twin_replay_owner") is connection_token:
+                sync = runtime.get("twin_sync")
+                if sync is not None:
+                    try:
+                        sync.go_live()
+                    except Exception:
+                        logger.exception("Failed to restore twin live mode on disconnect")
+                runtime["twin_replay_owner"] = None
             logger.info("Twin %s closed for %s", "control" if control_only else "stream", camera_id)
 
     async def handler(websocket):
@@ -940,15 +986,22 @@ async def main():
                 sensors = [s for s in world.get_actors().filter("sensor.*")
                            if s.id not in rig_ids
                            and s.attributes.get("role_name") != "twin_rig"]
+                walkers = [
+                    actor for actor in world.get_actors().filter("walker.*")
+                    if actor.id not in twin_ids
+                    and actor.attributes.get("role_name") != "twin_object"
+                ]
                 # Historical props are session-owned and must be gone when no
                 # sessions are active.  Any remaining static prop is orphaned.
                 props = list(world.get_actors().filter("static.prop.*"))
                 props_to_clean = props
-                orphaned = len(vehicles) + len(sensors) + len(props_to_clean)
+                orphaned = (
+                    len(vehicles) + len(walkers) + len(sensors) + len(props_to_clean)
+                )
                 if orphaned > 0:
                     logger.warning(
-                        "Actor audit: %d orphaned actors (vehicles=%d, sensors=%d, props=%d). Cleaning up.",
-                        orphaned, len(vehicles), len(sensors), len(props_to_clean),
+                        "Actor audit: %d orphaned actors (vehicles=%d, walkers=%d, sensors=%d, props=%d). Cleaning up.",
+                        orphaned, len(vehicles), len(walkers), len(sensors), len(props_to_clean),
                     )
                     for a in sensors:
                         try:
@@ -960,6 +1013,11 @@ async def main():
                         except Exception:
                             pass
                     for a in vehicles:
+                        try:
+                            a.destroy()
+                        except Exception:
+                            pass
+                    for a in walkers:
                         try:
                             a.destroy()
                         except Exception:
@@ -1037,7 +1095,7 @@ async def main():
 
         # Stop the digital twin (server-owned rig cameras + synced actors).
         try:
-            stop_twin()
+            await stop_twin()
         except Exception as e:
             logger.debug("Twin stop on shutdown failed: %s", e)
 

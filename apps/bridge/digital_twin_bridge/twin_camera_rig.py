@@ -3,8 +3,8 @@ Twin Camera Rig — CARLA RGB sensors mirroring the real street cameras.
 
 Spawns one static camera per real camera at the exact real-world pose
 (shared pole GPS + per-channel height/pitch/yaw/heading from
-config/cameras.json) so the digital twin renders the same view the
-physical camera sees. Frames are kept as latest-JPEG buffers for the
+config/cameras.json) so the digital twin renders the configured candidate
+view. Physical-camera equivalence remains a separate calibration gate. Frames are kept as latest-JPEG buffers for the
 /twin WebSocket stream.
 
 Pose conversion notes:
@@ -18,11 +18,13 @@ Pose conversion notes:
   same sign convention as CARLA's Rotation.pitch (negative = down).
 """
 
+import hashlib
 import json
 import logging
 import math
 import os
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -30,6 +32,15 @@ from digital_twin_bridge.frame_encoder import encode_jpeg
 from digital_twin_bridge.geo_utils import gps_to_carla
 
 logger = logging.getLogger(__name__)
+
+TWIN_LENS_DEFAULTS = {
+    "lens_k": 0.0,
+    "lens_kcube": 0.0,
+    "lens_circle_falloff": 5.0,
+    "lens_circle_multiplier": 0.0,
+    "lens_x_size": 0.08,
+    "lens_y_size": 0.08,
+}
 
 DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
 
@@ -126,16 +137,25 @@ class TwinCameraRig:
         image_height: int = 960,
         fps: float = 12.0,
         jpeg_quality: int = 70,
+        frame_context_provider=None,
     ) -> None:
         self._world = world
         self._map = carla_map
         self._config = config
+        self._camera_config = {
+            str(camera["id"]): deepcopy(camera)
+            for camera in config.get("cameras", [])
+        }
         self._image_width = int(image_width)
         self._image_height = int(image_height)
         self._fps = float(fps)
+        if not math.isfinite(self._fps) or self._fps <= 0.0:
+            raise ValueError("twin camera fps must be finite and positive")
         self._jpeg_quality = int(jpeg_quality)
+        self._frame_context_provider = frame_context_provider
         self._cameras: Dict[str, object] = {}
         self._frames: Dict[str, bytes] = {}
+        self._frame_metadata: Dict[str, dict] = {}
         self._frame_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
         self._accepting_frames = False
@@ -160,6 +180,25 @@ class TwinCameraRig:
             camera_bp.set_attribute("image_size_y", str(self._image_height))
             camera_bp.set_attribute("fov", f"{horizontal_fov_deg(camera['intrinsics']):.2f}")
             camera_bp.set_attribute("sensor_tick", f"{1.0 / self._fps:.4f}")
+            lens = dict(TWIN_LENS_DEFAULTS)
+            lens.update(camera.get("twin_lens") or {})
+            try:
+                lens = {key: float(lens[key]) for key in TWIN_LENS_DEFAULTS}
+                if not all(math.isfinite(value) for value in lens.values()):
+                    raise ValueError("non-finite lens value")
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Twin camera %s has invalid lens configuration", camera_id)
+                continue
+            lens_applied = True
+            for key, value in lens.items():
+                try:
+                    camera_bp.set_attribute(key, str(value))
+                except (IndexError, RuntimeError, TypeError, ValueError):
+                    logger.warning("Twin camera %s has invalid %s", camera_id, key)
+                    lens_applied = False
+                    break
+            if not lens_applied:
+                continue
             try:
                 camera_bp.set_attribute("role_name", "twin_rig")
             except (IndexError, RuntimeError):
@@ -195,12 +234,30 @@ class TwinCameraRig:
                 return
             try:
                 jpeg = encode_jpeg(image, quality=self._jpeg_quality)
+                carla_frame = int(image.frame)
+                sensor_timestamp = float(image.timestamp)
             except Exception as exc:
                 logger.debug("Twin frame encode error (%s): %s", camera_id, exc)
                 return
+            context = {}
+            if self._frame_context_provider is not None:
+                try:
+                    context = self._frame_context_provider() or {}
+                except Exception:
+                    logger.debug("Twin frame context unavailable (%s)", camera_id)
             with self._lock:
                 self._frames[camera_id] = jpeg
-                self._frame_counts[camera_id] = self._frame_counts.get(camera_id, 0) + 1
+                count = self._frame_counts.get(camera_id, 0) + 1
+                self._frame_counts[camera_id] = count
+                self._frame_metadata[camera_id] = {
+                    "camera_id": camera_id,
+                    "frame_count": count,
+                    "carla_frame": carla_frame,
+                    "sensor_timestamp": sensor_timestamp,
+                    "jpeg_sha256": hashlib.sha256(jpeg).hexdigest(),
+                    "mode": context.get("mode"),
+                    "replay_clock": context.get("replay_clock"),
+                }
 
         return _on_frame
 
@@ -218,6 +275,7 @@ class TwinCameraRig:
         self._cameras.clear()
         with self._lock:
             self._frames.clear()
+            self._frame_metadata.clear()
         logger.info("Twin camera rig destroyed")
 
     # ------------------------------------------------------------------
@@ -237,6 +295,61 @@ class TwinCameraRig:
     def get_latest_frame(self, camera_id: str) -> Optional[bytes]:
         with self._lock:
             return self._frames.get(camera_id)
+
+    def get_latest_frame_packet(self, camera_id: str):
+        """Return an atomically paired JPEG and render/replay metadata."""
+        with self._lock:
+            frame = self._frames.get(camera_id)
+            metadata = self._frame_metadata.get(camera_id)
+            if frame is None or metadata is None:
+                return None
+            return frame, dict(metadata)
+
+    def camera_model(self, camera_id: str) -> Optional[dict]:
+        """Return the exact, fingerprinted UE5 camera model behind a stream.
+
+        Acceptance tooling must be able to project a replay actor through the
+        same transform and optical settings that produced the JPEG.  Returning
+        only a channel name lets stale or differently configured cameras look
+        equivalent, so the hello protocol carries this immutable evidence.
+        """
+        actor = self._cameras.get(camera_id)
+        camera = self._camera_config.get(camera_id)
+        if actor is None or camera is None:
+            return None
+        transform = actor.get_transform()
+        lens = dict(TWIN_LENS_DEFAULTS)
+        lens.update(camera.get("twin_lens") or {})
+        canonical = json.dumps(
+            camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        canonical_config = json.dumps(
+            self._config, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return {
+            "camera_id": camera_id,
+            "actor_id": int(actor.id),
+            "config_sha256": hashlib.sha256(canonical).hexdigest(),
+            "cameras_config_sha256": hashlib.sha256(canonical_config).hexdigest(),
+            "transform": {
+                "location": {
+                    "x": float(transform.location.x),
+                    "y": float(transform.location.y),
+                    "z": float(transform.location.z),
+                },
+                "rotation": {
+                    "pitch": float(transform.rotation.pitch),
+                    "yaw": float(transform.rotation.yaw),
+                    "roll": float(transform.rotation.roll),
+                },
+            },
+            "image": {
+                "width": self._image_width,
+                "height": self._image_height,
+                "horizontal_fov_deg": float(horizontal_fov_deg(camera["intrinsics"])),
+            },
+            "lens": {key: float(value) for key, value in lens.items()},
+        }
 
     def status(self) -> dict:
         with self._lock:

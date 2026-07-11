@@ -13,11 +13,26 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+from pathlib import Path
+import subprocess
 import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 import websockets
+
+
+DEFAULT_TWIN_YOLO_PYTHON = Path("/home/path/V2XCarla/perception-venv/bin/python")
+DEFAULT_TWIN_YOLO_DETECTOR = (
+    Path(__file__).resolve().parents[2]
+    / "perception"
+    / "tools"
+    / "detect_jpeg_objects.py"
+)
+DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
+ACCEPTED_TWIN_YOLO_MODEL_SHA256 = {
+    "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
+}
 
 
 class VerificationError(RuntimeError):
@@ -98,6 +113,399 @@ async def receive_binary_frame(
             evidence["binary_frames"] = evidence.get("binary_frames", 0) + 1
         if different_from is None or digest != different_from:
             return digest
+
+
+async def receive_binary_payload(websocket, timeout, *, evidence=None):
+    """Receive one rendered JPEG while preserving only its digest in evidence."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise VerificationError("timed out waiting for twin JPEG evidence")
+        raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        if not isinstance(raw, bytes):
+            if evidence is not None:
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                evidence.setdefault("json_types", []).append(payload.get("type"))
+            continue
+        if evidence is not None:
+            evidence["binary_frames"] = evidence.get("binary_frames", 0) + 1
+        return raw, binary_digest(raw)
+
+
+async def receive_twin_frame_packet(
+    websocket,
+    timeout,
+    *,
+    camera_id,
+    minimum_replay_epoch,
+    maximum_skew_seconds=0.5,
+    previous_frame_count=None,
+    evidence=None,
+):
+    """Receive a hash-bound JPEG whose server replay clock is current enough."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    metadata = None
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise VerificationError("timed out waiting for a current twin frame packet")
+        raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        if not isinstance(raw, bytes):
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if evidence is not None:
+                evidence.setdefault("json_types", []).append(payload.get("type"))
+            if payload.get("type") == "twin_frame":
+                metadata = payload
+            continue
+        if evidence is not None:
+            evidence["binary_frames"] = evidence.get("binary_frames", 0) + 1
+        if metadata is None:
+            continue
+        digest = binary_digest(raw)
+        if metadata.get("jpeg_sha256") != digest:
+            raise VerificationError("twin frame metadata/JPEG hash mismatch")
+        if metadata.get("camera_id") != camera_id:
+            raise VerificationError("twin frame metadata identifies the wrong camera")
+        if metadata.get("mode") != "replay":
+            metadata = None
+            continue
+        frame_count = metadata.get("frame_count")
+        carla_frame = metadata.get("carla_frame")
+        sensor_timestamp = metadata.get("sensor_timestamp")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (frame_count, carla_frame)
+        ) or (
+            isinstance(sensor_timestamp, bool)
+            or not isinstance(sensor_timestamp, (int, float))
+            or not math.isfinite(float(sensor_timestamp))
+            or float(sensor_timestamp) < 0.0
+        ):
+            raise VerificationError("twin frame metadata has invalid UE5 frame identity")
+        if previous_frame_count is not None and frame_count <= previous_frame_count:
+            metadata = None
+            continue
+        frame_epoch = replay_clock_epoch(metadata.get("replay_clock"))
+        if frame_epoch is None:
+            raise VerificationError("twin frame metadata has no replay clock")
+        skew = frame_epoch - minimum_replay_epoch
+        if skew < 0.0:
+            metadata = None
+            continue
+        if skew > maximum_skew_seconds:
+            raise VerificationError(
+                f"twin frame replay clock skew is {skew:.3f}s; "
+                f"maximum is {maximum_skew_seconds:.3f}s"
+            )
+        return raw, digest, metadata, skew
+
+
+def _carla_rotation_axes(rotation):
+    pitch = math.radians(float(rotation["pitch"]))
+    yaw = math.radians(float(rotation["yaw"]))
+    roll = math.radians(float(rotation["roll"]))
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cr, sr = math.cos(roll), math.sin(roll)
+    return (
+        (cp * cy, cp * sy, sp),
+        (cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr),
+        (-cy * sp * cr - sy * sr, -sy * sp * cr + cy * sr, cp * cr),
+    )
+
+
+def project_world_xyz(point, camera_model):
+    """Project one CARLA XYZ through the exact zero-distortion twin model."""
+    lens = camera_model["lens"]
+    if abs(lens["lens_k"]) > 1e-9 or abs(lens["lens_kcube"]) > 1e-9:
+        raise VerificationError(
+            "twin actor projection does not support unmodeled nonzero CARLA lens distortion"
+        )
+    transform = camera_model["transform"]
+    location = transform["location"]
+    delta = tuple(float(point[index]) - location[axis] for index, axis in enumerate(("x", "y", "z")))
+    forward, right, up = _carla_rotation_axes(transform["rotation"])
+    depth = sum(left * right_value for left, right_value in zip(delta, forward))
+    if depth <= 0.1:
+        return None
+    local_right = sum(left * right_value for left, right_value in zip(delta, right))
+    local_up = sum(left * right_value for left, right_value in zip(delta, up))
+    image = camera_model["image"]
+    focal = (image["width"] / 2.0) / math.tan(
+        math.radians(image["horizontal_fov_deg"]) / 2.0
+    )
+    return (
+        image["width"] / 2.0 + focal * local_right / depth,
+        image["height"] / 2.0 - focal * local_up / depth,
+        depth,
+    )
+
+
+def project_actor_geometry(
+    actor,
+    camera_model,
+    *,
+    minimum_area_px=900.0,
+    minimum_dimension_px=20.0,
+    minimum_visibility_ratio=0.75,
+):
+    """Project one UE5 actor with clipping and depth evidence."""
+    bounding_box = getattr(actor, "bounding_box", None)
+    if bounding_box is None or not hasattr(bounding_box, "get_world_vertices"):
+        raise VerificationError("mapped UE5 actor has no projectable bounding box")
+    try:
+        vertices = bounding_box.get_world_vertices(actor.get_transform())
+    except Exception as exc:
+        raise VerificationError("failed to obtain mapped UE5 actor bounding box") from exc
+    projected = []
+    for vertex in vertices:
+        value = project_world_xyz((vertex.x, vertex.y, vertex.z), camera_model)
+        if value is not None:
+            projected.append(value)
+    if len(projected) < 4:
+        raise VerificationError("mapped UE5 actor is not sufficiently in front of twin camera")
+    xs, ys = [value[0] for value in projected], [value[1] for value in projected]
+    raw = (min(xs), min(ys), max(xs), max(ys))
+    width, height = camera_model["image"]["width"], camera_model["image"]["height"]
+    clipped = (
+        max(0.0, min(float(width), raw[0])),
+        max(0.0, min(float(height), raw[1])),
+        max(0.0, min(float(width), raw[2])),
+        max(0.0, min(float(height), raw[3])),
+    )
+    raw_area = max(0.0, raw[2] - raw[0]) * max(0.0, raw[3] - raw[1])
+    area = max(0.0, clipped[2] - clipped[0]) * max(0.0, clipped[3] - clipped[1])
+    clipped_width = clipped[2] - clipped[0]
+    clipped_height = clipped[3] - clipped[1]
+    visibility_ratio = area / raw_area if raw_area > 0.0 else 0.0
+    if (
+        area < minimum_area_px
+        or clipped_width < minimum_dimension_px
+        or clipped_height < minimum_dimension_px
+        or visibility_ratio < minimum_visibility_ratio
+    ):
+        raise VerificationError(
+            "mapped UE5 actor projection is too small or too clipped for visual proof"
+        )
+    return {
+        "actor_id": int(actor.id),
+        "bbox": tuple(round(value, 3) for value in clipped),
+        "raw_bbox": tuple(round(value, 3) for value in raw),
+        "area_px": round(area, 3),
+        "visibility_ratio": round(visibility_ratio, 4),
+        "minimum_depth_m": round(min(value[2] for value in projected), 4),
+        "median_depth_m": round(
+            sorted(value[2] for value in projected)[len(projected) // 2], 4
+        ),
+    }
+
+
+def project_actor_bbox(actor, camera_model):
+    """Compatibility wrapper returning only the clipped actor rectangle."""
+    return project_actor_geometry(actor, camera_model)["bbox"]
+
+
+def _bbox_iou(left, right):
+    ix1, iy1 = max(left[0], right[0]), max(left[1], right[1])
+    ix2, iy2 = min(left[2], right[2]), min(left[3], right[3])
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return (intersection / union if union > 0.0 else 0.0), (
+        intersection / left_area if left_area > 0.0 else 0.0
+    )
+
+
+def _bbox_area(box):
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _bbox_center(box):
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def validate_projected_actor_detection(
+    projected_bbox,
+    detections,
+    object_type,
+    *,
+    minimum_iou=0.15,
+    minimum_actor_coverage=0.50,
+    minimum_confidence=0.50,
+    maximum_area_ratio=2.5,
+):
+    """Require a compatible visual detection overlapping the exact actor projection."""
+    expected = {
+        "car": {"car"},
+        "truck": {"truck"},
+        "bus": {"bus"},
+        "person": {"person"},
+    }.get(object_type, set())
+    candidates = []
+    for detection in detections:
+        if detection.get("label") not in expected:
+            continue
+        bbox = tuple(float(value) for value in detection["bbox"])
+        iou, coverage = _bbox_iou(projected_bbox, bbox)
+        confidence = float(detection["confidence"])
+        detection_center = _bbox_center(bbox)
+        area_ratio = _bbox_area(bbox) / max(_bbox_area(projected_bbox), 1e-9)
+        center_inside = (
+            projected_bbox[0] <= detection_center[0] <= projected_bbox[2]
+            and projected_bbox[1] <= detection_center[1] <= projected_bbox[3]
+        )
+        candidate = {
+            "label": detection["label"],
+            "confidence": round(confidence, 4),
+            "bbox": [round(value, 3) for value in bbox],
+            "iou_with_projected_actor": round(iou, 4),
+            "projected_actor_coverage": round(coverage, 4),
+            "detection_to_actor_area_ratio": round(area_ratio, 4),
+            "detection_center_inside_actor": center_inside,
+        }
+        candidate["compatible"] = (
+            iou >= minimum_iou
+            and coverage >= minimum_actor_coverage
+            and confidence >= minimum_confidence
+            and area_ratio <= maximum_area_ratio
+            and center_inside
+        )
+        candidates.append(candidate)
+    matches = [candidate for candidate in candidates if candidate["compatible"]]
+    if not matches:
+        raise VerificationError(
+            "no compatible visual detection overlaps the projected UE5 actor"
+        )
+    best = max(
+        matches,
+        key=lambda candidate: (
+            candidate["iou_with_projected_actor"],
+            candidate["projected_actor_coverage"],
+            candidate["confidence"],
+        ),
+    )
+    return {
+        "projected_bbox": list(projected_bbox),
+        "minimum_iou": minimum_iou,
+        "minimum_actor_coverage": minimum_actor_coverage,
+        "minimum_confidence": minimum_confidence,
+        "maximum_area_ratio": maximum_area_ratio,
+        "best_detection": best,
+        "candidate_count": len(candidates),
+    }
+
+
+def project_scene_actor_geometries(world, camera_model, target_actor_id):
+    """Project every potentially confounding vehicle/walker in the UE5 scene."""
+    geometries = {}
+    for actor in world.get_actors():
+        type_id = str(getattr(actor, "type_id", ""))
+        if not type_id.startswith(("vehicle.", "walker.")):
+            continue
+        try:
+            is_target = int(getattr(actor, "id", -1)) == int(target_actor_id)
+            geometry = project_actor_geometry(
+                actor,
+                camera_model,
+                minimum_area_px=900.0 if is_target else 1.0,
+                minimum_dimension_px=20.0 if is_target else 1.0,
+                minimum_visibility_ratio=0.75 if is_target else 0.0,
+            )
+        except VerificationError:
+            if int(getattr(actor, "id", -1)) == int(target_actor_id):
+                raise
+            continue
+        geometries[int(actor.id)] = geometry
+    if int(target_actor_id) not in geometries:
+        raise VerificationError("target UE5 actor has no acceptable scene projection")
+    return geometries
+
+
+def validate_target_actor_exclusivity(
+    target_actor_id,
+    scene_geometries,
+    detection_bbox,
+    *,
+    minimum_iou_margin=0.10,
+    maximum_foreground_coverage=0.15,
+):
+    """Reject a detection explained better by another or foreground actor."""
+    target = scene_geometries[int(target_actor_id)]
+    target_iou, _ = _bbox_iou(target["bbox"], detection_bbox)
+    confounders = []
+    for actor_id, geometry in scene_geometries.items():
+        if int(actor_id) == int(target_actor_id):
+            continue
+        detection_iou, _ = _bbox_iou(geometry["bbox"], detection_bbox)
+        _, target_coverage = _bbox_iou(target["bbox"], geometry["bbox"])
+        foreground = geometry["minimum_depth_m"] < target["minimum_depth_m"] - 0.25
+        confounders.append({
+            "actor_id": int(actor_id),
+            "detection_iou": round(detection_iou, 4),
+            "target_coverage": round(target_coverage, 4),
+            "foreground": foreground,
+            "minimum_depth_m": geometry["minimum_depth_m"],
+        })
+        if foreground and target_coverage > maximum_foreground_coverage:
+            raise VerificationError(
+                "foreground UE5 actor occludes the projected target actor"
+            )
+        if detection_iou > 0.0 and target_iou - detection_iou < minimum_iou_margin:
+            raise VerificationError(
+                "visual detection is not exclusive to the target UE5 actor"
+            )
+    return {
+        "target_actor_id": int(target_actor_id),
+        "target_detection_iou": round(target_iou, 4),
+        "minimum_iou_margin": minimum_iou_margin,
+        "maximum_foreground_coverage": maximum_foreground_coverage,
+        "confounders": confounders,
+    }
+
+
+def file_sha256(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def detect_twin_objects(jpeg, detector, *, confidence, device):
+    """Run YOLO in its intended perception environment through bounded stdin."""
+    command = [
+        str(detector["python"]),
+        str(detector["script"]),
+        "--model",
+        str(detector["model"]),
+        "--confidence",
+        str(float(confidence)),
+        "--device",
+        str(device),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=jpeg,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60.0,
+            check=False,
+        )
+        payload = json.loads(completed.stdout)
+    except Exception as exc:
+        raise VerificationError("twin visual detection helper failed") from exc
+    if completed.returncode != 0 or payload.get("ok") is not True:
+        raise VerificationError("twin visual detection helper rejected the JPEG")
+    detections = payload.get("detections")
+    if not isinstance(detections, list):
+        raise VerificationError("twin visual detection helper returned invalid evidence")
+    return detections
 
 
 def world_actor_inventory(world):
@@ -336,6 +744,183 @@ def _object_from_twin_status(status, object_id):
     return matches[0]
 
 
+def camera_config_fingerprint(path, camera_id):
+    try:
+        payload = json.loads(Path(path).read_text())
+        camera = next(
+            camera
+            for camera in payload.get("cameras", [])
+            if camera.get("id") == camera_id
+        )
+    except (OSError, ValueError, StopIteration, TypeError) as exc:
+        raise VerificationError("tracked camera configuration is unavailable") from exc
+    canonical = json.dumps(
+        camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def cameras_config_fingerprint(path):
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, ValueError, TypeError) as exc:
+        raise VerificationError("tracked camera configuration is unavailable") from exc
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_twin_camera_model(
+    hello,
+    expected_camera_id,
+    expected_config_sha256=None,
+    expected_cameras_config_sha256=None,
+):
+    """Validate the exact configured and fingerprinted UE5 stream sensor."""
+    if hello.get("camera_id") != expected_camera_id:
+        raise VerificationError("twin stream camera does not match the request")
+    model = hello.get("camera_model")
+    if not isinstance(model, dict) or model.get("camera_id") != expected_camera_id:
+        raise VerificationError("twin stream has no matching camera model")
+    actor_id = model.get("actor_id")
+    if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id <= 0:
+        raise VerificationError("twin camera model has no valid UE5 actor_id")
+    fingerprint = str(model.get("config_sha256") or "")
+    if not (
+        len(fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise VerificationError("twin camera model has no valid config fingerprint")
+    if expected_config_sha256 is not None and fingerprint != expected_config_sha256:
+        raise VerificationError("twin camera model does not match tracked camera config")
+    whole_fingerprint = str(model.get("cameras_config_sha256") or "")
+    if not (
+        len(whole_fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in whole_fingerprint)
+    ):
+        raise VerificationError("twin camera model has no valid whole-config fingerprint")
+    if (
+        expected_cameras_config_sha256 is not None
+        and whole_fingerprint != expected_cameras_config_sha256
+    ):
+        raise VerificationError(
+            "twin camera model does not match the tracked site/camera config"
+        )
+    transform = _finite_transform_payload(model.get("transform"), "twin camera model")
+    image = model.get("image")
+    if not isinstance(image, dict):
+        raise VerificationError("twin camera model has no image geometry")
+    width, height = image.get("width"), image.get("height")
+    fov = image.get("horizontal_fov_deg")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+        or width != hello.get("width")
+        or height != hello.get("height")
+        or isinstance(fov, bool)
+        or not isinstance(fov, (int, float))
+        or not math.isfinite(float(fov))
+        or not 10.0 <= float(fov) <= 170.0
+    ):
+        raise VerificationError("twin camera model image geometry is invalid")
+    lens = model.get("lens")
+    expected_lens_keys = {
+        "lens_k",
+        "lens_kcube",
+        "lens_circle_falloff",
+        "lens_circle_multiplier",
+        "lens_x_size",
+        "lens_y_size",
+    }
+    if not isinstance(lens, dict) or set(lens) != expected_lens_keys:
+        raise VerificationError("twin camera model lens geometry is invalid")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in lens.values()
+    ):
+        raise VerificationError("twin camera model lens geometry is invalid")
+    return {
+        "camera_id": expected_camera_id,
+        "actor_id": actor_id,
+        "config_sha256": fingerprint,
+        "cameras_config_sha256": whole_fingerprint,
+        "transform": transform,
+        "image": {
+            "width": width,
+            "height": height,
+            "horizontal_fov_deg": float(fov),
+        },
+        "lens": {key: float(value) for key, value in lens.items()},
+    }
+
+
+def validate_live_twin_camera_actor(world, camera_model):
+    """Pin advertised camera evidence to the concrete live UE5 sensor actor."""
+    actor = world.get_actor(camera_model["actor_id"])
+    if actor is None or not str(getattr(actor, "type_id", "")).startswith(
+        "sensor.camera."
+    ):
+        raise VerificationError("advertised twin camera UE5 actor does not exist")
+    attributes = getattr(actor, "attributes", None) or {}
+    if attributes.get("role_name") != "twin_rig":
+        raise VerificationError("advertised twin camera actor has unexpected role")
+    observed = _actor_transform_payload(actor)
+    expected = camera_model["transform"]
+    position_error = math.sqrt(sum(
+        (observed["location"][axis] - expected["location"][axis]) ** 2
+        for axis in ("x", "y", "z")
+    ))
+    rotation_error = max(
+        _angular_error(
+            observed["rotation"][axis], expected["rotation"][axis]
+        )
+        for axis in ("pitch", "yaw", "roll")
+    )
+    if position_error > 0.01 or rotation_error > 0.05:
+        raise VerificationError("advertised twin camera transform drifted from UE5 actor")
+    image = camera_model["image"]
+    expected_attributes = {
+        "image_size_x": float(image["width"]),
+        "image_size_y": float(image["height"]),
+        "fov": float(image["horizontal_fov_deg"]),
+        "lens_k": float(camera_model["lens"]["lens_k"]),
+        "lens_kcube": float(camera_model["lens"]["lens_kcube"]),
+        "lens_circle_falloff": float(
+            camera_model["lens"]["lens_circle_falloff"]
+        ),
+        "lens_circle_multiplier": float(
+            camera_model["lens"]["lens_circle_multiplier"]
+        ),
+        "lens_x_size": float(camera_model["lens"]["lens_x_size"]),
+        "lens_y_size": float(camera_model["lens"]["lens_y_size"]),
+    }
+    for key, expected_value in expected_attributes.items():
+        try:
+            observed_value = float(attributes[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VerificationError(
+                f"advertised twin camera actor lacks {key}"
+            ) from exc
+        tolerance = 0.01 if key == "fov" else 1e-6
+        if abs(observed_value - expected_value) > tolerance:
+            raise VerificationError(
+                f"advertised twin camera actor {key} does not match stream model"
+            )
+    return {
+        "actor_id": int(actor.id),
+        "type_id": str(actor.type_id),
+        "position_error_m": round(position_error, 6),
+        "rotation_error_deg": round(rotation_error, 6),
+    }
+
+
 def _exact_schema_version(value, expected):
     return (
         not isinstance(value, bool)
@@ -487,6 +1072,68 @@ def validate_twin_object_sample(
     }
 
 
+def validate_visual_motion_consistency(
+    samples,
+    *,
+    minimum_projected_motion_px=5.0,
+    minimum_direction_cosine=0.75,
+    maximum_vector_error_px=10.0,
+    maximum_relative_vector_error=0.50,
+):
+    """Tie the YOLO track's image displacement to UE5 projected displacement."""
+    projected_centers = []
+    detection_centers = []
+    try:
+        for sample in samples:
+            visual = sample["visual"]
+            projected_centers.append(
+                _bbox_center(visual["before_capture"]["projected_bbox"])
+            )
+            detection_centers.append(
+                _bbox_center(visual["best_detection"]["bbox"])
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VerificationError("twin visual samples lack motion geometry") from exc
+    projected_vector = (
+        projected_centers[-1][0] - projected_centers[0][0],
+        projected_centers[-1][1] - projected_centers[0][1],
+    )
+    detection_vector = (
+        detection_centers[-1][0] - detection_centers[0][0],
+        detection_centers[-1][1] - detection_centers[0][1],
+    )
+    projected_distance = math.hypot(*projected_vector)
+    detection_distance = math.hypot(*detection_vector)
+    if projected_distance < minimum_projected_motion_px:
+        raise VerificationError(
+            "twin actor projected motion is not visually resolvable"
+        )
+    if detection_distance <= 1e-6:
+        raise VerificationError("twin visual detection did not move with the actor")
+    direction_cosine = sum(
+        left * right for left, right in zip(projected_vector, detection_vector)
+    ) / (projected_distance * detection_distance)
+    vector_error = math.hypot(
+        projected_vector[0] - detection_vector[0],
+        projected_vector[1] - detection_vector[1],
+    )
+    allowed_error = min(
+        maximum_vector_error_px,
+        maximum_relative_vector_error * projected_distance,
+    )
+    if direction_cosine < minimum_direction_cosine or vector_error > allowed_error:
+        raise VerificationError(
+            "twin visual detection motion disagrees with projected UE5 actor motion"
+        )
+    return {
+        "projected_displacement_px": round(projected_distance, 3),
+        "detection_displacement_px": round(detection_distance, 3),
+        "direction_cosine": round(direction_cosine, 4),
+        "vector_error_px": round(vector_error, 3),
+        "allowed_vector_error_px": round(allowed_error, 3),
+    }
+
+
 def validate_twin_object_samples(
     samples,
     *,
@@ -516,8 +1163,10 @@ def validate_twin_object_samples(
         for value in media_clocks
     ):
         raise VerificationError("twin object samples have invalid media timestamps")
-    if any(right < left for left, right in zip(media_clocks, media_clocks[1:])):
-        raise VerificationError("twin object media timestamps regressed")
+    if any(right <= left for left, right in zip(media_clocks, media_clocks[1:])):
+        raise VerificationError("twin object media timestamps did not advance")
+    if len(set(event_ids)) < 2:
+        raise VerificationError("twin object samples reuse one detection event")
     clocks = [sample.get("replay_clock_epoch") for sample in samples]
     if any(
         isinstance(value, bool)
@@ -555,6 +1204,20 @@ def validate_twin_object_samples(
         raise VerificationError(
             f"twin object moved only {max_movement:.3f}m; need {min_movement_m:.3f}m"
         )
+    visuals = [sample.get("visual") for sample in samples]
+    if any(
+        not isinstance(visual, dict)
+        or not isinstance(visual.get("best_detection"), dict)
+        or visual["best_detection"].get("compatible") is not True
+        for visual in visuals
+    ):
+        raise VerificationError("twin object samples lack projected visual proof")
+    frame_hashes = [str(visual.get("frame_sha256") or "") for visual in visuals]
+    if any(len(value) != 64 for value in frame_hashes):
+        raise VerificationError("twin object visual samples have invalid frame hashes")
+    if len(set(frame_hashes)) != len(frame_hashes):
+        raise VerificationError("twin object visual samples reused a rendered frame")
+    motion = validate_visual_motion_consistency(samples)
     return {
         "sample_count": len(samples),
         "object_id": next(iter(object_ids)),
@@ -569,6 +1232,8 @@ def validate_twin_object_samples(
         "replay_span_seconds": round(span, 3),
         "max_planar_movement_m": round(max_movement, 3),
         "planar_path_length_m": round(path_length, 3),
+        "visual_frame_sha256": frame_hashes,
+        "visual_motion": motion,
     }
 
 
@@ -702,11 +1367,20 @@ async def verify_zero_active_sessions(args):
     return validate_zero_active_sessions(status)
 
 
-async def collect_twin_object_samples(args, control_socket, world, evidence):
+async def collect_twin_object_samples(
+    args,
+    control_socket,
+    stream_socket,
+    world,
+    camera_model,
+    detector,
+    evidence,
+):
     """Collect three independently timestamped exact-object status samples."""
     samples = []
     deadline = asyncio.get_running_loop().time() + args.timeout
     next_sample_clock = None
+    previous_frame_count = None
     while len(samples) < 3:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -744,9 +1418,91 @@ async def collect_twin_object_samples(args, control_socket, world, evidence):
             status,
             args.twin_object_id,
             world,
-            position_tolerance_m=args.position_tolerance_m,
-            rotation_tolerance_deg=args.yaw_tolerance_deg,
+            position_tolerance_m=args.twin_position_tolerance_m,
+            rotation_tolerance_deg=args.twin_rotation_tolerance_deg,
         )
+        validate_live_twin_camera_actor(world, camera_model)
+        actor = world.get_actor(sample["actor_id"])
+        geometry_before = project_actor_geometry(actor, camera_model)
+        scene_before = project_scene_actor_geometries(
+            world, camera_model, sample["actor_id"]
+        )
+        jpeg, jpeg_digest, frame_metadata, frame_skew = (
+            await receive_twin_frame_packet(
+                stream_socket,
+                min(args.timeout, remaining),
+                camera_id=args.twin_camera,
+                minimum_replay_epoch=replay_epoch,
+                maximum_skew_seconds=args.twin_frame_max_skew,
+                previous_frame_count=previous_frame_count,
+                evidence=evidence,
+            )
+        )
+        previous_frame_count = frame_metadata["frame_count"]
+        evidence.setdefault("object_sync_frames", []).append(
+            synchronize_world(world, min(1.0, remaining))
+        )
+        validate_live_twin_camera_actor(world, camera_model)
+        actor_after = world.get_actor(sample["actor_id"])
+        if actor_after is None:
+            raise VerificationError("mapped UE5 actor disappeared during frame capture")
+        geometry_after = project_actor_geometry(actor_after, camera_model)
+        scene_after = project_scene_actor_geometries(
+            world, camera_model, sample["actor_id"]
+        )
+        detections = detect_twin_objects(
+            jpeg,
+            detector,
+            confidence=args.twin_yolo_confidence,
+            device=args.twin_yolo_device,
+        )
+        before_match = validate_projected_actor_detection(
+            geometry_before["bbox"],
+            detections,
+            sample["object_type"],
+            minimum_iou=args.twin_min_iou,
+            minimum_actor_coverage=args.twin_min_actor_coverage,
+        )
+        after_match = validate_projected_actor_detection(
+            geometry_after["bbox"],
+            detections,
+            sample["object_type"],
+            minimum_iou=args.twin_min_iou,
+            minimum_actor_coverage=args.twin_min_actor_coverage,
+        )
+        if before_match["best_detection"]["bbox"] != after_match["best_detection"]["bbox"]:
+            raise VerificationError(
+                "different visual detections matched the actor capture bracket"
+            )
+        detection_bbox = before_match["best_detection"]["bbox"]
+        exclusivity_before = validate_target_actor_exclusivity(
+            sample["actor_id"], scene_before, detection_bbox
+        )
+        exclusivity_after = validate_target_actor_exclusivity(
+            sample["actor_id"], scene_after, detection_bbox
+        )
+        sample["visual"] = {
+            "frame_sha256": jpeg_digest,
+            "frame_metadata": {
+                key: frame_metadata[key]
+                for key in (
+                    "camera_id", "frame_count", "carla_frame",
+                    "sensor_timestamp", "replay_clock", "jpeg_sha256",
+                )
+            },
+            "frame_replay_skew_seconds": round(frame_skew, 6),
+            "before_capture": {
+                **before_match,
+                "actor_geometry": geometry_before,
+                "exclusivity": exclusivity_before,
+            },
+            "after_capture": {
+                **after_match,
+                "actor_geometry": geometry_after,
+                "exclusivity": exclusivity_after,
+            },
+            "best_detection": before_match["best_detection"],
+        }
         samples.append(sample)
         next_sample_clock = replay_epoch + 1.0
 
@@ -756,6 +1512,18 @@ async def collect_twin_object_samples(args, control_socket, world, evidence):
 
 async def verify_twin(args, world=None):
     evidence = {"binary_frames": 0, "json_types": []}
+    detector = None
+    if args.twin_object_id:
+        detector = {
+            "python": args.twin_yolo_python,
+            "script": args.twin_yolo_detector,
+            "model": args.twin_yolo_model,
+        }
+        model_digest = file_sha256(args.twin_yolo_model)
+        if model_digest not in ACCEPTED_TWIN_YOLO_MODEL_SHA256:
+            raise VerificationError("twin visual proof model hash is not allowlisted")
+        evidence["twin_yolo_model_sha256"] = model_digest
+        evidence["twin_yolo_detector_sha256"] = file_sha256(args.twin_yolo_detector)
     control_url = websocket_url(args.ws_url, "/twin", "control=1")
     stream_url = websocket_url(
         args.ws_url, "/twin", f"cam={args.twin_camera}"
@@ -769,6 +1537,16 @@ async def verify_twin(args, world=None):
         )
         if evidence["stream_hello"]["type"] == "twin_error":
             raise VerificationError(evidence["stream_hello"].get("message", "twin error"))
+        evidence["validated_camera_model"] = validate_twin_camera_model(
+            evidence["stream_hello"],
+            args.twin_camera,
+            camera_config_fingerprint(args.cameras_json, args.twin_camera),
+            cameras_config_fingerprint(args.cameras_json),
+        )
+        if world is not None:
+            evidence["validated_camera_actor"] = validate_live_twin_camera_actor(
+                world, evidence["validated_camera_model"]
+            )
         live_digest = await receive_binary_frame(
             stream_socket, args.timeout, evidence=evidence
         )
@@ -831,7 +1609,13 @@ async def verify_twin(args, world=None):
                         )
                     evidence["object_correlation"] = (
                         await collect_twin_object_samples(
-                            args, control_socket, world, evidence
+                            args,
+                            control_socket,
+                            stream_socket,
+                            world,
+                            evidence["validated_camera_model"],
+                            detector,
+                            evidence,
                         )
                     )
 
@@ -856,15 +1640,32 @@ async def verify_twin(args, world=None):
                     second_clock - first_clock, 3
                 )
             finally:
-                live = await request_json(
-                    control_socket,
-                    {"type": "twin_live"},
-                    {"twin_mode", "twin_error"},
-                    args.timeout,
-                    evidence,
-                )
-                evidence["restored_mode"] = live
-                restored = live.get("mode") == "live"
+                try:
+                    live = await request_json(
+                        control_socket,
+                        {"type": "twin_live"},
+                        {"twin_mode", "twin_error"},
+                        args.timeout,
+                        evidence,
+                    )
+                    evidence["restored_mode"] = live
+                    confirmed = await request_json(
+                        control_socket,
+                        {"type": "twin_status"},
+                        {"twin_mode", "twin_error"},
+                        args.timeout,
+                        evidence,
+                    )
+                    evidence["restored_status"] = confirmed
+                    restored = (
+                        live.get("mode") == "live"
+                        and confirmed.get("mode") == "live"
+                        and confirmed.get("replay_clock") is None
+                    )
+                except Exception as exc:
+                    evidence["restore_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if not restored:
                 raise VerificationError("failed to restore twin live mode")
     return evidence
@@ -1239,6 +2040,36 @@ def build_parser():
         help="twin camera whose replay frames must visibly change",
     )
     parser.add_argument(
+        "--cameras-json",
+        type=Path,
+        default=DEFAULT_CAMERAS_JSON,
+        help="tracked camera config whose channel fingerprint must match the stream",
+    )
+    parser.add_argument(
+        "--twin-yolo-model",
+        type=Path,
+        help="local YOLO weights required for exact projected-actor visual proof",
+    )
+    parser.add_argument(
+        "--twin-yolo-python",
+        type=Path,
+        default=DEFAULT_TWIN_YOLO_PYTHON,
+        help="Python executable containing the pinned perception dependencies",
+    )
+    parser.add_argument(
+        "--twin-yolo-detector",
+        type=Path,
+        default=DEFAULT_TWIN_YOLO_DETECTOR,
+        help="tracked stdin-only JPEG detection helper",
+    )
+    parser.add_argument("--twin-yolo-device", default="cpu")
+    parser.add_argument("--twin-yolo-confidence", type=float, default=0.25)
+    parser.add_argument("--twin-min-iou", type=float, default=0.15)
+    parser.add_argument("--twin-min-actor-coverage", type=float, default=0.50)
+    parser.add_argument("--twin-frame-max-skew", type=float, default=0.25)
+    parser.add_argument("--twin-position-tolerance-m", type=float, default=0.50)
+    parser.add_argument("--twin-rotation-tolerance-deg", type=float, default=1.0)
+    parser.add_argument(
         "--apply",
         action="store_true",
         help=(
@@ -1264,6 +2095,43 @@ def validate_cli_args(args):
             raise VerificationError("--twin-object-id requires --apply")
         if args.skip_twin:
             raise VerificationError("--twin-object-id cannot be used with --skip-twin")
+        if args.twin_yolo_model is None or not args.twin_yolo_model.is_file():
+            raise VerificationError(
+                "--twin-object-id requires an existing --twin-yolo-model"
+            )
+        if not args.twin_yolo_python.is_file():
+            raise VerificationError("--twin-yolo-python does not exist")
+        if not args.twin_yolo_detector.is_file():
+            raise VerificationError("--twin-yolo-detector does not exist")
+        if not args.cameras_json.is_file():
+            raise VerificationError("--cameras-json does not exist")
+    elif args.twin_yolo_model is not None:
+        raise VerificationError("--twin-yolo-model requires --twin-object-id")
+    for value, label in (
+        (args.twin_yolo_confidence, "--twin-yolo-confidence"),
+        (args.twin_min_iou, "--twin-min-iou"),
+        (args.twin_min_actor_coverage, "--twin-min-actor-coverage"),
+    ):
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise VerificationError(f"{label} must be in (0, 1]")
+    if (
+        not math.isfinite(args.twin_frame_max_skew)
+        or not 0.0 < args.twin_frame_max_skew <= 0.25
+    ):
+        raise VerificationError("--twin-frame-max-skew must be in (0, 0.25]")
+    if args.twin_min_iou < 0.15:
+        raise VerificationError("--twin-min-iou cannot weaken the 0.15 floor")
+    if args.twin_min_actor_coverage < 0.50:
+        raise VerificationError(
+            "--twin-min-actor-coverage cannot weaken the 0.50 floor"
+        )
+    if (
+        not 0.0 < args.twin_position_tolerance_m <= 0.50
+        or not 0.0 < args.twin_rotation_tolerance_deg <= 1.0
+    ):
+        raise VerificationError(
+            "exact twin actor tolerances cannot exceed 0.50m and 1.0deg"
+        )
     return args
 
 

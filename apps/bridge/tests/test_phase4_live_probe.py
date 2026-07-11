@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 import pytest
 import tools.verify_phase4_live as live_probe
@@ -9,7 +10,9 @@ from tools.verify_phase4_live import (
     binary_digest,
     build_parser,
     choose_teleport_target,
+    project_world_xyz,
     receive_binary_frame,
+    receive_twin_frame_packet,
     receive_json,
     replay_clock_epoch,
     session_candidate_actor_ids,
@@ -18,13 +21,54 @@ from tools.verify_phase4_live import (
     validate_actor_delta,
     validate_cli_args,
     validate_isolated_ego_roles,
+    validate_live_twin_camera_actor,
     validate_session_actor_manifest,
+    validate_twin_camera_model,
+    validate_projected_actor_detection,
+    validate_target_actor_exclusivity,
     validate_twin_object_sample,
     validate_twin_object_samples,
+    validate_visual_motion_consistency,
     validate_zero_active_sessions,
     verify_twin,
     websocket_url,
 )
+
+
+def twin_camera_hello(camera_id="ch1"):
+    return {
+        "type": "twin_hello",
+        "camera_id": camera_id,
+        "width": 1280,
+        "height": 960,
+        "camera_model": {
+            "camera_id": camera_id,
+            "actor_id": 33,
+            "config_sha256": live_probe.camera_config_fingerprint(
+                live_probe.DEFAULT_CAMERAS_JSON, camera_id
+            ),
+            "cameras_config_sha256": live_probe.cameras_config_fingerprint(
+                live_probe.DEFAULT_CAMERAS_JSON
+            ),
+            "transform": {
+                "location": {"x": 1.0, "y": 2.0, "z": 8.0},
+                "rotation": {"pitch": -35.0, "yaw": 90.0, "roll": 0.0},
+            },
+            "image": {
+                "width": 1280,
+                "height": 960,
+                "horizontal_fov_deg": 90.0,
+            },
+            "lens": {
+                "lens_k": 0.0,
+                "lens_kcube": 0.0,
+                "lens_circle_falloff": 5.0,
+                "lens_circle_multiplier": 0.0,
+                "lens_x_size": 0.08,
+                "lens_y_size": 0.08,
+            },
+        },
+    }
 
 
 class FakeLocation:
@@ -63,6 +107,60 @@ class FakeWebSocket:
         return next(self.messages)
 
 
+def frame_packet_metadata(jpeg, replay_clock, frame_count):
+    return json.dumps({
+        "type": "twin_frame",
+        "camera_id": "ch1",
+        "frame_count": frame_count,
+        "carla_frame": 1000 + frame_count,
+        "sensor_timestamp": 50.0 + frame_count,
+        "jpeg_sha256": hashlib.sha256(jpeg).hexdigest(),
+        "mode": "replay",
+        "replay_clock": replay_clock,
+    })
+
+
+@pytest.mark.asyncio
+async def test_twin_frame_packet_discards_stale_and_hash_binds_current_jpeg():
+    old, current = b"old", b"current"
+    websocket = FakeWebSocket([
+        frame_packet_metadata(old, "2026-07-10T06:00:00.000Z", 1),
+        old,
+        frame_packet_metadata(current, "2026-07-10T06:00:01.100Z", 2),
+        current,
+    ])
+    jpeg, digest, metadata, skew = await receive_twin_frame_packet(
+        websocket,
+        1.0,
+        camera_id="ch1",
+        minimum_replay_epoch=live_probe.replay_clock_epoch(
+            "2026-07-10T06:00:01.000Z"
+        ),
+        maximum_skew_seconds=0.25,
+    )
+    assert jpeg == current
+    assert digest == hashlib.sha256(current).hexdigest()
+    assert metadata["frame_count"] == 2
+    assert skew == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_twin_frame_packet_rejects_metadata_jpeg_mismatch():
+    websocket = FakeWebSocket([
+        frame_packet_metadata(b"expected", "2026-07-10T06:00:01.000Z", 2),
+        b"different",
+    ])
+    with pytest.raises(VerificationError, match="hash mismatch"):
+        await receive_twin_frame_packet(
+            websocket,
+            1.0,
+            camera_id="ch1",
+            minimum_replay_epoch=live_probe.replay_clock_epoch(
+                "2026-07-10T06:00:01.000Z"
+            ),
+        )
+
+
 class FakeActor:
     def __init__(
         self,
@@ -95,6 +193,7 @@ def twin_status(
     actor_id=77,
     object_type="car",
     actor_type="vehicle.tesla.model3",
+    event_id=None,
     x=10.0,
     y=20.0,
 ):
@@ -106,7 +205,7 @@ def twin_status(
             {
                 "object_id": object_id,
                 "object_type": object_type,
-                "event_id": "event-1",
+                "event_id": event_id or f"event-{clock}",
                 "detection_timestamp_utc": clock,
                 "media_timestamp_utc": clock,
                 "timestamp_schema_version": 2,
@@ -129,7 +228,181 @@ def twin_status(
     }
 
 
+def test_validates_fingerprinted_twin_camera_model():
+    model = validate_twin_camera_model(twin_camera_hello(), "ch1")
+    assert model["camera_id"] == "ch1"
+    assert model["actor_id"] == 33
+    assert model["image"]["horizontal_fov_deg"] == pytest.approx(90.0)
+
+
+@pytest.mark.parametrize(
+    "mutate,error",
+    [
+        (lambda hello: hello.pop("camera_model"), "no matching camera model"),
+        (
+            lambda hello: hello["camera_model"].update(config_sha256="bad"),
+            "config fingerprint",
+        ),
+        (
+            lambda hello: hello["camera_model"].update(
+                cameras_config_sha256="bad"
+            ),
+            "whole-config fingerprint",
+        ),
+        (
+            lambda hello: hello["camera_model"]["image"].update(width=640),
+            "image geometry",
+        ),
+    ],
+)
+def test_rejects_unverifiable_twin_camera_model(mutate, error):
+    hello = twin_camera_hello()
+    mutate(hello)
+    with pytest.raises(VerificationError, match=error):
+        validate_twin_camera_model(hello, "ch1")
+
+
+def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
+    model = validate_twin_camera_model(twin_camera_hello(), "ch1")
+    actor = FakeActor(
+        actor_id=33,
+        type_id="sensor.camera.rgb",
+        role_name="twin_rig",
+        transform=FakeTransform(1.0, 2.0, 8.0, pitch=-35.0, yaw=90.0),
+    )
+    actor.attributes.update({
+        "image_size_x": "1280",
+        "image_size_y": "960",
+        "fov": "90.0",
+        "lens_k": "0.0",
+        "lens_kcube": "0.0",
+        "lens_circle_falloff": "5.0",
+        "lens_circle_multiplier": "0.0",
+        "lens_x_size": "0.08",
+        "lens_y_size": "0.08",
+    })
+    evidence = validate_live_twin_camera_actor(FakeWorld([actor]), model)
+    assert evidence["actor_id"] == 33
+    actor._transform = FakeTransform(1.5, 2.0, 8.0, pitch=-35.0, yaw=90.0)
+    with pytest.raises(VerificationError, match="transform drifted"):
+        validate_live_twin_camera_actor(FakeWorld([actor]), model)
+
+
+def test_projects_world_point_through_fingerprinted_camera_model():
+    model = twin_camera_hello()["camera_model"]
+    model["transform"] = {
+        "location": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+    }
+    model["image"] = {
+        "width": 1000,
+        "height": 500,
+        "horizontal_fov_deg": 90.0,
+    }
+    assert project_world_xyz((10.0, 0.0, 0.0), model) == pytest.approx(
+        (500.0, 250.0, 10.0)
+    )
+    assert project_world_xyz((10.0, 1.0, 1.0), model) == pytest.approx(
+        (550.0, 200.0, 10.0)
+    )
+    model["lens"]["lens_k"] = -0.1
+    with pytest.raises(VerificationError, match="nonzero CARLA lens distortion"):
+        project_world_xyz((10.0, 0.0, 0.0), model)
+
+
+def test_projected_actor_requires_strong_compatible_visual_overlap():
+    result = validate_projected_actor_detection(
+        (100.0, 100.0, 200.0, 200.0),
+        [
+            {"label": "person", "confidence": 0.99, "bbox": [100, 100, 200, 200]},
+            {"label": "car", "confidence": 0.90, "bbox": [110, 110, 195, 195]},
+        ],
+        "car",
+    )
+    assert result["best_detection"]["compatible"] is True
+    assert result["best_detection"]["iou_with_projected_actor"] > 0.7
+    with pytest.raises(VerificationError, match="no compatible visual detection"):
+        validate_projected_actor_detection(
+            (100.0, 100.0, 200.0, 200.0),
+            [{"label": "car", "confidence": 0.9, "bbox": [190, 190, 260, 260]}],
+            "car",
+        )
+
+
+def test_projected_actor_rejects_low_confidence_or_oversized_detection():
+    projected = (100.0, 100.0, 200.0, 200.0)
+    for detection in (
+        {"label": "car", "confidence": 0.49, "bbox": [105, 105, 195, 195]},
+        {"label": "car", "confidence": 0.90, "bbox": [0, 0, 400, 400]},
+    ):
+        with pytest.raises(VerificationError, match="no compatible visual detection"):
+            validate_projected_actor_detection(projected, [detection], "car")
+
+
+def test_target_actor_exclusivity_rejects_occluder_and_ambiguous_neighbor():
+    target = {
+        "actor_id": 77,
+        "bbox": (100.0, 100.0, 200.0, 200.0),
+        "minimum_depth_m": 20.0,
+    }
+    foreground = {
+        "actor_id": 88,
+        "bbox": (110.0, 110.0, 190.0, 190.0),
+        "minimum_depth_m": 10.0,
+    }
+    with pytest.raises(VerificationError, match="occludes"):
+        validate_target_actor_exclusivity(
+            77, {77: target, 88: foreground}, [105, 105, 195, 195]
+        )
+    neighbor = {
+        "actor_id": 89,
+        "bbox": (105.0, 100.0, 205.0, 200.0),
+        "minimum_depth_m": 20.5,
+    }
+    with pytest.raises(VerificationError, match="not exclusive"):
+        validate_target_actor_exclusivity(
+            77, {77: target, 89: neighbor}, [105, 100, 200, 200]
+        )
+
+
+def test_scene_projection_keeps_clipped_confounders(monkeypatch):
+    target = FakeActor(actor_id=77)
+    confounder = FakeActor(actor_id=88)
+    world = type("World", (), {"get_actors": lambda self: [target, confounder]})()
+    calls = {}
+
+    def fake_project(actor, _camera, **thresholds):
+        calls[actor.id] = thresholds
+        return {
+            "actor_id": actor.id,
+            "bbox": (100.0, 100.0, 200.0, 200.0),
+            "minimum_depth_m": 10.0,
+        }
+
+    monkeypatch.setattr(live_probe, "project_actor_geometry", fake_project)
+    geometries = live_probe.project_scene_actor_geometries(
+        world, twin_camera_hello()["camera_model"], 77
+    )
+
+    assert set(geometries) == {77, 88}
+    assert calls[77]["minimum_visibility_ratio"] == 0.75
+    assert calls[88]["minimum_visibility_ratio"] == 0.0
+    assert calls[88]["minimum_area_px"] == 1.0
+
+
+def test_visual_motion_rejects_detection_moving_against_actor_projection():
+    samples = [
+        twin_sample(100.0, 10.0),
+        twin_sample(101.0, 10.2),
+        twin_sample(102.0, 10.5),
+    ]
+    samples[-1]["visual"]["best_detection"]["bbox"] = [100, 100, 200, 200]
+    with pytest.raises(VerificationError, match="motion disagrees"):
+        validate_visual_motion_consistency(samples)
+
+
 def twin_sample(clock, x, *, actor_id=77):
+    bbox = [x * 20.0, 100.0, x * 20.0 + 100.0, 200.0]
     return {
         "object_id": "global_car_run_1",
         "actor_id": actor_id,
@@ -139,6 +412,11 @@ def twin_sample(clock, x, *, actor_id=77):
         "reported_transform": {
             "location": {"x": x, "y": 20.0, "z": 0.3},
             "rotation": {"pitch": 0.0, "yaw": 12.0, "roll": 0.0},
+        },
+        "visual": {
+            "frame_sha256": f"{int(clock):064x}",
+            "best_detection": {"compatible": True, "bbox": list(bbox)},
+            "before_capture": {"projected_bbox": list(bbox)},
         },
     }
 
@@ -448,6 +726,16 @@ def test_twin_samples_require_three_stable_samples_over_two_seconds_with_motion(
         "replay_span_seconds": 2.0,
         "max_planar_movement_m": 0.4,
         "planar_path_length_m": 0.4,
+        "visual_frame_sha256": [
+            f"{value:064x}" for value in (100, 101, 102)
+        ],
+        "visual_motion": {
+            "projected_displacement_px": 8.0,
+            "detection_displacement_px": 8.0,
+            "direction_cosine": 1.0,
+            "vector_error_px": 0.0,
+            "allowed_vector_error_px": 4.0,
+        },
     }
 
 
@@ -482,6 +770,30 @@ def test_twin_samples_reject_weak_identity_time_or_motion_proof(samples, message
         validate_twin_object_samples(samples)
 
 
+def test_twin_samples_reject_reused_rendered_frame():
+    samples = [
+        twin_sample(100.0, 10.0),
+        twin_sample(101.0, 10.2),
+        twin_sample(102.0, 10.5),
+    ]
+    for sample in samples:
+        sample["visual"]["frame_sha256"] = "a" * 64
+    with pytest.raises(VerificationError, match="reused a rendered frame"):
+        validate_twin_object_samples(samples)
+
+
+def test_twin_samples_reject_reused_detection_event():
+    samples = [
+        twin_sample(100.0, 10.0),
+        twin_sample(101.0, 10.2),
+        twin_sample(102.0, 10.5),
+    ]
+    for sample in samples:
+        sample["event_id"] = "same-event"
+    with pytest.raises(VerificationError, match="reuse one detection event"):
+        validate_twin_object_samples(samples)
+
+
 def test_zero_active_session_gate_rejects_busy_or_malformed_status():
     assert validate_zero_active_sessions({"active_sessions": 0}) == {
         "active_sessions": 0
@@ -492,7 +804,9 @@ def test_zero_active_session_gate_rejects_busy_or_malformed_status():
         validate_zero_active_sessions({"active_sessions": False})
 
 
-def test_exact_object_cli_supports_camera_replay_start_and_skip_drive():
+def test_exact_object_cli_supports_camera_replay_start_and_skip_drive(tmp_path):
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"weights")
     args = validate_cli_args(
         build_parser().parse_args(
             [
@@ -504,6 +818,8 @@ def test_exact_object_cli_supports_camera_replay_start_and_skip_drive():
                 "2026-07-10T06:00:00Z",
                 "--twin-camera",
                 "ch4",
+                "--twin-yolo-model",
+                str(model),
             ]
         )
     )
@@ -574,7 +890,7 @@ async def test_twin_replay_restores_live_when_acceptance_fails(monkeypatch):
     monkeypatch.setattr(live_probe.websockets, "connect", lambda *_a, **_k: Context())
 
     async def fake_receive_json(*_args, **_kwargs):
-        return {"type": "twin_hello"}
+        return twin_camera_hello()
 
     binary_calls = 0
 
@@ -590,7 +906,12 @@ async def test_twin_replay_restores_live_when_acceptance_fails(monkeypatch):
     async def fake_request_json(_socket, payload, *_args, **_kwargs):
         sent_types.append(payload["type"])
         if payload["type"] == "twin_status":
-            return {"type": "twin_mode", "mode": "live", "replay_supported": True}
+            return {
+                "type": "twin_mode",
+                "mode": "live",
+                "replay_clock": None,
+                "replay_supported": True,
+            }
         if payload["type"] == "twin_replay":
             return {"type": "twin_mode", "mode": "replay"}
         if payload["type"] == "twin_live":
@@ -607,7 +928,7 @@ async def test_twin_replay_restores_live_when_acceptance_fails(monkeypatch):
     with pytest.raises(VerificationError, match="injected replay-frame failure"):
         await verify_twin(args)
 
-    assert sent_types[-1] == "twin_live"
+    assert sent_types[-2:] == ["twin_live", "twin_status"]
 
 
 @pytest.mark.asyncio
@@ -620,7 +941,7 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         twin_status(clock="2026-07-10T06:00:02.000Z", x=10.5),
     ]
     call_order = []
-    sync_frames = iter((101, 102, 103))
+    sync_frames = iter((101, 102, 103, 104, 105, 106))
 
     def fake_synchronize(sync_world, timeout):
         assert sync_world is world
@@ -639,6 +960,62 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
 
     monkeypatch.setattr(live_probe, "synchronize_world", fake_synchronize)
     monkeypatch.setattr(live_probe, "request_json", fake_request_json)
+    monkeypatch.setattr(
+        live_probe, "validate_live_twin_camera_actor", lambda *_args: {"actor_id": 33}
+    )
+    def fake_geometry(projected_actor, _camera):
+        x = projected_actor.get_transform().location.x * 20.0
+        return {
+            "actor_id": projected_actor.id,
+            "bbox": (x, 100.0, x + 100.0, 200.0),
+            "raw_bbox": (x, 100.0, x + 100.0, 200.0),
+            "area_px": 10000.0,
+            "visibility_ratio": 1.0,
+            "minimum_depth_m": 10.0,
+            "median_depth_m": 11.0,
+        }
+
+    monkeypatch.setattr(live_probe, "project_actor_geometry", fake_geometry)
+    monkeypatch.setattr(
+        live_probe,
+        "project_scene_actor_geometries",
+        lambda _world, camera, target_id: {target_id: fake_geometry(actor, camera)},
+    )
+
+    async def fake_packet(*_args, **_kwargs):
+        fake_packet.count += 1
+        digest = f"{fake_packet.count:064x}"
+        return (
+            b"jpeg",
+            digest,
+            {
+                "camera_id": "ch1",
+                "frame_count": fake_packet.count,
+                "carla_frame": 100 + fake_packet.count,
+                "sensor_timestamp": 10.0 + fake_packet.count,
+                "replay_clock": f"2026-07-10T06:00:0{fake_packet.count - 1}.000Z",
+                "jpeg_sha256": digest,
+            },
+            0.0,
+        )
+
+    fake_packet.count = 0
+
+    monkeypatch.setattr(live_probe, "receive_twin_frame_packet", fake_packet)
+    monkeypatch.setattr(
+        live_probe,
+        "detect_twin_objects",
+        lambda *_args, **_kwargs: [{
+            "label": "car",
+            "confidence": 0.9,
+            "bbox": [
+                actor.get_transform().location.x * 20.0,
+                100,
+                actor.get_transform().location.x * 20.0 + 100.0,
+                200,
+            ],
+        }],
+    )
 
     args = type(
         "Args",
@@ -646,17 +1023,26 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         {
             "timeout": 5.0,
             "twin_object_id": "global_car_run_1",
-            "position_tolerance_m": 0.5,
-            "yaw_tolerance_deg": 1.0,
+                "position_tolerance_m": 0.5,
+                "yaw_tolerance_deg": 1.0,
+                "twin_position_tolerance_m": 0.5,
+                "twin_rotation_tolerance_deg": 1.0,
+            "twin_yolo_confidence": 0.25,
+            "twin_yolo_device": "cpu",
+            "twin_min_iou": 0.15,
+                "twin_min_actor_coverage": 0.5,
+                "twin_frame_max_skew": 0.25,
+                "twin_camera": "ch1",
         },
     )()
     evidence = {}
 
     result = await live_probe.collect_twin_object_samples(
-        args, object(), world, evidence
+        args, object(), object(), world, twin_camera_hello()["camera_model"], object(), evidence
     )
 
-    assert call_order == ["sync", "request"] * 3
-    assert evidence["object_sync_frames"] == [101, 102, 103]
+    assert call_order == ["sync", "request", "sync"] * 3
+    assert evidence["object_sync_frames"] == [101, 102, 103, 104, 105, 106]
     assert result["sample_count"] == 3
     assert result["max_planar_movement_m"] == pytest.approx(0.5)
+    assert all(sample["visual"]["best_detection"]["compatible"] for sample in result["samples"])
