@@ -262,6 +262,9 @@ def twin_status(
                 "actor_id": actor_id,
                 "actor_present": True,
                 "actor_type": actor_type,
+                "raw_carla_location": {"x": x, "y": y, "z": 0.0},
+                "target_carla_location": {"x": x, "y": y, "z": 0.3},
+                "placement_planar_error_m": 0.0,
                 "carla_transform": {
                     "location": {"x": x, "y": y, "z": 0.3},
                     "rotation": {"pitch": 0.0, "yaw": 12.0, "roll": 0.0},
@@ -839,6 +842,20 @@ def test_exact_twin_sample_proves_actor_role_type_and_transform():
     assert sample["role_name"] == "twin_object"
     assert sample["position_error_m"] == 0.0
     assert sample["rotation_error_deg"] == 0.0
+    assert sample["raw_planar_error_m"] == 0.0
+
+
+def test_twin_object_rejects_planar_lane_snap_masking():
+    status = twin_status()
+    status["objects"][0]["raw_carla_location"]["x"] = 7.0
+    with pytest.raises(VerificationError, match="planar placement diverges"):
+        validate_twin_object_sample(
+            status,
+            "global_car_run_1",
+            FakeWorld([FakeActor()]),
+            position_tolerance_m=0.5,
+            rotation_tolerance_deg=1.0,
+        )
 
 
 @pytest.mark.parametrize(

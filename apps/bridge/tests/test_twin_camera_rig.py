@@ -69,19 +69,19 @@ class TestIntrinsics:
             horizontal_fov_deg(CAMERA["intrinsics"]) - 1.25
         )
 
-    def test_blueprint_uses_pinhole_lens_unless_measured(self, mock_world):
+    def test_blueprint_preserves_actor_default_lens_and_rejects_overrides(self, mock_world):
         blueprint = mock_world.get_blueprint_library().find("sensor.camera.rgb")
         configure_twin_camera_blueprint(blueprint, CAMERA, 1280, 960, 12.0)
-        assert str(blueprint.get_attribute("lens_k")) == "0.0"
-        assert str(blueprint.get_attribute("lens_kcube")) == "0.0"
+        assert not any(
+            key.startswith("lens_") for key, _value in blueprint.set_attribute_calls
+        )
         assert float(str(blueprint.get_attribute("sensor_tick"))) == pytest.approx(
             1 / 12, abs=1e-6
         )
 
         measured = {**CAMERA, "twin_lens": {"lens_k": -0.2, "lens_kcube": 0.03}}
-        configure_twin_camera_blueprint(blueprint, measured, 1280, 960)
-        assert str(blueprint.get_attribute("lens_k")) == "-0.2"
-        assert str(blueprint.get_attribute("lens_kcube")) == "0.03"
+        with pytest.raises(ValueError, match="lens overrides are held"):
+            configure_twin_camera_blueprint(blueprint, measured, 1280, 960)
 
 
 class TestMapGate:
@@ -302,7 +302,7 @@ class TestTwinCameraRig:
         assert model["image"]["width"] == 1280
         assert model["image"]["height"] == 960
         assert model["image"]["horizontal_fov_deg"] == pytest.approx(
-            round(horizontal_fov_deg(CAMERA["intrinsics"]), 2)
+            horizontal_fov_deg(CAMERA["intrinsics"]), abs=1e-6
         )
         assert model["lens"] == {
             "lens_k": -1.0,
