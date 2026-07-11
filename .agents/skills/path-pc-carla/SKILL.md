@@ -499,10 +499,15 @@ Generate a dimensioned board with the tracked acquisition tool, print it at
   --inner-columns 9 --inner-rows 6 --square-mm 25
 ```
 
-For each fixed physical camera, acquire at least 10 sharp, unique images at its
-native resolution. Move and tilt the board across the image, including corners
-and depth variation; do not crop, resize, digitally warp, or reuse frames.
-Calibrate with one `--image` argument per retained source image:
+For each fixed physical camera, acquire at least 10 sharp, unique fit images
+and two untouched holdouts at its native resolution. Bind the camera/channel,
+resolution, crop, focus/zoom state, board hash, capture times, and source
+hashes. Move and tilt the board across every image edge/corner with at least 15
+degrees of tilt spread and 1.3x distance variation; do not crop, resize,
+digitally warp, or reuse frames. Obtain site-access and traffic-safety
+authorization before roadside capture, and re-capture frozen landmarks after
+the session to prove the camera mount did not move. Calibrate with one
+`--image` argument per fit image and one `--holdout-image` per holdout:
 
 ```bash
 /home/path/V2XCarla/carla-venv-310/bin/python \
@@ -510,15 +515,19 @@ Calibrate with one `--image` argument per retained source image:
   --image /path/to/ch1-board-01.png \
   --image /path/to/ch1-board-02.png \
   `# repeat for at least 10 unique accepted images` \
+  --holdout-image /path/to/ch1-board-holdout-01.png \
+  --holdout-image /path/to/ch1-board-holdout-02.png \
   --output /path/to/ch1-intrinsics.json \
   --report /path/to/ch1-intrinsics-report.json \
   --inner-columns 9 --inner-rows 6 --square-mm 25
 ```
 
 The tool must reject decode failures, mixed resolutions, duplicate source
-hashes, fewer than 10 accepted detections, non-finite output, and RMS above
-2 px. Preserve the board hash, every source image, artifact, report, and the
-artifact SHA-256 copied into `cameras.json`.
+hashes, fewer than 10 accepted fits or two disjoint holdouts, poor edge/corner,
+tilt, or distance coverage, non-finite output, fit or holdout RMS above 2 px,
+and held-out per-corner max error above 5 px. Preserve the board hash, every
+source image, artifact, report, and the artifact SHA-256 copied into
+`cameras.json`.
 
 Only in an authorized mutation window with zero Drive sessions, resolve those
 twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
