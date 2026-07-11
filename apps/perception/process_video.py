@@ -249,6 +249,9 @@ def _live_pipeline_shutdown_timeout_seconds(
     return timeout_seconds
 
 
+MAX_VEHICLE_LOCALIZATION_UNCERTAINTY_M = 2.0
+
+
 def assess_media_clock(
     frame_media_clock,
     decode_received_epoch,
@@ -492,8 +495,28 @@ def records_ready_for_upload(records, live):
         if (
             record.get("timestamp_schema_version") == TIMESTAMP_SCHEMA_VERSION
             and record.get("media_time_trusted") is True
+            and vehicle_localization_acceptable(record)
         )
     ]
+
+
+def vehicle_localization_acceptable(record):
+    if record.get("object_type") not in {"car", "truck", "bus"}:
+        return True
+    value = (
+        record.get("camera_data", {})
+        .get("bifocal_metadata", {})
+        .get("world_position", {})
+        .get("uncertainty_meters")
+    )
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(value)
+        and 0.0 <= value <= MAX_VEHICLE_LOCALIZATION_UNCERTAINTY_M
+    )
 
 def env_bool(name, default=False):
     value = os.getenv(name)
@@ -531,6 +554,36 @@ def load_cameras_config():
     if not config.get("cameras"):
         return None
     return config
+
+
+def camera_localization_parameters(camera):
+    """Return measured localization uncertainty or block deployment startup."""
+    localization = camera.get("localization")
+    if not isinstance(localization, dict):
+        raise ValueError(
+            f"camera {camera.get('id')!r} has no measured localization block"
+        )
+    try:
+        pixel_sigma = float(localization["pixel_sigma"])
+        calibration_uncertainty_m = float(
+            localization["calibration_uncertainty_m"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"camera {camera.get('id')!r} localization evidence is incomplete"
+        ) from exc
+    if (
+        not math.isfinite(pixel_sigma)
+        or pixel_sigma < 0.1
+        or not math.isfinite(calibration_uncertainty_m)
+        or not 0.0
+        <= calibration_uncertainty_m
+        <= MAX_VEHICLE_LOCALIZATION_UNCERTAINTY_M
+    ):
+        raise ValueError(
+            f"camera {camera.get('id')!r} localization evidence is invalid"
+        )
+    return pixel_sigma, calibration_uncertainty_m
 
 def parse_video_paths():
     value = os.getenv("V2X_PERCEPTION_VIDEO_PATHS", "").strip()
@@ -1163,6 +1216,11 @@ class MultiCameraPipeline:
     TRACK_MAX_DISTANCE_M = 8.0
     TRACK_MIN_APPEARANCE_SIMILARITY = 0.65
     VEHICLE_MIN_APPEARANCE_SIMILARITY = 0.60
+    VEHICLE_AMBIGUITY_DISTANCE_MARGIN_M = 1.5
+    VEHICLE_AMBIGUITY_APPEARANCE_MARGIN = 0.08
+    MAX_VEHICLE_ASSOCIATION_UNCERTAINTY_M = (
+        MAX_VEHICLE_LOCALIZATION_UNCERTAINTY_M
+    )
     VEHICLE_EMBEDDING_REFRESH_FRAMES = 5
     VEHICLE_EMBEDDING_CACHE_MAX = 1024
 
@@ -1283,19 +1341,149 @@ class MultiCameraPipeline:
             return None
         return parsed.timestamp() if parsed.tzinfo is not None else None
 
+    @classmethod
+    def _trusted_event_epoch(cls, detection):
+        """Return the schema-v2 HLS media epoch or fail closed."""
+        schema = detection.get('timestamp_schema_version')
+        clock = detection.get('media_clock')
+        media_timestamp = detection.get('media_timestamp_utc')
+        if (
+            schema != TIMESTAMP_SCHEMA_VERSION
+            or isinstance(schema, bool)
+            or detection.get('media_time_trusted') is not True
+            or detection.get('media_clock_status') != 'matched'
+            or not isinstance(clock, dict)
+            or clock.get('source') != 'hls_ext_x_program_date_time'
+            or clock.get('schema_version') != 1
+            or isinstance(clock.get('schema_version'), bool)
+            or detection.get('timestamp_utc') != media_timestamp
+        ):
+            return None
+        return cls._event_epoch(detection)
+
     @staticmethod
     def _localization_uncertainty(detection):
         value = (
             detection.get('camera_data', {})
             .get('bifocal_metadata', {})
             .get('world_position', {})
-            .get('uncertainty_meters', 0.0)
+            .get('uncertainty_meters')
         )
         try:
             value = float(value)
         except (TypeError, ValueError):
-            return 0.0
-        return min(1.5, max(0.0, value)) if math.isfinite(value) else 0.0
+            return float('inf')
+        return max(0.0, value) if math.isfinite(value) else float('inf')
+
+    @classmethod
+    def _vehicle_association_uncertainty(cls, *detections_or_values):
+        total = 0.0
+        for item in detections_or_values:
+            value = (
+                cls._localization_uncertainty(item)
+                if isinstance(item, dict)
+                else float(item)
+            )
+            if not math.isfinite(value):
+                return None
+            total += value
+        if total > cls.MAX_VEHICLE_ASSOCIATION_UNCERTAINTY_M:
+            return None
+        return total
+
+    def _same_frame_vehicle_candidate(
+        self, new_det, existing_det, require_trusted_time
+    ):
+        if (
+            existing_det.get('object_type') not in self.VEHICLE_CLASSES
+            or new_det.get('device_id') == existing_det.get('device_id')
+        ):
+            return None
+        epoch_reader = (
+            self._trusted_event_epoch
+            if require_trusted_time else self._event_epoch
+        )
+        new_epoch = epoch_reader(new_det)
+        existing_epoch = epoch_reader(existing_det)
+        if (
+            new_epoch is None
+            or existing_epoch is None
+            or abs(new_epoch - existing_epoch)
+            > self.CROSS_CAMERA_MAX_TIME_DELTA_SEC
+        ):
+            return None
+        appearance = self._appearance_similarity(
+            new_det.get('embedding'), existing_det.get('embedding')
+        )
+        if (
+            appearance is None
+            or appearance < self.VEHICLE_MIN_APPEARANCE_SIMILARITY
+        ):
+            return None
+        uncertainty = self._vehicle_association_uncertainty(
+            new_det, existing_det
+        )
+        if uncertainty is None:
+            return None
+        distance = self.haversine_distance_meters(
+            new_det['gps_location']['latitude'],
+            new_det['gps_location']['longitude'],
+            existing_det['gps_location']['latitude'],
+            existing_det['gps_location']['longitude'],
+        )
+        if distance >= 2.0 + uncertainty:
+            return None
+        return {
+            'record': existing_det,
+            'distance_meters': float(distance),
+            'appearance_similarity': float(appearance),
+            'media_delta_seconds': abs(new_epoch - existing_epoch),
+        }
+
+    def _select_unambiguous_vehicle_candidate(self, candidates):
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate['distance_meters'],
+                -candidate['appearance_similarity'],
+            ),
+        )
+        if len(ordered) == 1:
+            return ordered[0], None
+        best, second = ordered[:2]
+        close_in_space = (
+            second['distance_meters'] - best['distance_meters']
+            < self.VEHICLE_AMBIGUITY_DISTANCE_MARGIN_M
+        )
+        close_in_appearance = abs(
+            second['appearance_similarity']
+            - best['appearance_similarity']
+        ) < self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN
+        conflicting_evidence = (
+            second['appearance_similarity']
+            > best['appearance_similarity']
+            + self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN
+        )
+        if not (
+            (close_in_space and close_in_appearance) or conflicting_evidence
+        ):
+            return best, None
+        return None, {
+            'method': 'ambiguous_spatiotemporal_convnext',
+            'distance_margin_meters': self.VEHICLE_AMBIGUITY_DISTANCE_MARGIN_M,
+            'appearance_margin': self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN,
+            'candidates': [
+                {
+                    'distance_meters': round(item['distance_meters'], 3),
+                    'appearance_similarity': round(
+                        item['appearance_similarity'], 4
+                    ),
+                    'device_id': item['record'].get('device_id'),
+                    'object_id': item['record'].get('object_id'),
+                }
+                for item in ordered[:4]
+            ],
+        }
 
     def _prune_tracks(self, current_time_epoch):
         stale = {
@@ -1309,7 +1497,13 @@ class MultiCameraPipeline:
                 key: gid for key, gid in self.local_to_global.items() if gid not in stale
             }
 
-    def deduplicate(self, raw_buffer, current_time_epoch, merge_radius_meters=1.5):
+    def deduplicate(
+        self,
+        raw_buffer,
+        current_time_epoch,
+        merge_radius_meters=1.5,
+        require_trusted_time=True,
+    ):
         """
         Takes a list of V2X JSON records and removes duplicates that are
         physically too close together (overlapping camera seams).
@@ -1326,6 +1520,51 @@ class MultiCameraPipeline:
         clean_buffer = []
 
         for new_det in raw_buffer:
+            if (
+                new_det['object_type'] in self.VEHICLE_CLASSES
+                and self.cross_camera_vehicle_association
+            ):
+                candidates = [
+                    candidate
+                    for existing_det in clean_buffer
+                    if (
+                        candidate := self._same_frame_vehicle_candidate(
+                            new_det, existing_det, require_trusted_time
+                        )
+                    ) is not None
+                ]
+                selected, ambiguity = self._select_unambiguous_vehicle_candidate(
+                    candidates
+                ) if candidates else (None, None)
+                if ambiguity is not None:
+                    new_det['identity_ambiguity'] = ambiguity
+                    clean_buffer.append(new_det)
+                    continue
+                if selected is None:
+                    clean_buffer.append(new_det)
+                    continue
+                existing_det = selected['record']
+                evidence = {
+                    'method': 'spatiotemporal_convnext',
+                    'appearance_similarity': round(
+                        selected['appearance_similarity'], 4
+                    ),
+                    'appearance_threshold': self.VEHICLE_MIN_APPEARANCE_SIMILARITY,
+                    'distance_meters': round(selected['distance_meters'], 3),
+                    'media_delta_seconds': round(
+                        selected['media_delta_seconds'], 3
+                    ),
+                    'devices': sorted([
+                        str(new_det['device_id']),
+                        str(existing_det['device_id']),
+                    ]),
+                }
+                if new_det['confidence_score'] > existing_det['confidence_score']:
+                    existing_det.clear()
+                    existing_det.update(new_det)
+                existing_det['cross_camera_dedup'] = evidence
+                continue
+
             is_duplicate = False
 
             for existing_det in clean_buffer:
@@ -1356,58 +1595,16 @@ class MultiCameraPipeline:
 
                 new_epoch = self._event_epoch(new_det)
                 existing_epoch = self._event_epoch(existing_det)
-                if (
-                    new_epoch is not None
-                    and existing_epoch is not None
-                    and abs(new_epoch - existing_epoch) > self.CROSS_CAMERA_MAX_TIME_DELTA_SEC
-                ):
-                    continue
-
-                if new_det['object_type'] in self.VEHICLE_CLASSES:
-                    appearance = self._appearance_similarity(
-                        new_det.get('embedding'), existing_det.get('embedding')
-                    )
-                    if (
-                        appearance is None
-                        or appearance < self.VEHICLE_MIN_APPEARANCE_SIMILARITY
-                    ):
-                        continue
-                    radius = min(
-                        5.0,
-                        2.0
-                        + self._localization_uncertainty(new_det)
-                        + self._localization_uncertainty(existing_det),
-                    )
-                else:
-                    radius = float(merge_radius_meters)
+                radius = float(merge_radius_meters)
 
                 if dist < radius:
                     is_duplicate = True
-                    cross_camera_evidence = None
-                    if new_det['object_type'] in self.VEHICLE_CLASSES:
-                        cross_camera_evidence = {
-                            'method': 'spatiotemporal_convnext',
-                            'appearance_similarity': round(float(appearance), 4),
-                            'appearance_threshold': self.VEHICLE_MIN_APPEARANCE_SIMILARITY,
-                            'distance_meters': round(float(dist), 3),
-                            'media_delta_seconds': (
-                                round(abs(new_epoch - existing_epoch), 3)
-                                if new_epoch is not None and existing_epoch is not None
-                                else None
-                            ),
-                            'devices': sorted([
-                                str(new_det['device_id']),
-                                str(existing_det['device_id']),
-                            ]),
-                        }
                     if new_det['confidence_score'] > existing_det['confidence_score']:
                         # Select one internally consistent observation. Partial
                         # field replacement used to pair one camera's bbox with
                         # another camera's timestamp/media clock.
                         existing_det.clear()
                         existing_det.update(new_det)
-                    if cross_camera_evidence is not None:
-                        existing_det['cross_camera_dedup'] = cross_camera_evidence
                     break
 
             if not is_duplicate:
@@ -1421,13 +1618,46 @@ class MultiCameraPipeline:
             best_match_id = None
             min_dist = float('inf')
             match_evidence = None
+            temporal_vehicle_candidates = []
             local_key = f"{det['device_id']}_{det['track_id']}"
+            vehicle_detection = det['object_type'] in vehicle_classes
+            event_epoch = (
+                self._trusted_event_epoch(det)
+                if require_trusted_time and vehicle_detection
+                else self._event_epoch(det)
+            )
 
             # 1. Fast Path: Use visual local tracker ID
-            if local_key in self.local_to_global:
+            if (
+                local_key in self.local_to_global
+                and not (vehicle_detection and det.get('identity_ambiguity'))
+            ):
                 gid = self.local_to_global[local_key]
                 if gid in self.global_tracks and gid not in claimed_gids:
-                    if current_time_epoch - self.global_tracks[gid]['last_seen'] <= self.TRACK_MAX_IDLE_SEC:
+                    track = self.global_tracks[gid]
+                    compatible_class = (
+                        track['type'] == det['object_type']
+                        or (
+                            track['type'] in vehicle_classes
+                            and det['object_type'] in vehicle_classes
+                        )
+                    )
+                    trusted_vehicle = (
+                        not vehicle_detection
+                        or not require_trusted_time
+                        or event_epoch is not None
+                    )
+                    bounded_vehicle_uncertainty = (
+                        not vehicle_detection
+                        or self._vehicle_association_uncertainty(det) is not None
+                    )
+                    if (
+                        compatible_class
+                        and trusted_vehicle
+                        and bounded_vehicle_uncertainty
+                        and current_time_epoch - track['last_seen']
+                        <= self.TRACK_MAX_IDLE_SEC
+                    ):
                         best_match_id = gid
                         match_evidence = {
                             'method': 'same_camera_local_tracker',
@@ -1436,7 +1666,9 @@ class MultiCameraPipeline:
                         }
 
             # 2. Slow Path: Spatial Math Search
-            if best_match_id is None:
+            if best_match_id is None and not (
+                vehicle_detection and det.get('identity_ambiguity')
+            ):
                 for gid, track in self.global_tracks.items():
                     if gid in claimed_gids:
                         continue
@@ -1502,11 +1734,33 @@ class MultiCameraPipeline:
                     ):
                         continue
 
-                    uncertainty = min(
-                        2.0,
-                        self._localization_uncertainty(det)
-                        + float(track.get('uncertainty_meters', 0.0)),
-                    )
+                    if vehicle_reassociation:
+                        track_epoch = track.get('event_epoch')
+                        if (
+                            (require_trusted_time and (
+                                event_epoch is None or track_epoch is None
+                            ))
+                            or (
+                                event_epoch is not None
+                                and track_epoch is not None
+                                and abs(event_epoch - track_epoch)
+                                > self.TRACK_MAX_IDLE_SEC
+                            )
+                        ):
+                            continue
+
+                    if vehicle_reassociation:
+                        uncertainty = self._vehicle_association_uncertainty(
+                            det, track.get('uncertainty_meters', float('inf'))
+                        )
+                        if uncertainty is None:
+                            continue
+                    else:
+                        uncertainty = min(
+                            2.0,
+                            self._localization_uncertainty(det)
+                            + float(track.get('uncertainty_meters', 0.0)),
+                        )
                     close_gate = self.TRACK_CLOSE_DISTANCE_M + uncertainty
                     max_gate = self.TRACK_MAX_DISTANCE_M + uncertainty
                     if dist < max_gate and dist < min_dist:
@@ -1514,9 +1768,7 @@ class MultiCameraPipeline:
                             dist < close_gate
                             or emb_sim >= self.TRACK_MIN_APPEARANCE_SIMILARITY
                         ):
-                            best_match_id = gid
-                            min_dist = dist
-                            match_evidence = {
+                            evidence = {
                                 'method': (
                                     'cross_camera_spatiotemporal_convnext'
                                     if cross_camera_vehicle
@@ -1538,6 +1790,36 @@ class MultiCameraPipeline:
                                 'previous_device_id': track.get('last_device_id'),
                                 'device_id': det.get('device_id'),
                             }
+                            if vehicle_reassociation:
+                                temporal_vehicle_candidates.append({
+                                    'gid': gid,
+                                    'record': {
+                                        'device_id': track.get('last_device_id'),
+                                        'object_id': (
+                                            f"global_{track['type']}_"
+                                            f"{self.perception_run_prefix}_{gid}"
+                                        ),
+                                    },
+                                    'distance_meters': float(dist),
+                                    'appearance_similarity': float(appearance),
+                                    'match_evidence': evidence,
+                                })
+                            else:
+                                best_match_id = gid
+                                min_dist = dist
+                                match_evidence = evidence
+
+            if best_match_id is None and temporal_vehicle_candidates:
+                selected, ambiguity = self._select_unambiguous_vehicle_candidate(
+                    temporal_vehicle_candidates
+                )
+                if ambiguity is not None:
+                    ambiguity['method'] = 'ambiguous_track_reattachment'
+                    det['identity_ambiguity'] = ambiguity
+                elif selected is not None:
+                    best_match_id = selected['gid']
+                    min_dist = selected['distance_meters']
+                    match_evidence = selected['match_evidence']
 
             if best_match_id is not None:
                 claimed_gids.add(best_match_id)
@@ -1557,15 +1839,21 @@ class MultiCameraPipeline:
                 self.global_tracks[best_match_id].setdefault(
                     'device_tracks', {}
                 )[det['device_id']] = det['track_id']
+                self.global_tracks[best_match_id]['event_epoch'] = event_epoch
                 self.global_tracks[best_match_id]['uncertainty_meters'] = self._localization_uncertainty(det)
                 self.global_tracks[best_match_id]['last_device_id'] = det.get('device_id')
                 det['object_id'] = (
                     f"global_{self.global_tracks[best_match_id]['type']}_"
                     f"{self.perception_run_prefix}_{best_match_id}"
                 )
-                det['object_type'] = self.global_tracks[best_match_id]['type'] # Enforce stable class
                 self.local_to_global[local_key] = best_match_id
                 det['identity_association'] = match_evidence
+                track_type = self.global_tracks[best_match_id]['type']
+                if det['object_type'] != track_type:
+                    det['identity_association']['class_conflict'] = {
+                        'track_type': track_type,
+                        'observed_type': det['object_type'],
+                    }
             else:
                 self.next_global_id += 1
                 new_gid = self.next_global_id
@@ -1577,9 +1865,11 @@ class MultiCameraPipeline:
                     'device_tracks': {
                         det['device_id']: det['track_id']
                     },
+                    'event_epoch': event_epoch,
                     'uncertainty_meters': self._localization_uncertainty(det),
                     'last_device_id': det.get('device_id')
                 }
+                claimed_gids.add(new_gid)
                 det['object_id'] = (
                     f"global_{det['object_type']}_"
                     f"{self.perception_run_prefix}_{new_gid}"
@@ -2112,7 +2402,10 @@ class MultiCameraPipeline:
                     else time.time()
                 )
                 clean_batch = self.deduplicate(
-                    raw_buffer, batch_event_epoch, merge_radius_meters=3.0
+                    raw_buffer,
+                    batch_event_epoch,
+                    merge_radius_meters=3.0,
+                    require_trusted_time=live_mode,
                 )
                 self.all_clean_detections.extend(clean_batch)
 
@@ -2243,7 +2536,8 @@ class MultiCameraPipeline:
 
 class VideoObjectDetector:
     def __init__(self, model_path, conf=0.25, K=np.eye(3,3), dist_coeffs=None, camera_height=5.0, pitch_deg=0.0, yaw_deg=0.0, heading_deg=0.0, device_id="cam-001", origin_lat=0.0, origin_lon=0.0,
-                 city="", state="", country=""):
+                 city="", state="", country="", localization_pixel_sigma=4.0,
+                 calibration_uncertainty_m=float("inf")):
 
         """
         Args:
@@ -2268,6 +2562,10 @@ class VideoObjectDetector:
         self.fy = self.K[1, 1]
         self.cx = self.K[0, 2]
         self.cy = self.K[1, 2]
+        self.localization_pixel_sigma = max(
+            0.1, float(localization_pixel_sigma)
+        )
+        self.calibration_uncertainty_m = float(calibration_uncertainty_m)
 
         self.pitch_deg = pitch_deg
         self.yaw_deg = yaw_deg
@@ -2365,6 +2663,23 @@ class VideoObjectDetector:
         }
         return colors.get(class_id, (255, 255, 255))
 
+    def _ground_intersection(self, u, v):
+        pixel = np.array([[u, v]], dtype=np.float32)
+        undistorted = cv2.undistortPoints(
+            pixel, self.K, self.dist_coeffs, P=self.K
+        )
+        u_u, v_u = undistorted[0][0]
+        ray_cam = np.array([
+            (u_u - self.cx) / self.fx,
+            (v_u - self.cy) / self.fy,
+            1.0,
+        ])
+        dx, dy, dz = self.R @ ray_cam
+        if dy <= 1e-6:
+            return None
+        scale = self.camera_height / dy
+        return np.array([scale * dx, scale * dz], dtype=np.float64)
+
     def compute_world_coordinates(self, u, v):
         """
         Compute 3D world coordinates (X, Y, Z) from 2D pixel coordinates (u, v).
@@ -2376,58 +2691,39 @@ class VideoObjectDetector:
         Returns:
             Dictionary containing X, Y, Z, distance, and angle if valid, else None.
         """
-        # 1. Undistort the pixel
-        pixel = np.array([[u, v]], dtype=np.float32)
-        undistorted = cv2.undistortPoints(pixel, self.K, self.dist_coeffs, P=self.K)
-        u_u, v_u = undistorted[0][0]
-
-        # 2. Create the Local Camera Ray
-        ray_cam = np.array([(u_u - self.cx) / self.fx, (v_u - self.cy) / self.fy, 1.0])
-
-        # 3. Rotate the Ray using the Extrinsics Matrix
-        ray_world = self.R @ ray_cam
-        dx, dy, dz = ray_world
-
-        # 4. Intersect with the Ground
-        # In OpenCV, Y points down. So the ground is at Y = camera_height.
-        # If dy <= 0, the ray is pointing at or above the horizon (won't hit the ground).
-        if dy <= 1e-6:
+        point = self._ground_intersection(u, v)
+        if point is None:
             return None
-            # theta = np.arctan2(dx, dz)
-            # return {
-            #     "X": float(999.0 * np.sin(theta)),
-            #     "Y": 0.0,
-            #     "Z": float(999.0 * np.cos(theta)),
-            #     "theta_rad": float(theta),
-            #     "theta_deg": float(np.degrees(theta)),
-            #     "distance": 999.0
-            # }
-
-        # Scaling factor to reach the ground
-        t = self.camera_height / dy
-
-        # Calculate final distances in meters
-        X = t * dx
-        Z = t * dz
+        X, Z = point
 
         theta = np.arctan2(X, Z)
         distance = np.sqrt(X**2 + Z**2)
 
-        pixel_plus = np.array([[u, v + 1]], dtype=np.float32)
-        undistorted_plus = cv2.undistortPoints(pixel_plus, self.K, self.dist_coeffs, P=self.K)
-        u_u_p, v_u_p = undistorted_plus[0][0]
-
-        ray_cam_plus = np.array([(u_u_p - self.cx) / self.fx, (v_u_p - self.cy) / self.fy, 1.0])
-        ray_world_plus = self.R @ ray_cam_plus
-        dx_p, dy_p, dz_p = ray_world_plus
-
-        if dy_p > 1e-6:
-            t_p = self.camera_height / dy_p
-            Z_plus = t_p * dz_p
-            # The absolute difference in meters for a 1-pixel error
-            uncertainty_meters = abs(Z - Z_plus)
+        samples = (
+            self._ground_intersection(u + 1.0, v),
+            self._ground_intersection(u - 1.0, v),
+            self._ground_intersection(u, v + 1.0),
+            self._ground_intersection(u, v - 1.0),
+        )
+        if any(sample is None for sample in samples):
+            pixel_uncertainty_m = float("inf")
         else:
-            uncertainty_meters = 999.0 # Effectively infinite error at the horizon
+            du = (samples[0] - samples[1]) / 2.0
+            dv = (samples[2] - samples[3]) / 2.0
+            pixel_uncertainty_m = self.localization_pixel_sigma * math.sqrt(
+                float(np.dot(du, du) + np.dot(dv, dv))
+            )
+        calibration_uncertainty_m = self.calibration_uncertainty_m
+        if (
+            math.isfinite(pixel_uncertainty_m)
+            and math.isfinite(calibration_uncertainty_m)
+            and calibration_uncertainty_m >= 0.0
+        ):
+            uncertainty_meters = math.hypot(
+                pixel_uncertainty_m, calibration_uncertainty_m
+            )
+        else:
+            uncertainty_meters = float("inf")
 
         return {
             "X": float(X),
@@ -2436,7 +2732,21 @@ class VideoObjectDetector:
             "theta_rad": float(theta),
             "theta_deg": float(np.degrees(theta)),
             "distance": float(distance),
-            "uncertainty_meters": float(uncertainty_meters)
+            "uncertainty_meters": (
+                float(uncertainty_meters)
+                if math.isfinite(uncertainty_meters) else None
+            ),
+            "uncertainty_components": {
+                "pixel_sigma": float(self.localization_pixel_sigma),
+                "pixel_meters": (
+                    float(pixel_uncertainty_m)
+                    if math.isfinite(pixel_uncertainty_m) else None
+                ),
+                "calibration_meters": (
+                    float(calibration_uncertainty_m)
+                    if math.isfinite(calibration_uncertainty_m) else None
+                ),
+            },
         }
 
     def compute_3d_detections(self, detections_2d, current_utc_str=None, current_epoch=None):
@@ -2654,6 +2964,9 @@ if __name__ == "__main__":
     if cameras_config:
         site = cameras_config.get("site", {})
         for cam in cameras_config["cameras"]:
+            pixel_sigma, calibration_uncertainty_m = (
+                camera_localization_parameters(cam)
+            )
             intr = cam["intrinsics"]
             K = np.array([
                 [intr["fx"], 0, intr["cx"]],
@@ -2666,6 +2979,8 @@ if __name__ == "__main__":
                 cam["device_id"],
                 site.get("lat", 0.0), site.get("lon", 0.0),
                 site.get("city", ""), site.get("state", ""), site.get("country", ""),
+                localization_pixel_sigma=pixel_sigma,
+                calibration_uncertainty_m=calibration_uncertainty_m,
             ))
     else:
         # Legacy fallback: values predate config/cameras.json
