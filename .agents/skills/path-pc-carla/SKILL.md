@@ -43,6 +43,15 @@ Observed on 2026-07-11 UTC; verify rather than assume:
 - The recovery worktree contains rejected exploratory camera CSVs and a dirty
   `config/cameras.json`. Preserve them as user-owned diagnostics, but never
   stage, glob, fit, promote, or deploy them.
+- The integration candidate now shares one complete actor-observed CARLA
+  default lens tuple across rig, manifest builder, optimizer, and replay
+  verifier. Configured lens overrides remain a hard safety hold and no lens
+  attributes are written at runtime.
+- Proposal-only SIFT diagnostics for the retained source pairs found distributed
+  proposal counts ch1/ch2/ch3/ch4 = 1/1/6/1. None reaches the 12-point manual
+  evidence minimum. Outputs at
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260711T064950Z-acquisition-deficit/proposals/`
+  are `acceptance_eligible=false` and must not be promoted.
 - The latest simforgelaptop Computer Use companion finished with Dia approval
   denied by both app name and bundle ID. Classify `/live`, `/timeline`, and
   `/drive` as evidence collection BLOCKED/FAIL, not product failure; no UI,
@@ -482,6 +491,25 @@ horizon, vanishing points, curb/crosswalk topology, and stable map landmarks.
 If the retained render visibly contradicts the real view, fail the candidate
 even when a point-only threshold passes; do not weaken thresholds or relabel
 matcher-generated points to make it green.
+Use `propose_twin_calibration_annotations.py` only as a bounded manual-review
+aid. It hashes both frames, requires mutual Lowe-ratio SIFT matches, distributes
+proposals across configurable cells, bounds encoded and decoded image sizes,
+and atomically refuses output overwrite. Its schema intentionally lacks
+acceptance point/road fields and every proposal carries
+`provenance="matcher_proposal_only"` plus `acceptance_eligible=false`:
+
+```bash
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  apps/bridge/tools/propose_twin_calibration_annotations.py \
+  --camera ch1 --real-frame /path/to/ch1-real.jpg \
+  --twin-frame /path/to/ch1-twin.jpg \
+  --output /path/to/ch1-proposals.json
+```
+
+Never translate this file mechanically into manifest annotations. A human must
+independently establish a unique semantic/world identity, freeze the split, and
+write accepted provenance; the manifest builder must continue to reject the
+proposal schema directly.
 
 Manual four-camera evidence must use one JSON annotation artifact per channel.
 Capture observational pairs with `capture_twin_calibration_pairs.py` only

@@ -21,7 +21,10 @@ import uuid
 
 import websockets
 
-from digital_twin_bridge.twin_camera_rig import TWIN_LENS_ATTRIBUTE_KEYS
+from digital_twin_bridge.twin_camera_rig import (
+    CARLA_DEFAULT_PINHOLE_LENS,
+    TWIN_LENS_ATTRIBUTE_KEYS,
+)
 
 
 DEFAULT_TWIN_YOLO_PYTHON = Path("/home/path/V2XCarla/perception-venv/bin/python")
@@ -267,21 +270,6 @@ def _carla_rotation_axes(rotation):
         (cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr),
         (-cy * sp * cr - sy * sr, -sy * sp * cr + cy * sr, cp * cr),
     )
-
-
-CARLA_DEFAULT_PINHOLE_LENS = {
-    # A CARLA sensor maintainer confirms the 0.9.x default tuple is the
-    # undistorted pinhole state (carla-simulator/carla#3198).  The parameters
-    # are not OpenCV Brown-Conrady coefficients (#3130).  UE5/0.10 equivalence
-    # is still enforced empirically by the unchanged visual/motion gates.
-    # Accept only actor-observed defaults; every other tuple remains fail closed.
-    "lens_k": -1.0,
-    "lens_kcube": 0.0,
-    "lens_circle_falloff": 5.0,
-    "lens_circle_multiplier": 0.0,
-    "lens_x_size": 0.08,
-    "lens_y_size": 0.08,
-}
 
 
 def project_world_xyz(point, camera_model):
