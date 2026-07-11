@@ -313,6 +313,7 @@ def resolve_manifest(
     annotation_sha256,
     cameras_file_sha256,
     camera_config_sha256,
+    depth_raw_sha256,
 ):
     """Back-project validated annotations using one frozen UE5 depth frame."""
     fov = twin_horizontal_fov_deg(camera)
@@ -374,6 +375,8 @@ def resolve_manifest(
             "sensor_timestamp": float(depth_image.timestamp),
             "width": int(depth_image.width),
             "height": int(depth_image.height),
+            "raw_data_sha256": depth_raw_sha256,
+            "raw_data_size": len(depth_image.raw_data),
         },
         "baseline": {
             "location": [
@@ -411,6 +414,11 @@ def main():
         "--intrinsics-artifact",
         required=True,
         help="retained measured intrinsics JSON whose SHA-256 is frozen in cameras.json",
+    )
+    parser.add_argument(
+        "--depth-frame-output",
+        required=True,
+        help="retained raw BGRA depth buffer used to resolve every twin annotation",
     )
     args = parser.parse_args()
 
@@ -473,6 +481,7 @@ def main():
         depth_image = wait_for_frame(world, frames)
         if depth_image is None:
             raise RuntimeError("no UE5 depth frame received")
+        depth_raw = bytes(depth_image.raw_data)
         manifest = resolve_manifest(
             annotations,
             camera_id=args.camera,
@@ -486,8 +495,13 @@ def main():
             camera_config_sha256=hashlib.sha256(json.dumps(
                 camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             ).encode("utf-8")).hexdigest(),
+            depth_raw_sha256=hashlib.sha256(depth_raw).hexdigest(),
         )
         manifest["ue5_map"] = str(world.get_map().name)
+        manifest["ue5_map_opendrive_sha256"] = hashlib.sha256(
+            world.get_map().to_opendrive().encode("utf-8")
+        ).hexdigest()
+        Path(args.depth_frame_output).write_bytes(depth_raw)
     finally:
         try:
             actor.stop()
