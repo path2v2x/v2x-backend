@@ -6,9 +6,11 @@ import concurrent.futures
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -62,12 +64,17 @@ def _fetch_json(url, timeout_seconds):
         url,
         headers={
             "accept": "application/json",
+            "cache-control": "no-cache",
             "user-agent": "v2x-perception-verifier/1",
         },
     )
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read(2 * 1024 * 1024 + 1)
+    except HTTPError as exc:
+        safe_error = sanitize_source_error(exc)
+        exc.close()
+        raise VerificationError(f"JSON request failed: {safe_error}") from None
     except Exception as exc:
         raise VerificationError(
             f"JSON request failed: {sanitize_source_error(exc)}"
@@ -83,11 +90,27 @@ def _fetch_json(url, timeout_seconds):
     return decoded
 
 
-def _collect_timestamp_sample(base_url, timeout_seconds):
+def _collect_timestamp_sample(
+    base_url,
+    timeout_seconds,
+    min_decode_latency_ms=-1_000.0,
+    max_decode_latency_ms=120_000.0,
+):
     health = _fetch_json(f"{base_url}/health", timeout_seconds)
     detections = _fetch_json(f"{base_url}/detections/latest", timeout_seconds)
     if health.get("status") != "ok" or health.get("ready") is not True:
         raise VerificationError("perception health is not ready")
+    if health.get("media_clock_ready") is not True:
+        raise VerificationError("perception media clock is not ready")
+
+    min_decode_latency_ms = float(min_decode_latency_ms)
+    max_decode_latency_ms = float(max_decode_latency_ms)
+    if (
+        not math.isfinite(min_decode_latency_ms)
+        or not math.isfinite(max_decode_latency_ms)
+        or min_decode_latency_ms > max_decode_latency_ms
+    ):
+        raise VerificationError("decode latency bounds are invalid")
 
     health_cameras = health.get("cameras")
     detection_cameras = detections.get("cameras")
@@ -109,6 +132,27 @@ def _collect_timestamp_sample(base_url, timeout_seconds):
             or health_camera.get("fresh") is not True
         ):
             raise VerificationError(f"{camera_id} is not fresh and streaming")
+        if (
+            health_camera.get("media_clock_status") != "matched"
+            or health_camera.get("media_time_trusted") is not True
+        ):
+            raise VerificationError(
+                f"{camera_id} does not have a trusted matched media clock"
+            )
+        decode_latency_ms = health_camera.get("decode_latency_ms")
+        if (
+            not isinstance(decode_latency_ms, (int, float))
+            or isinstance(decode_latency_ms, bool)
+            or not math.isfinite(float(decode_latency_ms))
+            or not (
+                min_decode_latency_ms
+                <= float(decode_latency_ms)
+                <= max_decode_latency_ms
+            )
+        ):
+            raise VerificationError(
+                f"{camera_id} decode latency is outside the accepted bounds"
+            )
         frame_count = health_camera.get("frame_count")
         if not isinstance(frame_count, int) or isinstance(frame_count, bool):
             raise VerificationError(f"{camera_id} frame count is invalid")
@@ -122,6 +166,7 @@ def _collect_timestamp_sample(base_url, timeout_seconds):
                 f"{camera_id} event timestamp",
             ),
             "frame_count": frame_count,
+            "decode_latency_ms": float(decode_latency_ms),
         }
     return sample
 
@@ -188,6 +233,10 @@ def _read_mjpeg_hashes(url, timeout_seconds):
                         break
     except VerificationError:
         raise
+    except HTTPError as exc:
+        safe_error = sanitize_source_error(exc)
+        exc.close()
+        raise VerificationError(f"MJPEG request failed: {safe_error}") from None
     except Exception as exc:
         raise VerificationError(
             f"MJPEG request failed: {sanitize_source_error(exc)}"
@@ -231,15 +280,21 @@ def _validate_timestamp_samples(first, second, max_age_seconds, now=None):
                 first_camera["event"].isoformat().replace("+00:00", "Z"),
                 second_camera["event"].isoformat().replace("+00:00", "Z"),
             ],
+            "decode_latency_ms": [
+                first_camera["decode_latency_ms"],
+                second_camera["decode_latency_ms"],
+            ],
         }
     return output
 
 
 def verify_live_feeds(
     base_url,
-    sample_interval_seconds=2.0,
+    sample_interval_seconds=5.0,
     max_age_seconds=15.0,
     timeout_seconds=20.0,
+    min_decode_latency_ms=-1_000.0,
+    max_decode_latency_ms=120_000.0,
     stream_path_template="/streams/{camera_id}.mjpg",
 ):
     base_url = normalize_base_url(base_url)
@@ -254,9 +309,19 @@ def verify_live_feeds(
     ):
         raise VerificationError("stream path template is invalid")
 
-    first = _collect_timestamp_sample(base_url, timeout_seconds)
+    first = _collect_timestamp_sample(
+        base_url,
+        timeout_seconds,
+        min_decode_latency_ms,
+        max_decode_latency_ms,
+    )
     time.sleep(max(0.0, float(sample_interval_seconds)))
-    second = _collect_timestamp_sample(base_url, timeout_seconds)
+    second = _collect_timestamp_sample(
+        base_url,
+        timeout_seconds,
+        min_decode_latency_ms,
+        max_decode_latency_ms,
+    )
     output = _validate_timestamp_samples(first, second, max_age_seconds)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -284,9 +349,11 @@ def main(argv=None):
         description="Verify fresh, changing ch1-ch4 perception feeds."
     )
     parser.add_argument("base_url")
-    parser.add_argument("--sample-interval", type=float, default=2.0)
+    parser.add_argument("--sample-interval", type=float, default=5.0)
     parser.add_argument("--max-age", type=float, default=15.0)
     parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--min-decode-latency-ms", type=float, default=-1_000.0)
+    parser.add_argument("--max-decode-latency-ms", type=float, default=120_000.0)
     parser.add_argument(
         "--stream-path-template", default="/streams/{camera_id}.mjpg"
     )
@@ -297,6 +364,8 @@ def main(argv=None):
             sample_interval_seconds=args.sample_interval,
             max_age_seconds=args.max_age,
             timeout_seconds=args.timeout,
+            min_decode_latency_ms=args.min_decode_latency_ms,
+            max_decode_latency_ms=args.max_decode_latency_ms,
             stream_path_template=args.stream_path_template,
         )
     except Exception as exc:
