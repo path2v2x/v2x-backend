@@ -51,9 +51,9 @@ ACCEPTANCE_MINIMUM_POINTS = 12
 ACCEPTANCE_MINIMUM_HELDOUT = 4
 ACCEPTANCE_MINIMUM_HORIZONTAL_SPAN = 0.5
 ACCEPTANCE_MINIMUM_VERTICAL_SPAN = 0.3
-ACCEPTANCE_MAXIMUM_RMSE_PX = 75.0
-ACCEPTANCE_MAXIMUM_P95_PX = 125.0
-ACCEPTANCE_MAXIMUM_ERROR_PX = 175.0
+ACCEPTANCE_MAXIMUM_RMSE_PX = 10.0
+ACCEPTANCE_MAXIMUM_P95_PX = 16.0
+ACCEPTANCE_MAXIMUM_ERROR_PX = 24.0
 ACCEPTANCE_MAXIMUM_NEAR_OCCLUSION_FRACTION = 0.10
 
 
@@ -194,7 +194,7 @@ def calibration_dataset_gate(points, width, height, *, minimum_total=12,
         reasons.append("insufficient_heldout_landmarks")
     if any(point.get("carla_xyz") is None and point.get("gps") is None for point in points):
         reasons.append("non_global_landmarks")
-    approved_provenance = {"surveyed", "manual_verified_static"}
+    approved_provenance = {"surveyed"}
     if any(point.get("provenance") not in approved_provenance for point in points):
         reasons.append("unverified_landmark_provenance")
     landmark_ids = [point.get("landmark_id") for point in points]
@@ -261,9 +261,9 @@ def heldout_calibration_gate(points, errors, width, height, *,
                              minimum_heldout_points=4,
                              minimum_horizontal_span=0.5,
                              minimum_vertical_span=0.3,
-                             maximum_rmse_px=75.0,
-                             maximum_p95_px=125.0,
-                             maximum_error_px=175.0):
+                             maximum_rmse_px=ACCEPTANCE_MAXIMUM_RMSE_PX,
+                             maximum_p95_px=ACCEPTANCE_MAXIMUM_P95_PX,
+                             maximum_error_px=ACCEPTANCE_MAXIMUM_ERROR_PX):
     """Predeclared independent-landmark acceptance gate at render resolution."""
     if len(errors) != len(points):
         return {
@@ -521,13 +521,18 @@ def main():
         if gate["passed"]:
             metrics = gate["metrics"]
             print(
-                "held-out calibration gate: PASS "
+                "diagnostic held-out geometry check: PASS "
                 f"rmse={metrics['rmse_px']:.0f}px "
                 f"p95={metrics['p95_px']:.0f}px max={metrics['max_px']:.0f}px"
             )
+            print(
+                "production calibration gate: FAIL "
+                "(legacy verifier does not bind measured intrinsics artifacts/source images)"
+            )
+            exit_code = 1
         else:
             print(
-                "held-out calibration gate: FAIL "
+                "diagnostic held-out geometry check: FAIL "
                 f"({', '.join(gate['reasons'])})"
             )
             exit_code = 1

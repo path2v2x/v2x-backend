@@ -15,6 +15,7 @@ Run on the Path PC:
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 import math
 import sys
@@ -89,6 +90,46 @@ def nelder_mead(f, x0, step=1.0, max_iter=300, tol=1e-3, bounds=None):
     return simplex[order[0]], scores[order[0]]
 
 
+POSE_PARAMETER_NAMES = (
+    "yaw_offset_deg", "pitch_offset_deg", "height_offset_m",
+    "roll_offset_deg", "forward_offset_m", "right_offset_m",
+    "fov_offset_deg",
+)
+
+
+def absolute_pose_bounds(optimize_translation=False):
+    """Return zero-referenced bounds that cannot drift across repeated runs."""
+    translation = (-3.0, 3.0) if optimize_translation else (0.0, 0.0)
+    return [
+        (-15.0, 15.0),
+        (-15.0, 15.0),
+        translation,
+        (-8.0, 8.0),
+        translation,
+        translation,
+        (-20.0, 20.0),
+    ]
+
+
+def bounded_initial_pose(camera, bounds, start_from_config=False):
+    pose = camera.get("twin_pose") or {}
+    raw = [
+        float(pose.get(name, 0.0)) if start_from_config else 0.0
+        for name in POSE_PARAMETER_NAMES
+    ]
+    return [max(low, min(high, value)) for value, (low, high) in zip(raw, bounds)]
+
+
+def candidate_config_is_eligible(report):
+    cameras = report.get("cameras") or {}
+    return bool(cameras) and all(
+        value.get("dataset_gate", {}).get("passed") is True
+        and value.get("heldout_gate", {}).get("passed") is True
+        and value.get("acceptance_eligible") is True
+        for value in cameras.values()
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -114,6 +155,14 @@ def main():
         action="store_true",
         help="allow height/forward/right search only with independently surveyed position data",
     )
+    parser.add_argument(
+        "--start-from-config",
+        action="store_true",
+        help=(
+            "seed from the configured pose, clamped to absolute zero-referenced "
+            "bounds; the default seed is the physical zero-offset model"
+        ),
+    )
     args = parser.parse_args()
 
     import carla
@@ -130,7 +179,18 @@ def main():
 
     site = config["site"]
     suggestions = {}
-    report = {"map": carla_map.name, "cameras": {}}
+    config_path = Path(args.cameras_json).resolve() if args.cameras_json else None
+    report = {
+        "schema": "v2x-diagnostic-legacy-twin-pose-fit/v1",
+        "acceptance_eligible": False,
+        "warning": "legacy local-XZ evidence cannot authorize deployment",
+        "map": carla_map.name,
+        "cameras_json_sha256": (
+            hashlib.sha256(config_path.read_bytes()).hexdigest()
+            if config_path is not None else None
+        ),
+        "cameras": {},
+    }
     for camera in config["cameras"]:
         camera_id = camera["id"]
         if args.camera and camera_id != args.camera:
@@ -170,22 +230,9 @@ def main():
                 point,
             ))
 
-        names = (
-            "yaw_offset_deg", "pitch_offset_deg", "height_offset_m",
-            "roll_offset_deg", "forward_offset_m", "right_offset_m",
-            "fov_offset_deg",
-        )
-        initial_pose = camera.get("twin_pose") or {}
-        x0 = [float(initial_pose.get(name, 0.0)) for name in names]
-        bounds = [
-            (x0[0] - 5.0, x0[0] + 5.0),
-            (x0[1] - 5.0, x0[1] + 5.0),
-            (x0[2] - 1.5, x0[2] + 1.5) if args.optimize_translation else (x0[2], x0[2]),
-            (x0[3] - 3.0, x0[3] + 3.0),
-            (x0[4] - 2.0, x0[4] + 2.0) if args.optimize_translation else (x0[4], x0[4]),
-            (x0[5] - 2.0, x0[5] + 2.0) if args.optimize_translation else (x0[5], x0[5]),
-            (x0[6] - 4.0, x0[6] + 4.0),
-        ]
+        names = POSE_PARAMETER_NAMES
+        bounds = absolute_pose_bounds(args.optimize_translation)
+        x0 = bounded_initial_pose(camera, bounds, args.start_from_config)
 
         def objective(params, _camera=camera, _world_points=world_points,
                       _scale=(scale_u, scale_v)):
@@ -245,6 +292,9 @@ def main():
             "training_objective_before": before,
             "training_objective_after": score,
             "dataset_gate": dataset_gate,
+            "acceptance_eligible": False,
+            "seed": "config_clamped_to_absolute_bounds" if args.start_from_config else "zero",
+            "absolute_bounds": dict(zip(names, bounds)),
             "candidate_only": True,
         }
 
@@ -254,6 +304,13 @@ def main():
         Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
         print(f"detailed candidate report: {args.output}")
     if args.candidate_config:
+        if not candidate_config_is_eligible(report):
+            print(
+                "refusing candidate config: one or more camera datasets failed "
+                "the independent evidence gate",
+                file=sys.stderr,
+            )
+            return 2
         candidate_config = deepcopy(config)
         for candidate_camera in candidate_config["cameras"]:
             if candidate_camera["id"] in suggestions:
