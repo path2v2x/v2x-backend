@@ -440,6 +440,37 @@ model against the deployed UE5 centered-pinhole render over the image; an
 optical mismatch above 0.25 px keeps deployment closed until a shared render
 distortion or physical-feed undistortion path is implemented and verified.
 
+Generate a dimensioned board with the tracked acquisition tool, print it at
+100% scale, and verify one square with a physical ruler before capture:
+
+```bash
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  apps/bridge/tools/calibrate_camera_intrinsics.py generate-board \
+  --output /path/to/checkerboard-9x6-25mm.svg \
+  --inner-columns 9 --inner-rows 6 --square-mm 25
+```
+
+For each fixed physical camera, acquire at least 10 sharp, unique images at its
+native resolution. Move and tilt the board across the image, including corners
+and depth variation; do not crop, resize, digitally warp, or reuse frames.
+Calibrate with one `--image` argument per retained source image:
+
+```bash
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  apps/bridge/tools/calibrate_camera_intrinsics.py calibrate \
+  --image /path/to/ch1-board-01.png \
+  --image /path/to/ch1-board-02.png \
+  `# repeat for at least 10 unique accepted images` \
+  --output /path/to/ch1-intrinsics.json \
+  --report /path/to/ch1-intrinsics-report.json \
+  --inner-columns 9 --inner-rows 6 --square-mm 25
+```
+
+The tool must reject decode failures, mixed resolutions, duplicate source
+hashes, fewer than 10 accepted detections, non-finite output, and RMS above
+2 px. Preserve the board hash, every source image, artifact, report, and the
+artifact SHA-256 copied into `cameras.json`.
+
 Only in an authorized mutation window with zero Drive sessions, resolve those
 twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
 
