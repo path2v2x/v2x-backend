@@ -15,6 +15,10 @@ import time
 from runtime_health import sanitize_source_error
 
 
+class _ProactiveRenewal(Exception):
+    """Internal control flow for rotating a signed source before expiry."""
+
+
 def _bounded_bytes(value, limit=32_768):
     """Return a bounded byte representation without copying a full frame."""
     if isinstance(value, bytes):
@@ -121,6 +125,7 @@ class LiveStreamReader:
         media_clock_retry_seconds=2.0,
         frame_identity_history_size=256,
         duplicate_frame_limit=90,
+        connection_max_age_seconds=None,
     ):
         self.source_factory = source_factory
         self.capture_factory = capture_factory
@@ -139,6 +144,13 @@ class LiveStreamReader:
             1, int(frame_identity_history_size)
         )
         self.duplicate_frame_limit = max(1, int(duplicate_frame_limit))
+        if connection_max_age_seconds is None:
+            self.connection_max_age_seconds = None
+        else:
+            maximum_age = float(connection_max_age_seconds)
+            if not math.isfinite(maximum_age) or maximum_age <= 0.0:
+                raise ValueError("connection_max_age_seconds must be positive")
+            self.connection_max_age_seconds = maximum_age
 
         self._condition = threading.Condition()
         self._stop_event = threading.Event()
@@ -236,7 +248,15 @@ class LiveStreamReader:
                     source = None
 
                 connected = False
+                connection_started = self.monotonic()
                 while not self._stop_event.is_set():
+                    if (
+                        connected
+                        and self.connection_max_age_seconds is not None
+                        and self.monotonic() - connection_started
+                        >= self.connection_max_age_seconds
+                    ):
+                        raise _ProactiveRenewal()
                     ret, frame = cap.read()
                     if not ret or frame is None:
                         raise RuntimeError("frame read failed")
@@ -320,6 +340,12 @@ class LiveStreamReader:
                             frame_media_clock,
                         )
                         self._condition.notify_all()
+            except _ProactiveRenewal:
+                # Keep the broadcaster in its current streaming state and the
+                # latest trusted frame available while a fresh signed session
+                # opens. Normal freshness/clock gates still fail closed if the
+                # rotation takes too long.
+                continue
             except Exception as exc:
                 if self._stop_event.is_set():
                     break

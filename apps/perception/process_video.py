@@ -1364,6 +1364,13 @@ class MultiCameraPipeline:
         duplicate_frame_limit = int(env_float(
             "V2X_PERCEPTION_DUPLICATE_FRAME_LIMIT", 90
         ))
+        proactive_renew_seconds = env_float(
+            "V2X_PERCEPTION_PROACTIVE_RENEW_SEC", 240.0
+        )
+        if not 30.0 <= proactive_renew_seconds <= 270.0:
+            raise ValueError(
+                "V2X_PERCEPTION_PROACTIVE_RENEW_SEC must be between 30 and 270"
+            )
         media_clock_min_latency_ms = env_float(
             "V2X_PERCEPTION_MEDIA_CLOCK_MIN_LATENCY_MS", -1_000.0
         )
@@ -1427,6 +1434,7 @@ class MultiCameraPipeline:
                     ),
                     frame_identity_history_size=frame_identity_history_size,
                     duplicate_frame_limit=duplicate_frame_limit,
+                    connection_max_age_seconds=proactive_renew_seconds,
                 )
                 live_readers.append(reader)
         else:

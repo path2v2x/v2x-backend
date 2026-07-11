@@ -120,6 +120,51 @@ class LiveStreamReaderTests(unittest.TestCase):
         finally:
             reader.stop(timeout=2.0)
 
+    def test_proactive_renewal_rotates_source_without_reconnecting_state(self):
+        source_calls = []
+        states = []
+        monotonic_value = [0.0]
+
+        def monotonic():
+            value = monotonic_value[0]
+            monotonic_value[0] += 1.0
+            return value
+
+        def source_factory():
+            source_calls.append(f"signed-session-{len(source_calls) + 1}")
+            return source_calls[-1]
+
+        reader = LiveStreamReader(
+            source_factory=source_factory,
+            capture_factory=lambda source: ScriptedCapture(
+                [f"{source}-frame-1", f"{source}-frame-2"]
+            ),
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            monotonic=monotonic,
+            connection_max_age_seconds=2.0,
+        )
+        reader.start()
+        try:
+            self.assertTrue(self.wait_until(lambda: len(source_calls) >= 2))
+            self.assertFalse(any(
+                event["state"] == "reconnecting" for event in states
+            ))
+            self.assertGreaterEqual(sum(
+                event["state"] == "connected" for event in states
+            ), 2)
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_proactive_renewal_age_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            LiveStreamReader(
+                source_factory=lambda: "signed-session",
+                capture_factory=lambda _source: ScriptedCapture([]),
+                recovery=StreamRecovery(0.1, 0.1),
+                connection_max_age_seconds=0,
+            )
+
     def test_snapshot_never_relabels_the_same_frame_as_new(self):
         release_read = threading.Event()
         reader = LiveStreamReader(

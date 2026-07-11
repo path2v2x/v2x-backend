@@ -36,6 +36,11 @@
   matched ch1 at 6.8 seconds; the revised 4–5-fragment implementation remains
   a canary until all channels survive reconnect boundaries. Five-minute read
   endings align with signed-session expiry and reconnect successfully.
+  A subsequent four-fragment canary held latency below 8.03 seconds for 11
+  minutes but was also rolled back because expiry caused 6–7 second health
+  outages, above the fixed 5-second bound. The next candidate proactively
+  rotates at 240 seconds, before the 300-second URL expiry, while keeping the
+  last trusted frame subject to the existing freshness gate.
 - A dimensioned 9x6-inner-corner, 25 mm checkerboard is retained at
   `/home/path/V2XCarla/v2x-evidence/intrinsics/board/` with SHA-256
   `9fc88b316e318068d46e2bfa267ae22609b2f47c78b30fdd7ef0907ce00dde08`.

@@ -416,6 +416,17 @@ upload; a query over a 24-hour window is not itself proof of 24-hour history:
   https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com
 ```
 
+Perception live HLS must request four or five playlist fragments; two or three
+can roll the exact anchor frame out before the matcher runs, while five can
+exceed the 10-second latency gate. With 300-second signed sessions, rotate the
+source proactively at 240 seconds without marking the feed reconnecting. Keep
+the previous trusted frame available only within the normal freshness bound;
+if opening or exact clock anchoring takes too long, health must still fail
+closed. Acceptance requires all four trusted clocks and changing JPEGs, latency
+at most 10 seconds, and no health outage above 5 seconds across at least two
+proactive rotations. An expiry-driven 6–7 second gap is a failure even if the
+steady-state latency passes.
+
 Twin camera alignment is a separate gate from channel wiring. The existing
 perception CSVs contain only 4-7 local-XZ points per channel, no independent
 holdouts, no global landmark IDs, and internally inconsistent shared points;
