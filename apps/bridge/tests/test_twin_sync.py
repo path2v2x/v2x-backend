@@ -120,7 +120,11 @@ class TestSpawn:
                 "z": pytest.approx(0.4),
             },
             "lane_snap_distance_m": pytest.approx(0.0),
-            "placement_planar_error_m": pytest.approx(0.0),
+            "raw_to_target_planar_m": pytest.approx(0.0),
+            "raw_to_actor_planar_m": pytest.approx(0.0),
+            "reference_to_actor_planar_m": None,
+            "placement_planar_error_m": None,
+            "placement_metric_status": "independent_reference_missing",
             "tracked_actor_id": actor.id,
             "actor_id": actor.id,
             "actor_present": True,
@@ -186,7 +190,9 @@ class TestSpawn:
         assert transform.rotation.yaw == pytest.approx(73.0)
         status = sync.status()["objects"][0]
         assert status["lane_snap_distance_m"] == pytest.approx(3.0)
-        assert status["placement_planar_error_m"] == pytest.approx(0.0)
+        assert status["raw_to_target_planar_m"] == pytest.approx(0.0)
+        assert status["placement_planar_error_m"] is None
+        assert status["placement_metric_status"] == "independent_reference_missing"
 
     def test_firetruck_never_selected(self, sync, mock_world):
         pools = {

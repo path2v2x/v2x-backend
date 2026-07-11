@@ -1,6 +1,7 @@
 from ultralytics import YOLO
 from concurrent.futures import TimeoutError as FutureTimeoutError
 import cv2
+import hashlib
 from itertools import chain
 import math
 import os
@@ -42,6 +43,11 @@ from runtime_health import (
     validate_batch_response,
 )
 from tracking_utils import AppearanceExtractor, KalmanTracker, VehicleAppearanceExtractor
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from v2x_common.geodesy import local_xz_to_geodetic  # noqa: E402
 
 
 TIMESTAMP_SCHEMA_VERSION = 2
@@ -541,19 +547,242 @@ DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[2] / "config" / "cameras
 def load_cameras_config():
     """Load the shared camera-pose config used by perception and the twin rig.
 
-    Path override via V2X_CAMERAS_JSON. Returns None when unavailable so the
-    caller can fall back to the legacy hardcoded values.
+    Path override via V2X_CAMERAS_JSON. Production fails closed. The legacy
+    nominal model is available only through an explicit development-only flag
+    and can never upload detections.
     """
     path = os.getenv("V2X_CAMERAS_JSON") or str(DEFAULT_CAMERAS_JSON)
     try:
         with open(path) as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"cameras config unavailable ({path}): {exc}")
-        return None
-    if not config.get("cameras"):
-        return None
+        if env_bool("V2X_ALLOW_LEGACY_CAMERA_CONFIG", False):
+            return None
+        raise RuntimeError(f"required cameras config is unavailable: {path}") from exc
+    if (
+        not isinstance(config, dict)
+        or not isinstance(config.get("cameras"), list)
+        or not config["cameras"]
+    ):
+        if env_bool("V2X_ALLOW_LEGACY_CAMERA_CONFIG", False):
+            return None
+        raise RuntimeError("required cameras config has no camera definitions")
     return config
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_object_sha256(value):
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def camera_config_fingerprints(config, path=None):
+    """Bind emitted observations to the exact file and selected camera."""
+    config_path = Path(
+        path
+        or os.getenv("V2X_CAMERAS_JSON")
+        or str(DEFAULT_CAMERAS_JSON)
+    )
+    file_hash = sha256_file(config_path)
+    camera_hashes = {
+        camera["id"]: canonical_object_sha256(camera)
+        for camera in config.get("cameras", [])
+    }
+    return file_hash, camera_hashes
+
+
+def _resolve_calibration_evidence_path(root, value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} path is missing")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(root) / path
+    try:
+        return path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{label} path is unreadable") from exc
+
+
+def _verify_intrinsics_artifacts(calibration, evidence_root):
+    artifact = _resolve_calibration_evidence_path(
+        evidence_root, calibration.get("artifact_path"), "intrinsics artifact"
+    )
+    report_path = _resolve_calibration_evidence_path(
+        evidence_root, calibration.get("report_path"), "intrinsics report"
+    )
+    source_values = calibration.get("source_image_paths")
+    if not isinstance(source_values, list) or not source_values:
+        raise ValueError("intrinsics source image paths are missing")
+    source_paths = [
+        _resolve_calibration_evidence_path(
+            evidence_root, value, "intrinsics source image"
+        )
+        for value in source_values
+    ]
+    if sha256_file(artifact) != calibration["artifact_sha256"]:
+        raise ValueError("intrinsics artifact hash does not match")
+    report_hash = calibration.get("report_sha256")
+    if (
+        not isinstance(report_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", report_hash) is None
+        or sha256_file(report_path) != report_hash
+    ):
+        raise ValueError("intrinsics report hash does not match")
+    try:
+        artifact_value = json.loads(artifact.read_bytes())
+        report = json.loads(report_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("intrinsics artifact/report is invalid JSON") from exc
+    declared_artifact = {
+        key: calibration[key]
+        for key in (
+            "method",
+            "image_count",
+            "source_images_sha256",
+            "rms_reprojection_error_px",
+            "resolution",
+            "camera_matrix",
+            "distortion",
+        )
+    }
+    if artifact_value != declared_artifact:
+        raise ValueError("intrinsics artifact contents do not match config")
+    accepted = report.get("accepted") if isinstance(report, dict) else None
+    holdouts = report.get("holdouts") if isinstance(report, dict) else None
+    metrics = report.get("holdout_metrics") if isinstance(report, dict) else None
+    try:
+        holdout_rmse = float(metrics["rmse_px"])
+        holdout_max = float(metrics["max_error_px"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("intrinsics holdout metrics are invalid") from exc
+    expected_report_schema = {
+        "checkerboard": "v2x-checkerboard-calibration-report/v1",
+        "charuco": "v2x-charuco-calibration-report/v1",
+    }.get(calibration.get("method"))
+    if (
+        report.get("schema") != expected_report_schema
+        or not isinstance(accepted, list)
+        or len(accepted) < 10
+        or not isinstance(holdouts, list)
+        or len(holdouts) < 2
+        or not math.isfinite(holdout_rmse)
+        or not math.isfinite(holdout_max)
+        or holdout_rmse > 2.0
+        or holdout_max > 5.0
+    ):
+        raise ValueError("intrinsics untouched holdout gate did not pass")
+    expected_hashes = calibration["source_images_sha256"]
+    actual_hashes = []
+    for path in source_paths:
+        raw = path.read_bytes()
+        image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("intrinsics source image is not decodable")
+        actual_hashes.append(hashlib.sha256(raw).hexdigest())
+    if (
+        len(actual_hashes) != len(expected_hashes)
+        or len(set(actual_hashes)) != len(actual_hashes)
+        or set(actual_hashes) != set(expected_hashes)
+    ):
+        raise ValueError("intrinsics source image hashes do not match")
+    report_hashes = {
+        item.get("sha256")
+        for item in accepted + holdouts
+        if isinstance(item, dict)
+    }
+    if report_hashes != set(expected_hashes):
+        raise ValueError("intrinsics report/source hashes do not match")
+
+
+def camera_intrinsics_evidence(camera, *, evidence_root=None,
+                               require_artifacts=False):
+    """Return measured Brown-Conrady coefficients or block startup."""
+    intrinsics = camera.get("intrinsics")
+    calibration = camera.get("intrinsics_calibration")
+    if not isinstance(intrinsics, dict) or not isinstance(calibration, dict):
+        raise ValueError(
+            f"camera {camera.get('id')!r} has no measured intrinsics evidence"
+        )
+    try:
+        matrix = calibration["camera_matrix"]
+        resolution = calibration["resolution"]
+        distortion = calibration["distortion"]
+        rms = float(calibration["rms_reprojection_error_px"])
+        image_count = int(calibration["image_count"])
+        source_hashes = calibration["source_images_sha256"]
+        artifact_hash = calibration["artifact_sha256"]
+        values = np.array(
+            [
+                distortion["k1"],
+                distortion["k2"],
+                distortion["p1"],
+                distortion["p2"],
+                distortion["k3"],
+            ],
+            dtype=np.float64,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"camera {camera.get('id')!r} intrinsics evidence is incomplete"
+        ) from exc
+    expected_matrix = np.array(
+        [
+            [intrinsics["fx"], 0.0, intrinsics["cx"]],
+            [0.0, intrinsics["fy"], intrinsics["cy"]],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    try:
+        observed_matrix = np.asarray(matrix, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"camera {camera.get('id')!r} intrinsics matrix is invalid"
+        ) from exc
+    valid_hashes = (
+        isinstance(artifact_hash, str)
+        and re.fullmatch(r"[0-9a-f]{64}", artifact_hash) is not None
+        and isinstance(source_hashes, list)
+        and len(source_hashes) >= 10
+        and len(set(source_hashes)) == len(source_hashes)
+        and all(
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            for value in source_hashes
+        )
+    )
+    valid = (
+        calibration.get("method") in {"checkerboard", "charuco"}
+        and valid_hashes
+        and image_count == len(source_hashes)
+        and image_count >= 10
+        and math.isfinite(rms)
+        and 0.0 <= rms <= 2.0
+        and resolution == [intrinsics["width"], intrinsics["height"]]
+        and observed_matrix.shape == (3, 3)
+        and np.all(np.isfinite(observed_matrix))
+        and np.allclose(observed_matrix, expected_matrix, rtol=0.0, atol=1e-9)
+        and values.shape == (5,)
+        and np.all(np.isfinite(values))
+    )
+    if not valid:
+        raise ValueError(
+            f"camera {camera.get('id')!r} intrinsics evidence is invalid"
+        )
+    if require_artifacts:
+        if evidence_root is None:
+            raise ValueError("intrinsics evidence root is required")
+        _verify_intrinsics_artifacts(calibration, evidence_root)
+    return values
 
 
 def camera_localization_parameters(camera):
@@ -1135,7 +1364,9 @@ class PerceptionHttpServer:
             self.httpd.shutdown()
             self.httpd.server_close()
 
-def xy_to_gps(X, Z, origin_lat, origin_lon, heading_deg):
+def xy_to_gps(
+    X, Z, origin_lat, origin_lon, heading_deg, map_georeference=None
+):
         """
         Convert local camera XZ coordinates (meters) to GPS lat/lon.
         Uses a simple flat-earth approximation (accurate within ~10km).
@@ -1149,16 +1380,19 @@ def xy_to_gps(X, Z, origin_lat, origin_lon, heading_deg):
         Returns:
             (latitude, longitude)
         """
-        heading_rad = radians(heading_deg)
-        easting = Z * sin(heading_rad) + X * cos(heading_rad)
-        northing = Z * cos(heading_rad) - X * sin(heading_rad)
-
-        METERS_PER_DEG_LAT = 111_320.0
-        meters_per_deg_lon = 111_320.0 * cos(radians(origin_lat))#np.cos(np.radians(origin_lat))
-
-        lat = origin_lat + (northing / METERS_PER_DEG_LAT)
-        lon = origin_lon + (easting / meters_per_deg_lon)
-
+        projection = map_georeference or (
+            f"+proj=tmerc +lat_0={float(origin_lat):.15g} "
+            f"+lon_0={float(origin_lon):.15g} +k=1 +x_0=0 +y_0=0 "
+            "+datum=WGS84 +units=m +no_defs"
+        )
+        lat, lon = local_xz_to_geodetic(
+            float(X),
+            float(Z),
+            float(origin_lat),
+            float(origin_lon),
+            float(heading_deg),
+            projection,
+        )
         return float(lat), float(lon)
 
 def compute_geohash(lat, lon, precision=5):
@@ -2538,7 +2772,10 @@ class MultiCameraPipeline:
 class VideoObjectDetector:
     def __init__(self, model_path, conf=0.25, K=np.eye(3,3), dist_coeffs=None, camera_height=5.0, pitch_deg=0.0, yaw_deg=0.0, heading_deg=0.0, device_id="cam-001", origin_lat=0.0, origin_lon=0.0,
                  city="", state="", country="", localization_pixel_sigma=4.0,
-                 calibration_uncertainty_m=float("inf")):
+                 calibration_uncertainty_m=float("inf"), image_width=None,
+                 image_height=None, cameras_json_sha256=None,
+                 camera_config_sha256=None, detector_model_sha256=None,
+                 map_georeference=None):
 
         """
         Args:
@@ -2567,6 +2804,12 @@ class VideoObjectDetector:
             0.1, float(localization_pixel_sigma)
         )
         self.calibration_uncertainty_m = float(calibration_uncertainty_m)
+        self.image_width = int(image_width) if image_width is not None else None
+        self.image_height = int(image_height) if image_height is not None else None
+        self.cameras_json_sha256 = cameras_json_sha256
+        self.camera_config_sha256 = camera_config_sha256
+        self.detector_model_sha256 = detector_model_sha256
+        self.map_georeference = map_georeference
 
         self.pitch_deg = pitch_deg
         self.yaw_deg = yaw_deg
@@ -2779,7 +3022,14 @@ class VideoObjectDetector:
                 continue
 
             # Convert XZ → GPS
-            lat, lon = xy_to_gps(world['X'], world['Z'], self.origin_lat, self.origin_lon, self.heading_deg)
+            lat, lon = xy_to_gps(
+                world['X'],
+                world['Z'],
+                self.origin_lat,
+                self.origin_lon,
+                self.heading_deg,
+                getattr(self, "map_georeference", None),
+            )
             geohash = compute_geohash(lat, lon, precision=5)
 
             event_id = str(uuid.uuid4())
@@ -2819,6 +3069,46 @@ class VideoObjectDetector:
                 "expires_at": epoch_now + 86400,   # expire in 24 h
                 "ingested_at_epoch": epoch_now,
                 "track_id": det.get('track_id')
+            }
+            pixel_sigma_sq = float(self.localization_pixel_sigma) ** 2
+            record["raw_observation"] = {
+                "schema": "v2x-raw-detection-observation/v1",
+                "native_resolution": (
+                    [
+                        getattr(self, "image_width", None),
+                        getattr(self, "image_height", None),
+                    ]
+                    if getattr(self, "image_width", None) is not None
+                    and getattr(self, "image_height", None) is not None
+                    else None
+                ),
+                "bbox": dict(det['bbox']),
+                "ground_contact": {
+                    "method": "bbox_bottom_center_diagnostic",
+                    "pixel": [float(u), float(v)],
+                    "covariance_px2": [
+                        [pixel_sigma_sq, 0.0],
+                        [0.0, pixel_sigma_sq],
+                    ],
+                    "reviewed": False,
+                },
+                "fingerprints": {
+                    "cameras_json_sha256": getattr(
+                        self, "cameras_json_sha256", None
+                    ),
+                    "camera_config_sha256": getattr(
+                        self, "camera_config_sha256", None
+                    ),
+                    "detector_model_sha256": getattr(
+                        self, "detector_model_sha256", None
+                    ),
+                },
+                "optimizer_contract": {
+                    "pixel_observation_is_input": True,
+                    "gps_location_is_derived_baseline": True,
+                    "acceptance_eligible": False,
+                    "reason": "ground_contact_not_reviewed",
+                },
             }
             records.append(record)
         return records
@@ -2963,10 +3253,21 @@ if __name__ == "__main__":
     cameras_config = load_cameras_config()
     detectors = []
     if cameras_config:
+        cameras_json_sha256, camera_hashes = camera_config_fingerprints(
+            cameras_config
+        )
+        detector_model_sha256 = sha256_file(model_path)
         site = cameras_config.get("site", {})
         for cam in cameras_config["cameras"]:
             pixel_sigma, calibration_uncertainty_m = (
                 camera_localization_parameters(cam)
+            )
+            distortion = camera_intrinsics_evidence(
+                cam,
+                evidence_root=Path(
+                    os.getenv("V2X_CAMERAS_JSON") or str(DEFAULT_CAMERAS_JSON)
+                ).expanduser().resolve().parent,
+                require_artifacts=True,
             )
             intr = cam["intrinsics"]
             K = np.array([
@@ -2975,16 +3276,25 @@ if __name__ == "__main__":
                 [0, 0, 1]
             ], dtype=np.float64)
             detectors.append(VideoObjectDetector(
-                model_path, conf, K, None,
+                model_path, conf, K, distortion,
                 cam["height_m"], cam["pitch_deg"], cam["yaw_deg"], cam["heading_deg"],
                 cam["device_id"],
                 site.get("lat", 0.0), site.get("lon", 0.0),
                 site.get("city", ""), site.get("state", ""), site.get("country", ""),
                 localization_pixel_sigma=pixel_sigma,
                 calibration_uncertainty_m=calibration_uncertainty_m,
+                image_width=intr["width"],
+                image_height=intr["height"],
+                cameras_json_sha256=cameras_json_sha256,
+                camera_config_sha256=camera_hashes[cam["id"]],
+                detector_model_sha256=detector_model_sha256,
+                map_georeference=site.get("map_georeference"),
             ))
     else:
-        # Legacy fallback: values predate config/cameras.json
+        # Explicit development-only legacy fallback. It is deliberately
+        # incompatible with uploads and never acceptance eligible.
+        if env_bool("V2X_PERCEPTION_UPLOAD", False):
+            raise RuntimeError("legacy camera fallback cannot upload detections")
         K = np.array([
             [1325.4,      0, 1280.0],  # fx=1325.4, cx=1280
             [     0, 1325.4,  960.0],  # fy=1325.4, cy=960

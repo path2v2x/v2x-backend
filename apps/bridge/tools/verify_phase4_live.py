@@ -1392,13 +1392,13 @@ def validate_twin_object_sample(
         raw_y = float(raw_location["y"])
         target_x = float(target_location["x"])
         target_y = float(target_location["y"])
-        reported_planar_error = float(item.get("placement_planar_error_m"))
+        reported_raw_to_target = float(item.get("raw_to_target_planar_m"))
     except (KeyError, TypeError, ValueError) as exc:
         raise VerificationError(
             "twin object raw placement evidence is invalid"
         ) from exc
     if not all(math.isfinite(value) for value in (
-        raw_x, raw_y, target_x, target_y, reported_planar_error
+        raw_x, raw_y, target_x, target_y, reported_raw_to_target
     )):
         raise VerificationError("twin object raw placement evidence is invalid")
     try:
@@ -1446,8 +1446,8 @@ def validate_twin_object_sample(
     raw_planar_error = math.hypot(target_x - raw_x, target_y - raw_y)
     if (
         raw_planar_error > 0.10
-        or reported_planar_error > 0.10
-        or abs(raw_planar_error - reported_planar_error) > 0.01
+        or reported_raw_to_target > 0.10
+        or abs(raw_planar_error - reported_raw_to_target) > 0.01
     ):
         raise VerificationError(
             "twin actor planar placement diverges from GPS-derived CARLA location"
@@ -1475,7 +1475,8 @@ def validate_twin_object_sample(
         "transform_source": transform_source,
         "position_error_m": round(position_error, 3),
         "rotation_error_deg": round(rotation_error, 3),
-        "raw_planar_error_m": round(raw_planar_error, 3),
+        "raw_to_target_planar_m": round(raw_planar_error, 3),
+        "placement_accuracy_claimed": False,
         "target_location": {"x": target_x, "y": target_y},
     }
 
