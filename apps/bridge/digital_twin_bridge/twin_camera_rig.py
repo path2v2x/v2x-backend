@@ -33,14 +33,14 @@ from digital_twin_bridge.geo_utils import gps_to_carla
 
 logger = logging.getLogger(__name__)
 
-TWIN_LENS_DEFAULTS = {
-    "lens_k": 0.0,
-    "lens_kcube": 0.0,
-    "lens_circle_falloff": 5.0,
-    "lens_circle_multiplier": 0.0,
-    "lens_x_size": 0.08,
-    "lens_y_size": 0.08,
-}
+TWIN_LENS_ATTRIBUTE_KEYS = (
+    "lens_k",
+    "lens_kcube",
+    "lens_circle_falloff",
+    "lens_circle_multiplier",
+    "lens_x_size",
+    "lens_y_size",
+)
 
 DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
 
@@ -157,6 +157,9 @@ class TwinCameraRig:
         self._frames: Dict[str, bytes] = {}
         self._frame_metadata: Dict[str, dict] = {}
         self._frame_counts: Dict[str, int] = {}
+        self._refused_cameras: Dict[str, str] = {}
+        self._spawn_failures: Dict[str, str] = {}
+        self._camera_model_errors: Dict[str, str] = {}
         self._lock = threading.Lock()
         self._accepting_frames = False
 
@@ -167,8 +170,15 @@ class TwinCameraRig:
     def spawn(self) -> int:
         """Spawn one camera per configured channel. Returns spawn count."""
         bp_lib = self._world.get_blueprint_library()
-        camera_bp = bp_lib.find("sensor.camera.rgb")
+        try:
+            camera_bp = bp_lib.find("sensor.camera.rgb")
+        except (IndexError, RuntimeError):
+            camera_bp = None
         if camera_bp is None:
+            self._spawn_failures = {
+                str(camera.get("id")): "camera_blueprint_unavailable"
+                for camera in self._config.get("cameras", [])
+            }
             logger.warning("sensor.camera.rgb blueprint not found; twin rig disabled")
             return 0
 
@@ -176,29 +186,18 @@ class TwinCameraRig:
         self._accepting_frames = True
         for camera in self._config["cameras"]:
             camera_id = camera["id"]
+            if camera.get("twin_lens"):
+                self._refused_cameras[camera_id] = "lens_override_safety_hold"
+                logger.error(
+                    "Twin camera %s requests lens overrides, but RR lens mutation "
+                    "is held after the exit-139 canary; camera not spawned",
+                    camera_id,
+                )
+                continue
             camera_bp.set_attribute("image_size_x", str(self._image_width))
             camera_bp.set_attribute("image_size_y", str(self._image_height))
             camera_bp.set_attribute("fov", f"{horizontal_fov_deg(camera['intrinsics']):.2f}")
             camera_bp.set_attribute("sensor_tick", f"{1.0 / self._fps:.4f}")
-            lens = dict(TWIN_LENS_DEFAULTS)
-            lens.update(camera.get("twin_lens") or {})
-            try:
-                lens = {key: float(lens[key]) for key in TWIN_LENS_DEFAULTS}
-                if not all(math.isfinite(value) for value in lens.values()):
-                    raise ValueError("non-finite lens value")
-            except (KeyError, TypeError, ValueError):
-                logger.warning("Twin camera %s has invalid lens configuration", camera_id)
-                continue
-            lens_applied = True
-            for key, value in lens.items():
-                try:
-                    camera_bp.set_attribute(key, str(value))
-                except (IndexError, RuntimeError, TypeError, ValueError):
-                    logger.warning("Twin camera %s has invalid %s", camera_id, key)
-                    lens_applied = False
-                    break
-            if not lens_applied:
-                continue
             try:
                 camera_bp.set_attribute("role_name", "twin_rig")
             except (IndexError, RuntimeError):
@@ -208,11 +207,14 @@ class TwinCameraRig:
             try:
                 actor = self._world.spawn_actor(camera_bp, transform)
             except Exception as exc:
+                self._spawn_failures[camera_id] = "spawn_actor_failed"
                 logger.warning("Twin camera %s spawn failed: %s", camera_id, exc)
                 continue
 
             actor.listen(self._make_listener(camera_id))
             self._cameras[camera_id] = actor
+            self._spawn_failures.pop(camera_id, None)
+            self._camera_model_errors.pop(camera_id, None)
             self._frame_counts[camera_id] = 0
             logger.info(
                 "Twin camera %s spawned at (%.1f, %.1f, %.1f) yaw=%.1f pitch=%.1f fov=%.1f",
@@ -318,8 +320,37 @@ class TwinCameraRig:
         if actor is None or camera is None:
             return None
         transform = actor.get_transform()
-        lens = dict(TWIN_LENS_DEFAULTS)
-        lens.update(camera.get("twin_lens") or {})
+        attributes = getattr(actor, "attributes", None) or {}
+        try:
+            lens = {
+                key: float(attributes[key])
+                for key in TWIN_LENS_ATTRIBUTE_KEYS
+            }
+            image_width = int(attributes["image_size_x"])
+            image_height = int(attributes["image_size_y"])
+            horizontal_fov = float(attributes["fov"])
+        except (KeyError, TypeError, ValueError):
+            self._camera_model_errors[camera_id] = (
+                "observed_camera_model_incomplete"
+            )
+            logger.error(
+                "Twin camera %s does not expose a complete observed camera model",
+                camera_id,
+            )
+            return None
+        if (
+            image_width <= 0
+            or image_height <= 0
+            or not 10.0 <= horizontal_fov <= 170.0
+            or not math.isfinite(horizontal_fov)
+            or not all(math.isfinite(value) for value in lens.values())
+        ):
+            self._camera_model_errors[camera_id] = (
+                "observed_camera_model_invalid"
+            )
+            logger.error("Twin camera %s exposes invalid camera values", camera_id)
+            return None
+        self._camera_model_errors.pop(camera_id, None)
         canonical = json.dumps(
             camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("utf-8")
@@ -344,9 +375,9 @@ class TwinCameraRig:
                 },
             },
             "image": {
-                "width": self._image_width,
-                "height": self._image_height,
-                "horizontal_fov_deg": float(horizontal_fov_deg(camera["intrinsics"])),
+                "width": image_width,
+                "height": image_height,
+                "horizontal_fov_deg": horizontal_fov,
             },
             "lens": {key: float(value) for key, value in lens.items()},
         }
@@ -360,4 +391,7 @@ class TwinCameraRig:
             "width": self._image_width,
             "height": self._image_height,
             "fps": self._fps,
+            "refused_cameras": dict(self._refused_cameras),
+            "spawn_failures": dict(self._spawn_failures),
+            "camera_model_errors": dict(self._camera_model_errors),
         }

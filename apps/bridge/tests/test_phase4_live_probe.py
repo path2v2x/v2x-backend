@@ -12,6 +12,7 @@ from tools.verify_phase4_live import (
     choose_teleport_target,
     project_world_xyz,
     receive_binary_frame,
+    receive_live_twin_frame_packet,
     receive_twin_frame_packet,
     receive_json,
     replay_clock_epoch,
@@ -24,6 +25,7 @@ from tools.verify_phase4_live import (
     validate_live_twin_camera_actor,
     validate_session_actor_manifest,
     validate_twin_camera_model,
+    validate_twin_rig_status,
     validate_projected_actor_detection,
     validate_target_actor_exclusivity,
     validate_twin_object_sample,
@@ -67,6 +69,13 @@ def twin_camera_hello(camera_id="ch1"):
                 "lens_x_size": 0.08,
                 "lens_y_size": 0.08,
             },
+        },
+        "cameras": [camera_id],
+        "rig": {
+            "cameras": [camera_id],
+            "refused_cameras": {},
+            "spawn_failures": {},
+            "camera_model_errors": {},
         },
     }
 
@@ -159,6 +168,39 @@ async def test_twin_frame_packet_rejects_metadata_jpeg_mismatch():
                 "2026-07-10T06:00:01.000Z"
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_live_twin_frame_packet_is_hash_bound_without_replay():
+    jpeg = b"live-jpeg"
+    metadata = json.loads(frame_packet_metadata(
+        jpeg, "2026-07-10T06:00:01.000Z", 2
+    ))
+    metadata.update(mode="live", replay_clock=None)
+    frame, digest, observed = await receive_live_twin_frame_packet(
+        FakeWebSocket([json.dumps(metadata), jpeg]),
+        1.0,
+        camera_id="ch1",
+    )
+
+    assert frame == jpeg
+    assert digest == binary_digest(jpeg)
+    assert observed["mode"] == "live"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("refused_cameras", {"ch1": "lens_override_safety_hold"}),
+        ("spawn_failures", {"ch1": "spawn_actor_failed"}),
+        ("camera_model_errors", {"ch1": "observed_camera_model_invalid"}),
+    ],
+)
+def test_read_only_rig_status_rejects_any_channel_failure(field, value):
+    hello = twin_camera_hello()
+    hello["rig"][field] = value
+    with pytest.raises(VerificationError, match=field):
+        validate_twin_rig_status(hello, ["ch1"])
 
 
 class FakeActor:

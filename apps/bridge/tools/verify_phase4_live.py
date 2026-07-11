@@ -21,6 +21,8 @@ import uuid
 
 import websockets
 
+from digital_twin_bridge.twin_camera_rig import TWIN_LENS_ATTRIBUTE_KEYS
+
 
 DEFAULT_TWIN_YOLO_PYTHON = Path("/home/path/V2XCarla/perception-venv/bin/python")
 DEFAULT_TWIN_YOLO_DETECTOR = (
@@ -205,6 +207,52 @@ async def receive_twin_frame_packet(
                 f"maximum is {maximum_skew_seconds:.3f}s"
             )
         return raw, digest, metadata, skew
+
+
+async def receive_live_twin_frame_packet(
+    websocket,
+    timeout,
+    *,
+    camera_id,
+    evidence=None,
+):
+    """Receive one hash-bound LIVE JPEG without sending a control message."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    metadata = None
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise VerificationError("timed out waiting for a LIVE twin frame packet")
+        raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        if not isinstance(raw, bytes):
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if evidence is not None:
+                evidence.setdefault("json_types", []).append(payload.get("type"))
+            if payload.get("type") == "twin_frame":
+                metadata = payload
+            continue
+        if evidence is not None:
+            evidence["binary_frames"] = evidence.get("binary_frames", 0) + 1
+        if metadata is None:
+            continue
+        digest = binary_digest(raw)
+        if metadata.get("jpeg_sha256") != digest:
+            raise VerificationError("LIVE twin frame metadata/JPEG hash mismatch")
+        if metadata.get("camera_id") != camera_id:
+            raise VerificationError("LIVE twin frame identifies the wrong camera")
+        if metadata.get("mode") != "live" or metadata.get("replay_clock") is not None:
+            raise VerificationError("twin frame is not bound to LIVE mode")
+        frame_count = metadata.get("frame_count")
+        carla_frame = metadata.get("carla_frame")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (frame_count, carla_frame)
+        ):
+            raise VerificationError("LIVE twin frame has invalid UE5 frame identity")
+        return raw, digest, metadata
 
 
 def _carla_rotation_axes(rotation):
@@ -922,14 +970,7 @@ def validate_twin_camera_model(
     ):
         raise VerificationError("twin camera model image geometry is invalid")
     lens = model.get("lens")
-    expected_lens_keys = {
-        "lens_k",
-        "lens_kcube",
-        "lens_circle_falloff",
-        "lens_circle_multiplier",
-        "lens_x_size",
-        "lens_y_size",
-    }
+    expected_lens_keys = set(TWIN_LENS_ATTRIBUTE_KEYS)
     if not isinstance(lens, dict) or set(lens) != expected_lens_keys:
         raise VerificationError("twin camera model lens geometry is invalid")
     if any(
@@ -951,6 +992,30 @@ def validate_twin_camera_model(
             "horizontal_fov_deg": float(fov),
         },
         "lens": {key: float(value) for key, value in lens.items()},
+    }
+
+
+def validate_twin_rig_status(hello, expected_camera_ids):
+    expected = list(expected_camera_ids)
+    rig = hello.get("rig")
+    if not isinstance(rig, dict):
+        raise VerificationError("twin hello has no machine-readable rig status")
+    cameras = rig.get("cameras")
+    if not isinstance(cameras, list) or sorted(cameras) != sorted(expected):
+        raise VerificationError("twin rig does not contain every configured camera")
+    if sorted(hello.get("cameras") or []) != sorted(expected):
+        raise VerificationError("twin hello camera inventory disagrees with config")
+    for field in ("refused_cameras", "spawn_failures", "camera_model_errors"):
+        value = rig.get(field)
+        if not isinstance(value, dict):
+            raise VerificationError(f"twin rig status has no {field} map")
+        if value:
+            raise VerificationError(f"twin rig reports {field}: {value}")
+    return {
+        "cameras": cameras,
+        "refused_cameras": {},
+        "spawn_failures": {},
+        "camera_model_errors": {},
     }
 
 
@@ -2235,6 +2300,91 @@ async def apply_probe(args, carla_module=None):
     return result
 
 
+async def verify_twin_metadata(args, carla_module=None):
+    """Read-only four-camera protocol/actor/JPEG canary."""
+    if carla_module is None:
+        try:
+            import carla as carla_module
+        except ImportError as exc:
+            raise VerificationError(
+                "--verify-twin-metadata requires the CARLA Python environment"
+            ) from exc
+    try:
+        config = json.loads(args.cameras_json.read_text())
+        camera_ids = [
+            str(camera["id"]) for camera in config.get("cameras", [])
+        ]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise VerificationError("tracked camera configuration is unavailable") from exc
+    if (
+        not camera_ids
+        or len(set(camera_ids)) != len(camera_ids)
+        or any(not camera_id for camera_id in camera_ids)
+    ):
+        raise VerificationError("tracked camera inventory is invalid")
+
+    client = carla_module.Client(args.carla_host, args.carla_port)
+    client.set_timeout(args.timeout)
+    world = client.get_world()
+    evidence = {
+        "mode": "read_only_twin_metadata",
+        "checked_at": utc_iso(),
+        "map": world.get_map().name,
+        "cameras_config_sha256": cameras_config_fingerprint(args.cameras_json),
+        "channels": {},
+    }
+    for camera_id in camera_ids:
+        channel_evidence = {"binary_frames": 0, "json_types": []}
+        stream_url = websocket_url(
+            args.ws_url, "/twin", f"cam={camera_id}"
+        )
+        async with websockets.connect(
+            stream_url,
+            open_timeout=args.timeout,
+            max_size=args.max_message_bytes,
+        ) as stream_socket:
+            hello = await receive_json(
+                stream_socket,
+                {"twin_hello", "twin_error"},
+                args.timeout,
+                channel_evidence,
+            )
+            if hello.get("type") == "twin_error":
+                raise VerificationError(
+                    hello.get("message", "twin stream is unavailable")
+                )
+            rig_status = validate_twin_rig_status(hello, camera_ids)
+            model = validate_twin_camera_model(
+                hello,
+                camera_id,
+                camera_config_fingerprint(args.cameras_json, camera_id),
+                evidence["cameras_config_sha256"],
+            )
+            model["expected_config_transform"] = (
+                expected_twin_camera_transform(
+                    world, args.cameras_json, camera_id
+                )
+            )
+            actor = validate_live_twin_camera_actor(world, model)
+            _jpeg, jpeg_digest, frame_metadata = (
+                await receive_live_twin_frame_packet(
+                    stream_socket,
+                    args.timeout,
+                    camera_id=camera_id,
+                    evidence=channel_evidence,
+                )
+            )
+        evidence["channels"][camera_id] = {
+            "rig_status": rig_status,
+            "camera_model": model,
+            "camera_actor": actor,
+            "frame_sha256": jpeg_digest,
+            "frame_metadata": frame_metadata,
+            "protocol_counts": channel_evidence,
+        }
+    return evidence
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8765")
@@ -2310,10 +2460,28 @@ def build_parser():
             "--skip-drive is set; default is read-only"
         ),
     )
+    parser.add_argument(
+        "--verify-twin-metadata",
+        action="store_true",
+        help=(
+            "read-only validation of every configured twin camera model, "
+            "live UE5 actor, and hash-bound LIVE JPEG"
+        ),
+    )
     return parser
 
 
 def validate_cli_args(args):
+    if args.verify_twin_metadata and args.apply:
+        raise VerificationError(
+            "--verify-twin-metadata cannot be combined with --apply"
+        )
+    if args.verify_twin_metadata and args.skip_twin:
+        raise VerificationError(
+            "--verify-twin-metadata cannot be combined with --skip-twin"
+        )
+    if args.verify_twin_metadata and not args.cameras_json.is_file():
+        raise VerificationError("--cameras-json does not exist")
     if args.skip_drive and not args.apply:
         raise VerificationError("--skip-drive is meaningful only with --apply")
     if args.twin_replay_start and not args.apply:
@@ -2371,7 +2539,13 @@ def validate_cli_args(args):
 def main():
     try:
         args = validate_cli_args(build_parser().parse_args())
-        result = asyncio.run(apply_probe(args) if args.apply else observational_probe(args))
+        if args.apply:
+            coroutine = apply_probe(args)
+        elif args.verify_twin_metadata:
+            coroutine = verify_twin_metadata(args)
+        else:
+            coroutine = observational_probe(args)
+        result = asyncio.run(coroutine)
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         return 1

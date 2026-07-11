@@ -197,9 +197,20 @@ class MockBlueprint:
     def __init__(self, bp_id: str, attributes: Optional[dict[str, MockBlueprintAttribute]] = None):
         self.id = bp_id
         self._attributes = attributes or {}
+        self.set_attribute_calls: list[tuple[str, str]] = []
         if bp_id.startswith("vehicle."):
             self._attributes.setdefault("number_of_wheels", MockBlueprintAttribute("4"))
             self._attributes.setdefault("color", MockBlueprintAttribute("255,255,255", ["255,255,255", "180,0,0"]))
+        if bp_id == "sensor.camera.rgb":
+            for key, value in {
+                "lens_k": "-1.0",
+                "lens_kcube": "0.0",
+                "lens_circle_falloff": "5.0",
+                "lens_circle_multiplier": "0.0",
+                "lens_x_size": "0.08",
+                "lens_y_size": "0.08",
+            }.items():
+                self._attributes.setdefault(key, MockBlueprintAttribute(value))
 
     def has_attribute(self, key: str) -> bool:
         return key in self._attributes
@@ -208,6 +219,7 @@ class MockBlueprint:
         return self._attributes[key]
 
     def set_attribute(self, key: str, value: str) -> None:
+        self.set_attribute_calls.append((key, value))
         self._attributes[key] = MockBlueprintAttribute(value)
 
 
@@ -312,6 +324,10 @@ class MockWorld:
 
     def try_spawn_actor(self, blueprint, transform, attach_to=None, **kwargs) -> Optional[MockActor]:
         actor = MockActor(self._next_id, getattr(blueprint, "id", "unknown"))
+        actor.attributes = {
+            key: str(value)
+            for key, value in getattr(blueprint, "_attributes", {}).items()
+        }
         self._actors[actor.id] = actor
         actor._transform = transform
         self._next_id += 1

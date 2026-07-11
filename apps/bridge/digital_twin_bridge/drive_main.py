@@ -766,6 +766,7 @@ async def main():
             "height": rig_status["height"],
             "fps": rig_status["fps"],
             "cameras": rig_status["cameras"],
+            "rig": rig_status,
             "sync": (
                 runtime["twin_sync"].status()
                 if runtime.get("twin_sync") is not None else None

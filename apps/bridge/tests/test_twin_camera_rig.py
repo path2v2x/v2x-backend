@@ -100,10 +100,72 @@ class TestTwinCameraRig:
 
         assert rig.spawn() == 0
         assert rig.camera_ids == []
+        assert rig.status()["refused_cameras"] == {
+            "ch1": "lens_override_safety_hold"
+        }
+
+    def test_even_baseline_matching_lens_override_is_refused(self, mock_world):
+        config = make_config()
+        config["cameras"][0]["twin_lens"] = {
+            "lens_k": -1.0,
+            "lens_kcube": 0.0,
+            "lens_circle_falloff": 5.0,
+            "lens_circle_multiplier": 0.0,
+            "lens_x_size": 0.08,
+            "lens_y_size": 0.08,
+        }
+        rig = TwinCameraRig(mock_world, mock_world.get_map(), config)
+
+        assert rig.spawn() == 0
+        assert rig.status()["refused_cameras"]["ch1"] == (
+            "lens_override_safety_hold"
+        )
+
+    def test_mixed_config_refuses_only_unsafe_channel(
+        self, mock_world, monkeypatch
+    ):
+        unsafe = {**CAMERA, "id": "ch1", "twin_lens": {"lens_k": -1.0}}
+        safe = {**CAMERA, "id": "ch2"}
+        monkeypatch.setattr(
+            twin_camera_rig,
+            "gps_to_carla",
+            lambda *_args: MockLocation(0.0, 0.0, 0.0),
+        )
+        rig = TwinCameraRig(
+            mock_world, mock_world.get_map(), make_config([unsafe, safe])
+        )
+
+        assert rig.spawn() == 1
+        assert rig.camera_ids == ["ch2"]
+        assert rig.status()["refused_cameras"] == {
+            "ch1": "lens_override_safety_hold"
+        }
 
     def test_nonpositive_fps_is_rejected(self, mock_world):
         with pytest.raises(ValueError, match="finite and positive"):
             TwinCameraRig(mock_world, mock_world.get_map(), make_config(), fps=0)
+
+    def test_spawn_failure_is_machine_readable(
+        self, mock_world, monkeypatch
+    ):
+        monkeypatch.setattr(
+            twin_camera_rig,
+            "gps_to_carla",
+            lambda *_args: MockLocation(0.0, 0.0, 0.0),
+        )
+        monkeypatch.setattr(
+            mock_world,
+            "spawn_actor",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected spawn failure")
+            ),
+        )
+        rig = TwinCameraRig(mock_world, mock_world.get_map(), make_config())
+
+        assert rig.spawn() == 0
+        assert rig.status()["spawn_failures"] == {
+            "ch1": "spawn_actor_failed"
+        }
 
     def test_spawn_frames_destroy(self, mock_world, monkeypatch):
         monkeypatch.setattr(
@@ -123,6 +185,11 @@ class TestTwinCameraRig:
         assert rig.has_camera("ch1")
         assert not rig.has_camera("ch9")
         assert len(rig.actor_ids()) == 1
+        camera_bp = mock_world.get_blueprint_library().find("sensor.camera.rgb")
+        assert not any(
+            key.startswith("lens_")
+            for key, _value in camera_bp.set_attribute_calls
+        )
 
         # No frame yet
         assert rig.get_latest_frame("ch1") is None
@@ -153,10 +220,10 @@ class TestTwinCameraRig:
         assert model["image"]["width"] == 1280
         assert model["image"]["height"] == 960
         assert model["image"]["horizontal_fov_deg"] == pytest.approx(
-            horizontal_fov_deg(CAMERA["intrinsics"])
+            round(horizontal_fov_deg(CAMERA["intrinsics"]), 2)
         )
         assert model["lens"] == {
-            "lens_k": 0.0,
+            "lens_k": -1.0,
             "lens_kcube": 0.0,
             "lens_circle_falloff": 5.0,
             "lens_circle_multiplier": 0.0,
@@ -165,6 +232,21 @@ class TestTwinCameraRig:
         }
         assert model["transform"]["location"]["z"] == pytest.approx(7.0)
         assert rig.camera_model("ch9") is None
+
+        rig._cameras["ch1"].attributes["fov"] = "87.5"
+        assert rig.camera_model("ch1")["image"]["horizontal_fov_deg"] == 87.5
+
+        rig._cameras["ch1"].attributes.pop("lens_k")
+        assert rig.camera_model("ch1") is None
+        assert rig.status()["camera_model_errors"]["ch1"] == (
+            "observed_camera_model_incomplete"
+        )
+
+        rig._cameras["ch1"].attributes["lens_k"] = "nan"
+        assert rig.camera_model("ch1") is None
+        assert rig.status()["camera_model_errors"]["ch1"] == (
+            "observed_camera_model_invalid"
+        )
 
         rig.destroy()
         assert rig.camera_ids == []
