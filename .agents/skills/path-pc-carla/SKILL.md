@@ -7,22 +7,29 @@ description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252
 
 Treat this file as an operating procedure, not proof of current state. Re-run the read-only baseline before every intervention.
 
-## Current replay-protocol safety hold
+## Current replay-protocol deployment and safety hold
 
 Observed on 2026-07-11 UTC; verify rather than assume:
 
-- Canonical source through `299efc56f55f9775f0d583e8f56f5d0e791674c4`
-  contains hash-bound twin camera/frame metadata and stricter replay acceptance,
-  but that protocol runtime is **not deployed** on the Path PC.
-- The live checkout was deliberately rolled back to clean
-  `094ffca0e36e57330e0dc89926a0fd5d6fd3aa2a` after bounded replay
-  diagnostics correlated with eight `v2x-carla-rr.service` automatic
-  restarts and exit status 139. The failed-canary report is
+- Canonical source and the clean live checkout are
+  `205069271e1940e0de8019e5629691aa1c0fd924`. This metadata-safe revision
+  reads lens attributes from spawned UE5 actors, refuses configured lens
+  overrides, and provides a read-only `--verify-twin-metadata` canary.
+- The earlier replay-capable runtime was rolled back to
+  `094ffca0e36e57330e0dc89926a0fd5d6fd3aa2a` after bounded replay diagnostics
+  correlated with eight `v2x-carla-rr.service` automatic restarts and exit
+  status 139. The failed-canary report remains at
   `/home/path/V2XCarla/v2x-evidence/twin-protocol/20260711T0415Z-canary/report.md`.
-- Do not redeploy or retry the new replay protocol merely because its unit
-  tests, GitHub merge, mirror sync, or Amplify release passed. First isolate
-  the UE5.5 worker crash in a bounded V2X-owned canary and prove that the
-  CARLA and Drive restart counters do not increase.
+- Revision `2050692` passed the four-channel read-only metadata canary both
+  before and after a full scheduled CARLA/Drive restart. Each fresh-spawn gate
+  was followed by a 120-second zero-restart watch with no container-death or
+  exit-139 signature. Durable evidence is in
+  `/home/path/V2XCarla/v2x-evidence/twin-protocol/20260711T0457Z-metadata-canary/report.md`.
+- Metadata/live operation is deployed, but replay mutation remains on safety
+  hold. Do not run replay merely because metadata, unit tests, GitHub merge,
+  mirror sync, or Amplify release passed. Replay needs a separately bounded
+  gate after the projection model handles actor-observed lens distortion and
+  the unchanged same-car visual/geometric acceptance gate passes.
 - Before any replay mutation, record `NRestarts`, `ExecMainStartTimestamp`,
   container start time, zero active sessions, and LIVE mode. Hold all three
   mutation-capable timers. On any UE5 exit-139, `world.tick() failed:
@@ -35,6 +42,9 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   `no compatible visual detection overlaps the projected UE5 actor`.
   This is a calibration/placement blocker, not a reason to lower projection,
   visibility, YOLO, or identity thresholds.
+- The perception service is exposed through a Quick Tunnel. Use the current
+  `*.trycloudflare.com` URL emitted by the running tunnel, not the unprovisioned
+  fallback `perception.path2v2x.net`, until named-tunnel DNS parity is proven.
 
 ## Safety boundaries
 
