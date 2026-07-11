@@ -1682,14 +1682,26 @@ even when a point-only threshold passes; do not weaken thresholds or relabel
 matcher-generated points to make it green.
 
 Manual four-camera evidence must use one JSON annotation artifact per channel.
+Capture observational pairs with `capture_twin_calibration_pairs.py` only
+against a twin protocol that sends a `twin_frame` JSON packet immediately
+before each binary JPEG. Pass the exact active `--cameras-json`; the capture
+must bind the JPEG hash, channel ID, LIVE mode, CARLA frame/timestamp, capture
+gap, whole config hash, and selected camera hash. The older binary-only/twin
+clock sequence is diagnostic and must fail this capture gate.
 Points require `provenance="manually_verified_unique"`, at least eight frozen
 train and four untouched holdouts. Road edges, lane markings, and crosswalk
 geometry require `provenance="manually_traced_geometry"`, at least three train
 and two holdout polylines; infinite-line evidence is not accepted. Include the
 exact real/twin frame SHA-256 values and decode both retained images to verify
-their actual dimensions. Reject annotated twin pixels whose 3x3 depth
+their actual dimensions. Also freeze the exact `cameras.json` SHA-256 that
+produced the annotated twin render and reject a manifest build against any
+other config. Reject duplicate real/twin point pixels across train and holdout,
+zero-length or duplicate/resampled train/holdout polylines, collinear/clustered
+point sets, holdouts copied from fit geometry, and blank/duplicate semantic
+landmark descriptions. Reject annotated twin pixels whose 3x3 depth
 neighborhood crosses a geometry discontinuity; a plausible center depth alone
-does not establish frozen world truth. Never translate
+does not establish frozen world truth. Retain the numeric 3x3 neighborhood
+range/deviation evidence for every point and polyline vertex. Never translate
 `manual_verified_static`, matcher proposals, or vague repeated line points into
 the accepted provenance labels.
 
@@ -1699,9 +1711,11 @@ backed by a retained checkerboard or ChArUco JSON result artifact: exact
 SHA-256, one unique SHA-256 per accepted source image, at least 10 accepted
 calibration images, no more than 2 px calibration RMS, matching image
 resolution and camera matrix, and finite Brown-Conrady `k1/k2/p1/p2/k3`. Pass
-the actual result with `--intrinsics-artifact`; the manifest builder must hash,
-parse, and compare its normalized contents to `cameras.json` before it connects
-to CARLA or spawns a depth sensor. Quantify the full measured physical
+the actual result with `--intrinsics-artifact` and repeat
+`--intrinsics-source-image` for every declared source hash; the manifest
+builder must decode and hash every retained calibration image, then parse and
+compare the normalized result to `cameras.json` before it connects to CARLA or
+spawns a depth sensor. Quantify the full measured physical
 model against the deployed UE5 centered-pinhole render over the image; an
 optical mismatch above 0.25 px keeps deployment closed until a shared render
 distortion or physical-feed undistortion path is implemented and verified.
@@ -1717,6 +1731,8 @@ twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
   --real-frame /path/to/real-ch1.jpg \
   --twin-frame /path/to/twin-ch1.jpg \
   --intrinsics-artifact /path/to/ch1-intrinsics.json \
+  --intrinsics-source-image /path/to/ch1-charuco-01.png \
+  --intrinsics-source-image /path/to/ch1-charuco-02.png \
   --depth-frame-output /path/to/ch1-depth.bgra \
   --cameras-json /home/path/V2XCarla/v2x-backend/config/cameras.json
 ```
@@ -1733,8 +1749,9 @@ Retain the exact raw BGRA depth buffer, including its SHA-256 and byte count;
 the manifest alone is insufficient evidence for depth-derived world points.
 
 At optimization time, pass the exact retained annotations, real frame, twin
-frame, cameras file, and intrinsics artifact again. The optimizer must re-hash
-all five, re-hash the selected canonical camera object, and compare the
+frame, cameras file, intrinsics artifact, and every calibration source image
+again. The optimizer must re-hash all inputs, decode and match every declared
+source image, re-hash the selected canonical camera object, and compare the
 calibration block with both `cameras.json` and the parsed artifact; a direct
 `optimize_manifest()` call without this binding is non-acceptable:
 
@@ -1748,6 +1765,8 @@ calibration block with both `cameras.json` and the parsed artifact; a direct
   --twin-frame /path/to/twin-ch1.jpg \
   --cameras-json /path/to/cameras.json \
   --intrinsics-artifact /path/to/ch1-intrinsics.json \
+  --intrinsics-source-image /path/to/ch1-charuco-01.png \
+  --intrinsics-source-image /path/to/ch1-charuco-02.png \
   --depth-frame /path/to/ch1-depth.bgra
 ```
 

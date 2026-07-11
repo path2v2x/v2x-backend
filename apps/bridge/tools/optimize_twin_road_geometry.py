@@ -37,6 +37,8 @@ from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
 )
 from build_twin_calibration_manifest import (  # noqa: E402
     build_deployment_model,
+    convex_hull_area,
+    decoded_image_size,
     stable_depth_meters,
 )
 from build_twin_camera_landmarks import (  # noqa: E402
@@ -428,6 +430,25 @@ def manifest_gate(manifest):
         for feature in train_lines + held_lines
     ):
         reasons.append("unverified_road_geometry_provenance")
+    descriptions = [str(feature.get("description") or "").strip() for feature in features]
+    if (
+        any(len(value) < 8 for value in descriptions)
+        or len({value.casefold() for value in descriptions}) != len(descriptions)
+    ):
+        reasons.append("missing_or_duplicate_semantic_descriptions")
+    for field in ("image", "twin"):
+        pixels = [tuple(feature.get(field) or ()) for feature in train_points + held_points]
+        if any(len(pixel) != 2 for pixel in pixels) or len(set(pixels)) != len(pixels):
+            reasons.append(f"duplicate_or_invalid_{field}_point_pixels")
+    if any(
+        not isinstance(feature.get("depth_neighborhood"), dict)
+        for feature in train_points + held_points
+    ) or any(
+        not isinstance(feature.get("depth_neighborhoods"), list)
+        or len(feature["depth_neighborhoods"]) != len(feature.get("twin_polyline") or [])
+        for feature in train_lines + held_lines
+    ):
+        reasons.append("missing_depth_neighborhood_evidence")
 
     width, height = float(manifest.get("width", 0)), float(manifest.get("height", 0))
     for label, points in (("train", train_points), ("heldout", held_points)):
@@ -439,6 +460,9 @@ def manifest_gate(manifest):
             horizontal = vertical = 0.0
         if horizontal < 0.5 or vertical < 0.3:
             reasons.append(f"{label}_image_coverage")
+        if pixels and width > 0 and height > 0:
+            if convex_hull_area(pixels) / (width * height) < 0.02:
+                reasons.append(f"{label}_image_collinear_or_clustered")
 
     angles = []
     for feature in train_lines:
@@ -472,6 +496,7 @@ def verify_external_evidence(
     twin_frame_bytes,
     cameras_bytes,
     intrinsics_artifact_bytes,
+    intrinsics_source_image_bytes,
     depth_frame_bytes,
     runtime_evidence,
 ):
@@ -510,6 +535,24 @@ def verify_external_evidence(
             reasons.append("camera_config_sha256_mismatch")
         if camera.get("intrinsics_calibration") != manifest.get("intrinsics_calibration"):
             reasons.append("intrinsics_calibration_config_mismatch")
+        expected_source_hashes = set(
+            (manifest.get("intrinsics_calibration") or {}).get(
+                "source_images_sha256"
+            ) or []
+        )
+        actual_source_hashes = []
+        try:
+            for index, payload in enumerate(intrinsics_source_image_bytes):
+                decoded_image_size(payload, f"intrinsics source {index}")
+                actual_source_hashes.append(hashlib.sha256(payload).hexdigest())
+        except ValueError:
+            reasons.append("intrinsics_source_image_invalid")
+        if (
+            len(actual_source_hashes) != len(expected_source_hashes)
+            or len(set(actual_source_hashes)) != len(actual_source_hashes)
+            or set(actual_source_hashes) != expected_source_hashes
+        ):
+            reasons.append("intrinsics_source_images_mismatch")
         intrinsics = camera.get("intrinsics") or {}
         twin_pose = camera.get("twin_pose") or {}
         expected_base = {
@@ -973,6 +1016,10 @@ def main():
     parser.add_argument("--twin-frame", required=True)
     parser.add_argument("--cameras-json", required=True)
     parser.add_argument("--intrinsics-artifact", required=True)
+    parser.add_argument(
+        "--intrinsics-source-image", action="append", required=True,
+        help="retained calibration source image; repeat once per artifact hash",
+    )
     parser.add_argument("--depth-frame", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2000)
@@ -999,6 +1046,9 @@ def main():
         twin_frame_bytes=Path(args.twin_frame).read_bytes(),
         cameras_bytes=Path(args.cameras_json).read_bytes(),
         intrinsics_artifact_bytes=Path(args.intrinsics_artifact).read_bytes(),
+        intrinsics_source_image_bytes=[
+            Path(path).read_bytes() for path in args.intrinsics_source_image
+        ],
         depth_frame_bytes=depth_frame_bytes,
         runtime_evidence=runtime_evidence,
     )
