@@ -269,12 +269,35 @@ def _carla_rotation_axes(rotation):
     )
 
 
+CARLA_DEFAULT_PINHOLE_LENS = {
+    # A CARLA sensor maintainer confirms the 0.9.x default tuple is the
+    # undistorted pinhole state (carla-simulator/carla#3198).  The parameters
+    # are not OpenCV Brown-Conrady coefficients (#3130).  UE5/0.10 equivalence
+    # is still enforced empirically by the unchanged visual/motion gates.
+    # Accept only actor-observed defaults; every other tuple remains fail closed.
+    "lens_k": -1.0,
+    "lens_kcube": 0.0,
+    "lens_circle_falloff": 5.0,
+    "lens_circle_multiplier": 0.0,
+    "lens_x_size": 0.08,
+    "lens_y_size": 0.08,
+}
+
+
 def project_world_xyz(point, camera_model):
-    """Project one CARLA XYZ through the exact zero-distortion twin model."""
+    """Project one CARLA XYZ through its exact default pinhole lens state."""
     lens = camera_model["lens"]
-    if abs(lens["lens_k"]) > 1e-9 or abs(lens["lens_kcube"]) > 1e-9:
+    if any(
+        not math.isclose(
+            float(lens.get(key, math.nan)),
+            expected,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for key, expected in CARLA_DEFAULT_PINHOLE_LENS.items()
+    ):
         raise VerificationError(
-            "twin actor projection does not support unmodeled nonzero CARLA lens distortion"
+            "twin actor projection rejects a non-default CARLA lens model"
         )
     transform = camera_model["transform"]
     location = transform["location"]

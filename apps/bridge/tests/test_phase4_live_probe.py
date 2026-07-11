@@ -1,3 +1,4 @@
+import copy
 import json
 import hashlib
 
@@ -62,7 +63,7 @@ def twin_camera_hello(camera_id="ch1"):
                 "horizontal_fov_deg": 90.0,
             },
             "lens": {
-                "lens_k": 0.0,
+                "lens_k": -1.0,
                 "lens_kcube": 0.0,
                 "lens_circle_falloff": 5.0,
                 "lens_circle_multiplier": 0.0,
@@ -304,6 +305,22 @@ def test_rejects_unverifiable_twin_camera_model(mutate, error):
         validate_twin_camera_model(hello, "ch1")
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda hello: hello["camera_model"]["lens"].pop("lens_k"),
+        lambda hello: hello["camera_model"]["lens"].update(extra=0.0),
+        lambda hello: hello["camera_model"]["lens"].update(lens_k=float("nan")),
+        lambda hello: hello["camera_model"]["lens"].update(lens_k=float("inf")),
+    ],
+)
+def test_rejects_incomplete_or_nonfinite_twin_lens_model(mutate):
+    hello = twin_camera_hello()
+    mutate(hello)
+    with pytest.raises(VerificationError, match="lens geometry is invalid"):
+        validate_twin_camera_model(hello, "ch1")
+
+
 def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
     model = validate_twin_camera_model(twin_camera_hello(), "ch1")
     actor = FakeActor(
@@ -316,7 +333,7 @@ def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
         "image_size_x": "1280",
         "image_size_y": "960",
         "fov": "90.0",
-        "lens_k": "0.0",
+        "lens_k": "-1.0",
         "lens_kcube": "0.0",
         "lens_circle_falloff": "5.0",
         "lens_circle_multiplier": "0.0",
@@ -327,6 +344,45 @@ def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
     assert evidence["actor_id"] == 33
     actor._transform = FakeTransform(1.5, 2.0, 8.0, pitch=-35.0, yaw=90.0)
     with pytest.raises(VerificationError, match="transform drifted"):
+        validate_live_twin_camera_actor(FakeWorld([actor]), model)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "error"),
+    [
+        ("lens_k", "0.0", "does not match stream model"),
+        ("lens_kcube", "0.01", "does not match stream model"),
+        ("lens_circle_falloff", "4.9", "does not match stream model"),
+        ("lens_circle_multiplier", "0.01", "does not match stream model"),
+        ("lens_x_size", "0.09", "does not match stream model"),
+        ("lens_y_size", "0.09", "does not match stream model"),
+        ("lens_k", None, "lacks lens_k"),
+    ],
+)
+def test_rejects_live_actor_lens_drift_or_missing_attribute(key, value, error):
+    model = validate_twin_camera_model(twin_camera_hello(), "ch1")
+    actor = FakeActor(
+        actor_id=33,
+        type_id="sensor.camera.rgb",
+        role_name="twin_rig",
+        transform=FakeTransform(1.0, 2.0, 8.0, pitch=-35.0, yaw=90.0),
+    )
+    actor.attributes.update({
+        "image_size_x": "1280",
+        "image_size_y": "960",
+        "fov": "90.0",
+        "lens_k": "-1.0",
+        "lens_kcube": "0.0",
+        "lens_circle_falloff": "5.0",
+        "lens_circle_multiplier": "0.0",
+        "lens_x_size": "0.08",
+        "lens_y_size": "0.08",
+    })
+    if value is None:
+        actor.attributes.pop(key)
+    else:
+        actor.attributes[key] = value
+    with pytest.raises(VerificationError, match=error):
         validate_live_twin_camera_actor(FakeWorld([actor]), model)
 
 
@@ -343,7 +399,7 @@ def test_rr_sensor_zero_transform_uses_tracked_config_proof():
         "image_size_x": "1280",
         "image_size_y": "960",
         "fov": "90.0",
-        "lens_k": "0.0",
+        "lens_k": "-1.0",
         "lens_kcube": "0.0",
         "lens_circle_falloff": "5.0",
         "lens_circle_multiplier": "0.0",
@@ -377,9 +433,18 @@ def test_projects_world_point_through_fingerprinted_camera_model():
     assert project_world_xyz((10.0, 1.0, 1.0), model) == pytest.approx(
         (550.0, 200.0, 10.0)
     )
-    model["lens"]["lens_k"] = -0.1
-    with pytest.raises(VerificationError, match="nonzero CARLA lens distortion"):
-        project_world_xyz((10.0, 0.0, 0.0), model)
+    for key, value in (
+        ("lens_k", 0.0),
+        ("lens_kcube", 0.01),
+        ("lens_circle_falloff", 4.9),
+        ("lens_circle_multiplier", 0.01),
+        ("lens_x_size", 0.09),
+        ("lens_y_size", 0.09),
+    ):
+        changed = copy.deepcopy(model)
+        changed["lens"][key] = value
+        with pytest.raises(VerificationError, match="non-default CARLA lens model"):
+            project_world_xyz((10.0, 0.0, 0.0), changed)
 
 
 def test_projected_actor_requires_strong_compatible_visual_overlap():
