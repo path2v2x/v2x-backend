@@ -502,6 +502,53 @@ def test_target_actor_exclusivity_rejects_occluder_and_ambiguous_neighbor():
         )
 
 
+def test_scene_persistence_rejects_transient_pre_frame_occluder():
+    target = FakeActor(actor_id=77)
+    occluder = FakeActor(actor_id=88)
+    states = [
+        {"actor": target, "actor_id": 77, "transform": target.get_transform()},
+        {"actor": occluder, "actor_id": 88, "transform": occluder.get_transform()},
+    ]
+    with pytest.raises(VerificationError, match="actor vanished.*88"):
+        live_probe.validate_captured_scene_persistence(states, [target])
+    assert live_probe.validate_captured_scene_persistence(
+        states, [target, occluder]
+    ) == {
+        "before_actor_ids": [77, 88],
+        "after_actor_ids": [77, 88],
+    }
+
+
+def test_scene_capture_rejects_any_snapshot_missing_confounder():
+    actor = FakeActor(actor_id=88)
+    snapshot = type("Snapshot", (), {"find": lambda self, _actor_id: None})()
+    world = type(
+        "World",
+        (),
+        {
+            "get_snapshot": lambda self: snapshot,
+            "get_actors": lambda self: [actor],
+        },
+    )()
+    with pytest.raises(VerificationError, match="snapshot lacks actor 88"):
+        live_probe.capture_scene_actor_states(world)
+
+
+def test_sensor_frame_must_be_inside_independent_carla_tick_bracket():
+    assert live_probe.validate_frame_carla_tick_bracket(
+        {"carla_frame": 101}, 100, 102
+    ) == {
+        "before_carla_frame": 100,
+        "sensor_carla_frame": 101,
+        "after_carla_frame": 102,
+    }
+    for sensor_frame in (99, 103):
+        with pytest.raises(VerificationError, match="outside.*tick bracket"):
+            live_probe.validate_frame_carla_tick_bracket(
+                {"carla_frame": sensor_frame}, 100, 102
+            )
+
+
 def test_scene_projection_keeps_clipped_confounders(monkeypatch):
     target = FakeActor(actor_id=77)
     confounder = FakeActor(actor_id=88)
@@ -1103,10 +1150,9 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
     monkeypatch.setattr(
         live_probe, "validate_live_twin_camera_actor", lambda *_args: {"actor_id": 33}
     )
-    def fake_geometry(projected_actor, _camera, **_kwargs):
-        x = projected_actor.get_transform().location.x * 20.0
+    def geometry_at(x, target_id=77):
         return {
-            "actor_id": projected_actor.id,
+            "actor_id": target_id,
             "bbox": (x, 100.0, x + 100.0, 200.0),
             "raw_bbox": (x, 100.0, x + 100.0, 200.0),
             "area_px": 10000.0,
@@ -1115,15 +1161,41 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
             "median_depth_m": 11.0,
         }
 
-    monkeypatch.setattr(live_probe, "project_actor_geometry", fake_geometry)
+    def fake_capture(_world, *, actors=None):
+        call_order.append(
+            "capture_scene" if actors is None else "capture_scene_after"
+        )
+        return [{
+            "actor": actor,
+            "actor_id": actor.id,
+            "transform": actor.get_transform(),
+        }]
+
+    def fake_project_captured(states, _camera, target_id):
+        call_order.append("project_captured")
+        x = states[0]["transform"].location.x * 20.0
+        return {target_id: geometry_at(x, target_id)}
+
+    def fake_candidates(_world):
+        call_order.append("inventory_after")
+        return [actor]
+
+    monkeypatch.setattr(live_probe, "capture_scene_actor_states", fake_capture)
     monkeypatch.setattr(
-        live_probe,
-        "project_scene_actor_geometries",
-        lambda _world, camera, target_id: {target_id: fake_geometry(actor, camera)},
+        live_probe, "project_captured_scene_actor_geometries", fake_project_captured
     )
+    monkeypatch.setattr(live_probe, "scene_actor_candidates", fake_candidates)
 
     async def fake_packet(*_args, **_kwargs):
+        call_order.append("packet")
         fake_packet.count += 1
+        current = actor.get_transform()
+        actor._transform = FakeTransform(
+            current.location.x + 0.05,
+            current.location.y,
+            current.location.z,
+            yaw=12.0,
+        )
         digest = f"{fake_packet.count:064x}"
         return (
             b"jpeg",
@@ -1131,7 +1203,7 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
             {
                 "camera_id": "ch1",
                 "frame_count": fake_packet.count,
-                "carla_frame": 100 + fake_packet.count,
+                "carla_frame": (102, 105, 108)[fake_packet.count - 1],
                 "sensor_timestamp": 10.0 + fake_packet.count,
                 "replay_clock": f"2026-07-10T06:00:0{fake_packet.count - 1}.000Z",
                 "jpeg_sha256": digest,
@@ -1181,10 +1253,22 @@ async def test_exact_twin_samples_synchronize_independent_carla_client(monkeypat
         args, object(), object(), world, twin_camera_hello()["camera_model"], object(), evidence
     )
 
-    assert call_order == ["sync", "request", "sync", "request", "sync"] * 3
+    assert call_order == [
+        "sync", "request", "sync", "capture_scene", "request", "packet",
+        "project_captured", "sync", "inventory_after", "capture_scene_after",
+        "project_captured",
+    ] * 3
     assert evidence["object_sync_frames"] == [101, 103, 104, 106, 107, 109]
     assert evidence["object_status_sync_frames"] == [102, 105, 108]
     assert evidence["object_status_refreshes"] == 3
     assert result["sample_count"] == 3
     assert result["max_planar_movement_m"] == pytest.approx(0.5)
     assert all(sample["visual"]["best_detection"]["compatible"] for sample in result["samples"])
+    assert [
+        sample["visual"]["before_capture"]["projected_bbox"][0]
+        for sample in result["samples"]
+    ] == pytest.approx([200.0, 204.0, 210.0])
+    assert [
+        sample["visual"]["after_capture"]["projected_bbox"][0]
+        for sample in result["samples"]
+    ] == pytest.approx([201.0, 205.0, 211.0])

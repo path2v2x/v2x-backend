@@ -144,7 +144,7 @@ async def receive_twin_frame_packet(
     *,
     camera_id,
     minimum_replay_epoch,
-    maximum_skew_seconds=0.5,
+    maximum_skew_seconds=0.25,
     previous_frame_count=None,
     evidence=None,
 ):
@@ -486,31 +486,114 @@ def validate_projected_actor_detection(
     }
 
 
-def project_scene_actor_geometries(world, camera_model, target_actor_id):
-    """Project every potentially confounding vehicle/walker in the UE5 scene."""
-    geometries = {}
-    for actor in world.get_actors():
-        type_id = str(getattr(actor, "type_id", ""))
-        if not type_id.startswith(("vehicle.", "walker.")):
-            continue
+def scene_actor_candidates(world):
+    """Return one concrete inventory of potentially confounding scene actors."""
+    return [
+        actor
+        for actor in world.get_actors()
+        if str(getattr(actor, "type_id", "")).startswith(("vehicle.", "walker."))
+    ]
+
+
+def capture_scene_actor_states(world, *, actors=None):
+    """Capture one tick-bound pre-frame transform for every scene candidate."""
+    try:
+        snapshot = world.get_snapshot()
+    except (AttributeError, RuntimeError) as exc:
+        raise VerificationError("cannot capture pre-frame CARLA scene snapshot") from exc
+    states = []
+    candidates = scene_actor_candidates(world) if actors is None else list(actors)
+    for actor in candidates:
+        actor_id = int(getattr(actor, "id", -1))
         try:
-            is_target = int(getattr(actor, "id", -1)) == int(target_actor_id)
+            actor_snapshot = snapshot.find(actor_id)
+        except (AttributeError, RuntimeError):
+            actor_snapshot = None
+        if actor_snapshot is None:
+            raise VerificationError(
+                f"pre-frame CARLA scene snapshot lacks actor {actor_id}"
+            )
+        states.append({
+            "actor": actor,
+            "actor_id": actor_id,
+            "transform": actor_snapshot.get_transform(),
+        })
+    return states
+
+
+def project_captured_scene_actor_geometries(states, camera_model, target_actor_id):
+    """Project a saved scene snapshot without any new world/actor RPC reads."""
+    geometries = {}
+    for state in states:
+        actor = state["actor"]
+        actor_id = int(state["actor_id"])
+        try:
+            is_target = actor_id == int(target_actor_id)
             geometry = project_actor_geometry(
                 actor,
                 camera_model,
-                actor_transform=actor_world_transform(world, actor),
+                actor_transform=state["transform"],
                 minimum_area_px=900.0 if is_target else 1.0,
                 minimum_dimension_px=20.0 if is_target else 1.0,
                 minimum_visibility_ratio=0.75 if is_target else 0.0,
             )
         except VerificationError:
-            if int(getattr(actor, "id", -1)) == int(target_actor_id):
+            if is_target:
                 raise
             continue
-        geometries[int(actor.id)] = geometry
+        geometries[actor_id] = geometry
     if int(target_actor_id) not in geometries:
         raise VerificationError("target UE5 actor has no acceptable scene projection")
     return geometries
+
+
+def project_scene_actor_geometries(world, camera_model, target_actor_id, *, actors=None):
+    """Project every potentially confounding vehicle/walker in the UE5 scene."""
+    candidates = scene_actor_candidates(world) if actors is None else list(actors)
+    states = [
+        {
+            "actor": actor,
+            "actor_id": int(actor.id),
+            "transform": actor_world_transform(world, actor),
+        }
+        for actor in candidates
+    ]
+    return project_captured_scene_actor_geometries(
+        states, camera_model, target_actor_id
+    )
+
+
+def validate_captured_scene_persistence(states_before, actors_after):
+    """Fail if a possible pre-frame occluder vanished before post-frame proof."""
+    before_ids = {int(state["actor_id"]) for state in states_before}
+    after_ids = {int(actor.id) for actor in actors_after}
+    vanished_actor_ids = sorted(before_ids - after_ids)
+    if vanished_actor_ids:
+        raise VerificationError(
+            "pre-frame UE5 scene actor vanished during frame capture: "
+            f"{vanished_actor_ids}"
+        )
+    return {"before_actor_ids": sorted(before_ids), "after_actor_ids": sorted(after_ids)}
+
+
+def validate_frame_carla_tick_bracket(frame_metadata, before_frame, after_frame):
+    """Bind the server-stamped sensor frame to independent CARLA client ticks."""
+    carla_frame = frame_metadata.get("carla_frame")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (carla_frame, before_frame, after_frame)
+    ):
+        raise VerificationError("CARLA frame bracket has invalid tick identity")
+    if not before_frame <= carla_frame <= after_frame:
+        raise VerificationError(
+            "twin sensor CARLA frame is outside the verifier tick bracket: "
+            f"{before_frame} <= {carla_frame} <= {after_frame} is false"
+        )
+    return {
+        "before_carla_frame": before_frame,
+        "sensor_carla_frame": carla_frame,
+        "after_carla_frame": after_frame,
+    }
 
 
 def validate_target_actor_exclusivity(
@@ -1700,6 +1783,7 @@ async def collect_twin_object_samples(
         evidence.setdefault("object_status_sync_frames", []).append(
             status_sync_frame
         )
+        scene_states_before = capture_scene_actor_states(world)
         status = await request_json(
             control_socket,
             {"type": "twin_status"},
@@ -1730,15 +1814,15 @@ async def collect_twin_object_samples(
             rotation_tolerance_deg=args.twin_rotation_tolerance_deg,
         )
         validate_live_twin_camera_actor(world, camera_model)
-        actor = world.get_actor(sample["actor_id"])
-        geometry_before = project_actor_geometry(
-            actor,
-            camera_model,
-            actor_transform=actor_world_transform(world, actor),
-        )
-        scene_before = project_scene_actor_geometries(
-            world, camera_model, sample["actor_id"]
-        )
+        captured_actor_ids = {
+            int(state["actor_id"]) for state in scene_states_before
+        }
+        if int(sample["actor_id"]) not in captured_actor_ids:
+            raise VerificationError(
+                "pre-frame CARLA scene snapshot lacks the mapped target actor"
+            )
+        # Keep the final status-to-frame interval free of CARLA actor/scene RPC
+        # walks. Projection uses the already captured tick-bound scene state.
         jpeg, jpeg_digest, frame_metadata, frame_skew = (
             await receive_twin_frame_packet(
                 stream_socket,
@@ -1751,21 +1835,32 @@ async def collect_twin_object_samples(
             )
         )
         previous_frame_count = frame_metadata["frame_count"]
+        scene_before = project_captured_scene_actor_geometries(
+            scene_states_before, camera_model, sample["actor_id"]
+        )
+        geometry_before = scene_before[int(sample["actor_id"])]
+        post_capture_sync_frame = synchronize_world(world, min(1.0, remaining))
         evidence.setdefault("object_sync_frames", []).append(
-            synchronize_world(world, min(1.0, remaining))
+            post_capture_sync_frame
+        )
+        frame_tick_bracket = validate_frame_carla_tick_bracket(
+            frame_metadata, status_sync_frame, post_capture_sync_frame
         )
         validate_live_twin_camera_actor(world, camera_model)
+        actors_after = scene_actor_candidates(world)
+        scene_persistence = validate_captured_scene_persistence(
+            scene_states_before, actors_after
+        )
+        scene_states_after = capture_scene_actor_states(
+            world, actors=actors_after
+        )
         actor_after = world.get_actor(sample["actor_id"])
         if actor_after is None:
             raise VerificationError("mapped UE5 actor disappeared during frame capture")
-        geometry_after = project_actor_geometry(
-            actor_after,
-            camera_model,
-            actor_transform=actor_world_transform(world, actor_after),
+        scene_after = project_captured_scene_actor_geometries(
+            scene_states_after, camera_model, sample["actor_id"]
         )
-        scene_after = project_scene_actor_geometries(
-            world, camera_model, sample["actor_id"]
-        )
+        geometry_after = scene_after[int(sample["actor_id"])]
         detections = detect_twin_objects(
             jpeg,
             detector,
@@ -1807,6 +1902,8 @@ async def collect_twin_object_samples(
                 )
             },
             "frame_replay_skew_seconds": round(frame_skew, 6),
+            "frame_tick_bracket": frame_tick_bracket,
+            "scene_persistence": scene_persistence,
             "before_capture": {
                 **before_match,
                 "actor_geometry": geometry_before,
