@@ -7,6 +7,35 @@ description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252
 
 Treat this file as an operating procedure, not proof of current state. Re-run the read-only baseline before every intervention.
 
+## Current replay-protocol safety hold
+
+Observed on 2026-07-11 UTC; verify rather than assume:
+
+- Canonical source through `299efc56f55f9775f0d583e8f56f5d0e791674c4`
+  contains hash-bound twin camera/frame metadata and stricter replay acceptance,
+  but that protocol runtime is **not deployed** on the Path PC.
+- The live checkout was deliberately rolled back to clean
+  `094ffca0e36e57330e0dc89926a0fd5d6fd3aa2a` after bounded replay
+  diagnostics correlated with eight `v2x-carla-rr.service` automatic
+  restarts and exit status 139. The failed-canary report is
+  `/home/path/V2XCarla/v2x-evidence/twin-protocol/20260711T0415Z-canary/report.md`.
+- Do not redeploy or retry the new replay protocol merely because its unit
+  tests, GitHub merge, mirror sync, or Amplify release passed. First isolate
+  the UE5.5 worker crash in a bounded V2X-owned canary and prove that the
+  CARLA and Drive restart counters do not increase.
+- Before any replay mutation, record `NRestarts`, `ExecMainStartTimestamp`,
+  container start time, zero active sessions, and LIVE mode. Hold all three
+  mutation-capable timers. On any UE5 exit-139, `world.tick() failed:
+  std::exception`, listener loss, or restart-counter increment, stop the
+  Drive client workload, restore the last verified bundle/source, re-prove
+  LIVE/zero-session state, restore timers, and keep the canary failed.
+- The archived white-car evidence for `global_car_4db7ffc8_2` passed
+  independent ch3/ch4 physical-frame recovery and ConvNeXt similarity, but
+  the matching ch4 UE5 replay still failed the unchanged final visual gate:
+  `no compatible visual detection overlaps the projected UE5 actor`.
+  This is a calibration/placement blocker, not a reason to lower projection,
+  visibility, YOLO, or identity thresholds.
+
 ## Safety boundaries
 
 - Work locally when already on `path-B860I-AORUS-PRO-ICE`; do not SSH back into the same host.
