@@ -1943,6 +1943,11 @@ Before changing live services:
 4. Stop both repair timers and the hourly restart timer.
 5. Capture installed unit hashes, process commands, container image ID, live Git status, tunnel/runtime config, ignored-model/cache hashes, perception Python/pip state, and service logs.
 6. Preserve rollback copies of installed units, ignored runtime assets, and the live repository changes.
+   Use `scripts/capture-v2x-rollback.sh` in its default plan mode first. After
+   the timers are stopped, run `ACTION=capture`, then require `ACTION=verify`
+   against the new bundle; verification rehearses tracked, staged, unstaged,
+   and untracked repository restoration in an isolated clone without changing
+   the live checkout.
 7. Let `v2x-carla-rr.service` adopt an already-running validated container through `docker wait`; do not restart or recreate it merely to add supervision.
 8. Install one layer at a time and refresh UI/API evidence after each action.
 9. Start perception with `/etc/v2x-perception.env` keeping `V2X_PERCEPTION_UPLOAD=false`; require four fresh/changing feeds before enabling production uploads and proving a current DynamoDB record.
