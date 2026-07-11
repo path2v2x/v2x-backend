@@ -386,6 +386,17 @@ require similarity at least `0.60` for every slow-path vehicle reattachment
 and persist the association method, similarity, threshold, devices, time, and
 distance. Missing appearance evidence fails closed rather than falling back to
 proximity alone.
+Live vehicle association must also require exact trusted schema-v2 HLS media
+time and reject missing, non-finite, or combined localization uncertainty above
+2.0 m. Never clamp a large uncertainty into the accepted association radius,
+and record rather than silently overwrite a car/truck/bus class conflict.
+When two vehicle candidates have insufficient spatial/appearance separation,
+reject association, persist bounded ambiguity evidence, and start a distinct
+track. Never let greedy input order choose between adjacent plausible cars.
+Every tracked camera must provide finite measured `localization.pixel_sigma`
+and `localization.calibration_uncertainty_m` no greater than 2.0 m. Missing
+values block perception startup; never fill them from rejected exploratory or
+matcher-generated calibration rows.
 
 The 24-hour persistence gate is paginated and fail-closed. Require every
 camera to have trusted schema-v2 events spanning at least 23 hours and a recent
