@@ -394,6 +394,14 @@ require similarity at least `0.60` for every slow-path vehicle reattachment
 and persist the association method, similarity, threshold, devices, time, and
 distance. Missing appearance evidence fails closed rather than falling back to
 proximity alone.
+Live vehicle association must also require exact trusted schema-v2 HLS media
+time and reject missing, non-finite, or combined localization uncertainty above
+2.0 m. Never clamp a large uncertainty into the accepted association radius,
+and record rather than silently overwrite a car/truck/bus class conflict.
+Every tracked camera must provide finite measured `localization.pixel_sigma`
+and `localization.calibration_uncertainty_m` no greater than 2.0 m. Missing
+values block perception startup; never fill them from rejected exploratory or
+matcher-generated calibration rows.
 
 The 24-hour persistence gate is paginated and fail-closed. Require every
 camera to have trusted schema-v2 events spanning at least 23 hours and a recent
@@ -523,7 +531,9 @@ The exact-object gate must retain one CARLA actor ID over at least three replay
 samples and require a compatible YOLO detection to overlap that actor's
 projected 3-D bounding box in each corresponding twin JPEG. The stream's
 `twin_hello` must carry the exact UE5 camera actor ID, transform, dimensions,
-FOV, lens values, and camera-config SHA-256 used for projection. Until the
+FOV, all six CARLA lens attributes, and camera-config SHA-256 used for
+projection. Configure every lens attribute explicitly per camera so a shared
+blueprint cannot leak one channel's optical settings into another. Until the
 tracked projection model supports a measured nonzero CARLA `lens_k` or
 `lens_kcube`, fail closed rather than treating pinhole projection as equivalent.
 Each JPEG must also be preceded by hash-matching `twin_frame` metadata with an
@@ -534,7 +544,12 @@ attributes. Require before/after capture projection overlap with the same YOLO
 bbox, at least 0.50 matched confidence, 0.15 IoU, 0.50 actor coverage, 75% of
 the raw actor projection in frame, and an allowlisted YOLO model hash. Project
 all live vehicles/walkers and reject foreground occlusion or a neighboring
-actor that explains the detection within the fixed exclusivity margin. Across
+actor that explains the detection within the fixed exclusivity margin. Apply
+target-grade size/visibility thresholds only to the target; retain small or
+partly clipped projected actors as potential confounders. Lane lookup may
+provide vehicle height and yaw but must never replace the GPS-derived planar
+position. Require the reported and independently recomputed raw-to-actor
+planar error to remain at or below 0.10 m. Across
 the three samples, require distinct JPEGs and image-space detection motion that
 agrees with the target actor's projected direction and displacement. CLI
 overrides may tighten these floors but must never weaken them.

@@ -11,6 +11,7 @@ from tools.verify_phase4_live import (
     build_parser,
     choose_teleport_target,
     project_world_xyz,
+    project_scene_actor_geometries,
     receive_binary_frame,
     receive_twin_frame_packet,
     receive_json,
@@ -56,7 +57,14 @@ def twin_camera_hello(camera_id="ch1"):
                 "height": 960,
                 "horizontal_fov_deg": 90.0,
             },
-            "lens": {"lens_k": 0.0, "lens_kcube": 0.0},
+            "lens": {
+                "lens_k": 0.0,
+                "lens_kcube": 0.0,
+                "lens_circle_falloff": 5.0,
+                "lens_circle_multiplier": 0.0,
+                "lens_x_size": 0.08,
+                "lens_y_size": 0.08,
+            },
         },
     }
 
@@ -175,6 +183,9 @@ class FakeWorld:
     def get_actor(self, actor_id):
         return self.actors.get(actor_id)
 
+    def get_actors(self):
+        return list(self.actors.values())
+
 
 def twin_status(
     *,
@@ -208,6 +219,9 @@ def twin_status(
                 "actor_id": actor_id,
                 "actor_present": True,
                 "actor_type": actor_type,
+                "raw_carla_location": {"x": x, "y": y, "z": 0.0},
+                "target_carla_location": {"x": x, "y": y, "z": 0.3},
+                "placement_planar_error_m": 0.0,
                 "carla_transform": {
                     "location": {"x": x, "y": y, "z": 0.3},
                     "rotation": {"pitch": 0.0, "yaw": 12.0, "roll": 0.0},
@@ -259,6 +273,10 @@ def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
         "fov": "90.0",
         "lens_k": "0.0",
         "lens_kcube": "0.0",
+        "lens_circle_falloff": "5.0",
+        "lens_circle_multiplier": "0.0",
+        "lens_x_size": "0.08",
+        "lens_y_size": "0.08",
     })
     evidence = validate_live_twin_camera_actor(FakeWorld([actor]), model)
     assert evidence["actor_id"] == 33
@@ -342,6 +360,55 @@ def test_target_actor_exclusivity_rejects_occluder_and_ambiguous_neighbor():
         validate_target_actor_exclusivity(
             77, {77: target, 89: neighbor}, [105, 100, 200, 200]
         )
+
+
+def test_scene_projection_keeps_small_confounders_for_exclusivity(monkeypatch):
+    target = FakeActor(actor_id=77)
+    confounder = FakeActor(actor_id=88)
+    world = FakeWorld([target, confounder])
+    quality = {}
+
+    def fake_project(actor, _camera_model, *, enforce_target_quality=True):
+        quality[actor.id] = enforce_target_quality
+        return {
+            "actor_id": actor.id,
+            "bbox": (100.0, 100.0, 200.0, 200.0),
+            "minimum_depth_m": 10.0,
+        }
+
+    monkeypatch.setattr(live_probe, "project_actor_geometry", fake_project)
+    geometries = project_scene_actor_geometries(world, {}, 77)
+    assert set(geometries) == {77, 88}
+    assert quality == {77: True, 88: False}
+
+
+def test_twin_object_rejects_planar_lane_snap_masking():
+    status = twin_status()
+    status["objects"][0]["raw_carla_location"]["x"] = 7.0
+    actor = FakeActor()
+    with pytest.raises(VerificationError, match="planar placement diverges"):
+        validate_twin_object_sample(
+            status,
+            "global_car_run_1",
+            FakeWorld([actor]),
+            position_tolerance_m=0.5,
+            rotation_tolerance_deg=1.0,
+        )
+
+
+def test_twin_object_allows_actor_lerp_toward_exact_planar_target():
+    status = twin_status()
+    status["objects"][0]["carla_transform"]["location"]["x"] = 9.0
+    actor = FakeActor(transform=FakeTransform(9.0, 20.0, 0.3, yaw=12.0))
+    evidence = validate_twin_object_sample(
+        status,
+        "global_car_run_1",
+        FakeWorld([actor]),
+        position_tolerance_m=0.5,
+        rotation_tolerance_deg=1.0,
+    )
+    assert evidence["raw_planar_error_m"] == 0.0
+    assert evidence["reported_transform"]["location"]["x"] == 9.0
 
 
 def test_visual_motion_rejects_detection_moving_against_actor_projection():

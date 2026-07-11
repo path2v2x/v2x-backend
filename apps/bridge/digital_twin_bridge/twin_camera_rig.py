@@ -116,7 +116,14 @@ def configure_twin_camera_blueprint(
     if fps is not None:
         camera_bp.set_attribute("sensor_tick", f"{1.0 / float(fps):.6f}")
 
-    lens = {"lens_k": 0.0, "lens_kcube": 0.0}
+    lens = {
+        "lens_k": 0.0,
+        "lens_kcube": 0.0,
+        "lens_circle_falloff": 5.0,
+        "lens_circle_multiplier": 0.0,
+        "lens_x_size": 0.08,
+        "lens_y_size": 0.08,
+    }
     lens.update(camera.get("twin_lens") or {})
     for key in (
         "lens_k",
@@ -126,8 +133,6 @@ def configure_twin_camera_blueprint(
         "lens_x_size",
         "lens_y_size",
     ):
-        if key not in lens:
-            continue
         try:
             camera_bp.set_attribute(key, str(float(lens[key])))
         except (IndexError, RuntimeError, TypeError, ValueError):
@@ -358,7 +363,14 @@ class TwinCameraRig:
         if actor is None or camera is None:
             return None
         transform = actor.get_transform()
-        lens = {"lens_k": 0.0, "lens_kcube": 0.0}
+        lens = {
+            "lens_k": 0.0,
+            "lens_kcube": 0.0,
+            "lens_circle_falloff": 5.0,
+            "lens_circle_multiplier": 0.0,
+            "lens_x_size": 0.08,
+            "lens_y_size": 0.08,
+        }
         lens.update(camera.get("twin_lens") or {})
         canonical = json.dumps(
             camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -384,11 +396,7 @@ class TwinCameraRig:
                 "height": self._image_height,
                 "horizontal_fov_deg": float(twin_horizontal_fov_deg(camera)),
             },
-            "lens": {
-                key: float(value)
-                for key, value in lens.items()
-                if key in {"lens_k", "lens_kcube"}
-            },
+            "lens": {key: float(value) for key, value in lens.items()},
         }
 
     def status(self) -> dict:

@@ -248,7 +248,7 @@ def project_world_xyz(point, camera_model):
     )
 
 
-def project_actor_geometry(actor, camera_model):
+def project_actor_geometry(actor, camera_model, *, enforce_target_quality=True):
     """Project one UE5 actor with clipping and depth evidence."""
     bounding_box = getattr(actor, "bounding_box", None)
     if bounding_box is None or not hasattr(bounding_box, "get_world_vertices"):
@@ -278,7 +278,7 @@ def project_actor_geometry(actor, camera_model):
     clipped_width = clipped[2] - clipped[0]
     clipped_height = clipped[3] - clipped[1]
     visibility_ratio = area / raw_area if raw_area > 0.0 else 0.0
-    if (
+    if enforce_target_quality and (
         area < 900.0
         or clipped_width < 20.0
         or clipped_height < 20.0
@@ -404,7 +404,13 @@ def project_scene_actor_geometries(world, camera_model, target_actor_id):
         if not type_id.startswith(("vehicle.", "walker.")):
             continue
         try:
-            geometry = project_actor_geometry(actor, camera_model)
+            geometry = project_actor_geometry(
+                actor,
+                camera_model,
+                enforce_target_quality=(
+                    int(getattr(actor, "id", -1)) == int(target_actor_id)
+                ),
+            )
         except VerificationError:
             if int(getattr(actor, "id", -1)) == int(target_actor_id):
                 raise
@@ -788,7 +794,15 @@ def validate_twin_camera_model(
     ):
         raise VerificationError("twin camera model image geometry is invalid")
     lens = model.get("lens")
-    if not isinstance(lens, dict) or set(lens) != {"lens_k", "lens_kcube"}:
+    expected_lens_keys = {
+        "lens_k",
+        "lens_kcube",
+        "lens_circle_falloff",
+        "lens_circle_multiplier",
+        "lens_x_size",
+        "lens_y_size",
+    }
+    if not isinstance(lens, dict) or set(lens) != expected_lens_keys:
         raise VerificationError("twin camera model lens geometry is invalid")
     if any(
         isinstance(value, bool)
@@ -842,6 +856,14 @@ def validate_live_twin_camera_actor(world, camera_model):
         "fov": float(image["horizontal_fov_deg"]),
         "lens_k": float(camera_model["lens"]["lens_k"]),
         "lens_kcube": float(camera_model["lens"]["lens_kcube"]),
+        "lens_circle_falloff": float(
+            camera_model["lens"]["lens_circle_falloff"]
+        ),
+        "lens_circle_multiplier": float(
+            camera_model["lens"]["lens_circle_multiplier"]
+        ),
+        "lens_x_size": float(camera_model["lens"]["lens_x_size"]),
+        "lens_y_size": float(camera_model["lens"]["lens_y_size"]),
     }
     for key, expected_value in expected_attributes.items():
         try:
@@ -974,6 +996,26 @@ def validate_twin_object_sample(
         item.get("carla_transform"), "twin_status object"
     )
     observed = _actor_transform_payload(actor)
+    raw_location = item.get("raw_carla_location")
+    target_location = item.get("target_carla_location")
+    if not isinstance(raw_location, dict) or not isinstance(target_location, dict):
+        raise VerificationError(
+            "twin object has no raw/target CARLA placement evidence"
+        )
+    try:
+        raw_x = float(raw_location["x"])
+        raw_y = float(raw_location["y"])
+        target_x = float(target_location["x"])
+        target_y = float(target_location["y"])
+        reported_planar_error = float(item.get("placement_planar_error_m"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VerificationError(
+            "twin object raw placement evidence is invalid"
+        ) from exc
+    if not all(math.isfinite(value) for value in (
+        raw_x, raw_y, target_x, target_y, reported_planar_error
+    )):
+        raise VerificationError("twin object raw placement evidence is invalid")
     reported_location = reported["location"]
     observed_location = observed["location"]
     position_error = math.sqrt(
@@ -989,6 +1031,18 @@ def validate_twin_object_sample(
         for axis in ("pitch", "yaw", "roll")
     }
     rotation_error = max(rotation_errors.values())
+    raw_planar_error = math.hypot(
+        target_x - raw_x,
+        target_y - raw_y,
+    )
+    if (
+        raw_planar_error > 0.10
+        or reported_planar_error > 0.10
+        or abs(raw_planar_error - reported_planar_error) > 0.01
+    ):
+        raise VerificationError(
+            "twin actor planar placement diverges from GPS-derived CARLA location"
+        )
     if position_error > position_tolerance_m or rotation_error > rotation_tolerance_deg:
         raise VerificationError(
             "twin_status transform does not match the mapped UE5 CARLA actor: "
@@ -1011,6 +1065,11 @@ def validate_twin_object_sample(
         "observed_transform": observed,
         "position_error_m": round(position_error, 3),
         "rotation_error_deg": round(rotation_error, 3),
+        "raw_planar_error_m": round(raw_planar_error, 3),
+        "target_location": {
+            "x": target_x,
+            "y": target_y,
+        },
     }
 
 

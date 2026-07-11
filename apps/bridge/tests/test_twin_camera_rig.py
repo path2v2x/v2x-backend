@@ -72,6 +72,10 @@ class TestIntrinsics:
         configure_twin_camera_blueprint(blueprint, CAMERA, 1280, 960, 12.0)
         assert str(blueprint.get_attribute("lens_k")) == "0.0"
         assert str(blueprint.get_attribute("lens_kcube")) == "0.0"
+        assert str(blueprint.get_attribute("lens_circle_falloff")) == "5.0"
+        assert str(blueprint.get_attribute("lens_circle_multiplier")) == "0.0"
+        assert str(blueprint.get_attribute("lens_x_size")) == "0.08"
+        assert str(blueprint.get_attribute("lens_y_size")) == "0.08"
         assert float(str(blueprint.get_attribute("sensor_tick"))) == pytest.approx(
             1 / 12, abs=1e-6
         )
@@ -80,6 +84,10 @@ class TestIntrinsics:
         configure_twin_camera_blueprint(blueprint, measured, 1280, 960)
         assert str(blueprint.get_attribute("lens_k")) == "-0.2"
         assert str(blueprint.get_attribute("lens_kcube")) == "0.03"
+
+        configure_twin_camera_blueprint(blueprint, CAMERA, 1280, 960)
+        assert str(blueprint.get_attribute("lens_k")) == "0.0"
+        assert str(blueprint.get_attribute("lens_x_size")) == "0.08"
 
 
 class TestMapGate:
@@ -203,7 +211,14 @@ class TestTwinCameraRig:
         assert model["image"]["horizontal_fov_deg"] == pytest.approx(
             horizontal_fov_deg(CAMERA["intrinsics"])
         )
-        assert model["lens"] == {"lens_k": 0.0, "lens_kcube": 0.0}
+        assert model["lens"] == {
+            "lens_k": 0.0,
+            "lens_kcube": 0.0,
+            "lens_circle_falloff": 5.0,
+            "lens_circle_multiplier": 0.0,
+            "lens_x_size": 0.08,
+            "lens_y_size": 0.08,
+        }
         assert model["transform"]["location"]["z"] == pytest.approx(7.0)
         assert rig.camera_model("ch9") is None
 
