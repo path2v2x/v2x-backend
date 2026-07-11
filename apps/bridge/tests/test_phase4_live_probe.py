@@ -288,6 +288,36 @@ def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
         validate_live_twin_camera_actor(FakeWorld([actor]), model)
 
 
+def test_rr_sensor_zero_transform_uses_tracked_config_proof():
+    model = validate_twin_camera_model(twin_camera_hello(), "ch1")
+    model["expected_config_transform"] = model["transform"]
+    actor = FakeActor(
+        actor_id=33,
+        type_id="sensor.camera.rgb",
+        role_name="twin_rig",
+        transform=FakeTransform(0.0, 0.0, 0.0),
+    )
+    actor.attributes.update({
+        "image_size_x": "1280",
+        "image_size_y": "960",
+        "fov": "90.0",
+        "lens_k": "0.0",
+        "lens_kcube": "0.0",
+        "lens_circle_falloff": "5.0",
+        "lens_circle_multiplier": "0.0",
+        "lens_x_size": "0.08",
+        "lens_y_size": "0.08",
+    })
+
+    evidence = validate_live_twin_camera_actor(FakeWorld([actor]), model)
+
+    assert evidence["transform_source"] == (
+        "tracked_config_rr_sensor_snapshot_unavailable"
+    )
+    assert evidence["position_error_m"] is None
+    assert evidence["configured_position_error_m"] == 0.0
+
+
 def test_projects_world_point_through_fingerprinted_camera_model():
     model = twin_camera_hello()["camera_model"]
     model["transform"] = {

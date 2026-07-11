@@ -771,6 +771,86 @@ def cameras_config_fingerprint(path):
     return hashlib.sha256(canonical).hexdigest()
 
 
+def expected_twin_camera_transform(world, path, camera_id):
+    """Recompute the configured sensor pose independently for RR/CARLA 0.10.
+
+    RR camera actors are resolvable by ID but are absent from world snapshots,
+    and an independent client receives a zero transform for them.  Bind the
+    server-advertised spawn transform to the exact tracked site/camera JSON and
+    the live map georeference instead of accepting that zero placeholder.
+    """
+    try:
+        payload = json.loads(Path(path).read_text())
+        site = payload["site"]
+        camera = next(
+            item for item in payload["cameras"] if item.get("id") == camera_id
+        )
+        carla_map = world.get_map()
+        import carla
+
+        origin = carla_map.transform_to_geolocation(carla.Location())
+        latitude = float(site["lat"])
+        longitude = float(site["lon"])
+        if hasattr(carla_map, "geolocation_to_transform"):
+            corrected_latitude = 2.0 * float(origin.latitude) - latitude
+            projected = carla_map.geolocation_to_transform(
+                carla.GeoLocation(
+                    latitude=corrected_latitude,
+                    longitude=longitude,
+                    altitude=0.0,
+                )
+            )
+            location = getattr(projected, "location", projected)
+        else:
+            meters_per_degree_latitude = 111_320.0
+            meters_per_degree_longitude = (
+                meters_per_degree_latitude
+                * math.cos(math.radians(float(origin.latitude)))
+            )
+            location = carla.Location(
+                x=(longitude - float(origin.longitude))
+                * meters_per_degree_longitude,
+                y=-(
+                    (latitude - float(origin.latitude))
+                    * meters_per_degree_latitude
+                ),
+                z=0.0,
+            )
+        waypoint = carla_map.get_waypoint(location, project_to_road=True)
+        if waypoint is not None:
+            location.z = float(waypoint.transform.location.z)
+        pose = camera.get("twin_pose") or {}
+        yaw = (
+            float(camera["heading_deg"])
+            + float(camera["yaw_deg"])
+            + float(pose.get("yaw_offset_deg", 0.0))
+            - 90.0
+        )
+        yaw = (yaw + 180.0) % 360.0 - 180.0
+        pitch = float(camera["pitch_deg"]) + float(
+            pose.get("pitch_offset_deg", 0.0)
+        )
+        location.z += float(camera["height_m"]) + float(
+            pose.get("height_offset_m", 0.0)
+        )
+        forward = float(pose.get("forward_offset_m", 0.5))
+        location.x += forward * math.cos(math.radians(yaw))
+        location.y += forward * math.sin(math.radians(yaw))
+    except (KeyError, OSError, StopIteration, TypeError, ValueError) as exc:
+        raise VerificationError(
+            "tracked camera transform cannot be independently recomputed"
+        ) from exc
+    expected = {
+        "location": {
+            "x": float(location.x),
+            "y": float(location.y),
+            "z": float(location.z),
+        },
+        "rotation": {"pitch": pitch, "yaw": yaw, "roll": 0.0},
+    }
+    return _finite_transform_payload(expected, "tracked camera transform")
+
+
 def validate_twin_camera_model(
     hello,
     expected_camera_id,
@@ -871,20 +951,78 @@ def validate_live_twin_camera_actor(world, camera_model):
     attributes = getattr(actor, "attributes", None) or {}
     if attributes.get("role_name") != "twin_rig":
         raise VerificationError("advertised twin camera actor has unexpected role")
-    observed = _actor_transform_payload(actor)
     expected = camera_model["transform"]
-    position_error = math.sqrt(sum(
-        (observed["location"][axis] - expected["location"][axis]) ** 2
-        for axis in ("x", "y", "z")
-    ))
-    rotation_error = max(
-        _angular_error(
-            observed["rotation"][axis], expected["rotation"][axis]
+    configured = camera_model.get("expected_config_transform")
+
+    def transform_errors(left, right):
+        return (
+            math.sqrt(sum(
+                (left["location"][axis] - right["location"][axis]) ** 2
+                for axis in ("x", "y", "z")
+            )),
+            max(
+                _angular_error(
+                    left["rotation"][axis], right["rotation"][axis]
+                )
+                for axis in ("pitch", "yaw", "roll")
+            ),
         )
-        for axis in ("pitch", "yaw", "roll")
-    )
-    if position_error > 0.01 or rotation_error > 0.05:
-        raise VerificationError("advertised twin camera transform drifted from UE5 actor")
+
+    configured_position_error = None
+    configured_rotation_error = None
+    if configured is not None:
+        configured_position_error, configured_rotation_error = transform_errors(
+            expected, configured
+        )
+        if configured_position_error > 0.01 or configured_rotation_error > 0.05:
+            raise VerificationError(
+                "advertised twin camera transform drifted from tracked config"
+            )
+
+    observed = _actor_transform_payload(actor)
+    snapshot = None
+    try:
+        snapshot = world.get_snapshot().find(camera_model["actor_id"])
+    except (AttributeError, RuntimeError):
+        pass
+    if snapshot is not None:
+        observed = _finite_transform_payload(
+            _actor_transform_payload(snapshot), "CARLA sensor snapshot"
+        )
+        transform_source = "carla_world_snapshot"
+    else:
+        observed_numbers = [
+            number
+            for group in observed.values()
+            for number in group.values()
+        ]
+        expected_numbers = [
+            number
+            for group in expected.values()
+            for number in group.values()
+        ]
+        rr_zero_placeholder = (
+            all(abs(number) <= 1e-9 for number in observed_numbers)
+            and any(abs(number) > 1e-9 for number in expected_numbers)
+        )
+        if rr_zero_placeholder:
+            if configured is None:
+                raise VerificationError(
+                    "RR sensor transform is unavailable without tracked config proof"
+                )
+            observed = None
+            transform_source = "tracked_config_rr_sensor_snapshot_unavailable"
+        else:
+            transform_source = "carla_actor_rpc"
+
+    position_error = None
+    rotation_error = None
+    if observed is not None:
+        position_error, rotation_error = transform_errors(observed, expected)
+        if position_error > 0.01 or rotation_error > 0.05:
+            raise VerificationError(
+                "advertised twin camera transform drifted from UE5 actor"
+            )
     image = camera_model["image"]
     expected_attributes = {
         "image_size_x": float(image["width"]),
@@ -916,8 +1054,23 @@ def validate_live_twin_camera_actor(world, camera_model):
     return {
         "actor_id": int(actor.id),
         "type_id": str(actor.type_id),
-        "position_error_m": round(position_error, 6),
-        "rotation_error_deg": round(rotation_error, 6),
+        "transform_source": transform_source,
+        "position_error_m": (
+            None if position_error is None else round(position_error, 6)
+        ),
+        "rotation_error_deg": (
+            None if rotation_error is None else round(rotation_error, 6)
+        ),
+        "configured_position_error_m": (
+            None
+            if configured_position_error is None
+            else round(configured_position_error, 6)
+        ),
+        "configured_rotation_error_deg": (
+            None
+            if configured_rotation_error is None
+            else round(configured_rotation_error, 6)
+        ),
     }
 
 
@@ -1544,6 +1697,11 @@ async def verify_twin(args, world=None):
             cameras_config_fingerprint(args.cameras_json),
         )
         if world is not None:
+            evidence["validated_camera_model"]["expected_config_transform"] = (
+                expected_twin_camera_transform(
+                    world, args.cameras_json, args.twin_camera
+                )
+            )
             evidence["validated_camera_actor"] = validate_live_twin_camera_actor(
                 world, evidence["validated_camera_model"]
             )
