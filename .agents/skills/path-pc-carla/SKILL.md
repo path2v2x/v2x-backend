@@ -395,6 +395,32 @@ If the retained render visibly contradicts the real view, fail the candidate
 even when a point-only threshold passes; do not weaken thresholds or relabel
 matcher-generated points to make it green.
 
+Manual four-camera evidence must use one JSON annotation artifact per channel.
+Points require `provenance="manually_verified_unique"`, at least eight frozen
+train and four untouched holdouts. Road edges, lane markings, and crosswalk
+geometry require `provenance="manually_traced_geometry"`, at least three train
+and two holdout polylines. Include the exact real/twin frame SHA-256 values;
+never translate `manual_verified_static`, matcher proposals, or vague repeated
+line points into the accepted provenance labels.
+
+Only in an authorized mutation window with zero Drive sessions, resolve those
+twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
+
+```bash
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  /home/path/V2XCarla/v2x-backend/apps/bridge/tools/build_twin_calibration_manifest.py \
+  /path/to/ch1-annotations.json /tmp/ch1-calibration-manifest.json \
+  --camera ch1 \
+  --real-frame /path/to/real-ch1.jpg \
+  --twin-frame /path/to/twin-ch1.jpg \
+  --cameras-json /home/path/V2XCarla/v2x-backend/config/cameras.json
+```
+
+The builder must destroy its owned depth sensor in `finally`. Preserve the
+manifest's annotation, camera-file, per-camera, real-frame, twin-frame, depth
+frame, and map fingerprints. Run `optimize_twin_road_geometry.py` only on this
+generated manifest; a hand-converted CSV is not acceptance evidence.
+
 Actor visual proof must also be reproducible across bridge restarts: choose UE5
 blueprints with a stable digest rather than Python's randomized `hash()`. For a
 same-car gate, require the projected actor bbox/centroid in the matched twin
