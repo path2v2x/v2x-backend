@@ -12,24 +12,27 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 Observed on 2026-07-11 UTC; verify rather than assume:
 
 - Canonical source and the clean live checkout are
-  `205069271e1940e0de8019e5629691aa1c0fd924`. This metadata-safe revision
-  reads lens attributes from spawned UE5 actors, refuses configured lens
-  overrides, and provides a read-only `--verify-twin-metadata` canary.
+  `061b2eb884a729797d764e177bb8535cea3c6288`. This revision reads lens
+  attributes from spawned UE5 actors, refuses configured lens overrides,
+  accepts only CARLA's complete actor-observed default pinhole tuple, and
+  binds replay frames to tick-bound pre/post scene snapshots.
 - The earlier replay-capable runtime was rolled back to
   `094ffca0e36e57330e0dc89926a0fd5d6fd3aa2a` after bounded replay diagnostics
   correlated with eight `v2x-carla-rr.service` automatic restarts and exit
   status 139. The failed-canary report remains at
   `/home/path/V2XCarla/v2x-evidence/twin-protocol/20260711T0415Z-canary/report.md`.
-- Revision `2050692` passed the four-channel read-only metadata canary both
+- Revisions `2050692` through `061b2eb` passed the four-channel read-only metadata canary both
   before and after a full scheduled CARLA/Drive restart. Each fresh-spawn gate
   was followed by a 120-second zero-restart watch with no container-death or
   exit-139 signature. Durable evidence is in
   `/home/path/V2XCarla/v2x-evidence/twin-protocol/20260711T0457Z-metadata-canary/report.md`.
-- Metadata/live operation is deployed, but replay mutation remains on safety
-  hold. Do not run replay merely because metadata, unit tests, GitHub merge,
-  mirror sync, or Amplify release passed. Replay needs a separately bounded
-  gate after the projection model handles actor-observed lens distortion and
-  the unchanged same-car visual/geometric acceptance gate passes.
+- Metadata/live operation and the crash-safe replay verifier are deployed.
+  Exact replay no longer mutates lens attributes and a bounded ch4 run kept
+  CARLA/Drive at zero restarts, proved clock/scene synchronization and cleanup,
+  then failed the unchanged final visual gate. Evidence is at
+  `/home/path/V2XCarla/v2x-evidence/twin-replay/20260711T0546Z-default-lens-canary/report.md`.
+  Replay remains an acceptance-only mutation: do not repeat it without a new
+  calibration/localization candidate and a bounded maintenance gate.
 - Before any replay mutation, record `NRestarts`, `ExecMainStartTimestamp`,
   container start time, zero active sessions, and LIVE mode. Hold all three
   mutation-capable timers. On any UE5 exit-139, `world.tick() failed:
