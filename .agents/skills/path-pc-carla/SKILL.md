@@ -1664,6 +1664,16 @@ and persist the association method, similarity, threshold, devices, time, and
 distance. Missing appearance evidence fails closed rather than falling back to
 proximity alone.
 
+The 24-hour persistence gate is paginated and fail-closed. Require every
+camera to have trusted schema-v2 events spanning at least 23 hours and a recent
+upload; a query over a 24-hour window is not itself proof of 24-hour history:
+
+```bash
+/home/path/V2XCarla/perception-venv/bin/python \
+  /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_detection_persistence.py \
+  https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com
+```
+
 Twin camera alignment is a separate gate from channel wiring. The existing
 perception CSVs contain only 4-7 local-XZ points per channel, no independent
 holdouts, no global landmark IDs, and internally inconsistent shared points;
