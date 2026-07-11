@@ -48,7 +48,7 @@ Observed on 2026-07-10 UTC; verify rather than assume:
 | Frontend | Vite on `0.0.0.0:5173`, `v2x-web.service`; do not inject browser-local `VITE_DRIVE_WS_URL` |
 | Perception | `0.0.0.0:8090`, `v2x-perception.service` |
 | Perception Python | `/home/path/V2XCarla/perception-venv/bin/python` (observed Python 3.12.3) |
-| Perception assets | ignored live `apps/perception/yolov8n.pt` plus `~/.cache/torch/hub/checkpoints/mobilenet_v3_small-047dcff4.pth`; hash and preserve both |
+| Perception assets | ignored live `apps/perception/yolov8n.pt` plus pinned `~/.cache/torch/hub/checkpoints/mobilenet_v3_small-047dcff4.pth` and `convnext_base-6075fbad.pth`; hash and preserve all three |
 | Drive tunnel | `v2x-cloudflared-drive.service`; currently Quick Tunnel unless a named-tunnel gate has completed |
 | Perception tunnel | `v2x-cloudflared-perception.service`; currently Quick Tunnel unless a named-tunnel gate has completed |
 | Public API | `https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com` |
@@ -366,6 +366,26 @@ a changed twin JPEG as same-object proof. Require the selected `object_id` in a
 map to an `actor_present=true` UE5 CARLA `actor_id`, type, role, and transform.
 Require three status samples spanning at least two replay seconds, one stable
 actor ID, and at least 0.25 m of movement; validate the actor directly in CARLA.
+
+A shared database `object_id` across cameras is not itself identity proof. For
+vehicles, require two independently passing historical reports, exact archived
+frame hashes, different cameras, bounded transit time, and the pinned ConvNeXt
+appearance gate before replay acceptance:
+
+```bash
+/home/path/V2XCarla/perception-venv/bin/python \
+  /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_cross_camera_identity.py \
+  --left-report /tmp/ch4-report.json --left-frame /tmp/ch4-frame.jpg \
+  --right-report /tmp/ch1-report.json --right-frame /tmp/ch1-frame.jpg \
+  --output /tmp/cross-camera-identity.json --device cuda
+```
+
+Production association must compute pinned ConvNeXt embeddings for vehicles,
+require similarity at least `0.60` for every slow-path vehicle reattachment
+(same or cross camera), never share a cache entry when `track_id` is absent,
+and persist the association method, similarity, threshold, devices, time, and
+distance. Missing appearance evidence fails closed rather than falling back to
+proximity alone.
 
 Twin camera alignment is a separate gate from channel wiring. The existing
 perception CSVs contain only 4-7 local-XZ points per channel, no independent

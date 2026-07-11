@@ -279,10 +279,29 @@ class RunScopedIdentityTests(unittest.TestCase):
         self.assertEqual(first["perception_run_id"], run_one)
         self.assertEqual(first["track_id"], 7)
 
+    def test_vehicle_embedding_cache_never_aliases_missing_track_ids(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        pipeline.vehicle_embedding_cache = {}
+        pipeline.vehicle_extractor = Mock()
+        pipeline.vehicle_extractor.extract.side_effect = [
+            np.array([1.0, 0.0]),
+            np.array([0.0, 1.0]),
+        ]
+        detection = self.detection()
+        detection["track_id"] = None
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        first = pipeline._vehicle_embedding(frame, detection, 1)
+        second = pipeline._vehicle_embedding(frame, detection, 2)
+        self.assertFalse(np.array_equal(first, second))
+        self.assertEqual(pipeline.vehicle_embedding_cache, {})
+
     def test_cross_camera_winner_keeps_one_consistent_media_observation(self):
         run_id = "123e4567-e89b-12d3-a456-426614174000"
         older = self.detection("ch1", 0.7, "older")
         winner = self.detection("ch2", 0.9, "winner")
+        older["embedding"] = np.array([1.0, 0.0])
+        winner["embedding"] = np.array([0.95, 0.05])
+        winner["embedding"] /= np.linalg.norm(winner["embedding"])
         result = self.pipeline(run_id).deduplicate(
             [copy.deepcopy(older), copy.deepcopy(winner)], 1_000.0
         )[0]
@@ -291,6 +310,27 @@ class RunScopedIdentityTests(unittest.TestCase):
         self.assertEqual(result["timestamp_utc"], "winner")
         self.assertEqual(result["media_timestamp_utc"], "winner")
         self.assertEqual(result["event_id"], "event-ch2")
+        self.assertEqual(
+            result["cross_camera_dedup"]["method"],
+            "spatiotemporal_convnext",
+        )
+        self.assertGreaterEqual(
+            result["cross_camera_dedup"]["appearance_similarity"], 0.60
+        )
+
+    def test_close_cross_camera_vehicles_require_appearance_evidence(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")
+        second = self.detection("ch2", 0.9, "2026-07-10T00:00:00.100Z")
+        result = pipeline.deduplicate([copy.deepcopy(first), copy.deepcopy(second)], 1_000.0)
+        self.assertEqual(len(result), 2)
+
+        first["embedding"] = np.array([1.0, 0.0])
+        second["embedding"] = np.array([0.0, 1.0])
+        result = self.pipeline(
+            "123e4567-e89b-12d3-a456-426614174000"
+        ).deduplicate([first, second], 1_000.0)
+        self.assertEqual(len(result), 2)
 
     def test_distinct_vehicles_seven_meters_apart_are_not_merged(self):
         pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
@@ -307,6 +347,45 @@ class RunScopedIdentityTests(unittest.TestCase):
         second = self.detection("ch2", 0.9, "2026-07-10T00:00:04.000Z")
         result = pipeline.deduplicate([first, second], 1_000.0)
         self.assertEqual(len(result), 2)
+
+    def test_temporal_cross_camera_track_requires_matching_vehicle_embedding(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")
+        first["embedding"] = np.array([1.0, 0.0])
+        first_result = pipeline.deduplicate([first], 1_000.0)[0]
+
+        mismatch = self.detection("ch2", 0.9, "2026-07-10T00:00:01.000Z")
+        mismatch["embedding"] = np.array([0.0, 1.0])
+        mismatch_result = pipeline.deduplicate([mismatch], 1_001.0)[0]
+        self.assertNotEqual(first_result["object_id"], mismatch_result["object_id"])
+
+        matching_pipeline = self.pipeline("abcdef01-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")
+        first["embedding"] = np.array([1.0, 0.0])
+        first_result = matching_pipeline.deduplicate([first], 2_000.0)[0]
+        match = self.detection("ch2", 0.9, "2026-07-10T00:00:01.000Z")
+        match["embedding"] = np.array([0.95, 0.05])
+        match["embedding"] /= np.linalg.norm(match["embedding"])
+        match_result = matching_pipeline.deduplicate([match], 2_001.0)[0]
+        self.assertEqual(first_result["object_id"], match_result["object_id"])
+        self.assertEqual(
+            match_result["identity_association"]["method"],
+            "cross_camera_spatiotemporal_convnext",
+        )
+        self.assertGreaterEqual(
+            match_result["identity_association"]["appearance_similarity"], 0.60
+        )
+
+    def test_same_camera_vehicle_reattachment_requires_appearance_after_id_change(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        first = self.detection("ch1", 0.9, "2026-07-10T00:00:00.000Z")
+        first["embedding"] = np.array([1.0, 0.0])
+        first_result = pipeline.deduplicate([first], 1_000.0)[0]
+        second = self.detection("ch1", 0.9, "2026-07-10T00:00:01.000Z")
+        second["track_id"] = 8
+        second["embedding"] = np.array([0.0, 1.0])
+        second_result = pipeline.deduplicate([second], 1_001.0)[0]
+        self.assertNotEqual(first_result["object_id"], second_result["object_id"])
 
     def test_stale_tracks_and_local_aliases_are_pruned(self):
         pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
