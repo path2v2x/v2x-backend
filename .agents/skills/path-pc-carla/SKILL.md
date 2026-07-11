@@ -7,6 +7,47 @@ description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252
 
 Treat this file as an operating procedure, not proof of current state. Re-run the read-only baseline before every intervention.
 
+## Current deployed state and integration hold
+
+Observed on 2026-07-11 UTC; verify rather than assume:
+
+- Canonical `origin/main`, the clean live checkout, the Amplify mirror, and
+  successful production Amplify job 202 are exact commit
+  `d54f5dfaec90e791af83105ff048e5dd3c6506a2`.
+- Live CARLA/Drive use the packaged UE5.5 RR/CARLA 0.10 worker. After the
+  scheduled 23:08 PDT restart both services held `NRestarts=0`, all expected
+  listeners remained bound, and the all-channel metadata plus local/public
+  four-feed verifiers passed.
+- Replay synchronization, tick-bound scene snapshots, exact actor-observed
+  default lens acceptance, and cleanup are deployed. A bounded replay for
+  `global_car_4db7ffc8_2` remained crash-free and returned to LIVE with zero
+  sessions, but failed the unchanged final visual gate: no compatible visual
+  detection overlapped the projected UE5 actor. Treat this as a genuine
+  calibration/localization failure; do not lower thresholds or rerun replay
+  before a new accepted candidate exists.
+- Durable replay evidence is at
+  `/home/path/V2XCarla/v2x-evidence/twin-replay/20260711T0546Z-default-lens-canary/`.
+  The verified rollback bundle is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260711T054633Z-default-lens`.
+- The HLS producer proactively rotates signed sessions at 240 seconds. The
+  deployed candidate passed 660 one-second samples across two rotations with
+  no health outage and per-channel maximum latency below 5.75 seconds. Re-run
+  that complete gate after any merged perception deployment; old evidence does
+  not transfer to a new fingerprint.
+- The clean integration worktree is
+  `/home/path/.codex/worktrees/v2x-calibration-integration` on
+  `codex/v2x-calibration-integration`. It layers the fail-closed calibration,
+  physical-intrinsics, identity, persistence, rollback, and GPS-planar-placement
+  gates onto current `origin/main` while preserving the newer replay protocol.
+  It is not deployed. Never deploy from the dirty recovery worktree.
+- The recovery worktree contains rejected exploratory camera CSVs and a dirty
+  `config/cameras.json`. Preserve them as user-owned diagnostics, but never
+  stage, glob, fit, promote, or deploy them.
+- The latest simforgelaptop Computer Use companion finished with Dia approval
+  denied by both app name and bundle ID. Classify `/live`, `/timeline`, and
+  `/drive` as evidence collection BLOCKED/FAIL, not product failure; no UI,
+  console, network, or same-car visual proof was collected.
+
 ## Safety boundaries
 
 - Work locally when already on `path-B860I-AORUS-PRO-ICE`; do not SSH back into the same host.
@@ -53,7 +94,7 @@ Observed on 2026-07-10 UTC; verify rather than assume:
 | Perception tunnel | `v2x-cloudflared-perception.service`; currently Quick Tunnel unless a named-tunnel gate has completed |
 | Public API | `https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com` |
 | AWS deploy caller | `arn:aws:iam::147229569658:user/rfs-v2x-service`; API writes require the dedicated least-privilege deploy role |
-| Amplify repository | reconcile stale `michaelvu1207/v2x-backend` to canonical `path2v2x/v2x-backend` with a fresh token and explicit release gate |
+| Amplify repository | temporary `michaelvu1207/v2x-backend-amplify` mirror at exact canonical SHA with successful sync workflow/webhook; preferred direct `path2v2x/v2x-backend` attachment still requires an organization-owner policy decision |
 
 Collect a non-mutating baseline:
 

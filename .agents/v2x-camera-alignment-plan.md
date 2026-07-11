@@ -13,8 +13,13 @@
 
 ## Current evidence and honest status
 
-- Source contains fail-closed manifest, optimizer, runtime-depth revalidation,
-  stable actor-blueprint, trusted-clock, and cross-camera identity gates.
+- Canonical/live/Amplify are exact
+  `d54f5dfaec90e791af83105ff048e5dd3c6506a2`. The clean integration branch
+  `codex/v2x-calibration-integration` layers the existing fail-closed manifest,
+  optimizer, runtime-depth revalidation, physical-intrinsics, trusted-clock,
+  rollback, ambiguity, and cross-camera identity gates onto that current main
+  while preserving its newer replay synchronization and actor-observed lens
+  safety model. The integration branch is tested but not deployed.
 - Trusted physical frames and fresh direct UE5 renders are retained at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260711T0228Z-source-pairs`.
 - The similarly named UTC artifacts correctly cross the local midnight
@@ -26,22 +31,36 @@
   about 642/133/199/50 px for ch1/ch2/ch3/ch4; none is acceptance evidence.
 - Production stores trusted schema-v2 detections, but no accepted record has
   the required explicit cross-camera ConvNeXt association evidence.
-- At the 2026-07-11T02:54:49Z persistence audit, trusted spans were
-  13.78/14.35/12.34/16.31 hours for ch1/ch2/ch3/ch4; none passes the 23-hour
+- At the 2026-07-11T06:22:12Z persistence audit, trusted spans were
+  13.78/14.35/14.42/19.31 hours for ch1/ch2/ch3/ch4; none passes the 23-hour
   minimum inside the 24-hour query window.
-- All four feeds were fresh and clock-matched, but decode latency was roughly
-  14.8–19.7 seconds and failed the 10-second gate. Source commit `0c989fe`
-  adds a bounded two-fragment perception-only HLS request; it is tested but
-  not deployed. Five-minute read endings align with signed-session expiry and
-  reconnect successfully.
+- The deployed four-fragment, 240-second proactive HLS rotation passed 660
+  one-second samples across two rotations with zero outage and per-channel
+  maximum latency below 5.75 seconds. That evidence is valid for the deployed
+  fingerprint only and must be repeated after the final merged deployment.
 - A dimensioned 9x6-inner-corner, 25 mm checkerboard is retained at
   `/home/path/V2XCarla/v2x-evidence/intrinsics/board/` with SHA-256
   `9fc88b316e318068d46e2bfa267ae22609b2f47c78b30fdd7ef0907ce00dde08`.
-- The latest native Computer Use run is durably retained at
-  `/home/path/V2XCarla/v2x-evidence/computer-use/20260711T023533Z/`; Dia access
-  was denied before UI state, so it proves no visual acceptance claim.
-- Canonical Amplify attachment is blocked by the organization policy disabling
-  deploy keys; the mirror remains the unchanged production source.
+- The latest simforgelaptop companion task
+  `019f4fd2-12a7-7523-98e8-ba16940e1690` finished with Dia approval denied by
+  app name and bundle ID. Its blocker artifacts are under
+  `/private/tmp/V2X-CUA-Evidence/`; it proves no visual acceptance claim.
+- Production Amplify job 202 succeeded at exact canonical SHA through the
+  temporary mirror. Direct canonical attachment remains an organization-owner
+  policy decision, not a release-integrity failure.
+
+## Phase 0: land safely on current main
+
+1. Inventory every recovery-only commit and apply only calibration, physical
+   intrinsics, identity, persistence, rollback, and placement gates to a clean
+   branch from current `origin/main`.
+2. Preserve the newer replay synchronization, tick-bound scene snapshots,
+   complete actor-observed default lens tuple, and lens-mutation safety hold.
+   Reject any conflict resolution that writes UE5 lens attributes.
+3. Run the entire bridge, perception, web, AWS route, and rollback suites in
+   the merged worktree. Review the actual diff with high-effort Fable.
+4. Define merge rollback as a tested revert/redeploy of the previous exact
+   fingerprint. No production mutation occurs until this phase passes.
 
 ## Phase gates
 
@@ -49,8 +68,11 @@
    channels, record service/source/map fingerprints and zero Drive sessions,
    and reject protocol versions that cannot bind each binary twin frame to its
    metadata. Copy accepted artifacts from volatile storage into immutable,
-   hash-manifested durable storage before exit. For static registration, record
-   both capture instants and prove mounts are fixed; dynamic same-car evidence
+   hash-manifested durable storage before exit, then replicate the manifest and
+   raw evidence off-host before calling it durable. Require UTC-only artifact
+   names and embed the observed NTP offset in every capture manifest. For static
+   registration, record both capture instants and prove mounts are fixed;
+   dynamic same-car evidence
    later requires a trusted replay-clock match, not sequential capture.
 2. **Measure physical intrinsics.** For each physical camera, retain at least
    ten unique checkerboard or ChArUco fit images plus at least two untouched
@@ -60,7 +82,12 @@
    and at least 1.3x distance spread. Require fit and holdout RMS no worse than
    2 px and held-out per-corner max error no worse than 5 px. Obtain explicit
    site-access and traffic-safety authorization before placing the board in a
-   roadside FOV. Re-capture frozen landmarks afterward to prove no mount moved.
+   roadside FOV. First prove per-channel board visibility and a safe working
+   position; if any FOV lies in active roadway, use an authorized after-hours
+   closure or a dimensioned larger target rather than entering traffic. Bind a
+   photograph and ruler/caliper measurement of the printed square size to the
+   board hash. Re-capture frozen landmarks afterward and require no more than
+   2 px median static-landmark shift to prove no mount moved.
    Exit only when the full measured lens
    model round-trips through the deployable render/undistortion path within
    0.25 px. Existing repeated nominal intrinsics do not pass this phase.
@@ -89,9 +116,9 @@
    automatically roll back on any feed/clock/session failure or more than five
    minutes of unavailable service. Restore all supervisors in success and
    failure paths.
-   The independent HLS low-latency change uses the same snapshot/canary/
-   rollback discipline before calibration deployment: canary one channel,
-   verify route/Lambda/source fingerprints, then require trusted decode latency
+   The HLS low-latency gate already passed on the current deployed fingerprint.
+   After the final merged deployment, verify route/Lambda/source fingerprints,
+   then require trusted decode latency
    at most 10 seconds on all channels continuously across at least two complete
    five-minute session-expiry/reconnect boundaries. Any upstream rejection,
    feed drop, legacy-latency fallback, or persistence regression fails and
@@ -109,7 +136,9 @@
    identity switches, world-centroid error at most 2.0 m, projected centroid
    error at most 16 px at 1280-wide, and projected bbox IoU at least 0.50.
    Require actor cleanup, LIVE restoration, and multi-session isolation;
-   existence alone fails.
+   existence alone fails. If ordinary traffic does not produce a qualifying
+   multi-camera transition, schedule one authorized cooperating test-vehicle
+   pass during the same field window; never substitute a simulated-only car.
 8. **Visible release proof and closeout.** Use normal-task Computer Use on
    simforgelaptop for refreshed `/live`, `/drive`, and `/timeline` screenshots,
    console and network/WebSocket evidence. Repair canonical GitHub/Amplify IAM
@@ -147,8 +176,9 @@
 6. In parallel, request the `path2v2x` organization owner decision required to
    enable canonical-repository Amplify attachment; do not weaken repository
    policy or use personal credentials to bypass that decision.
-7. Diagnose persistence gaps before re-auditing. Any perception/session-source
-   deployment resets the evidence window: require a new post-deploy 24-hour
+7. Do not spend or restart the persistence window after intermediate changes.
+   Any perception/session-source deployment resets the evidence window, so run
+   the final audit only after the last merged deployment: require a new 24-hour
    query with at least 23 hours trusted span per camera, latest event age at
    most 6 hours, no single trusted-event gap above 30 minutes during periods
    where the feed health reports streaming, and consume the pass within six
