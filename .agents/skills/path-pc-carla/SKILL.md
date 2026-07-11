@@ -12,10 +12,13 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 Observed on 2026-07-11 UTC; verify rather than assume:
 
 - Canonical source and the clean live checkout are
-  `061b2eb884a729797d764e177bb8535cea3c6288`. This revision reads lens
+  `d54f5dfaec90e791af83105ff048e5dd3c6506a2`. Its replay-tested parent
+  `061b2eb884a729797d764e177bb8535cea3c6288` reads lens
   attributes from spawned UE5 actors, refuses configured lens overrides,
   accepts only CARLA's complete actor-observed default pinhole tuple, and
   binds replay frames to tick-bound pre/post scene snapshots.
+  `d54f5df` additionally contains the read-only fail-closed calibration
+  evidence evaluator; it does not change a running service or camera config.
 - The earlier replay-capable runtime was rolled back to
   `094ffca0e36e57330e0dc89926a0fd5d6fd3aa2a` after bounded replay diagnostics
   correlated with eight `v2x-carla-rr.service` automatic restarts and exit
