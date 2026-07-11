@@ -15,6 +15,8 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 from build_twin_calibration_manifest import (  # noqa: E402
     build_deployment_model,
+    decoded_image_size,
+    stable_depth_meters,
     validate_intrinsics_artifact,
     validate_intrinsics_calibration,
     validate_annotations,
@@ -165,6 +167,41 @@ def test_artifact_hash_and_contents_are_bound_to_camera_config():
     assert evidence["artifact_sha256"] == hashlib.sha256(artifact).hexdigest()
     with pytest.raises(ValueError, match="hash does not match"):
         validate_intrinsics_artifact(camera, artifact + b" ")
+
+
+def test_retained_image_dimensions_are_decoded_not_trusted_from_cli(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "frame.png"
+    Image.new("RGB", (32, 24)).save(image_path)
+    assert decoded_image_size(image_path.read_bytes(), "test") == (32, 24)
+    with pytest.raises(ValueError, match="not a valid retained image"):
+        decoded_image_size(b"not-an-image", "test")
+
+
+def depth_buffer(width, height, default_depth, overrides=None):
+    overrides = overrides or {}
+    raw = bytearray(width * height * 4)
+    for v in range(height):
+        for u in range(width):
+            depth = overrides.get((u, v), default_depth)
+            encoded = round((depth / 1000.0) * 16777215.0)
+            offset = (v * width + u) * 4
+            raw[offset:offset + 4] = bytes([
+                (encoded >> 16) & 0xFF,
+                (encoded >> 8) & 0xFF,
+                encoded & 0xFF,
+                255,
+            ])
+    return bytes(raw)
+
+
+def test_depth_neighborhood_rejects_geometry_edges():
+    stable = depth_buffer(5, 5, 10.0)
+    assert stable_depth_meters(stable, 5, 5, 2, 2) == pytest.approx(10.0, abs=0.001)
+    discontinuous = depth_buffer(5, 5, 10.0, {(2, 2): 40.0})
+    with pytest.raises(ValueError, match="depth discontinuity"):
+        stable_depth_meters(discontinuous, 5, 5, 2, 2)
 
 
 @pytest.mark.parametrize(

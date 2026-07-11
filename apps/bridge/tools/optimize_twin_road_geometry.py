@@ -13,9 +13,21 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 
 import numpy as np
 from scipy.optimize import least_squares
+
+BRIDGE_DIR = Path(__file__).resolve().parents[1]
+if str(BRIDGE_DIR) not in sys.path:
+    sys.path.insert(0, str(BRIDGE_DIR))
+from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
+    absolute_twin_model,
+    heading_to_carla_yaw,
+    horizontal_fov_deg,
+    normalize_angle_degrees,
+    twin_pose_from_absolute,
+)
 
 
 # At the 1280x960 acceptance render, errors above roughly one percent of the
@@ -66,10 +78,11 @@ def project_world_points(world_points, location, params, width, height):
     local = (rotation.T @ (np.asarray(world_points) - np.asarray(location)).T).T
     depth = local[:, 0]
     focal = (float(width) / 2.0) / math.tan(math.radians(fov) / 2.0)
-    x = local[:, 1] / depth
-    y = -local[:, 2] / depth
-    radial = 1.0 + k1 * (x * x + y * y)
-    pixels = np.column_stack((cx + focal * x * radial, cy + focal * y * radial))
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        x = local[:, 1] / depth
+        y = -local[:, 2] / depth
+        radial = 1.0 + k1 * (x * x + y * y)
+        pixels = np.column_stack((cx + focal * x * radial, cy + focal * y * radial))
     return pixels, depth
 
 
@@ -78,34 +91,13 @@ def project_calibration_points(world_points, params, width, height):
     return project_world_points(world_points, params[:3], params[3:], width, height)
 
 
-def normalize_degrees(value):
-    """Normalize an angular delta without losing a legitimate 180 degree value."""
-    normalized = (float(value) + 180.0) % 360.0 - 180.0
-    return 180.0 if normalized == -180.0 and value > 0 else normalized
-
-
 def deployment_candidate(manifest, params):
     """Translate an absolute fit into the exact tracked twin_pose representation."""
     model = manifest["deployment_model"]
-    anchor = np.asarray(model["anchor_location"], dtype=float)
     base = model["base"]
-    location = np.asarray(params[:3], dtype=float)
-    pitch, yaw, roll, fov = (float(value) for value in params[3:7])
-    yaw_radians = math.radians(yaw)
-    delta_x, delta_y = location[:2] - anchor[:2]
-    return {
-        "forward_offset_m": float(
-            delta_x * math.cos(yaw_radians) + delta_y * math.sin(yaw_radians)
-        ),
-        "right_offset_m": float(
-            -delta_x * math.sin(yaw_radians) + delta_y * math.cos(yaw_radians)
-        ),
-        "height_offset_m": float(location[2] - anchor[2]),
-        "pitch_offset_deg": float(pitch - float(base["pitch_deg"])),
-        "yaw_offset_deg": normalize_degrees(yaw - float(base["yaw_deg"])),
-        "roll_offset_deg": float(roll - float(base["roll_deg"])),
-        "fov_offset_deg": float(fov - float(base["fov_deg"])),
-    }
+    return twin_pose_from_absolute(
+        model["anchor_location"], base, params[:3], *params[3:7]
+    )
 
 
 def deployment_roundtrip(manifest, params):
@@ -119,29 +111,20 @@ def deployment_roundtrip(manifest, params):
     """
     model = manifest["deployment_model"]
     candidate = deployment_candidate(manifest, params)
-    anchor = np.asarray(model["anchor_location"], dtype=float)
     base = model["base"]
-    yaw = float(base["yaw_deg"]) + candidate["yaw_offset_deg"]
-    yaw_radians = math.radians(yaw)
-    location = np.array([
-        anchor[0]
-        + candidate["forward_offset_m"] * math.cos(yaw_radians)
-        - candidate["right_offset_m"] * math.sin(yaw_radians),
-        anchor[1]
-        + candidate["forward_offset_m"] * math.sin(yaw_radians)
-        + candidate["right_offset_m"] * math.cos(yaw_radians),
-        anchor[2] + candidate["height_offset_m"],
-    ])
+    absolute = absolute_twin_model(model["anchor_location"], base, candidate)
     roundtrip = np.array([
-        *location,
-        float(base["pitch_deg"]) + candidate["pitch_offset_deg"],
-        yaw,
-        float(base["roll_deg"]) + candidate["roll_offset_deg"],
-        float(base["fov_deg"]) + candidate["fov_offset_deg"],
+        *absolute["location"],
+        absolute["pitch_deg"],
+        absolute["yaw_deg"],
+        absolute["roll_deg"],
+        absolute["fov_deg"],
     ])
     expected = np.asarray(params[:7], dtype=float)
     transform_errors = np.abs(roundtrip - expected)
-    transform_errors[4] = abs(normalize_degrees(roundtrip[4] - expected[4]))
+    transform_errors[4] = abs(
+        normalize_angle_degrees(roundtrip[4] - expected[4])
+    )
 
     width, height = float(manifest["width"]), float(manifest["height"])
     fov, cx, cy, k1 = (float(value) for value in params[6:10])
@@ -277,8 +260,12 @@ def point_metrics(errors):
     values = np.asarray(errors, dtype=float)
     if not len(values):
         return None
+    nonfinite_count = int(np.count_nonzero(~np.isfinite(values)))
+    if nonfinite_count:
+        values = np.where(np.isfinite(values), values, 5000.0)
     return {
         "count": int(len(values)),
+        "nonfinite_count": nonfinite_count,
         "rmse_px": float(np.sqrt(np.mean(values * values))),
         "p95_px": float(np.percentile(values, 95)),
         "max_px": float(np.max(values)),
@@ -394,8 +381,10 @@ def manifest_gate(manifest):
         reasons.append("invalid_or_duplicate_feature_id")
     train_points = [f for f in features if f.get("type") == "point" and f.get("split") == "train"]
     held_points = [f for f in features if f.get("type") == "point" and f.get("split") == "holdout"]
-    train_lines = [f for f in features if f.get("type") in {"line", "polyline"} and f.get("split") == "train"]
-    held_lines = [f for f in features if f.get("type") in {"line", "polyline"} and f.get("split") == "holdout"]
+    if any(feature.get("type") == "line" for feature in features):
+        reasons.append("infinite_line_evidence_not_allowed")
+    train_lines = [f for f in features if f.get("type") == "polyline" and f.get("split") == "train"]
+    held_lines = [f for f in features if f.get("type") == "polyline" and f.get("split") == "holdout"]
     if len(train_points) < 8:
         reasons.append("insufficient_train_points")
     if len(held_points) < 4:
@@ -450,6 +439,151 @@ def manifest_gate(manifest):
     }
 
 
+def verify_external_evidence(
+    manifest,
+    *,
+    annotations_bytes,
+    real_frame_bytes,
+    twin_frame_bytes,
+    cameras_bytes,
+    intrinsics_artifact_bytes,
+):
+    """Re-bind a mutable optimizer manifest to every retained source artifact."""
+    reasons = []
+    bindings = (
+        ("annotation_sha256", annotations_bytes),
+        ("source_frame_sha256", real_frame_bytes),
+        ("twin_frame_sha256", twin_frame_bytes),
+        ("cameras_file_sha256", cameras_bytes),
+    )
+    for field, payload in bindings:
+        if hashlib.sha256(payload).hexdigest() != manifest.get(field):
+            reasons.append(f"{field}_mismatch")
+    try:
+        cameras_payload = json.loads(cameras_bytes)
+        camera = next(
+            item for item in cameras_payload["cameras"]
+            if item.get("id") == manifest.get("camera_id")
+        )
+    except (KeyError, TypeError, StopIteration, UnicodeDecodeError, json.JSONDecodeError):
+        camera = None
+        reasons.append("camera_config_unreadable")
+    if camera is not None:
+        canonical = json.dumps(
+            camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        if hashlib.sha256(canonical).hexdigest() != manifest.get("camera_config_sha256"):
+            reasons.append("camera_config_sha256_mismatch")
+        if camera.get("intrinsics_calibration") != manifest.get("intrinsics_calibration"):
+            reasons.append("intrinsics_calibration_config_mismatch")
+        intrinsics = camera.get("intrinsics") or {}
+        twin_pose = camera.get("twin_pose") or {}
+        expected_base = {
+            "pitch_deg": float(camera["pitch_deg"]),
+            "yaw_deg": heading_to_carla_yaw(
+                float(camera["heading_deg"]), float(camera["yaw_deg"])
+            ),
+            "roll_deg": float(camera.get("roll_deg", 0.0)),
+            "fov_deg": horizontal_fov_deg(intrinsics),
+        }
+        deployment = manifest.get("deployment_model") or {}
+        if deployment.get("base") != expected_base:
+            reasons.append("deployment_base_camera_config_mismatch")
+        expected_lens = {
+            "lens_k": 0.0,
+            "lens_kcube": 0.0,
+            "lens_circle_falloff": 5.0,
+            "lens_circle_multiplier": 0.0,
+            "lens_x_size": 0.08,
+            "lens_y_size": 0.08,
+        }
+        expected_lens.update(camera.get("twin_lens") or {})
+        if deployment.get("lens") != expected_lens:
+            reasons.append("deployment_lens_camera_config_mismatch")
+        baseline = manifest.get("baseline") or {}
+        expected_baseline = {
+            "pitch_deg": expected_base["pitch_deg"]
+            + float(twin_pose.get("pitch_offset_deg", 0.0)),
+            "yaw_deg": expected_base["yaw_deg"]
+            + float(twin_pose.get("yaw_offset_deg", 0.0)),
+            "roll_deg": expected_base["roll_deg"]
+            + float(twin_pose.get("roll_offset_deg", 0.0)),
+            "fov_deg": expected_base["fov_deg"]
+            + float(twin_pose.get("fov_offset_deg", 0.0)),
+            "cx": float(intrinsics["cx"]),
+            "cy": float(intrinsics["cy"]),
+            "k1": 0.0,
+        }
+        if any(
+            not math.isclose(
+                float(baseline.get(key, math.nan)), value,
+                rel_tol=0.0, abs_tol=1e-9,
+            )
+            for key, value in expected_baseline.items()
+        ):
+            reasons.append("baseline_camera_config_mismatch")
+    calibration = manifest.get("intrinsics_calibration") or {}
+    if hashlib.sha256(intrinsics_artifact_bytes).hexdigest() != calibration.get(
+        "artifact_sha256"
+    ):
+        reasons.append("intrinsics_artifact_sha256_mismatch")
+    try:
+        artifact = json.loads(intrinsics_artifact_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        artifact = None
+        reasons.append("intrinsics_artifact_unreadable")
+    expected_artifact = {
+        key: value for key, value in calibration.items() if key != "artifact_sha256"
+    }
+    if artifact is not None and artifact != expected_artifact:
+        reasons.append("intrinsics_artifact_contents_mismatch")
+    try:
+        annotations = json.loads(annotations_bytes)
+        expected_features = []
+        for feature in annotations["points"]:
+            expected_features.append({
+                "id": str(feature["id"]).strip(),
+                "type": "point",
+                "split": feature["split"],
+                "provenance": feature["provenance"],
+                "category": str(feature.get("category") or "").strip(),
+                "twin": [float(value) for value in feature["twin"]],
+                "image": [float(value) for value in feature["image"]],
+            })
+        for feature in annotations["roads"]:
+            expected_features.append({
+                "id": str(feature["id"]).strip(),
+                "type": "polyline",
+                "split": feature["split"],
+                "provenance": feature["provenance"],
+                "category": str(feature.get("category") or "").strip(),
+                "twin_polyline": [
+                    [float(value) for value in pixel]
+                    for pixel in feature["twin_polyline"]
+                ],
+                "image_polyline": [
+                    [float(value) for value in pixel]
+                    for pixel in feature["image_polyline"]
+                ],
+            })
+        actual_features = []
+        for feature in manifest.get("features", []):
+            keys = (
+                ("id", "type", "split", "provenance", "category", "twin", "image")
+                if feature.get("type") == "point"
+                else (
+                    "id", "type", "split", "provenance", "category",
+                    "twin_polyline", "image_polyline",
+                )
+            )
+            actual_features.append({key: feature.get(key) for key in keys})
+        if actual_features != expected_features:
+            reasons.append("manifest_features_annotation_mismatch")
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        reasons.append("annotations_unreadable_for_feature_binding")
+    return {"passed": not reasons, "reasons": reasons}
+
+
 def feature_residuals(manifest, params, split):
     width, height = manifest["width"], manifest["height"]
     residuals = []
@@ -478,13 +612,14 @@ def feature_residuals(manifest, params, split):
                 feature["world"], params, width, height
             )
             target = np.asarray(feature["image_polyline"], dtype=float)
-            forward = point_to_polyline_distances(pixels, target)
-            backward = point_to_polyline_distances(target, pixels)
-            residuals.extend(
-                5000.0 if d <= 0.1 else float(error)
-                for error, d in zip(forward, depth)
-            )
-            residuals.extend(float(error) for error in backward)
+            invalid = np.any(depth <= 0.1) or not np.all(np.isfinite(pixels))
+            if invalid:
+                residuals.extend([5000.0] * (len(pixels) + len(target)))
+            else:
+                forward = point_to_polyline_distances(pixels, target)
+                backward = point_to_polyline_distances(target, pixels)
+                residuals.extend(float(error) for error in forward)
+                residuals.extend(float(error) for error in backward)
         else:
             raise ValueError(f"unsupported feature type {feature['type']!r}")
     return np.asarray(residuals, dtype=float)
@@ -513,14 +648,26 @@ def evaluate_split(manifest, params, split):
             )
         elif feature["type"] == "polyline":
             target = np.asarray(feature["image_polyline"], dtype=float)
-            line_errors.extend(point_to_polyline_distances(pixels, target))
-            line_errors.extend(point_to_polyline_distances(target, pixels))
+            invalid = np.any(depth <= 0.1) or not np.all(np.isfinite(pixels))
+            if invalid:
+                line_errors.extend([5000.0] * (len(pixels) + len(target)))
+            else:
+                line_errors.extend(point_to_polyline_distances(pixels, target))
+                line_errors.extend(point_to_polyline_distances(target, pixels))
         else:
             raise ValueError(f"unsupported feature type {feature['type']!r}")
     return {"points": point_metrics(point_errors), "lines": point_metrics(line_errors)}
 
 
-def optimize_manifest(manifest, allow_incomplete=False):
+def optimize_manifest(
+    manifest, allow_incomplete=False, external_evidence_verified=False
+):
+    if not external_evidence_verified:
+        return {
+            "passed": False,
+            "reason": "external_evidence_not_verified",
+            "reasons": ["external_evidence_not_verified"],
+        }
     gate = manifest_gate(manifest)
     if not gate["passed"] and not allow_incomplete:
         return {"passed": False, "dataset_gate": gate, "reason": "dataset_gate"}
@@ -591,15 +738,25 @@ def optimize_manifest(manifest, allow_incomplete=False):
     reasons = [] if gate["passed"] else ["dataset_gate"]
     point = heldout["points"]
     line = heldout["lines"]
-    if not point or point["rmse_px"] > POINT_RMSE_MAX_PX:
+    threshold_scale = float(manifest["width"]) / 1280.0
+    thresholds = {
+        "point_rmse_px": POINT_RMSE_MAX_PX * threshold_scale,
+        "point_p95_px": POINT_P95_MAX_PX * threshold_scale,
+        "point_max_px": POINT_MAX_ERROR_PX * threshold_scale,
+        "line_rmse_px": LINE_RMSE_MAX_PX * threshold_scale,
+        "line_max_px": LINE_MAX_ERROR_PX * threshold_scale,
+        "reference_width": 1280,
+        "scale": threshold_scale,
+    }
+    if not point or point["rmse_px"] > thresholds["point_rmse_px"]:
         reasons.append("heldout_point_rmse")
-    if not point or point["p95_px"] > POINT_P95_MAX_PX:
+    if not point or point["p95_px"] > thresholds["point_p95_px"]:
         reasons.append("heldout_point_p95")
-    if not point or point["max_px"] > POINT_MAX_ERROR_PX:
+    if not point or point["max_px"] > thresholds["point_max_px"]:
         reasons.append("heldout_point_max")
-    if not line or line["rmse_px"] > LINE_RMSE_MAX_PX:
+    if not line or line["rmse_px"] > thresholds["line_rmse_px"]:
         reasons.append("heldout_line_rmse")
-    if not line or line["max_px"] > LINE_MAX_ERROR_PX:
+    if not line or line["max_px"] > thresholds["line_max_px"]:
         reasons.append("heldout_line_max")
     deployability = deployment_roundtrip(manifest, best_params) if gate["passed"] else {
         "passed": False,
@@ -636,6 +793,7 @@ def optimize_manifest(manifest, allow_incomplete=False):
         },
         "train": train,
         "heldout": heldout,
+        "heldout_thresholds": thresholds,
         "bound_margin": {
             name: float(min(value - low, high - value))
             for name, value, low, high in zip(PARAMETER_NAMES, best_params, lower, upper)
@@ -647,6 +805,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--annotations", required=True)
+    parser.add_argument("--real-frame", required=True)
+    parser.add_argument("--twin-frame", required=True)
+    parser.add_argument("--cameras-json", required=True)
+    parser.add_argument("--intrinsics-artifact", required=True)
     parser.add_argument(
         "--diagnostic-incomplete",
         action="store_true",
@@ -655,7 +818,27 @@ def main():
     args = parser.parse_args()
     manifest_bytes = Path(args.manifest).read_bytes()
     manifest = json.loads(manifest_bytes)
-    report = optimize_manifest(manifest, allow_incomplete=args.diagnostic_incomplete)
+    external_evidence = verify_external_evidence(
+        manifest,
+        annotations_bytes=Path(args.annotations).read_bytes(),
+        real_frame_bytes=Path(args.real_frame).read_bytes(),
+        twin_frame_bytes=Path(args.twin_frame).read_bytes(),
+        cameras_bytes=Path(args.cameras_json).read_bytes(),
+        intrinsics_artifact_bytes=Path(args.intrinsics_artifact).read_bytes(),
+    )
+    if external_evidence["passed"]:
+        report = optimize_manifest(
+            manifest,
+            allow_incomplete=args.diagnostic_incomplete,
+            external_evidence_verified=True,
+        )
+    else:
+        report = {
+            "passed": False,
+            "reason": "external_evidence_gate",
+            "reasons": list(external_evidence["reasons"]),
+        }
+    report["external_evidence"] = external_evidence
     report["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
     Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

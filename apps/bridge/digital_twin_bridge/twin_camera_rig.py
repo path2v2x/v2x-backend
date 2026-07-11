@@ -95,6 +95,56 @@ def camera_with_twin_pose(camera: dict, overrides: dict) -> dict:
     return candidate
 
 
+def normalize_angle_degrees(value: float) -> float:
+    """Normalize an angle to the CARLA-compatible [-180, 180] interval."""
+    normalized = (float(value) + 180.0) % 360.0 - 180.0
+    return 180.0 if normalized == -180.0 and value > 0 else normalized
+
+
+def twin_pose_from_absolute(
+    anchor_location, base: dict, location, pitch_deg, yaw_deg, roll_deg, fov_deg
+) -> dict:
+    """Convert one absolute fitted camera into production twin_pose offsets."""
+    anchor = [float(value) for value in anchor_location]
+    target = [float(value) for value in location]
+    yaw = float(yaw_deg)
+    yaw_radians = math.radians(yaw)
+    delta_x, delta_y = target[0] - anchor[0], target[1] - anchor[1]
+    return {
+        "forward_offset_m": (
+            delta_x * math.cos(yaw_radians) + delta_y * math.sin(yaw_radians)
+        ),
+        "right_offset_m": (
+            -delta_x * math.sin(yaw_radians) + delta_y * math.cos(yaw_radians)
+        ),
+        "height_offset_m": target[2] - anchor[2],
+        "pitch_offset_deg": float(pitch_deg) - float(base["pitch_deg"]),
+        "yaw_offset_deg": normalize_angle_degrees(yaw - float(base["yaw_deg"])),
+        "roll_offset_deg": float(roll_deg) - float(base["roll_deg"]),
+        "fov_offset_deg": float(fov_deg) - float(base["fov_deg"]),
+    }
+
+
+def absolute_twin_model(anchor_location, base: dict, twin_pose: dict) -> dict:
+    """Apply production twin_pose semantics without importing CARLA classes."""
+    anchor = [float(value) for value in anchor_location]
+    yaw = float(base["yaw_deg"]) + float(twin_pose.get("yaw_offset_deg", 0.0))
+    yaw_radians = math.radians(yaw)
+    forward = float(twin_pose.get("forward_offset_m", 0.0))
+    right = float(twin_pose.get("right_offset_m", 0.0))
+    return {
+        "location": [
+            anchor[0] + forward * math.cos(yaw_radians) - right * math.sin(yaw_radians),
+            anchor[1] + forward * math.sin(yaw_radians) + right * math.cos(yaw_radians),
+            anchor[2] + float(twin_pose.get("height_offset_m", 0.0)),
+        ],
+        "pitch_deg": float(base["pitch_deg"]) + float(twin_pose.get("pitch_offset_deg", 0.0)),
+        "yaw_deg": yaw,
+        "roll_deg": float(base["roll_deg"]) + float(twin_pose.get("roll_offset_deg", 0.0)),
+        "fov_deg": float(base["fov_deg"]) + float(twin_pose.get("fov_offset_deg", 0.0)),
+    }
+
+
 def configure_twin_camera_blueprint(
     camera_bp,
     camera: dict,
@@ -152,34 +202,27 @@ def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
     import carla
 
     twin_pose = camera.get("twin_pose") or {}
-    yaw = heading_to_carla_yaw(
-        float(camera["heading_deg"]),
-        float(camera["yaw_deg"]) + float(twin_pose.get("yaw_offset_deg", 0.0)),
-    )
-    pitch = float(camera["pitch_deg"]) + float(twin_pose.get("pitch_offset_deg", 0.0))
-    roll = float(camera.get("roll_deg", 0.0)) + float(
-        twin_pose.get("roll_offset_deg", 0.0)
-    )
-
     location = gps_to_carla(carla_map, site["lat"], site["lon"])
     # gps_to_carla snaps z to the road surface; the camera sits on the
     # pole `height_m` above that.
-    location.z += float(camera["height_m"]) + float(twin_pose.get("height_offset_m", 0.0))
-
-    # A missing translation must mean the surveyed pole location.  A hidden
-    # forward offset made fitted, deployed, and verified cameras disagree.
-    forward = float(twin_pose.get("forward_offset_m", 0.0))
-    right = float(twin_pose.get("right_offset_m", 0.0))
-    if forward:
-        yaw_rad = math.radians(yaw)
-        location.x += forward * math.cos(yaw_rad)
-        location.y += forward * math.sin(yaw_rad)
-    if right:
-        yaw_rad = math.radians(yaw)
-        location.x -= right * math.sin(yaw_rad)
-        location.y += right * math.cos(yaw_rad)
-
-    rotation = carla.Rotation(pitch=pitch, yaw=yaw, roll=roll)
+    location.z += float(camera["height_m"])
+    base = {
+        "pitch_deg": float(camera["pitch_deg"]),
+        "yaw_deg": heading_to_carla_yaw(
+            float(camera["heading_deg"]), float(camera["yaw_deg"])
+        ),
+        "roll_deg": float(camera.get("roll_deg", 0.0)),
+        "fov_deg": horizontal_fov_deg(camera["intrinsics"]),
+    }
+    absolute = absolute_twin_model(
+        [location.x, location.y, location.z], base, twin_pose
+    )
+    location.x, location.y, location.z = absolute["location"]
+    rotation = carla.Rotation(
+        pitch=absolute["pitch_deg"],
+        yaw=absolute["yaw_deg"],
+        roll=absolute["roll_deg"],
+    )
     return carla.Transform(location, rotation)
 
 
