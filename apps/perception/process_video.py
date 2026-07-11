@@ -25,7 +25,7 @@ from runtime_health import (
     utc_iso,
     validate_batch_response,
 )
-from tracking_utils import AppearanceExtractor, KalmanTracker
+from tracking_utils import AppearanceExtractor, KalmanTracker, VehicleAppearanceExtractor
 
 
 TIMESTAMP_SCHEMA_VERSION = 2
@@ -651,6 +651,9 @@ class MultiCameraPipeline:
     TRACK_CLOSE_DISTANCE_M = 3.0
     TRACK_MAX_DISTANCE_M = 8.0
     TRACK_MIN_APPEARANCE_SIMILARITY = 0.65
+    VEHICLE_MIN_APPEARANCE_SIMILARITY = 0.60
+    VEHICLE_EMBEDDING_REFRESH_FRAMES = 5
+    VEHICLE_EMBEDDING_CACHE_MAX = 1024
     def __init__(self, detectors, perception_run_id=None):
         """
         Initialize the MultiCameraPipeline.
@@ -671,6 +674,49 @@ class MultiCameraPipeline:
         )
         self.perception_run_prefix = self.perception_run_id.replace("-", "")[:8]
         self.extractor = AppearanceExtractor()
+        self.vehicle_extractor = VehicleAppearanceExtractor()
+        self.vehicle_embedding_cache = {}
+
+    @staticmethod
+    def _appearance_similarity(left, right):
+        if left is None or right is None:
+            return None
+        value = float(np.dot(left, right))
+        return value if math.isfinite(value) else None
+
+    def _vehicle_embedding(self, frame, detection, frame_count):
+        track_id = detection.get('track_id')
+        key = (
+            (detection.get('device_id'), track_id)
+            if track_id is not None else None
+        )
+        cached = self.vehicle_embedding_cache.get(key) if key is not None else None
+        cache_age = (
+            frame_count - cached['frame_count'] if cached is not None else None
+        )
+        if (
+            cached is not None
+            and cache_age < self.VEHICLE_EMBEDDING_REFRESH_FRAMES
+        ):
+            return cached['embedding']
+        embedding = self.vehicle_extractor.extract(
+            frame, detection['camera_data']['bifocal_metadata']['bbox']
+        )
+        if embedding is None:
+            return cached['embedding'] if cached is not None else None
+        if embedding is not None and key is not None:
+            self.vehicle_embedding_cache[key] = {
+                'embedding': embedding,
+                'frame_count': frame_count,
+            }
+            if len(self.vehicle_embedding_cache) > self.VEHICLE_EMBEDDING_CACHE_MAX:
+                oldest = min(
+                    self.vehicle_embedding_cache,
+                    key=lambda item: self.vehicle_embedding_cache[item]['frame_count'],
+                )
+                if oldest != key:
+                    self.vehicle_embedding_cache.pop(oldest, None)
+        return embedding
 
     @staticmethod
     def haversine_distance_meters(lat1, lon1, lat2, lon2):
@@ -753,7 +799,13 @@ class MultiCameraPipeline:
             is_duplicate = False
 
             for existing_det in clean_buffer:
-                if new_det['object_type'] != existing_det['object_type']:
+                if (
+                    new_det['object_type'] != existing_det['object_type']
+                    and not (
+                        new_det['object_type'] in self.VEHICLE_CLASSES
+                        and existing_det['object_type'] in self.VEHICLE_CLASSES
+                    )
+                ):
                     continue
 
                 if new_det['device_id'] == existing_det['device_id']:
@@ -776,6 +828,14 @@ class MultiCameraPipeline:
                     continue
 
                 if new_det['object_type'] in self.VEHICLE_CLASSES:
+                    appearance = self._appearance_similarity(
+                        new_det.get('embedding'), existing_det.get('embedding')
+                    )
+                    if (
+                        appearance is None
+                        or appearance < self.VEHICLE_MIN_APPEARANCE_SIMILARITY
+                    ):
+                        continue
                     radius = min(
                         5.0,
                         2.0
@@ -787,12 +847,31 @@ class MultiCameraPipeline:
 
                 if dist < radius:
                     is_duplicate = True
+                    cross_camera_evidence = None
+                    if new_det['object_type'] in self.VEHICLE_CLASSES:
+                        cross_camera_evidence = {
+                            'method': 'spatiotemporal_convnext',
+                            'appearance_similarity': round(float(appearance), 4),
+                            'appearance_threshold': self.VEHICLE_MIN_APPEARANCE_SIMILARITY,
+                            'distance_meters': round(float(dist), 3),
+                            'media_delta_seconds': (
+                                round(abs(new_epoch - existing_epoch), 3)
+                                if new_epoch is not None and existing_epoch is not None
+                                else None
+                            ),
+                            'devices': sorted([
+                                str(new_det['device_id']),
+                                str(existing_det['device_id']),
+                            ]),
+                        }
                     if new_det['confidence_score'] > existing_det['confidence_score']:
                         # Select one internally consistent observation. Partial
                         # field replacement used to pair one camera's bbox with
                         # another camera's timestamp/media clock.
                         existing_det.clear()
                         existing_det.update(new_det)
+                    if cross_camera_evidence is not None:
+                        existing_det['cross_camera_dedup'] = cross_camera_evidence
                     break
 
             if not is_duplicate:
@@ -805,6 +884,7 @@ class MultiCameraPipeline:
         for det in clean_buffer:
             best_match_id = None
             min_dist = float('inf')
+            match_evidence = None
             local_key = f"{det['device_id']}_{det['track_id']}"
 
             # 1. Fast Path: Use visual local tracker ID
@@ -813,6 +893,11 @@ class MultiCameraPipeline:
                 if gid in self.global_tracks and gid not in claimed_gids:
                     if current_time_epoch - self.global_tracks[gid]['last_seen'] <= self.TRACK_MAX_IDLE_SEC:
                         best_match_id = gid
+                        match_evidence = {
+                            'method': 'same_camera_local_tracker',
+                            'device_id': det.get('device_id'),
+                            'local_track_id': det.get('track_id'),
+                        }
 
             # 2. Slow Path: Spatial Math Search
             if best_match_id is None:
@@ -845,8 +930,22 @@ class MultiCameraPipeline:
                     dist = min(dist_pred, dist_last)
 
                     emb_sim = 0.0
-                    if track.get('embedding') is not None and det.get('embedding') is not None:
-                        emb_sim = np.dot(track['embedding'], det['embedding'])
+                    appearance = self._appearance_similarity(
+                        track.get('embedding'), det.get('embedding')
+                    )
+                    if appearance is not None:
+                        emb_sim = appearance
+
+                    vehicle_reassociation = d_type in vehicle_classes
+                    cross_camera_vehicle = (
+                        vehicle_reassociation
+                        and track.get('last_device_id') != det.get('device_id')
+                    )
+                    if vehicle_reassociation and (
+                        appearance is None
+                        or appearance < self.VEHICLE_MIN_APPEARANCE_SIMILARITY
+                    ):
+                        continue
 
                     uncertainty = min(
                         2.0,
@@ -862,6 +961,28 @@ class MultiCameraPipeline:
                         ):
                             best_match_id = gid
                             min_dist = dist
+                            match_evidence = {
+                                'method': (
+                                    'cross_camera_spatiotemporal_convnext'
+                                    if cross_camera_vehicle
+                                    else (
+                                        'same_camera_spatiotemporal_convnext'
+                                        if vehicle_reassociation
+                                        else 'same_camera_spatiotemporal'
+                                    )
+                                ),
+                                'distance_meters': round(float(dist), 3),
+                                'appearance_similarity': (
+                                    round(float(appearance), 4)
+                                    if appearance is not None else None
+                                ),
+                                'appearance_threshold': (
+                                    self.VEHICLE_MIN_APPEARANCE_SIMILARITY
+                                    if vehicle_reassociation else None
+                                ),
+                                'previous_device_id': track.get('last_device_id'),
+                                'device_id': det.get('device_id'),
+                            }
 
             if best_match_id is not None:
                 claimed_gids.add(best_match_id)
@@ -879,12 +1000,14 @@ class MultiCameraPipeline:
 
                 self.global_tracks[best_match_id]['last_seen'] = current_time_epoch
                 self.global_tracks[best_match_id]['uncertainty_meters'] = self._localization_uncertainty(det)
+                self.global_tracks[best_match_id]['last_device_id'] = det.get('device_id')
                 det['object_id'] = (
                     f"global_{self.global_tracks[best_match_id]['type']}_"
                     f"{self.perception_run_prefix}_{best_match_id}"
                 )
                 det['object_type'] = self.global_tracks[best_match_id]['type'] # Enforce stable class
                 self.local_to_global[local_key] = best_match_id
+                det['identity_association'] = match_evidence
             else:
                 self.next_global_id += 1
                 new_gid = self.next_global_id
@@ -893,13 +1016,19 @@ class MultiCameraPipeline:
                     'kf': KalmanTracker(det['gps_location']['latitude'], det['gps_location']['longitude']),
                     'embedding': det.get('embedding'),
                     'last_seen': current_time_epoch
-                    , 'uncertainty_meters': self._localization_uncertainty(det)
+                    , 'uncertainty_meters': self._localization_uncertainty(det),
+                    'last_device_id': det.get('device_id')
                 }
                 det['object_id'] = (
                     f"global_{det['object_type']}_"
                     f"{self.perception_run_prefix}_{new_gid}"
                 )
                 self.local_to_global[local_key] = new_gid
+                det['identity_association'] = {
+                    'method': 'new_track',
+                    'device_id': det.get('device_id'),
+                    'local_track_id': det.get('track_id'),
+                }
 
             det['perception_run_id'] = self.perception_run_id
             tracked_buffer.append(det)
@@ -1158,7 +1287,11 @@ class MultiCameraPipeline:
                         )
 
                     for det in det_3d:
-                        if det['object_type'] == 'person':
+                        if det['object_type'] in self.VEHICLE_CLASSES:
+                            det['embedding'] = self._vehicle_embedding(
+                                frame, det, frame_count
+                            )
+                        elif det['object_type'] == 'person':
                             emb = self.extractor.extract(frame, det['camera_data']['bifocal_metadata']['bbox'])
                             det['embedding'] = emb
                         else:
