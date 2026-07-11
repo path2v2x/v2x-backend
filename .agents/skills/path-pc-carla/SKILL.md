@@ -1879,6 +1879,17 @@ blueprints with a stable digest rather than Python's randomized `hash()`. For a
 same-car gate, require the projected actor bbox/centroid in the matched twin
 camera over multiple replay timestamps, not merely `actor_present=true`.
 
+A shared persisted object ID across cameras is diagnostic, not identity proof.
+Run `apps/perception/tools/verify_cross_camera_persistence.py` against the
+public API and require trusted schema-v2 media clocks, matching perception run,
+finite GPS/bbox, localization uncertainty no greater than 2 m, plausible
+transit time/speed, and a persisted
+`identity_association.method="cross_camera_spatiotemporal_convnext"` with the
+previous device, ConvNeXt similarity at least 0.60, and consistent distance.
+Current production records that omit this association evidence must fail even
+when their object IDs happen to match; visual same-car proof remains a separate
+required gate.
+
 Useful logs:
 
 ```bash
