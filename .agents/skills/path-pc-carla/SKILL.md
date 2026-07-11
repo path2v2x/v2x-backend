@@ -40,6 +40,15 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   physical-intrinsics, identity, persistence, rollback, and GPS-planar-placement
   gates onto current `origin/main` while preserving the newer replay protocol.
   It is not deployed. Never deploy from the dirty recovery worktree.
+- The integration candidate also contains a read-only rolling detection-corpus
+  exporter, hash-bound observation/contact/tracklet curation, a shared WGS84
+  OpenDRIVE projection, honest independent placement metrics, and a bounded
+  detection-assisted trajectory fit. The fit is diagnostic by construction;
+  it cannot authorize deployment without measured per-camera intrinsics,
+  surveyed static/lane evidence, locked whole-track holdouts, bootstrap, RTK,
+  and UE5 visual proof. Read
+  [references/calibration.md](references/calibration.md) before calibration,
+  historical-frame, mapping, or same-car acceptance work.
 - The recovery worktree contains rejected exploratory camera CSVs and a dirty
   `config/cameras.json`. Preserve them as user-owned diagnostics, but never
   stage, glob, fit, promote, or deploy them.
@@ -52,10 +61,14 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   evidence minimum. Outputs at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260711T064950Z-acquisition-deficit/proposals/`
   are `acceptance_eligible=false` and must not be promoted.
-- The latest simforgelaptop Computer Use companion finished with Dia approval
-  denied by both app name and bundle ID. Classify `/live`, `/timeline`, and
-  `/drive` as evidence collection BLOCKED/FAIL, not product failure; no UI,
-  console, network, or same-car visual proof was collected.
+- Playwright CLI evidence at
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260711T073035Z/` proves the
+  `/timeline` archive workflow, four HTTP-200 video sessions, replay control,
+  a visible physical ch4 car, and cleanup to LIVE/zero sessions. It also proves
+  the strict geometric gate fails: the corresponding twin actor is not visibly
+  placed and road/crosswalk geometry is misregistered. Treat this as
+  counter-evidence, not acceptance. Refresh the browser evidence after any
+  deployed candidate; prior screenshots never transfer to a new fingerprint.
 
 ## Safety boundaries
 

@@ -7,11 +7,66 @@ coordinate system, correcting for the left-handed Y-axis inversion.
 
 import math
 import logging
+import hashlib
+from pathlib import Path
+import sys
 from typing import List, Tuple
 
 import carla
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from v2x_common.geodesy import (  # noqa: E402
+    GeodesyError,
+    TransverseMercator,
+    extract_opendrive_georeference,
+)
+
 logger = logging.getLogger(__name__)
+_MAP_PROJECTION_CACHE = {}
+
+
+def _projection_for_map(carla_map):
+    """Return the map-declared projection, cached by exact georef content."""
+    origin = carla_map.transform_to_geolocation(carla.Location())
+    map_name = str(getattr(carla_map, "name", "unknown"))
+    try:
+        opendrive = carla_map.to_opendrive()
+        georeference = extract_opendrive_georeference(opendrive)
+        key = (
+            map_name,
+            hashlib.sha256(georeference.encode("utf-8")).hexdigest(),
+        )
+        cached = _MAP_PROJECTION_CACHE.get(key)
+        if cached is not None:
+            return cached
+        projection = TransverseMercator.from_proj_string(georeference)
+        source = "opendrive_georeference"
+    except (AttributeError, GeodesyError, RuntimeError) as exc:
+        # Test doubles and legacy maps may not expose OpenDRIVE. Keep one
+        # WGS-84 implementation rather than reintroducing degree constants,
+        # but mark the missing map declaration loudly for acceptance evidence.
+        projection = TransverseMercator.from_proj_string(
+            f"+proj=tmerc +lat_0={float(origin.latitude):.15g} "
+            f"+lon_0={float(origin.longitude):.15g} +k=1 +x_0=0 +y_0=0 "
+            "+datum=WGS84 +units=m +no_defs"
+        )
+        source = "origin_centered_fallback"
+        key = (
+            map_name,
+            "fallback",
+            round(float(origin.latitude), 12),
+            round(float(origin.longitude), 12),
+        )
+        logger.warning(
+            "Map %s lacks a usable OpenDRIVE georeference: %s",
+            map_name,
+            exc,
+        )
+    result = (projection, source)
+    _MAP_PROJECTION_CACHE[key] = result
+    return result
 
 
 def lateral_shift(transform: carla.Transform, shift: float) -> carla.Location:
@@ -82,11 +137,20 @@ def extract_road_network_gps(carla_map: carla.Map) -> List[List[List[float]]]:
             l_loc = lateral_shift(w.transform, -w.lane_width * 0.5)
             r_loc = lateral_shift(w.transform, w.lane_width * 0.5)
 
-            l_geo = carla_map.transform_to_geolocation(l_loc)
-            r_geo = carla_map.transform_to_geolocation(r_loc)
-
-            left_edge.append([l_geo.longitude, output_latitude(l_geo.latitude)])
-            right_edge.append([r_geo.longitude, output_latitude(r_geo.latitude)])
+            if mirror_latitude:
+                l_geo = carla_map.transform_to_geolocation(l_loc)
+                r_geo = carla_map.transform_to_geolocation(r_loc)
+                left_edge.append(
+                    [l_geo.longitude, output_latitude(l_geo.latitude)]
+                )
+                right_edge.append(
+                    [r_geo.longitude, output_latitude(r_geo.latitude)]
+                )
+            else:
+                l_lat, l_lon = carla_to_gps(carla_map, l_loc)
+                r_lat, r_lon = carla_to_gps(carla_map, r_loc)
+                left_edge.append([l_lon, l_lat])
+                right_edge.append([r_lon, r_lat])
 
         if len(left_edge) > 1:
             road_lines.append(left_edge)
@@ -136,16 +200,14 @@ def gps_to_carla(
         # both shapes at this version boundary.
         location = getattr(projected, "location", projected)
     else:
-        # CARLA 0.10 dropped geolocation_to_transform, and its
-        # transform_to_geolocation returns correct WGS-84 (x = easting,
-        # y = -northing; verified empirically on the RFS map). Invert with a
-        # flat-earth approximation around the map origin — accurate to
-        # centimetres at site scale.
-        meters_per_deg_lat = 111_320.0
-        meters_per_deg_lon = 111_320.0 * math.cos(math.radians(origin_lat))
+        # CARLA 0.10 removed the inverse API. Invert the map's actual
+        # OpenDRIVE transverse-Mercator declaration using the shared WGS-84
+        # implementation; CARLA world x=easting and y=-northing.
+        projection, _source = _projection_for_map(carla_map)
+        easting, northing = projection.forward(float(lat), float(lon))
         location = carla.Location(
-            x=(lon - origin_geo.longitude) * meters_per_deg_lon,
-            y=-((lat - origin_lat) * meters_per_deg_lat),
+            x=easting,
+            y=-northing,
             z=0.0,
         )
 
@@ -172,11 +234,14 @@ def carla_to_gps(
     Returns:
         A ``(latitude, longitude)`` tuple in decimal degrees.
     """
-    geo = carla_map.transform_to_geolocation(location)
-
     if not hasattr(carla_map, "geolocation_to_transform"):
-        # CARLA 0.10: transform_to_geolocation is already correct WGS-84.
-        return geo.latitude, geo.longitude
+        projection, source = _projection_for_map(carla_map)
+        if source != "opendrive_georeference":
+            geo = carla_map.transform_to_geolocation(location)
+            return geo.latitude, geo.longitude
+        return projection.inverse(float(location.x), -float(location.y))
+
+    geo = carla_map.transform_to_geolocation(location)
 
     origin_geo = carla_map.transform_to_geolocation(carla.Location())
     origin_lat = origin_geo.latitude

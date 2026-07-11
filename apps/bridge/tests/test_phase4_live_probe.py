@@ -264,7 +264,8 @@ def twin_status(
                 "actor_type": actor_type,
                 "raw_carla_location": {"x": x, "y": y, "z": 0.0},
                 "target_carla_location": {"x": x, "y": y, "z": 0.3},
-                "placement_planar_error_m": 0.0,
+                "raw_to_target_planar_m": 0.0,
+                "placement_planar_error_m": None,
                 "carla_transform": {
                     "location": {"x": x, "y": y, "z": 0.3},
                     "rotation": {"pitch": 0.0, "yaw": 12.0, "roll": 0.0},
@@ -849,7 +850,8 @@ def test_exact_twin_sample_proves_actor_role_type_and_transform():
     assert sample["role_name"] == "twin_object"
     assert sample["position_error_m"] == 0.0
     assert sample["rotation_error_deg"] == 0.0
-    assert sample["raw_planar_error_m"] == 0.0
+    assert sample["raw_to_target_planar_m"] == 0.0
+    assert sample["placement_accuracy_claimed"] is False
 
 
 def test_twin_object_rejects_planar_lane_snap_masking():

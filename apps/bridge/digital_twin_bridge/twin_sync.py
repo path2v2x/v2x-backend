@@ -68,7 +68,7 @@ class TwinTrack:
         "timestamp_schema_version", "media_time_trusted", "media_clock",
         "device_id", "track_id", "bbox", "gps_location",
         "raw_carla_location", "lane_snap_distance_m",
-        "placement_planar_error_m",
+        "raw_to_target_planar_m", "placement_planar_error_m",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -93,6 +93,7 @@ class TwinTrack:
         self.gps_location = None
         self.raw_carla_location = None
         self.lane_snap_distance_m = None
+        self.raw_to_target_planar_m = None
         self.placement_planar_error_m = None
 
 
@@ -214,6 +215,7 @@ class TwinSync:
             "z": float(location.z),
         }
         track.lane_snap_distance_m = None
+        track.raw_to_target_planar_m = None
         track.placement_planar_error_m = None
         if track.object_type in VEHICLE_TYPES:
             waypoint = self._map.get_waypoint(location, project_to_road=True)
@@ -257,7 +259,7 @@ class TwinSync:
         # Lift above the surface or try_spawn_actor fails on ground collision;
         # walkers are placed by their capsule centre so they need ~1 m.
         location.z += 1.1 if track.object_type == "person" else 0.3
-        track.placement_planar_error_m = math.hypot(
+        track.raw_to_target_planar_m = math.hypot(
             float(location.x) - float(track.raw_carla_location["x"]),
             float(location.y) - float(track.raw_carla_location["y"]),
         )
@@ -562,6 +564,7 @@ class TwinSync:
         actor_present = False
         actor_type = None
         transform_payload = None
+        raw_to_actor_planar_m = None
         if track.actor_id is not None:
             try:
                 actor = self._world.get_actor(track.actor_id)
@@ -582,6 +585,13 @@ class TwinSync:
                             "roll": float(transform.rotation.roll),
                         },
                     }
+                    if isinstance(track.raw_carla_location, dict):
+                        raw_to_actor_planar_m = math.hypot(
+                            float(transform.location.x)
+                            - float(track.raw_carla_location["x"]),
+                            float(transform.location.y)
+                            - float(track.raw_carla_location["y"]),
+                        )
             except Exception:
                 logger.debug(
                     "Twin status transform unavailable for %s", track.object_id
@@ -610,7 +620,11 @@ class TwinSync:
                 if track.target is not None else None
             ),
             "lane_snap_distance_m": track.lane_snap_distance_m,
+            "raw_to_target_planar_m": track.raw_to_target_planar_m,
+            "raw_to_actor_planar_m": raw_to_actor_planar_m,
+            "reference_to_actor_planar_m": None,
             "placement_planar_error_m": track.placement_planar_error_m,
+            "placement_metric_status": "independent_reference_missing",
             # ``actor_id`` is acceptance evidence, so expose it only after
             # resolving the actor and its transform from the live UE5 world.
             # Keep the track's last ID separately for diagnostics.

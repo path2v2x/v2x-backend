@@ -33,8 +33,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from digital_twin_bridge.geo_utils import gps_to_carla
+from v2x_common.geodesy import local_xz_to_geodetic
 from digital_twin_bridge.twin_camera_rig import (
     configure_twin_camera_blueprint,
     compute_twin_camera_transform,
@@ -55,14 +57,23 @@ ACCEPTANCE_MAXIMUM_ERROR_PX = 175.0
 ACCEPTANCE_MAXIMUM_NEAR_OCCLUSION_FRACTION = 0.10
 
 
-def xz_to_gps(x, z, origin_lat, origin_lon, heading_deg):
+def xz_to_gps(
+    x, z, origin_lat, origin_lon, heading_deg, map_georeference=None
+):
     """Perception's local-XZ -> GPS conversion (mirror of xy_to_gps)."""
-    heading = math.radians(heading_deg)
-    easting = z * math.sin(heading) + x * math.cos(heading)
-    northing = z * math.cos(heading) - x * math.sin(heading)
-    meters_per_deg_lat = 111_320.0
-    meters_per_deg_lon = 111_320.0 * math.cos(math.radians(origin_lat))
-    return origin_lat + northing / meters_per_deg_lat, origin_lon + easting / meters_per_deg_lon
+    projection = map_georeference or (
+        f"+proj=tmerc +lat_0={float(origin_lat):.15g} "
+        f"+lon_0={float(origin_lon):.15g} +k=1 +x_0=0 +y_0=0 "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+    return local_xz_to_geodetic(
+        float(x),
+        float(z),
+        float(origin_lat),
+        float(origin_lon),
+        float(heading_deg),
+        projection,
+    )
 
 
 def project_world_point(carla_transform, world_location, fov_deg, width, height):
@@ -142,7 +153,12 @@ def calibration_world_location(carla_map, site, camera, point):
         lat, lon = point["gps"]
         return gps_to_carla(carla_map, float(lat), float(lon))
     lat, lon = xz_to_gps(
-        point["x"], point["z"], site["lat"], site["lon"], camera["heading_deg"]
+        point["x"],
+        point["z"],
+        site["lat"],
+        site["lon"],
+        camera["heading_deg"],
+        site.get("map_georeference"),
     )
     return gps_to_carla(carla_map, lat, lon)
 

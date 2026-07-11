@@ -1,7 +1,9 @@
 import sys
 import copy
 import math
+import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -18,7 +20,9 @@ from process_video import (  # noqa: E402
     VideoObjectDetector,
     attach_media_clock_metadata,
     assess_media_clock,
+    camera_intrinsics_evidence,
     camera_localization_parameters,
+    load_cameras_config,
     records_ready_for_upload,
     vehicle_localization_acceptable,
 )
@@ -90,6 +94,111 @@ class WorldLocalizationUncertaintyTests(unittest.TestCase):
             }),
             (4.0, 0.75),
         )
+
+    def test_camera_config_is_mandatory_unless_legacy_dev_flag_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing.json")
+            with patch.dict(os.environ, {"V2X_CAMERAS_JSON": missing}, clear=False):
+                os.environ.pop("V2X_ALLOW_LEGACY_CAMERA_CONFIG", None)
+                with self.assertRaisesRegex(RuntimeError, "required cameras config"):
+                    load_cameras_config()
+            with patch.dict(
+                os.environ,
+                {
+                    "V2X_CAMERAS_JSON": missing,
+                    "V2X_ALLOW_LEGACY_CAMERA_CONFIG": "true",
+                },
+                clear=False,
+            ):
+                self.assertIsNone(load_cameras_config())
+
+    def test_measured_intrinsics_are_required_and_return_distortion(self):
+        camera = {
+            "id": "ch1",
+            "intrinsics": {
+                "fx": 1000.0,
+                "fy": 1001.0,
+                "cx": 500.0,
+                "cy": 400.0,
+                "width": 1000,
+                "height": 800,
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "no measured intrinsics"):
+            camera_intrinsics_evidence(camera)
+        hashes = [f"{index:064x}" for index in range(1, 11)]
+        camera["intrinsics_calibration"] = {
+            "method": "charuco",
+            "artifact_sha256": "a" * 64,
+            "source_images_sha256": hashes,
+            "image_count": 10,
+            "rms_reprojection_error_px": 0.5,
+            "resolution": [1000, 800],
+            "camera_matrix": [
+                [1000.0, 0.0, 500.0],
+                [0.0, 1001.0, 400.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "distortion": {
+                "k1": -0.1,
+                "k2": 0.01,
+                "p1": 0.001,
+                "p2": -0.002,
+                "k3": 0.0,
+            },
+        }
+        distortion = camera_intrinsics_evidence(camera)
+        np.testing.assert_allclose(
+            distortion, [-0.1, 0.01, 0.001, -0.002, 0.0]
+        )
+        with self.assertRaisesRegex(ValueError, "artifact path"):
+            camera_intrinsics_evidence(
+                camera,
+                evidence_root=Path("/tmp"),
+                require_artifacts=True,
+            )
+
+    def test_emits_non_circular_raw_observation_provenance(self):
+        detector = self.detector()
+        detector.origin_lat = 37.9
+        detector.origin_lon = -122.3
+        detector.heading_deg = 0.0
+        detector.device_id = "cam-001-ch1"
+        detector.city = "Richmond"
+        detector.state = "CA"
+        detector.country = "USA"
+        detector.image_width = 1000
+        detector.image_height = 800
+        detector.cameras_json_sha256 = "a" * 64
+        detector.camera_config_sha256 = "b" * 64
+        detector.detector_model_sha256 = "c" * 64
+        record = detector.compute_3d_detections(
+            [
+                {
+                    "center": {"x": 600.0, "y": 700.0},
+                    "bbox": {
+                        "x1": 550.0,
+                        "y1": 600.0,
+                        "x2": 650.0,
+                        "y2": 790.0,
+                    },
+                    "class_name": "car",
+                    "confidence": 0.9,
+                    "frame": 5,
+                    "track_id": 7,
+                }
+            ],
+            "2026-07-11T03:32:21.022Z",
+            1783740741,
+        )[0]
+        raw = record["raw_observation"]
+        self.assertEqual(raw["ground_contact"]["pixel"], [600.0, 790.0])
+        self.assertFalse(raw["ground_contact"]["reviewed"])
+        self.assertTrue(
+            raw["optimizer_contract"]["gps_location_is_derived_baseline"]
+        )
+        self.assertFalse(raw["optimizer_contract"]["acceptance_eligible"])
+        self.assertEqual(raw["fingerprints"]["camera_config_sha256"], "b" * 64)
 
 
 class FrameBroadcasterTests(unittest.TestCase):

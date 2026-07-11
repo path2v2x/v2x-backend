@@ -1130,6 +1130,7 @@ def resolve_inputs(args: argparse.Namespace) -> dict[str, object]:
             detection, timestamp_field, media_timestamp
         ),
         "bbox": bbox,
+        "event_id": detection.get("event_id"),
         "object_id": args.object_id or detection.get("object_id"),
         "object_type": args.object_type or detection.get("object_type"),
         "confidence": confidence,
@@ -1187,6 +1188,7 @@ def verify_historical_correlation(
     timestamp_field: str,
     timestamp_trust: dict[str, object],
     bbox: tuple[float, float, float, float],
+    event_id: object = None,
     object_id: object = None,
     object_type: object = None,
     confidence: object = None,
@@ -1312,6 +1314,7 @@ def verify_historical_correlation(
         },
         "detection": {
             "camera_id": camera_id,
+            "event_id": str(event_id) if event_id is not None else None,
             "object_id": str(object_id) if object_id is not None else None,
             "object_type": str(object_type) if object_type is not None else None,
             "confidence": confidence,
