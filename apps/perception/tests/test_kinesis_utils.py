@@ -195,7 +195,7 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
             ContainerFormat="FRAGMENTED_MP4",
             DiscontinuityMode="ALWAYS",
             DisplayFragmentTimestamp="ALWAYS",
-            MaxMediaPlaylistFragmentResults=2,
+            MaxMediaPlaylistFragmentResults=4,
         )
 
     @patch("kinesis_utils.requests.get")
@@ -207,12 +207,12 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
             clear=False,
         ):
             self.assertEqual(
-                get_video_session_hls_url("v2x-backend-cam-ch1", 2),
+                get_video_session_hls_url("v2x-backend-cam-ch1", 4),
                 "signed-session",
             )
         get.assert_called_once_with(
             "https://api.invalid/video/session/ch1",
-            params={"max_fragments": "2"},
+            params={"max_fragments": "4"},
             headers={"accept": "application/json"},
             timeout=10,
         )
@@ -226,6 +226,17 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
         ):
             with self.assertRaisesRegex(ValueError, "between 2 and 5"):
                 get_video_session_hls_url("v2x-backend-cam-ch1", 1)
+
+    @patch("kinesis_utils.get_video_session_hls_url")
+    def test_perception_rejects_fragment_counts_that_cannot_anchor_clock(self, api):
+        with patch.dict(
+            "kinesis_utils.os.environ",
+            {"V2X_PERCEPTION_LIVE_HLS_FRAGMENTS": "3"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be 4 or 5"):
+                get_kvs_hls_url("v2x-backend-cam-ch1")
+        api.assert_not_called()
 
 
 if __name__ == "__main__":
