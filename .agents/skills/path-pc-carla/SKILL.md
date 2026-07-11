@@ -53,7 +53,7 @@ Observed on 2026-07-10 UTC; verify rather than assume:
 | Perception tunnel | `v2x-cloudflared-perception.service`; currently Quick Tunnel unless a named-tunnel gate has completed |
 | Public API | `https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com` |
 | AWS deploy caller | `arn:aws:iam::147229569658:user/rfs-v2x-service`; API writes require the dedicated least-privilege deploy role |
-| Amplify repository | reconcile stale `michaelvu1207/v2x-backend` to canonical `path2v2x/v2x-backend` with a fresh token and explicit release gate |
+| Amplify repository | preferred `path2v2x/v2x-backend`; temporary `michaelvu1207/v2x-backend-amplify` mirror is acceptable only with exact main-SHA parity, active successful sync workflow, active push webhook, and explicit release gate |
 
 Collect a non-mutating baseline:
 
@@ -121,6 +121,14 @@ for unit in \
   systemctl is-enabled "$unit" 2>&1 || true
 done
 ```
+
+The Path PC AWS files have named profiles rather than a default profile. Use
+`AWS_PROFILE=path AWS_REGION=us-west-2` for Amplify reads and the scoped
+`AWS_PROFILE=v2x-backend-deploy AWS_REGION=us-west-1` role only for reviewed
+exact-API deployment work. Never print credential values. A temporary Amplify
+mirror does not satisfy the preferred canonical-repository endpoint merely
+because a job succeeded; separately prove canonical/mirror `main` SHA parity,
+the tracked `Sync Amplify mirror` workflow, and the active Amplify push webhook.
 
 Inspect installed definitions before trusting tracked units:
 
