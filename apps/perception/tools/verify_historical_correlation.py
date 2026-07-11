@@ -201,6 +201,10 @@ def fetch_bytes(url: str, *, limit: int, timeout_seconds: float, label: str) -> 
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             body = response.read(limit + 1)
+    except HTTPError as exc:
+        error = _network_error(label, exc)
+        exc.close()
+        raise error from None
     except Exception as exc:
         error = _network_error(label, exc)
         close = getattr(exc, "close", None)

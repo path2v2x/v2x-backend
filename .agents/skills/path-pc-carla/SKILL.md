@@ -1875,7 +1875,7 @@ each feed, and rejects query-bearing endpoint input:
 ```bash
 /home/path/V2XCarla/perception-venv/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_live_feeds.py \
-  http://127.0.0.1:8090
+  http://127.0.0.1:8090 --max-decode-latency-ms 10000
 ```
 
 For a bounded Drive/twin/replay regression, run the tracked verifier
