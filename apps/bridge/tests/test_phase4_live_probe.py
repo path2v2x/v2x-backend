@@ -324,6 +324,13 @@ def test_rejects_incomplete_or_nonfinite_twin_lens_model(mutate):
         validate_twin_camera_model(hello, "ch1")
 
 
+def test_metadata_canary_rejects_complete_nondefault_twin_lens_model():
+    hello = twin_camera_hello()
+    hello["camera_model"]["lens"]["lens_k"] = -0.9
+    with pytest.raises(VerificationError, match="non-default CARLA lens model"):
+        validate_twin_camera_model(hello, "ch1")
+
+
 def test_pins_twin_camera_model_to_live_ue5_sensor_actor():
     model = validate_twin_camera_model(twin_camera_hello(), "ch1")
     actor = FakeActor(

@@ -460,6 +460,36 @@ class RunScopedIdentityTests(unittest.TestCase):
             ambiguous["identity_association"]["method"], "new_track"
         )
 
+    def test_third_candidate_with_conflicting_appearance_fails_closed(self):
+        pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
+        candidates = [
+            {
+                "distance_meters": 0.3,
+                "appearance_similarity": 0.62,
+                "record": {"device_id": "ch1", "object_id": "car-1"},
+            },
+            {
+                "distance_meters": 1.9,
+                "appearance_similarity": 0.60,
+                "record": {"device_id": "ch2", "object_id": "car-2"},
+            },
+            {
+                "distance_meters": 2.0,
+                "appearance_similarity": 0.95,
+                "record": {"device_id": "ch3", "object_id": "car-3"},
+            },
+        ]
+
+        selected, ambiguity = pipeline._select_unambiguous_vehicle_candidate(
+            candidates
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(
+            ambiguity["method"], "ambiguous_spatiotemporal_convnext"
+        )
+        self.assertEqual(len(ambiguity["candidates"]), 3)
+
     def test_ambiguous_temporal_reattachment_starts_distinct_track(self):
         pipeline = self.pipeline("123e4567-e89b-12d3-a456-426614174000")
         first = self.detection("ch1")

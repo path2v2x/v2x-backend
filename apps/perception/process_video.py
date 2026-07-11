@@ -918,23 +918,24 @@ class MultiCameraPipeline:
         )
         if len(ordered) == 1:
             return ordered[0], None
-        best, second = ordered[:2]
-        close_in_space = (
-            second['distance_meters'] - best['distance_meters']
-            < self.VEHICLE_AMBIGUITY_DISTANCE_MARGIN_M
+        best = ordered[0]
+        ambiguous = any(
+            (
+                candidate['distance_meters'] - best['distance_meters']
+                < self.VEHICLE_AMBIGUITY_DISTANCE_MARGIN_M
+                and abs(
+                    candidate['appearance_similarity']
+                    - best['appearance_similarity']
+                ) < self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN
+            )
+            or (
+                candidate['appearance_similarity']
+                > best['appearance_similarity']
+                + self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN
+            )
+            for candidate in ordered[1:]
         )
-        close_in_appearance = abs(
-            second['appearance_similarity']
-            - best['appearance_similarity']
-        ) < self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN
-        conflicting_evidence = (
-            second['appearance_similarity']
-            > best['appearance_similarity']
-            + self.VEHICLE_AMBIGUITY_APPEARANCE_MARGIN
-        )
-        if not (
-            (close_in_space and close_in_appearance) or conflicting_evidence
-        ):
+        if not ambiguous:
             return best, None
         return None, {
             'method': 'ambiguous_spatiotemporal_convnext',
