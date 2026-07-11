@@ -157,14 +157,16 @@
 
 ## Immediate executable sequence
 
-1. Finish and test the hash-bound capture helper, including explicit failure
-   against the deployed legacy twin WebSocket protocol.
-2. Determine whether every retained real/twin pair contains enough unique,
-   depth-safe static features. If any channel does not, acquire a better
-   source frame or map render; do not fabricate repeated-marking identities.
-3. Implement an annotation-assistance report that proposes features while
-   preserving manual/geometric holdouts, feature uniqueness, spatial coverage,
-   and train/holdout separation.
+1. The hash-bound capture helper and proposal-only annotation assistant are
+   implemented and tested. The assistant is structurally ineligible for the
+   strict manifest and atomically refuses overwrite.
+2. Retained pair diagnostics found distributed proposals ch1/ch2/ch3/ch4 =
+   1/1/6/1. None reaches the required 12 manually verified unique points; all
+   four need better source pairs after physical intrinsics capture. Do not
+   fabricate repeated-marking identities.
+3. Keep the complete actor-observed default lens tuple shared across rig,
+   manifest, optimizer, and verifier. Any configured override or tuple drift
+   remains a hard failure; never write lens attributes.
 4. Obtain real measured intrinsics evidence. This is a hard dependency for an
    accepted calibration and cannot be synthesized from the current frames.
    The acquisition task is to place a measured ChArUco/checkerboard target

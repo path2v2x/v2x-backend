@@ -26,6 +26,7 @@ from build_twin_camera_landmarks import (  # noqa: E402
     wait_for_frame,
 )
 from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
+    CARLA_DEFAULT_PINHOLE_LENS,
     compute_twin_camera_transform,
     configure_twin_camera_blueprint,
     heading_to_carla_yaw,
@@ -196,6 +197,8 @@ def validate_intrinsics_source_images(camera, source_paths):
 
 def build_deployment_model(camera, transform):
     """Freeze the exact rig anchor/base needed to round-trip an absolute fit."""
+    if camera.get("twin_lens"):
+        raise ValueError("twin lens overrides are held for runtime safety")
     intrinsics = camera["intrinsics"]
     twin_pose = camera.get("twin_pose") or {}
     final_yaw = math.radians(float(transform.rotation.yaw))
@@ -210,15 +213,6 @@ def build_deployment_model(camera, transform):
         - right * math.cos(final_yaw),
         float(transform.location.z) - float(twin_pose.get("height_offset_m", 0.0)),
     ]
-    lens = {
-        "lens_k": 0.0,
-        "lens_kcube": 0.0,
-        "lens_circle_falloff": 5.0,
-        "lens_circle_multiplier": 0.0,
-        "lens_x_size": 0.08,
-        "lens_y_size": 0.08,
-    }
-    lens.update(camera.get("twin_lens") or {})
     return {
         "type": "twin_camera_rig_v1",
         "anchor_location": anchor_location,
@@ -230,7 +224,7 @@ def build_deployment_model(camera, transform):
             "roll_deg": float(camera.get("roll_deg", 0.0)),
             "fov_deg": horizontal_fov_deg(intrinsics),
         },
-        "lens": {key: float(value) for key, value in lens.items()},
+        "lens": dict(CARLA_DEFAULT_PINHOLE_LENS),
     }
 
 

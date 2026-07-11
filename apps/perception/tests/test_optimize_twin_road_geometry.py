@@ -109,7 +109,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                     "fov_deg": 90.0,
                 },
                 "lens": {
-                    "lens_k": 0.0,
+                    "lens_k": -1.0,
                     "lens_kcube": 0.0,
                     "lens_circle_falloff": 5.0,
                     "lens_circle_multiplier": 0.0,
@@ -408,6 +408,24 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         }
         valid_gate = MODULE.verify_external_evidence(manifest, **kwargs)
         self.assertTrue(valid_gate["passed"], valid_gate)
+        unsafe_camera = json.loads(json.dumps(camera))
+        unsafe_camera["twin_lens"] = {"lens_k": -1.0}
+        unsafe_cameras = json.dumps({"cameras": [unsafe_camera]}).encode()
+        unsafe_manifest = json.loads(json.dumps(manifest))
+        unsafe_manifest["cameras_file_sha256"] = hashlib.sha256(
+            unsafe_cameras
+        ).hexdigest()
+        unsafe_manifest["camera_config_sha256"] = hashlib.sha256(json.dumps(
+            unsafe_camera,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()).hexdigest()
+        unsafe_kwargs = dict(kwargs)
+        unsafe_kwargs["cameras_bytes"] = unsafe_cameras
+        gate = MODULE.verify_external_evidence(unsafe_manifest, **unsafe_kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn("camera_lens_override_safety_hold", gate["reasons"])
         tampered = json.loads(json.dumps(manifest))
         tampered["intrinsics_calibration"]["distortion"]["k1"] = 0.123
         gate = MODULE.verify_external_evidence(tampered, **kwargs)

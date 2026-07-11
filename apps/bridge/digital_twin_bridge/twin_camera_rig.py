@@ -42,6 +42,18 @@ TWIN_LENS_ATTRIBUTE_KEYS = (
     "lens_y_size",
 )
 
+# RR/CARLA 0.10 reports this complete tuple on a newly spawned RGB sensor.
+# It is the only lens state accepted by the current pinhole projection model.
+# Never write these attributes at runtime; observe and verify them on the actor.
+CARLA_DEFAULT_PINHOLE_LENS = {
+    "lens_k": -1.0,
+    "lens_kcube": 0.0,
+    "lens_circle_falloff": 5.0,
+    "lens_circle_multiplier": 0.0,
+    "lens_x_size": 0.08,
+    "lens_y_size": 0.08,
+}
+
 DEFAULT_CAMERAS_JSON = Path(__file__).resolve().parents[3] / "config" / "cameras.json"
 
 TWIN_SUPPORTED_MAP_LEAVES = {"richmond_field_station_richmond_ca"}

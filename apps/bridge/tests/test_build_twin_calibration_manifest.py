@@ -120,7 +120,11 @@ def test_deployment_model_reverses_existing_offsets_exactly():
     assert model["base"]["pitch_deg"] == -30.0
     assert model["base"]["roll_deg"] == 1.0
     assert model["base"]["fov_deg"] == pytest.approx(90.0)
-    assert model["lens"]["lens_k"] == 0.0
+    assert model["lens"]["lens_k"] == -1.0
+
+    camera["twin_lens"] = {"lens_k": -1.0}
+    with pytest.raises(ValueError, match="lens overrides are held"):
+        build_deployment_model(camera, transform)
 
 
 def measured_camera():

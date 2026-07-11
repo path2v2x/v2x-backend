@@ -25,6 +25,7 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
+    CARLA_DEFAULT_PINHOLE_LENS,
     absolute_twin_model,
     compute_twin_camera_transform,
     configure_twin_camera_blueprint,
@@ -186,9 +187,15 @@ def deployment_roundtrip(manifest, params):
     if measured_optical_max > DEPLOYMENT_OPTICAL_ROUNDTRIP_MAX_PX:
         reasons.append("measured_physical_optics_not_representable_in_ue5")
     lens = model.get("lens") or {}
-    if any(abs(float(lens.get(key, 0.0))) > 1e-12 for key in (
-        "lens_k", "lens_kcube", "lens_circle_multiplier"
-    )):
+    if set(lens) != set(CARLA_DEFAULT_PINHOLE_LENS) or any(
+        not math.isclose(
+            float(lens.get(key, math.nan)),
+            expected,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for key, expected in CARLA_DEFAULT_PINHOLE_LENS.items()
+    ):
         reasons.append("unsupported_existing_ue5_lens_model")
     return {
         "passed": not reasons,
@@ -566,15 +573,9 @@ def verify_external_evidence(
         deployment = manifest.get("deployment_model") or {}
         if deployment.get("base") != expected_base:
             reasons.append("deployment_base_camera_config_mismatch")
-        expected_lens = {
-            "lens_k": 0.0,
-            "lens_kcube": 0.0,
-            "lens_circle_falloff": 5.0,
-            "lens_circle_multiplier": 0.0,
-            "lens_x_size": 0.08,
-            "lens_y_size": 0.08,
-        }
-        expected_lens.update(camera.get("twin_lens") or {})
+        if camera.get("twin_lens"):
+            reasons.append("camera_lens_override_safety_hold")
+        expected_lens = dict(CARLA_DEFAULT_PINHOLE_LENS)
         if deployment.get("lens") != expected_lens:
             reasons.append("deployment_lens_camera_config_mismatch")
         baseline = manifest.get("baseline") or {}
