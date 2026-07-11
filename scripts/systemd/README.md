@@ -50,7 +50,21 @@ sudo systemctl stop \
   v2x-hourly-drive-restart.timer
 ```
 
-Capture a new rollback bundle in addition to the existing repository backup:
+Capture a new rollback bundle in addition to the existing repository backup.
+The tracked helper is plan-only by default, refuses capture while any
+mutation-capable timer is active, records all three perception model assets,
+and can rehearse repository restoration in an isolated clone:
+
+```bash
+scripts/capture-v2x-rollback.sh
+ACTION=capture scripts/capture-v2x-rollback.sh
+ACTION=verify BUNDLE=/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-<UTC> \
+  scripts/capture-v2x-rollback.sh
+```
+
+The commands below document the bundle contents and remain useful for manual
+inspection. Do not stash the live checkout until the tracked bundle has passed
+`ACTION=verify`:
 
 ```bash
 set -euo pipefail
@@ -112,6 +126,7 @@ Static validation before install:
 bash -n infra/aws-cli/provision-read-api.sh infra/amplify/deploy.sh scripts/*.sh
 shellcheck -x infra/aws-cli/provision-read-api.sh infra/amplify/deploy.sh scripts/*.sh
 scripts/tests/test-recovery-infra.sh
+scripts/tests/test-rollback-bundle.sh
 scripts/run-carla-rr.sh validate
 ```
 
