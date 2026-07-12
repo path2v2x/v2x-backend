@@ -25,6 +25,8 @@ MAXIMUM_RELATIVE_FOCAL_LOO_SPREAD = 0.05
 MAXIMUM_RELATIVE_PRINCIPAL_POINT_FOCAL_SPREAD = 0.05
 MINIMUM_HORIZONTAL_FOV_DEG = 25.0
 MAXIMUM_HORIZONTAL_FOV_DEG = 140.0
+MAXIMUM_DUPLICATE_LINE_ANGLE_DEG = 0.25
+MAXIMUM_DUPLICATE_LINE_OFFSET_PX = 2.0
 
 
 class VanishingCalibrationError(ValueError):
@@ -69,7 +71,9 @@ def fit_vanishing_point(lines):
         else float(singular[0] / singular[-1])
     )
     if rank != 2 or condition > MAXIMUM_CONDITION:
-        raise VanishingCalibrationError("line family is rank deficient or ill-conditioned")
+        raise VanishingCalibrationError(
+            "line family is rank deficient or ill-conditioned"
+        )
     pixel, *_ = np.linalg.lstsq(matrix, target, rcond=None)
     residuals = []
     for item in lines:
@@ -95,7 +99,9 @@ def focal_from_orthogonal_vanishing_points(left, right, principal_point, width):
     focal = math.sqrt(focal_squared)
     horizontal_fov = math.degrees(2.0 * math.atan(float(width) / (2.0 * focal)))
     if not MINIMUM_HORIZONTAL_FOV_DEG <= horizontal_fov <= MAXIMUM_HORIZONTAL_FOV_DEG:
-        raise VanishingCalibrationError("implied horizontal FOV is physically implausible")
+        raise VanishingCalibrationError(
+            "implied horizontal FOV is physically implausible"
+        )
     return {
         "focal_px": focal,
         "focal_squared_px2": focal_squared,
@@ -116,7 +122,8 @@ def metric(values):
 
 
 def validate_line_set(lines, width, height):
-    seen_ids, seen_geometry = set(), set()
+    seen_ids, seen_physical_ids, seen_geometry = set(), set(), set()
+    canonical_lines = []
     normalized = []
     for item in lines:
         if not isinstance(item, dict):
@@ -125,19 +132,49 @@ def validate_line_set(lines, width, height):
         if not isinstance(line_id, str) or not line_id or line_id in seen_ids:
             raise VanishingCalibrationError("line IDs are blank or duplicated")
         seen_ids.add(line_id)
+        physical_line_id = item.get("physical_line_id")
+        if (
+            not isinstance(physical_line_id, str)
+            or not physical_line_id
+            or physical_line_id in seen_physical_ids
+        ):
+            raise VanishingCalibrationError(
+                "physical line IDs are blank, duplicated, or reused across frames"
+            )
+        seen_physical_ids.add(physical_line_id)
         if item.get("split") not in {"fit", "holdout"}:
             raise VanishingCalibrationError("line split is invalid")
         endpoints = np.asarray(item.get("endpoints"), dtype=float)
         normalized_line(endpoints)
         if np.any(endpoints[:, 0] < 0.0) or np.any(endpoints[:, 0] >= width):
-            raise VanishingCalibrationError("line endpoint is outside the retained frame")
+            raise VanishingCalibrationError(
+                "line endpoint is outside the retained frame"
+            )
         if np.any(endpoints[:, 1] < 0.0) or np.any(endpoints[:, 1] >= height):
-            raise VanishingCalibrationError("line endpoint is outside the retained frame")
+            raise VanishingCalibrationError(
+                "line endpoint is outside the retained frame"
+            )
         geometry = tuple(np.round(endpoints.ravel(), 6))
         reverse = tuple(np.round(endpoints[::-1].ravel(), 6))
         if geometry in seen_geometry or reverse in seen_geometry:
             raise VanishingCalibrationError("line geometry is duplicated")
         seen_geometry.add(geometry)
+        line = normalized_line(endpoints)
+        if line[0] < 0.0 or (abs(line[0]) <= 1e-12 and line[1] < 0.0):
+            line = -line
+        for previous in canonical_lines:
+            cosine = float(np.clip(line[:2] @ previous[:2], -1.0, 1.0))
+            angle = math.degrees(math.acos(abs(cosine)))
+            sign = 1.0 if cosine >= 0.0 else -1.0
+            offset = abs(float(line[2] - sign * previous[2]))
+            if (
+                angle <= MAXIMUM_DUPLICATE_LINE_ANGLE_DEG
+                and offset <= MAXIMUM_DUPLICATE_LINE_OFFSET_PX
+            ):
+                raise VanishingCalibrationError(
+                    "near-collinear fragments reuse one physical image line"
+                )
+        canonical_lines.append(line)
         if not isinstance(item.get("frame_id"), str) or not item["frame_id"]:
             raise VanishingCalibrationError("line frame binding is missing")
         normalized.append(item)
@@ -149,6 +186,12 @@ def evaluate_pair(left_lines, right_lines, principal_point, width, height):
     right_lines = validate_line_set(right_lines, width, height)
     if {item["id"] for item in left_lines} & {item["id"] for item in right_lines}:
         raise VanishingCalibrationError("physical line IDs are reused across families")
+    left_physical = {item["physical_line_id"] for item in left_lines}
+    right_physical = {item["physical_line_id"] for item in right_lines}
+    if left_physical & right_physical:
+        raise VanishingCalibrationError(
+            "physical line identities are reused across orthogonal families"
+        )
     left_fit = [item for item in left_lines if item["split"] == "fit"]
     right_fit = [item for item in right_lines if item["split"] == "fit"]
     left_holdout = [item for item in left_lines if item["split"] == "holdout"]
@@ -156,7 +199,10 @@ def evaluate_pair(left_lines, right_lines, principal_point, width, height):
     reasons = []
     if len(left_fit) < MINIMUM_FIT_LINES or len(right_fit) < MINIMUM_FIT_LINES:
         reasons.append("insufficient_fit_lines")
-    if len(left_holdout) < MINIMUM_HOLDOUT_LINES or len(right_holdout) < MINIMUM_HOLDOUT_LINES:
+    if (
+        len(left_holdout) < MINIMUM_HOLDOUT_LINES
+        or len(right_holdout) < MINIMUM_HOLDOUT_LINES
+    ):
         reasons.append("insufficient_holdout_lines")
     if reasons:
         return {"passed": False, "reasons": reasons}
@@ -305,7 +351,10 @@ def main(argv=None):
     source_path = Path(args.observations).resolve()
     source_raw = source_path.read_bytes()
     observations = json.loads(source_raw)
-    if observations.get("schema") != SCHEMA or observations.get("acceptance_eligible") is not False:
+    if (
+        observations.get("schema") != SCHEMA
+        or observations.get("acceptance_eligible") is not False
+    ):
         raise SystemExit("observations lack the diagnostic contract")
     try:
         frames = validate_frames(observations, source_path.parent)
@@ -322,8 +371,14 @@ def main(argv=None):
             principal = camera.get("principal_point", [width / 2.0, height / 2.0])
             families = camera.get("line_families")
             pair = camera.get("orthogonal_pair")
-            if not isinstance(families, dict) or not isinstance(pair, list) or len(pair) != 2:
-                raise VanishingCalibrationError("orthogonal line-family pair is missing")
+            if (
+                not isinstance(families, dict)
+                or not isinstance(pair, list)
+                or len(pair) != 2
+            ):
+                raise VanishingCalibrationError(
+                    "orthogonal line-family pair is missing"
+                )
             left_lines = families.get(pair[0])
             right_lines = families.get(pair[1])
             if not isinstance(left_lines, list) or not isinstance(right_lines, list):
