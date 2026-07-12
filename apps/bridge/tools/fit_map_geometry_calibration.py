@@ -276,6 +276,17 @@ def validate_pixel(pixel, width, height, label):
         raise ValueError(f"{label} is outside the retained real frame")
 
 
+def validate_vanishing_pixel(pixel, width, height, label):
+    if (
+        not isinstance(pixel, list)
+        or len(pixel) != 2
+        or not all(math.isfinite(float(value)) for value in pixel)
+        or not -10 * width <= pixel[0] <= 11 * width
+        or not -10 * height <= pixel[1] <= 11 * height
+    ):
+        raise ValueError(f"{label} vanishing point is invalid")
+
+
 def canonical_world_ref(reference):
     value = dict(reference)
     if value.get("kind") == "crosswalk_edge":
@@ -427,7 +438,7 @@ def fit_camera(camera_id, annotation, geometry_report, camera_config, output_dir
             or any(line_id not in line_index for line_id in line_ids)
         ):
             raise ValueError(f"{camera_id}: invalid vanishing-point line identities")
-        validate_pixel(item.get("real_uv"), width, height, item["id"])
+        validate_vanishing_pixel(item.get("real_uv"), width, height, item["id"])
         if item.get("split") not in {"fit", "holdout"}:
             raise ValueError(f"{camera_id}: invalid vanishing-point split")
         uncertainty = float(item.get("uncertainty_px", math.nan))
