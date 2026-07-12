@@ -78,6 +78,15 @@ Observed on 2026-07-11 UTC; verify rather than assume:
 - Do not overwrite `/home/path/V2XCarla/v2x-backend` until a controlled deployment gate. It may run active services and contain live-only work.
 - Preserve `/home/path/V2XCarla/v2x-backend-backups/` and take a fresh rollback snapshot before deployment.
 - Use only the packaged Unreal Engine 5.5 worker container `carla-rr-maps` for production V2X simulator work. The accepted image is RR/CARLA 0.10 and its runtime reports `5.5.0-0+UE5`.
+- Calibration batch rendering may use the same approved image in the tracked,
+  non-restarting `v2x-calibration-ue5` container on loopback ports 2300-2302.
+  This Path PC has a 16 GiB GPU and cannot safely run that worker alongside the
+  production worker: a dual-worker Richmond load produced a bounded Vulkan OOM
+  while production fingerprints remained stable. Use a rollback-captured,
+  zero-session maintenance window, hold all three mutation-capable timers, stop
+  Drive and the production UE5 worker, run one isolated batch, then stop the
+  owned calibration container and fully restore production/timers. Never point
+  an optimizer at production ports 2000-2002.
 - Never use the retired `carla-rfs`/CARLA 0.9.16 restart recipe.
 - Do not build, launch, debug, authorize, retry, coordinate, or accept evidence from `/home/path/V2XCarla/CarlaUE6`, `/home/path/V2XCarla/UnrealEngine_6`, `ue6-*` user units, or ports `2100-2102` in a V2X task. A separate UE6 task owns those paths, processes, changes, and acceptance criteria.
 - UE6 work must not stop, hold, delay, restart, or reconfigure V2X services or timers. V2X work must likewise remain independent: do not inspect, poll, gate on, coordinate, or operate UE6 paths, units, processes, listeners, or evidence. Validate only the V2X-owned UE5.5 resources below. Any cross-runtime contention is owned by the separate UE6 task, which must stop itself rather than asking V2X to change state.
@@ -523,6 +532,33 @@ Never translate this file mechanically into manifest annotations. A human must
 independently establish a unique semantic/world identity, freeze the split, and
 write accepted provenance; the manifest builder must continue to reject the
 proposal schema directly.
+
+Semantic inverse rendering is the preferred diagnostic search before manual
+acceptance annotation. Use `scripts/v2x-calibration-worker.sh` and
+`render_semantic_calibration_candidate.py` to produce hash-bound, synchronized
+RGB, raw semantic, raw instance, and metric-depth buffers for one explicit
+candidate. The renderer must reject the production container/port, verify the
+approved image and Richmond OpenDRIVE fingerprints, use one CARLA frame for all
+buffers, destroy all owned sensors, and keep every result
+`acceptance_eligible=false`.
+
+The current Richmond RR/UE5 build was observed to emit semantic tag 11 for 100%
+of static pixels and instance sentinel 65535 for 100% of static pixels, even
+while RGB and depth were valid. Retain those buffers as failure evidence; never
+claim class-aware alignment from them. Build diagnostic road-paint/curb targets
+from retained RGB, depth, reviewed topology, and class-specific masks instead.
+Score robust symmetric contour distance, P95/max, tolerance precision/recall,
+and topology separately. A lower clipped mean does not promote a candidate when
+P95, tolerance F1, a required semantic class, or the retained visual overlay
+regresses. Missing/mismatched map paint is a map blocker, not a reason to mask a
+required held-out class or weaken the road-geometry gate.
+
+Freeze the static camera before using vehicles. For a real vehicle with no close
+UE5 mesh, treat blueprint family and dimensions as nuisance variables and use a
+robust silhouette centroid/midpoint only as a lower-weight cue alongside visible
+contour, wheel/road contact, projected 3-D extent, multi-camera timing, road
+legality, and temporal smoothness. Never let midpoint agreement alone recalibrate
+the camera or certify same-car placement.
 
 Manual four-camera evidence must use one JSON annotation artifact per channel.
 Capture observational pairs with `capture_twin_calibration_pairs.py` only
