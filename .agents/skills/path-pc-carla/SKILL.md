@@ -9,6 +9,48 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
+Observed through 2026-07-12 20:25 UTC; verify rather than assume. These items
+override every older PR 32/candidate statement below.
+
+- PR 32 merged as canonical
+  `21554f18f523fdc577c8524623534a60b0ebf500`. A controlled live startup at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T200300Z-pr32-cadence-aware-startup/`
+  passed uploads disabled and enabled, five strict health samples plus five
+  four-feed checks in each mode, LIVE/zero sessions, unchanged CARLA/Drive/web
+  fingerprints, and timer restoration. A repeated startup at
+  `20260712T200830Z-pr32-cadence-aware-startup/` also passed. Two subsequent
+  ten-minute harnesses were invalidated by harness-only PID/schema errors and
+  correctly rolled back; retain them as rejected orchestration evidence, not
+  product failures or partial acceptance.
+- A fresh third startup then found a real, intermittent semantic mismatch in
+  the fourth upload-disabled feed round. Raw frames and strict media clocks
+  remained healthy, but ch1's `/detections/latest.updated_at` did not advance
+  across one three-second pair. The first three rounds already showed normal
+  per-camera inference-summary gaps up to 4.421 seconds, and the retained
+  corpus contains a 7.516-second gap. Four fixed-order camera jobs share two
+  workers and the next batch waits at the global barrier, so a three-second
+  paired sample is not an inference liveness deadline. The automatic rollback
+  restored `d54f5df`, the old unit/environment, perception, and all timers.
+  Evidence is
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T202300Z-pr32-final-startup/`;
+  rollback bundle
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T195908Z-pr32-cadence-retry/`
+  verifies cleanly. Do not redeploy PR 32 unchanged.
+- Candidate `40673cbcc890c628f07e422aa06c943933bb34cc` makes inference
+  liveness explicit rather than relaxing the existing gates. `/health` now
+  exposes a monotonic per-camera inference count, source timestamp, completion
+  age, and freshness; overall readiness fails closed when any inference result
+  is older than ten seconds. The feed verifier still requires raw capture to
+  advance across three seconds, two distinct JPEGs, timestamp ages at most 15
+  seconds, trusted matched media clocks, and decode latency in the unchanged
+  -1,000/+10,000 ms range. It polls each inference counter for at most ten
+  seconds, rejects regression immediately, and fails if any counter does not
+  advance. All 131 perception tests pass. This is source-only candidate
+  evidence: require an isolated four-camera stress canary, canonical merge, a
+  fresh rollback bundle, both live startup modes, the uninterrupted 600-sample
+  watch with decoder turnover, then attended 30-minute and automated 24-hour
+  gates before acceptance.
+
 Observed through 2026-07-12 19:38 UTC; verify rather than assume. This section
 overrides older perception candidate and deployment statements below.
 
