@@ -9,7 +9,43 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed through 2026-07-12 15:00 UTC; verify rather than assume:
+Observed through 2026-07-12 15:42 UTC; verify rather than assume:
+
+- The post-hourly clean HLS watch is complete at
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260712T150759Z-post-hourly-clean/`.
+  It ran from 15:07:59.841 through 15:38:48 UTC with 36,964 50-ms samples,
+  7/7/7/6 completed staggered session handoffs for ch1-ch4, a 1.75-second
+  worst availability gap, no active final outage, all four selected videos at
+  2560x1920/`readyState=4`/playing with no media error, and zero console
+  warnings or errors. A second final sample proved every video clock advanced.
+  The sanitized resource ledger retained only HTTP 200 for ten browser-session,
+  fifteen coverage, and 1,744 proxy responses, plus five status-0 proxy reads
+  bounded within successful double-buffer handoffs; the latter are retained as
+  retired-session abort candidates, not deleted. Direct and opaque browser
+  master canaries returned 200 for all four channels without persisting signed
+  or opaque URLs. This closes the attended browser-HLS seam only.
+- Do not promote that HLS result to the complete perception/product gate. The
+  final four-feed verifier proved two advancing trusted frames and distinct
+  hashes for every camera, but ch3 decode latency was 13.94/10.84 seconds,
+  exceeding the fixed 10-second limit; a later health sample had ch4 at 12.39
+  seconds. The inspected timeline visibly reported `Objects DB STALE` and its
+  newest persisted schema-v2 car was 14:33:40.087 UTC, while current live
+  frames at 15:42 UTC were fresh but contained zero detections. This may be an
+  empty-road interval rather than an upload failure, but a new eligible
+  schema-v2 persistence proof is still required before end-to-end acceptance.
+- Draft PR 22 now includes the tested HLS/API release and least-privilege
+  observability policy at `69b1f3a`. The policy adds read-only CloudWatch
+  metrics and read-only access to the exact read-Lambda log group. Its
+  state-hash bootstrap refused before mutation because the only V2X-account
+  source credential lacks `iam:GetUser`; do not bypass the administrator gate
+  or claim those observability permissions are deployed.
+- The isolated UE5.5 recovery workspace remains outside production. The
+  official engine dependency fetch and official CARLA `ue5-dev` content/LFS
+  materialization are in progress on `/mnt/v2x-ue5`. The exact 29-object
+  Richmond road core was hash-gated into the isolated CARLA project with
+  rollback evidence at
+  `/mnt/v2x-ue5/evidence/april-road-core-dependencies/migration-20260712T151559Z/`;
+  this is staging only, not conversion, render, cook, or calibration proof.
 
 - Canonical `origin/main`, the clean live checkout, the Amplify mirror, and
   successful production Amplify job 202 are exact commit
