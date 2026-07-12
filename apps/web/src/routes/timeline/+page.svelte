@@ -46,6 +46,7 @@
 
 	let clockTimer: ReturnType<typeof setInterval> | null = null;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
+	let coverageRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 	async function loadTimeline() {
 		try {
@@ -168,13 +169,17 @@
 		}, 1000);
 		refreshTimer = setInterval(() => {
 			void loadTimeline();
-			void loadCoverage();
 		}, 60_000);
+		// Historical chunks are immutable and cached on aligned 4h boundaries;
+		// only the live-edge chunk is re-fetched. Five-minute freshness is enough
+		// for the optional gap overlay and avoids continuous ListFragments load.
+		coverageRefreshTimer = setInterval(() => void loadCoverage(), 5 * 60_000);
 	});
 
 	onDestroy(() => {
 		if (clockTimer) clearInterval(clockTimer);
 		if (refreshTimer) clearInterval(refreshTimer);
+		if (coverageRefreshTimer) clearInterval(coverageRefreshTimer);
 	});
 </script>
 

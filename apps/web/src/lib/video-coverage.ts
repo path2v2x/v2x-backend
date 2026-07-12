@@ -6,6 +6,17 @@ export type CoverageFetcher = (
 	window: { start: string; end: string }
 ) => Promise<VideoCoverage>;
 
+const IMMUTABLE_LAG_MS = 2 * 60 * 1000;
+const completeChunkCache = new Map<string, VideoCoverage>();
+
+export function clearCoverageChunkCache(): void {
+	completeChunkCache.clear();
+}
+
+function chunkCacheKey(cameraId: string, startMs: number, endMs: number): string {
+	return `${cameraId}:${startMs}:${endMs}`;
+}
+
 /**
  * Fetch one camera's coverage chunks sequentially. Kinesis Video Streams can
  * reject concurrent ListFragments calls. The timeline caller also serializes
@@ -25,14 +36,31 @@ export async function fetchCameraCoverageSequentially(
 		throw new Error('coverage chunk size must be positive');
 	}
 
+	// Align requests to stable boundaries. Otherwise every rolling refresh moves
+	// all 24 query windows and defeats caching even though historical fragments
+	// are immutable. Only the chunk touching the live edge is re-fetched.
+	const alignedStartMs = Math.floor(startMs / chunkMs) * chunkMs;
+	const alignedEndMs = Math.ceil(endMs / chunkMs) * chunkMs;
+	const immutableBeforeMs = Date.now() - IMMUTABLE_LAG_MS;
 	const parts: PromiseSettledResult<VideoCoverage>[] = [];
-	for (let chunkStart = startMs; chunkStart < endMs; chunkStart += chunkMs) {
+	for (let chunkStart = alignedStartMs; chunkStart < alignedEndMs; chunkStart += chunkMs) {
+		const chunkEnd = Math.min(chunkStart + chunkMs, alignedEndMs);
+		const cacheKey = chunkCacheKey(cameraId, chunkStart, chunkEnd);
+		const cached = completeChunkCache.get(cacheKey);
+		if (cached) {
+			parts.push({ status: 'fulfilled', value: cached });
+			continue;
+		}
 		const window = {
 			start: toIsoMillis(chunkStart),
-			end: toIsoMillis(Math.min(chunkStart + chunkMs, endMs))
+			end: toIsoMillis(chunkEnd)
 		};
 		try {
-			parts.push({ status: 'fulfilled', value: await fetcher(cameraId, window) });
+			const value = await fetcher(cameraId, window);
+			parts.push({ status: 'fulfilled', value });
+			if (chunkEnd <= immutableBeforeMs && value.truncated !== true) {
+				completeChunkCache.set(cacheKey, value);
+			}
 		} catch (reason) {
 			parts.push({ status: 'rejected', reason });
 		}
@@ -43,7 +71,18 @@ export async function fetchCameraCoverageSequentially(
 		start: toIsoMillis(startMs),
 		end: toIsoMillis(endMs),
 		intervals: mergeCoverageIntervals(
-			parts.flatMap((part) => (part.status === 'fulfilled' ? part.value.intervals : []))
+			parts
+				.flatMap((part) => (part.status === 'fulfilled' ? part.value.intervals : []))
+				.flatMap((interval) => {
+					const parsedStart = Date.parse(interval.start);
+					const parsedEnd = Date.parse(interval.end);
+					if (!Number.isFinite(parsedStart) || !Number.isFinite(parsedEnd)) return [];
+					const clippedStart = Math.max(parsedStart, startMs);
+					const clippedEnd = Math.min(parsedEnd, endMs);
+					return clippedStart < clippedEnd
+						? [{ start: toIsoMillis(clippedStart), end: toIsoMillis(clippedEnd) }]
+						: [];
+				})
 		),
 		fragmentCount: parts.reduce(
 			(sum, part) => sum + (part.status === 'fulfilled' ? part.value.fragmentCount : 0),
