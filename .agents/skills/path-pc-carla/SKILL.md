@@ -75,6 +75,22 @@ section:
   validate every resolved clock before publication/handover, discard and
   re-anchor an out-of-window mapping, and still pass full detector, controlled
   live, 30-minute, and 24-hour gates without weakening -1/+10 second bounds.
+  PR 26 merged that validation as
+  `f9a966ddc5f07411969666efda328647dbdc0e3b`. Its controlled deployment again
+  passed startup/four-feed/LIVE gates, then the strict watch proved a second
+  fail-closed defect: after ch1 rejected a bad PTS mapping, ordinary unclocked
+  frames were still published during re-anchor, dropping global clock readiness
+  at sample 5. It was rolled back exactly; retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T174500Z-clock-validated-live-watch/failure.json`
+  and
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T174335Z-perception-clock-gate-f9a966dd/`.
+  The next candidate freezes publication on the last trusted frame during
+  re-anchor; that frame still ages normally, so a recovery longer than 15
+  seconds fails stale rather than hiding an outage. Its upload-disabled full
+  detector canary passed 120 strict accelerated-renewal samples with accepted
+  minima 2.778/2.674/1.499/1.739 seconds and maxima
+  7.028/7.771/8.221/7.654 seconds. This is not live acceptance; require a new
+  canonical commit and repeat the controlled watches.
 
 - The post-hourly clean HLS watch is complete at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T150759Z-post-hourly-clean/`.
