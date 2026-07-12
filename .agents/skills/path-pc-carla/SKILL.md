@@ -9,9 +9,42 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-12 22:31 UTC; verify rather than assume. These items
+Observed through 2026-07-12 23:23 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
+- PR 36 merged as canonical
+  `edaae29e9c00b411137ba40b0fd546f4b7d3c33d`. It contains the
+  fail-closed vehicle identity behavior described below. Controlled startup
+  passed both upload modes, its ten-minute watch passed 600/600 strict samples
+  plus ten feed rounds, and its attended watch passed 1,440 strict samples plus
+  25 feed rounds before ch3 had one terminal raw-reader failure and entered
+  reconnecting. The unchanged zero-reconnect gate correctly rejected the
+  release and automatically restored proven PR 35
+  `76e561cd41d070a6402c39c98847e646bd81cc9a`; retain evidence at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T225200Z-pr36-live-watch-30m/`
+  and rollback bundle
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T223703Z-pr36-identity`.
+  Restoring the persistent hourly timer immediately replayed its missed restart;
+  that restart completed successfully with Richmond, LIVE, four twin cameras,
+  zero sessions, perception, and all three safety timers healthy. Do not call
+  PR 36 deployed or accepted, and do not attribute the reader failure to the
+  identity-only change without stronger evidence.
+- Candidate `77a6dcac428c3d7f331ae98ca143f5be7a17eae1` preserves the last
+  trusted frame while a terminal FIFO read triggers a bounded five-second
+  off-thread replacement. The replacement must obtain a fresh signed session,
+  decode a real frame, and validate its exact media-clock mapping before atomic
+  handoff; otherwise the existing reconnect/staleness path still fails closed.
+  The 15-second freshness, ten-second capture/inference progress, -1/+10-second
+  clock, duplicate-frame, and zero-reconnect gates are unchanged. It also makes
+  abandoned asynchronous preparations cancellation-safe so they cannot retain
+  a hidden FFmpeg capture. Fast preparation failures are limited to one fresh
+  attempt so an outage cannot spin on session minting. Verification passed 139
+  perception tests, 241 bridge
+  tests in the intended Python 3.10 environment, and 23 generated read-API
+  tests. This is source evidence only: require canonical merge, a fresh verified
+  rollback bundle, upload-disabled and upload-enabled startup, uninterrupted
+  ten-minute and 30-minute gates, and the automated 24-hour monitor before
+  acceptance.
 - PR 35 merged as canonical
   `76e561cd41d070a6402c39c98847e646bd81cc9a`. Controlled startup
   passed both upload modes. Its new ten-minute watch passed 600/600 strict
