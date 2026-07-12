@@ -188,6 +188,7 @@ def optimize_candidate(
     signal_observed,
     fit_region,
     seed,
+    renderer=render_markings,
 ):
     from scipy.optimize import differential_evolution
 
@@ -195,7 +196,7 @@ def optimize_candidate(
 
     def objective(delta):
         params = expand(base, delta)
-        rendered = render_markings(vertices, triangles, params, width, height)
+        rendered = renderer(vertices, triangles, params, width, height)
         paint = paint_metrics(rendered, observed_paint, fit_region)
         signals = signal_metrics(
             signal_world, signal_observed, params, width * 2, height * 2
@@ -216,7 +217,7 @@ def optimize_candidate(
         workers=1,
     )
     params = expand(base, result.x)
-    rendered = render_markings(vertices, triangles, params, width, height)
+    rendered = renderer(vertices, triangles, params, width, height)
     bound_distances = {
         name: float(min(value - bounds[0], bounds[1] - value) / (bounds[1] - bounds[0]))
         for name, value, bounds in zip(

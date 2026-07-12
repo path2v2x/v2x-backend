@@ -93,3 +93,32 @@ def test_exclusive_writer_refuses_overwrite(tmp_path):
         pass
     else:
         raise AssertionError("writer overwrote immutable evidence")
+
+
+def test_parse_calibration_csv_checks_stored_error(tmp_path):
+    path = tmp_path / "ch4_calibration_errors.csv"
+    path.write_text(
+        "Point_ID,u_pixel,v_pixel,True_X_m,True_Z_m,Pred_X_m,Pred_Z_m,"
+        "Error_X_m,Error_Z_m,Total_Error_m\n"
+        "1,10,20,1,2,1.3,2.4,.3,.4,.5\n"
+        "2,11,21,2,3,2,3,0,0,0\n"
+        "3,12,22,3,4,3,4,0,0,0\n"
+    )
+    points, errors = tool.parse_calibration_csv(path, 100, 100)
+    assert len(points) == 3
+    assert errors == [0.5, 0.0, 0.0]
+    path.write_text(path.read_text().replace(",.5\n", ",.7\n"))
+    try:
+        tool.parse_calibration_csv(path, 100, 100)
+    except ValueError as error:
+        assert "internally inconsistent" in str(error)
+    else:
+        raise AssertionError("inconsistent stored CSV error was accepted")
+
+
+def test_rounded_csv_matches_script_points():
+    csv_points = [{"u": 10.12, "v": 20.46, "true_X": 1.234, "true_Z": 5.678}]
+    script_points = [{
+        "u": 10.1234, "v": 20.4567, "true_X": 1.234, "true_Z": 5.678,
+    }]
+    assert tool.rounded_csv_matches_script_points(csv_points, script_points) is True
