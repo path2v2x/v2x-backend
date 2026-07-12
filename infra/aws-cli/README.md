@@ -217,6 +217,11 @@ invoke permission. It cannot create a Lambda, delete API Gateway resources,
 modify IAM, or pass a role. `iam:PassRole` is unnecessary because the existing
 read Lambda keeps its current execution role.
 
+The role also has read-only CloudWatch metric access and read-only access to
+the exact `/aws/lambda/v2x-backend-read` log group so a release gate can retain
+error/throttle and failure-signature evidence. It has no CloudWatch or Logs
+write actions and no access to other log groups.
+
 Configure an AWS CLI role profile whose source profile is the existing
 `rfs-v2x-service` credential chain, then force the known API ID so the read
 provisioner does not need account-wide `GET /apis`:

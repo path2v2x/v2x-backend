@@ -39,6 +39,29 @@
         "lambda:RemovePermission"
       ],
       "Resource": "arn:aws:lambda:us-west-1:147229569658:function:v2x-backend-read"
+    },
+    {
+      "Sid": "ReadCloudWatchMetricsForReleaseEvidence",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadNamedV2xLambdaLogsForReleaseEvidence",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-west-1:147229569658:log-group:/aws/lambda/v2x-backend-read",
+        "arn:aws:logs:us-west-1:147229569658:log-group:/aws/lambda/v2x-backend-read:*"
+      ]
     }
   ]
 }
