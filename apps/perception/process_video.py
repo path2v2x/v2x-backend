@@ -1608,14 +1608,14 @@ class MultiCameraPipeline:
                 "V2X_PERCEPTION_PROACTIVE_RENEW_SEC must be between 30 and 270"
             )
         capture_hls_fragments = int(env_float(
-            "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 2
+            "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 1
         ))
         clock_hls_fragments = int(env_float(
             "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS", 5
         ))
-        if not 2 <= capture_hls_fragments <= 3:
+        if not 1 <= capture_hls_fragments <= 2:
             raise ValueError(
-                "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS must be 2 or 3"
+                "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS must be 1 or 2"
             )
         if not 4 <= clock_hls_fragments <= 5:
             raise ValueError(

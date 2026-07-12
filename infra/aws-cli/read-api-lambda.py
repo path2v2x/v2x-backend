@@ -769,12 +769,18 @@ def _get_hls_session(event, camera_id, qs, *, browser_proxy=False):
     end_dt = _parse_ts(qs.get("end"))
     on_demand = start_dt is not None or end_dt is not None
     raw_live_fragments = qs.get("max_fragments")
+    minimum_live_fragments = 2 if browser_proxy else 1
+    fragment_detail = (
+        "must be an integer from 2 through 5"
+        if browser_proxy
+        else "must be an integer from 1 through 5"
+    )
     try:
         live_fragments = 5 if raw_live_fragments is None else int(raw_live_fragments)
     except (TypeError, ValueError):
-        return _resp(400, {"error": "invalid_max_fragments", "detail": "must be an integer from 2 through 5"})
-    if not 2 <= live_fragments <= 5:
-        return _resp(400, {"error": "invalid_max_fragments", "detail": "must be an integer from 2 through 5"})
+        return _resp(400, {"error": "invalid_max_fragments", "detail": fragment_detail})
+    if not minimum_live_fragments <= live_fragments <= 5:
+        return _resp(400, {"error": "invalid_max_fragments", "detail": fragment_detail})
 
     if on_demand:
         if start_dt is None or end_dt is None:

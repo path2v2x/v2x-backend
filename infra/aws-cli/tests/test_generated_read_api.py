@@ -327,15 +327,15 @@ class LiveVideoSessionTest(unittest.TestCase):
         )
         return response, json.loads(response["body"])
 
-    def test_perception_can_request_two_fragment_live_edge(self):
-        response, body = self.invoke("2")
+    def test_perception_can_request_one_fragment_live_edge(self):
+        response, body = self.invoke("1")
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
+        self.assertEqual(body["maxMediaPlaylistFragmentResults"], 1)
         self.assertEqual(body["delivery"], "DIRECT_KINESIS")
         self.assertIn(self.secret, body["hlsUrl"])
         self.assertEqual(len(self.s3.put_calls), 0)
         self.assertEqual(
-            self.archived.calls[-1]["MaxMediaPlaylistFragmentResults"], 2
+            self.archived.calls[-1]["MaxMediaPlaylistFragmentResults"], 1
         )
 
     def test_browser_gets_opaque_same_origin_proxy(self):
@@ -347,8 +347,14 @@ class LiveVideoSessionTest(unittest.TestCase):
         self.assertNotIn(self.secret, response["body"])
         self.assertEqual(len(self.s3.put_calls), 1)
 
-    def test_live_fragment_count_is_bounded(self):
-        response, body = self.invoke("1")
+    def test_browser_fragment_count_is_bounded(self):
+        response, body = self.invoke("1", browser=True)
+        self.assertEqual(response["statusCode"], 400)
+        self.assertEqual(body["error"], "invalid_max_fragments")
+        self.assertEqual(self.archived.calls, [])
+
+    def test_direct_fragment_count_is_bounded(self):
+        response, body = self.invoke("0")
         self.assertEqual(response["statusCode"], 400)
         self.assertEqual(body["error"], "invalid_max_fragments")
         self.assertEqual(self.archived.calls, [])
