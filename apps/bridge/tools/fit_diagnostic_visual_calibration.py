@@ -19,18 +19,22 @@ import numpy as np
 
 
 CAMERA_FREE_PARAMETERS = {
-    "ch1": (3, 4, 5),              # weak geometry: rotation only
-    "ch2": (3, 4, 5, 6),           # straight road: rotation/FOV only
-    "ch3": (0, 1, 2, 3, 4, 5),    # unique equipment + crosswalk topology
-    "ch4": (3, 4, 5, 6),          # strong directions, weak translation depth
+    # Independent per-camera translation is deliberately forbidden here. It
+    # overfit the proposal lines while destroying the physical camera-cluster
+    # geometry. Use fit_joint_diagnostic_visual_calibration.py when a bounded
+    # common XYZ correction is diagnostically justified.
+    "ch1": (3, 4, 5, 6),
+    "ch2": (3, 4, 5, 6),
+    "ch3": (3, 4, 5, 6),
+    "ch4": (3, 4, 5, 6),
 }
 PARAMETER_NAMES = (
     "location_x", "location_y", "location_z",
     "pitch_deg", "yaw_deg", "roll_deg", "fov_deg",
 )
 PRIOR_SCALES = np.asarray((1.5, 1.5, 1.5, 6.0, 6.0, 3.0, 5.0))
-LOWER_DELTAS = np.asarray((-8.0, -8.0, -5.0, -30.0, -30.0, -15.0, -25.0))
-UPPER_DELTAS = np.asarray((8.0, 8.0, 5.0, 30.0, 30.0, 15.0, 25.0))
+LOWER_DELTAS = np.asarray((-8.0, -8.0, -5.0, -45.0, -60.0, -25.0, -35.0))
+UPPER_DELTAS = np.asarray((8.0, 8.0, 5.0, 45.0, 60.0, 25.0, 35.0))
 
 
 def rotation_matrix(pitch_deg, yaw_deg, roll_deg):

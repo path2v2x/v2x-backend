@@ -114,6 +114,9 @@ def validate_worker_inspect(document):
         raise RenderError("calibration worker restart policy is unsafe")
     if host_config.get("NetworkMode") != "bridge":
         raise RenderError("calibration worker network mode is invalid")
+    mounts = document.get("Mounts") or []
+    if mounts:
+        raise RenderError("calibration worker has unexpected filesystem mounts")
     bindings = host_config.get("PortBindings") or {}
     for port in range(EXPECTED_PORT, EXPECTED_PORT + 3):
         values = bindings.get(f"{port}/tcp") or []

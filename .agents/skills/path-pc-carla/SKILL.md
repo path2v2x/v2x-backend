@@ -9,7 +9,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed on 2026-07-11 UTC; verify rather than assume:
+Observed through 2026-07-12 12:20 UTC; verify rather than assume:
 
 - Canonical `origin/main`, the clean live checkout, the Amplify mirror, and
   successful production Amplify job 202 are exact commit
@@ -18,6 +18,13 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   scheduled 23:08 PDT restart both services held `NRestarts=0`, all expected
   listeners remained bound, and the all-channel metadata plus local/public
   four-feed verifiers passed.
+- A fresh read-only audit at 12:14–12:15 UTC found every V2X service and all
+  three mutation-capable timers active with `NRestarts=0`; the expected image,
+  shipping-binary, UE5 marker, Richmond OpenDRIVE, six listeners, LIVE twin
+  mode, zero active sessions, and four advancing twin camera counters matched.
+  The corrected local four-feed verifier passed with two advancing timestamps
+  and two distinct JPEG hashes for ch1–ch4. Re-run rather than inheriting this
+  result after any service, config, image, or source change.
 - Replay synchronization, tick-bound scene snapshots, exact actor-observed
   default lens acceptance, and cleanup are deployed. A bounded replay for
   `global_car_4db7ffc8_2` remained crash-free and returned to LIVE with zero
@@ -34,6 +41,14 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   no health outage and per-channel maximum latency below 5.75 seconds. Re-run
   that complete gate after any merged perception deployment; old evidence does
   not transfer to a new fingerprint.
+- Public `/timeline` is not currently an acceptance pass. Playwright evidence at
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260712T063328Z-current-baseline/`
+  shows only CH2 visible while CH1/CH3/CH4 remain black and the header reports
+  zero cameras/FPS. CLI HTTP 200 responses do not override the browser failure.
+  The integration branch contains a source-only same-origin HLS proxy, a
+  deterministic standalone Lambda artifact, prefix-scoped one-day S3 expiry,
+  and per-route session-mint throttling. None is deployed; pass the complete
+  plan/apply/rollback/browser gate before promotion.
 - The clean integration worktree is
   `/home/path/.codex/worktrees/v2x-calibration-integration` on
   `codex/v2x-calibration-integration`. It layers the fail-closed calibration,
@@ -49,6 +64,85 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   and UE5 visual proof. Read
   [references/calibration.md](references/calibration.md) before calibration,
   historical-frame, mapping, or same-car acceptance work.
+- The active completion contract is
+  `docs/v2x-calibration-completion-contract.md`. Its Fable-reviewed additions
+  include clock drift, independent map survey, one-use holdouts, fixed eligible
+  denominators/minimum sample counts, blind identity adjudication, per-axis
+  pixel scaling, and 30-minute plus 24-hour deployment watches. Do not use an
+  older plan as authority.
+- Current static evidence still fails. Clean, vehicle-resistant fit/dev/holdout
+  composites from three independent KVS windows per camera are retained at
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T072000Z-temporal-static-targets-v3/`.
+  They are proposal-only, not annotation truth. `build_temporal_static_targets.py`
+  now makes window IDs path-independent and defaults to at least three valid
+  samples; never opt down to one sample for an acceptance-labelled workflow.
+  The latest completed bounded isolated UE5 search is
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T104045Z-inverse-render-search-v6/`.
+  It retained 896 candidates (224 per camera except 223 for ch3) across broad
+  pose/FOV ranges. Every selected candidate fails the fixed geometry gate and
+  visual review; ch1/ch2/ch3/ch4 road-surface scores are approximately
+  0.702/0.540/0.470/0.508 and all remain below the contract. A subsequent cold
+  Richmond load did not become ready within ten minutes, so no v7 render corpus
+  exists. Do not re-enter a maintenance window until the map loader has a true
+  outer process deadline and rollback remains independently armed.
+- The decisive static-topology diagnostic is
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T103000Z-ch4-crosswalk-planar-consistency-v1/report.json`.
+  A homography fitted to one physical/map crosswalk reproduces that crosswalk,
+  but projects the other visible Richmond crosswalks tens to hundreds of pixels
+  away. CARLA exposes the paint as eight large aggregate `RoadLines` objects,
+  not independently controllable crosswalk objects, so hiding one bad marking
+  at runtime is not available and hiding all eight removes the full road-marking
+  layer. Camera pose alone cannot repair this map inconsistency. Require the
+  actual complete UE5.5 Richmond source map/dependency graph (or an authorized,
+  independently surveyed complete road-marking replacement), a fingerprinted
+  full cook, and fresh untouched holdouts before production calibration.
+- A joint-rig diagnostic that forbids independent per-camera translation is at
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T121500Z-joint-visual-selfcal-v1/`.
+  The 19 visual parameters are full-rank with condition about 1.5e3, but five
+  axes hit bounds and frozen ch1/ch2 road holdouts remain about 98/541 px at
+  640-wide. All four overlays were visually inspected; local fits break other
+  roads or landmarks. The candidate is rejected and must not be rendered,
+  deployed, or used for actor placement.
+- The map-source/capacity audit and accepted recovery routes are frozen in
+  `docs/v2x-map-correction-recovery-plan.md`. The private
+  `SimForgeinc/RFS_Reconstruction` main revision contains April Richmond
+  editor assets but remains UE4.26 and has no raw RoadRunner/FBX/OBJ/USD/GIS
+  source. The production image is cooked-only. The only local comparison
+  workspace with UE5.5 source belongs to the separate UE6 comparison task and
+  is ineligible for V2X. A dedicated clean V2X UE5.5 source/engine build needs
+  roughly 250 GB; the Path PC root currently has about 6 GB free. A read-only
+  audit found 877 GB free on the unmounted Windows NTFS volume, but no Richmond
+  source; it was unmounted unchanged and is not a Linux build volume without a
+  separate storage decision. Do not delete or reuse another task's workspace
+  to create capacity. The UE4 import metadata names the missing authoring file
+  as `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. A Drive
+  inventory records a 158 GB Richmond export dated 2026-03-30, but its linked
+  folder now returns 404 and read-only Drive/Slack searches found no replacement.
+- Exact source-frame evidence for `global_car_4db7ffc8_138` is retained at
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T100128Z-object-138-exact/`.
+  One representative persisted event per camera is bound to the exact fMP4
+  frame at 0 ms media-time error; independent YOLO detection IoU is about
+  0.951/0.963/0.870/0.943 for ch1/ch2/ch3/ch4. The four views visually support
+  the same white Toyota Camry, but this remains identity proposal evidence, not
+  blind-adjudicated identity or world-placement acceptance.
+- Cross-model segmentation contact consensus for that exact-frame sample has
+  three accepted proposals (ch1/ch2/ch4) with median mask IoU about 0.983 and
+  maximum native contact disagreement 1.5 px x / 1.75 px y. Ch3 is correctly
+  rejected as clipped. The report is
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T100128Z-object-138-exact/contact-consensus.json`.
+  It is useful proposal evidence but fails four-camera coverage and independent
+  contact review. The full frozen observation ledger contains 369 trusted
+  vehicle rows and zero acceptance-eligible rows because reviewed contacts,
+  static calibration, and independently adjudicated identity are absent.
+  Consensus schema v2 must load the
+  hash-bound capture report, cover its entire fixed denominator, validate masks
+  and covariance, and apply native x/y disagreement limits independently.
+  Producer-time samples that formerly appeared to show 0 ms phase/drift are
+  now rejected as a shared zero-residual ingest timestamp grid. The fail-closed
+  report is
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T101000Z-kvs-timestamp-drift-v3/report.json`;
+  it also has only two windows/4.43 hours versus four windows/12 hours and lacks
+  independent exposure/UTC truth.
 - The recovery worktree contains rejected exploratory camera CSVs and a dirty
   `config/cameras.json`. Preserve them as user-owned diagnostics, but never
   stage, glob, fit, promote, or deploy them.
@@ -61,6 +155,16 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   evidence minimum. Outputs at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260711T064950Z-acquisition-deficit/proposals/`
   are `acceptance_eligible=false` and must not be promoted.
+- The clean `path2v2x/co-perception` reference commit
+  `c4ec4730bbabd915d62fad7f4acecc8488be4533` has been re-audited with every
+  preserved channel CSV at
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T103000Z-legacy-co-perception-audit-v2/audit.json`.
+  It contains only 7/5/4/4 camera-local points, no measured-intrinsics artifact,
+  frame hashes, global landmark IDs, survey provenance, or frozen holdouts.
+  Leave-one-out RMSE is about 1.49/7.60/4.84/1.85 m for ch1/ch2/ch3/ch4;
+  ch1/ch2/ch4 geometry is collinear, and the active script's “Channel 4” comment
+  actually matches the ch1 CSV. Use its nominal K and transforms only as a
+  derived diagnostic baseline, never as physical or held-out calibration truth.
 - Playwright CLI evidence at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260711T073035Z/` proves the
   `/timeline` archive workflow, four HTTP-200 video sessions, replay control,
@@ -69,6 +173,13 @@ Observed on 2026-07-11 UTC; verify rather than assume:
   placed and road/crosswalk geometry is misregistered. Treat this as
   counter-evidence, not acceptance. Refresh the browser evidence after any
   deployed candidate; prior screenshots never transfer to a new fingerprint.
+- Fresh local Playwright CLI baseline at
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260712T122000Z-calibration-baseline/`
+  shows all four `/live` physical feeds visible, but `/timeline` still renders
+  only ch2 while ch1/ch3/ch4 are black, the global header reports zero cameras
+  and zero FPS, and the object table is stale. This is current counter-evidence;
+  infrastructure HTTP success and the passing four-feed CLI verifier do not
+  make the timeline UI an acceptance pass.
 
 ## Safety boundaries
 
@@ -103,7 +214,7 @@ The link-health units can repair/publish public runtime configuration when their
 
 ## Revalidate the live topology
 
-Observed on 2026-07-10 UTC; verify rather than assume:
+Observed through 2026-07-12 UTC; verify rather than assume:
 
 | Layer | Expected live value |
 |---|---|
@@ -397,17 +508,24 @@ Expected endpoints:
 - `/detections/latest`
 - `/streams/ch1.mjpg` through `/streams/ch4.mjpg`
 
-Validate upstream Kinesis separately through the read API:
+Validate video delivery separately through the read API. The currently deployed
+direct-Kinesis response is diagnostic-only; the accepted proxy candidate must
+report `delivery=SAME_ORIGIN_PROXY`:
 
 ```bash
 for camera in ch1 ch2 ch3 ch4; do
   curl -fsS \
     "https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com/video/session/${camera}" \
-    | jq '{cameraId,playbackMode,expiresIn,hlsUrlPresent:(.hlsUrl|length>0)}'
+    | jq '{cameraId,playbackMode,delivery,expiresIn,hlsUrlPresent:(.hlsUrl|length>0)}'
 done
 ```
 
-Never print or retain signed HLS query strings. For acceptance, require:
+Never print or retain direct signed HLS query strings or opaque proxy token
+paths. The tracked proxy design stores the Kinesis token only in encrypted,
+short-lived `hls-proxy/v1/` state, recursively rewrites playlists, HMAC-binds
+child resources, restricts the exact Kinesis origin/basenames, rejects redirects,
+and caps raw fragments at 4 MiB. A larger real fragment fails the Lambda/API
+Gateway transport gate; do not raise the bound. For acceptance, require:
 
 - ch1-ch4 decoded-frame capture timestamps remain recent and advance;
 - real frames change, not only response bytes;
@@ -418,8 +536,8 @@ Never print or retain signed HLS query strings. For acceptance, require:
 - a new DynamoDB record proves current media, decode-receipt, and ingestion timestamps plus schema-v2 provenance.
 
 For an archived vehicle/bbox acceptance gate, use the tracked read-only verifier
-with one exact persisted detection JSON and the local model. It keeps signed HLS
-URLs internal, requires trusted persisted provenance, selects the nearest actual
+with one exact persisted detection JSON and the local model. It keeps HLS
+session/proxy URLs internal, requires trusted persisted provenance, selects the nearest actual
 fMP4 frame, and exits nonzero for timing, bbox, or semantic mismatch:
 
 ```bash
@@ -497,6 +615,24 @@ evidence.
 The former 75/125/175 point limits were framing diagnostics and must never be
 used as calibration acceptance.
 
+The historical UE4.26 Richmond `Roads_Marking_Layer0` asset is not a UE5.5
+shortcut. A hash-locked, read-only isolated mount caused the approved worker to
+exit 139 with `Signal 11` before RPC readiness; evidence is at
+`/home/path/V2XCarla/v2x-evidence/calibration/20260712T091606Z-road-overlay-maintenance/`.
+A second attempt resaved the mesh and all 13 copied dependencies with UE5.5,
+duplicated it through the Asset Tools API into the map's exact CARLA package
+path, and completed a Linux cook with zero warnings. The resulting
+`sha256:035ce69294773fb703b143f9e4d99d7ef194e65db5558b0a691b13359d65e4e1`
+isolated image still timed out loading Richmond and exited 139. Evidence and
+the verified rollback bundle are at
+`/home/path/V2XCarla/v2x-evidence/calibration/20260712T092752Z-ue55-road-marking-conversion-v1/`
+and
+`/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T094404Z-mapfix`.
+Never mount, inject, or retry either transplanted asset. Any marking correction
+must be reimported or edited inside the actual CARLA UE5.5 source project and
+cooked as a complete map build. Then compare it offline and accept it against
+independent surveyed/held-out geometry before it can enter a deployment gate.
+
 Fit, deploy, and verify must all call the same tracked camera-transform and
 optical-model functions. A missing translation offset means zero; never hide a
 default pole displacement in one path. Resolve candidate landmarks directly
@@ -541,6 +677,23 @@ candidate. The renderer must reject the production container/port, verify the
 approved image and Richmond OpenDRIVE fingerprints, use one CARLA frame for all
 buffers, destroy all owned sensors, and keep every result
 `acceptance_eligible=false`.
+
+For a bounded multi-candidate fit/dev search, use
+`apps/bridge/tools/optimize_inverse_render_camera.py` only against loopback
+`127.0.0.1:2300` after the isolated worker launcher has loaded and verified
+`/Game/Carla/Maps/Richmond_Field_Station_Richmond_CA`, the approved image, the
+exact OpenDRIVE hash, and zero pre-existing sensors. The optimizer rejects
+holdout input, constrains physical translation/rotation/FOV, captures
+synchronized RGB plus metric depth, scores reviewed road traces and road
+surface/near-field visibility, retains every render/score, and never edits
+`cameras.json`. Its numerical minimum is a diagnostic proposal. Inspect every
+overlay and run the immutable held-out manifest gate before considering a
+candidate. A visually wrong horizon, vanishing direction, road edge, landmark,
+or required paint topology is a failure regardless of the scalar objective.
+`scripts/v2x-calibration-worker.sh` accepts a non-default candidate only when
+both `V2X_CALIBRATION_IMAGE` and its exact
+`V2X_CALIBRATION_EXPECTED_IMAGE_ID` are supplied. This is a fingerprint gate,
+not authorization to use a transplanted asset or an unreviewed image.
 
 The current Richmond RR/UE5 build was observed to emit semantic tag 11 for 100%
 of static pixels and instance sentinel 65535 for 100% of static pixels, even
@@ -745,7 +898,7 @@ each feed, and rejects query-bearing endpoint input:
 ```bash
 /home/path/V2XCarla/perception-venv/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_live_feeds.py \
-  http://127.0.0.1:8090 --max-decode-latency-ms 10000
+  http://127.0.0.1:8090
 ```
 
 For a bounded Drive/twin/replay regression, run the tracked verifier
@@ -754,7 +907,8 @@ or observational validation: it mutates simulator state by creating sessions
 and actors. Omit it entirely from read-only evidence.
 
 ```bash
-/home/path/V2XCarla/carla-venv-310/bin/python \
+PYTHONPATH=/home/path/V2XCarla/v2x-backend/apps/bridge \
+  /home/path/V2XCarla/carla-venv-310/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py
 ```
 
@@ -764,7 +918,8 @@ verifies correlated Teleport, exercises replay, restores live mode, and cleans
 up owned actors in `finally`:
 
 ```bash
-/home/path/V2XCarla/carla-venv-310/bin/python \
+PYTHONPATH=/home/path/V2XCarla/v2x-backend/apps/bridge \
+  /home/path/V2XCarla/carla-venv-310/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py --apply
 ```
 
@@ -773,7 +928,8 @@ verifier, use its exact run-scoped object, replay start, and camera for the
 same-object twin gate without creating a Drive session:
 
 ```bash
-/home/path/V2XCarla/perception-venv/bin/python \
+PYTHONPATH=/home/path/V2XCarla/v2x-backend/apps/bridge \
+  /home/path/V2XCarla/carla-venv-310/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/bridge/tools/verify_phase4_live.py \
   --apply --skip-drive \
   --twin-object-id global_car_RUN_ID_TRACK \
@@ -824,6 +980,18 @@ Before changing live services:
 10. Restore the previous artifact immediately when its acceptance gate fails. For Quick Tunnels, restore variables around the currently healthy endpoint, never a dead saved URL.
 11. Re-enable timers only after the final public/runtime checks pass.
 
-API route reconciliation is plan-first and exact-resource only. The normal service user cannot write API Gateway directly. A separately authorized principal must apply `infra/aws-cli/bootstrap-v2x-deploy-role.sh`; then assume `V2XBackendDeployRole` and run `provision-read-api.sh` with the reviewed API ID, `RECONCILE_LAMBDA=false`, IAM attachment disabled, explicit `PLAN_ONLY=false`, and the plan's `EXPECTED_CURRENT_STATE_HASH`. Do not add API privileges to the Amplify service role.
+API route reconciliation is plan-first and exact-resource only. The normal
+service user cannot write API Gateway or execution-role IAM directly. A route-
+only repair may still use `RECONCILE_LAMBDA=false` with IAM attachment disabled,
+but it cannot deploy the HLS proxy. For that candidate, a separately authorized
+IAM principal must first review the generated plan, then run
+`provision-read-api.sh` with the reviewed API ID, `RECONCILE_LAMBDA=true`,
+`ATTACH_DDB_READ_POLICY=true`, explicit `PLAN_ONLY=false`, and the plan's
+`EXPECTED_CURRENT_STATE_HASH`. Despite the legacy variable name, that reviewed
+inline policy also adds prefix-scoped S3 get/put/delete for opaque proxy state.
+Require exact `/video/proxy/{token}/{resource_id}` route parity, retained prior
+inline-policy rollback evidence, generated-Lambda tests, a real fragment below
+4 MiB, and refreshed browser network/playback proof. Do not add API privileges
+to the Amplify service role.
 
 Prefer source-controlled scripts and systemd units over one-off `nohup` or manual Docker commands. Do not leave source that exists only in the live checkout.

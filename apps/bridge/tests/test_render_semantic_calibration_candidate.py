@@ -51,6 +51,7 @@ def worker_inspect():
                 for port in (2300, 2301, 2302)
             },
         },
+        "Mounts": [],
         "State": {"Running": True, "StartedAt": "2026-07-12T00:00:00Z"},
     }
 
@@ -85,6 +86,18 @@ def test_worker_inspect_requires_exact_image_scope_and_loopback_ports():
             value["State"]["Running"] = False
         with pytest.raises(RenderError):
             validate_worker_inspect(value)
+
+
+def test_worker_inspect_rejects_every_filesystem_mount(tmp_path):
+    value = worker_inspect()
+    value["Mounts"] = [{
+        "Type": "bind",
+        "Source": str(tmp_path),
+        "Destination": "/home/carla/CarlaUnreal/Content/Berkley",
+        "RW": False,
+    }]
+    with pytest.raises(RenderError, match="unexpected filesystem mounts"):
+        validate_worker_inspect(value)
 
 
 def test_candidate_is_hash_bound_and_finite():

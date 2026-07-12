@@ -33,6 +33,7 @@ export interface VideoSession {
 	streamName: string;
 	playbackMode: 'LIVE' | 'ON_DEMAND' | string;
 	hlsUrl: string;
+	delivery?: 'SAME_ORIGIN_PROXY' | string;
 	expiresIn: number;
 	region: string;
 	start?: string;
