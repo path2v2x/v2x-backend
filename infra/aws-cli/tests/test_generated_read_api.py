@@ -141,7 +141,8 @@ class DeploymentArtifactContractTest(unittest.TestCase):
         self.assertIn("aws s3api get-bucket-lifecycle-configuration", script)
         self.assertIn("aws s3api put-bucket-lifecycle-configuration", script)
         self.assertIn('map(select(.ID != $rule_id))', script)
-        self.assertIn('--arg route_key "GET /video/session/{camera_id}"', script)
+        self.assertIn('--arg direct_route_key "GET /video/session/{camera_id}"', script)
+        self.assertIn('--arg browser_route_key "GET /video/browser-session/{camera_id}"', script)
         self.assertIn("ThrottlingBurstLimit", script)
         self.assertIn("ThrottlingRateLimit", script)
 
@@ -277,10 +278,12 @@ class LiveVideoSessionTest(unittest.TestCase):
         self.archived.get_hls_streaming_session_url = session
         self.module["_archived_media_client"] = lambda *_args: self.archived
 
-    def invoke(self, value):
+    def invoke(self, value, *, browser=False):
         response = self.module["handler"](
             {
-                "rawPath": "/video/session/ch1",
+                "rawPath": (
+                    "/video/browser-session/ch1" if browser else "/video/session/ch1"
+                ),
                 "queryStringParameters": {"max_fragments": value},
                 "requestContext": {
                     "domainName": "api.example.test",
@@ -295,13 +298,21 @@ class LiveVideoSessionTest(unittest.TestCase):
         response, body = self.invoke("2")
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
-        self.assertEqual(body["delivery"], "SAME_ORIGIN_PROXY")
-        self.assertTrue(body["hlsUrl"].startswith("https://api.example.test/video/proxy/"))
-        self.assertNotIn(self.secret, json.dumps(body))
-        self.assertEqual(len(self.s3.put_calls), 1)
+        self.assertEqual(body["delivery"], "DIRECT_KINESIS")
+        self.assertIn(self.secret, body["hlsUrl"])
+        self.assertEqual(len(self.s3.put_calls), 0)
         self.assertEqual(
             self.archived.calls[-1]["MaxMediaPlaylistFragmentResults"], 2
         )
+
+    def test_browser_gets_opaque_same_origin_proxy(self):
+        response, body = self.invoke("2", browser=True)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
+        self.assertEqual(body["delivery"], "SAME_ORIGIN_PROXY")
+        self.assertTrue(body["hlsUrl"].startswith("https://api.example.test/video/proxy/"))
+        self.assertNotIn(self.secret, response["body"])
+        self.assertEqual(len(self.s3.put_calls), 1)
 
     def test_live_fragment_count_is_bounded(self):
         response, body = self.invoke("1")
@@ -331,7 +342,7 @@ class HlsProxyTest(unittest.TestCase):
     def new_session(self):
         response = self.module["handler"](
             {
-                "rawPath": "/video/session/ch4",
+                "rawPath": "/video/browser-session/ch4",
                 "queryStringParameters": {
                     "start": "2026-07-10T05:00:00Z",
                     "end": "2026-07-10T05:15:00Z",

@@ -56,6 +56,7 @@ ROUTE_KEYS=(
   "GET /drive-config"
   "GET /snapshots/{object_id}/latest"
   "GET /video/session/{camera_id}"
+  "GET /video/browser-session/{camera_id}"
   "GET /video/proxy/{token}/{resource_id}"
   "GET /video/coverage/{camera_id}"
   "GET /detections/timeline"
@@ -508,6 +509,7 @@ print_reconciliation_plan() {
   echo "  currentStateHash=${CURRENT_STATE_HASH}"
   echo "  reconcileLambda=${RECONCILE_LAMBDA}"
   echo "  THROTTLE GET /video/session/{camera_id}: burst=${HLS_SESSION_THROTTLE_BURST}, rate=${HLS_SESSION_THROTTLE_RATE}/second"
+  echo "  THROTTLE GET /video/browser-session/{camera_id}: burst=${HLS_SESSION_THROTTLE_BURST}, rate=${HLS_SESSION_THROTTLE_RATE}/second"
   if [[ "${RECONCILE_LAMBDA}" == "true" ]]; then
     echo "  RECONCILE S3 lifecycle ${HLS_PROXY_LIFECYCLE_RULE_ID}: expire ${HLS_PROXY_PREFIX} after ${HLS_PROXY_LIFECYCLE_DAYS} day(s)"
   fi
@@ -862,23 +864,30 @@ if [[ -z "${current_stage_route_settings}" ]]; then
 fi
 jq -n \
   --argjson current "${current_stage_route_settings}" \
-  --arg route_key "GET /video/session/{camera_id}" \
+  --arg direct_route_key "GET /video/session/{camera_id}" \
+  --arg browser_route_key "GET /video/browser-session/{camera_id}" \
   --argjson burst "${HLS_SESSION_THROTTLE_BURST}" \
   --argjson rate "${HLS_SESSION_THROTTLE_RATE}" \
-  '$current + {($route_key): (($current[$route_key] // {}) + {
+  '$current + {($direct_route_key): (($current[$direct_route_key] // {}) + {
+    ThrottlingBurstLimit: $burst,
+    ThrottlingRateLimit: $rate
+  }), ($browser_route_key): (($current[$browser_route_key] // {}) + {
     ThrottlingBurstLimit: $burst,
     ThrottlingRateLimit: $rate
   })}' >"${stage_route_settings_file}"
 stage_throttle_matches="$(
   jq -r \
     --arg stage "${STAGE_NAME}" \
-    --arg route_key "GET /video/session/{camera_id}" \
+    --arg direct_route_key "GET /video/session/{camera_id}" \
+    --arg browser_route_key "GET /video/browser-session/{camera_id}" \
     --argjson burst "${HLS_SESSION_THROTTLE_BURST}" \
     --argjson rate "${HLS_SESSION_THROTTLE_RATE}" \
     'any(.Items[]?;
       .StageName == $stage
-      and .RouteSettings[$route_key].ThrottlingBurstLimit == $burst
-      and .RouteSettings[$route_key].ThrottlingRateLimit == $rate
+      and .RouteSettings[$direct_route_key].ThrottlingBurstLimit == $burst
+      and .RouteSettings[$direct_route_key].ThrottlingRateLimit == $rate
+      and .RouteSettings[$browser_route_key].ThrottlingBurstLimit == $burst
+      and .RouteSettings[$browser_route_key].ThrottlingRateLimit == $rate
     )' <<<"${STAGES_JSON}"
 )"
 if [[ -z "${stage_auto}" ]]; then

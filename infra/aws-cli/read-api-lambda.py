@@ -715,7 +715,7 @@ def _archived_media_client(stream_name, api_name):
         config=BotoConfig(retries={"max_attempts": 3}),
     )
 
-def _get_hls_session(event, camera_id, qs):
+def _get_hls_session(event, camera_id, qs, *, browser_proxy=False):
     if camera_id not in ALLOWED_CAMERA_IDS:
         return _resp(404, {"error": "camera_not_found", "cameraId": camera_id})
 
@@ -758,21 +758,25 @@ def _get_hls_session(event, camera_id, qs):
                 DisplayFragmentTimestamp="ALWAYS",
                 MaxMediaPlaylistFragmentResults=5000,
             )["HLSStreamingSessionURL"]
-            proxy_url = _new_hls_proxy_session(
-                event,
-                camera_id,
-                "ON_DEMAND",
-                hls_url,
-                VIDEO_ONDEMAND_EXPIRES_SECONDS,
-            )
+            delivery_url = hls_url
+            delivery = "DIRECT_KINESIS"
+            if browser_proxy:
+                delivery_url = _new_hls_proxy_session(
+                    event,
+                    camera_id,
+                    "ON_DEMAND",
+                    hls_url,
+                    VIDEO_ONDEMAND_EXPIRES_SECONDS,
+                )
+                delivery = "SAME_ORIGIN_PROXY"
             return _resp(
                 200,
                 {
                     "cameraId": camera_id,
                     "streamName": stream_name,
                     "playbackMode": "ON_DEMAND",
-                    "hlsUrl": proxy_url,
-                    "delivery": "SAME_ORIGIN_PROXY",
+                    "hlsUrl": delivery_url,
+                    "delivery": delivery,
                     "expiresIn": VIDEO_ONDEMAND_EXPIRES_SECONDS,
                     "start": _iso_millis(start_dt),
                     "end": _iso_millis(end_dt),
@@ -788,21 +792,25 @@ def _get_hls_session(event, camera_id, qs):
             DisplayFragmentTimestamp="ALWAYS",
             MaxMediaPlaylistFragmentResults=live_fragments,
         )["HLSStreamingSessionURL"]
-        proxy_url = _new_hls_proxy_session(
-            event,
-            camera_id,
-            "LIVE",
-            hls_url,
-            VIDEO_HLS_EXPIRES_SECONDS,
-        )
+        delivery_url = hls_url
+        delivery = "DIRECT_KINESIS"
+        if browser_proxy:
+            delivery_url = _new_hls_proxy_session(
+                event,
+                camera_id,
+                "LIVE",
+                hls_url,
+                VIDEO_HLS_EXPIRES_SECONDS,
+            )
+            delivery = "SAME_ORIGIN_PROXY"
         return _resp(
             200,
             {
                 "cameraId": camera_id,
                 "streamName": stream_name,
                 "playbackMode": "LIVE",
-                "hlsUrl": proxy_url,
-                "delivery": "SAME_ORIGIN_PROXY",
+                "hlsUrl": delivery_url,
+                "delivery": delivery,
                 "expiresIn": VIDEO_HLS_EXPIRES_SECONDS,
                 "maxMediaPlaylistFragmentResults": live_fragments,
                 "region": VIDEO_AWS_REGION,
@@ -1138,6 +1146,10 @@ def handler(event, context):
         resource_id = path_params.get("resource_id") or parts[1]
         return _get_hls_proxy_resource(event, token, resource_id)
 
+    if path.startswith("/video/browser-session/"):
+        camera_id = path_params.get("camera_id") or path.split("/video/browser-session/", 1)[1]
+        return _get_hls_session(event, camera_id, qs, browser_proxy=True)
+
     if path.startswith("/video/session/"):
         camera_id = path_params.get("camera_id") or path.split("/video/session/", 1)[1]
         return _get_hls_session(event, camera_id, qs)
@@ -1227,6 +1239,7 @@ def handler(event, context):
                     "/detections/object/{object_id}",
                     "/detections/geohash/{geohash}",
                     "/video/session/{camera_id}",
+                    "/video/browser-session/{camera_id}",
                     "/video/proxy/{token}/{resource_id}",
                     "/video/coverage/{camera_id}",
                 ],
