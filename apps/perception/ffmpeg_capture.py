@@ -12,6 +12,8 @@ held in an anonymous memfd inherited by the FFmpeg child.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -30,6 +32,54 @@ _MASTER_PLAYLIST_LIMIT = 64 * 1024
 
 class NvdecCaptureError(RuntimeError):
     """A deliberately sanitized capture setup failure."""
+
+
+@dataclass(frozen=True)
+class NvdecFrameIdentity:
+    """Fast reject key plus the authoritative full decoded-frame digest."""
+
+    quick: bytes
+    exact: bytes
+
+
+def quick_frame_identity(frame, axis_samples=64):
+    """Hash a distributed bounded sample before an authoritative exact hash."""
+    digest = hashlib.blake2b(digest_size=16)
+    shape = tuple(getattr(frame, "shape", ()) or ())
+    dtype = str(getattr(frame, "dtype", ""))
+    digest.update(repr((shape, dtype)).encode("ascii", errors="replace"))
+    if len(shape) >= 2 and hasattr(frame, "__getitem__"):
+        height, width = max(1, int(shape[0])), max(1, int(shape[1]))
+        y_step = max(1, (height + axis_samples - 1) // axis_samples)
+        x_step = max(1, (width + axis_samples - 1) // axis_samples)
+        try:
+            digest.update(frame[::y_step, ::x_step].tobytes())
+            for y, x in (
+                (0, 0),
+                (0, width - 1),
+                (height - 1, 0),
+                (height - 1, width - 1),
+                (height // 2, width // 2),
+            ):
+                digest.update(
+                    frame[
+                        max(0, y - 2):min(height, y + 3),
+                        max(0, x - 2):min(width, x + 3),
+                    ].tobytes()
+                )
+            return digest.digest()
+        except (AttributeError, IndexError, TypeError, ValueError):
+            pass
+    raw = frame if isinstance(frame, bytes) else repr(frame).encode("utf-8")
+    digest.update(raw[:32_768])
+    return digest.digest()
+
+
+def build_nvdec_frame_identity(frame, exact_identity):
+    return NvdecFrameIdentity(
+        quick=quick_frame_identity(frame),
+        exact=exact_identity(frame),
+    )
 
 
 def rewrite_hls_master(source_url, playlist_text):
@@ -308,7 +358,14 @@ def match_fragment_frame_nvdec(
             if not ok or frame is None:
                 break
             position = capture.get(cv2.CAP_PROP_POS_MSEC)
-            if frame_identity(frame) == target_identity:
+            if isinstance(target_identity, NvdecFrameIdentity):
+                matches_target = (
+                    quick_frame_identity(frame) == target_identity.quick
+                    and frame_identity(frame) == target_identity.exact
+                )
+            else:
+                matches_target = frame_identity(frame) == target_identity
+            if matches_target:
                 matches.append(float(position))
         return matches[0] if len(matches) == 1 else None
     finally:

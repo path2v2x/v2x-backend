@@ -2,12 +2,15 @@ import sys
 from pathlib import Path
 import unittest
 
+import numpy as np
+
 
 PERCEPTION_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_DIR))
 
 from ffmpeg_capture import (  # noqa: E402
     NvdecCaptureError,
+    build_nvdec_frame_identity,
     build_nvdec_command,
     match_fragment_frame_nvdec,
     rewrite_hls_master,
@@ -92,6 +95,29 @@ class FfmpegCaptureTests(unittest.TestCase):
             capture_factory=lambda _path: FakeCapture([b"a", b"b"], [0, 50]),
         )
         self.assertIsNone(result)
+
+    def test_quick_identity_only_runs_exact_hash_for_candidates(self):
+        frames = [
+            np.full((32, 32, 3), value, dtype=np.uint8)
+            for value in (0, 1, 2)
+        ]
+        exact_calls = []
+
+        def exact(frame):
+            exact_calls.append(int(frame[0, 0, 0]))
+            return frame.tobytes()
+
+        target = build_nvdec_frame_identity(frames[1], exact)
+        exact_calls.clear()
+        result = match_fragment_frame_nvdec(
+            b"init",
+            b"segment",
+            target,
+            exact,
+            capture_factory=lambda _path: FakeCapture(frames, [0, 50, 100]),
+        )
+        self.assertEqual(result, 50.0)
+        self.assertEqual(exact_calls, [1])
 
 
 if __name__ == "__main__":

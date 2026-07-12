@@ -93,7 +93,8 @@ class _AsyncCapturePreparation:
                 else source
             )
             capture = self._capture_factory(source)
-            source = None
+            if self._clock_source_factory is not None:
+                source = None
             if capture is None or not capture.isOpened():
                 raise RuntimeError("capture open failed")
 
@@ -119,6 +120,12 @@ class _AsyncCapturePreparation:
                 if position is None:
                     continue
                 if clock_resolution is None:
+                    if clock_source is None:
+                        clock_source = (
+                            self._clock_source_factory()
+                            if self._clock_source_factory is not None
+                            else source
+                        )
                     clock_resolution = _AsyncMediaClockResolution(
                         self._media_clock_factory,
                         (
@@ -128,6 +135,7 @@ class _AsyncCapturePreparation:
                             self._media_frame_identity,
                         ),
                     )
+                    clock_source = None
                 resolved, media_clock = clock_resolution.poll()
                 if not resolved:
                     # Keep draining the replacement FIFO while its first exact
@@ -446,9 +454,10 @@ class LiveStreamReader:
                 cap = self.capture_factory(source)
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("capture open failed")
+                if self.media_clock_source_factory is not None:
+                    source = None
                 if self.media_clock_factory is None:
                     source = None
-                    clock_source = None
 
                 connected = False
                 has_trusted_media_clock = self.media_clock_factory is None
@@ -585,6 +594,15 @@ class LiveStreamReader:
                         and capture_position is not None
                         and source_monotonic >= next_media_clock_retry
                     ):
+                        clock_source = (
+                            clock_source
+                            if clock_source is not None
+                            else (
+                                self.media_clock_source_factory()
+                                if self.media_clock_source_factory is not None
+                                else source
+                            )
+                        )
                         clock_resolution = _AsyncMediaClockResolution(
                             self.media_clock_factory,
                             (
@@ -594,6 +612,7 @@ class LiveStreamReader:
                                 self.media_frame_identity,
                             ),
                         )
+                        clock_source = None
                         resolved, candidate = clock_resolution.poll(
                             self.media_clock_initial_wait_seconds
                         )

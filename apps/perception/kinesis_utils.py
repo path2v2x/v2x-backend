@@ -11,9 +11,19 @@ import boto3
 import requests
 from dotenv import load_dotenv
 
-from ffmpeg_capture import match_fragment_frame_nvdec
+from ffmpeg_capture import (
+    build_nvdec_frame_identity,
+    match_fragment_frame_nvdec,
+)
 
 load_dotenv()
+
+
+# Bound exact-fragment GPU work across all camera clock threads. During one
+# staggered hot handover the process owns four active readers and one prepared
+# reader; three match workers keep the total at eight decoder sessions while a
+# single re-anchor completes five fragments in two batches.
+_NVDEC_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=3)
 
 
 def _utc_iso(epoch):
@@ -269,7 +279,11 @@ def resolve_hls_media_clock(
     if not fragments:
         return None
 
-    target_identity = frame_identity(reference_frame)
+    target_identity = (
+        build_nvdec_frame_identity(reference_frame, frame_identity)
+        if fragment_matcher is match_fragment_frame_nvdec
+        else frame_identity(reference_frame)
+    )
     init_cache = {}
     for init_url in {fragment.init_url for fragment in fragments}:
         init_response = http_get(init_url, timeout=timeout)
@@ -305,9 +319,13 @@ def resolve_hls_media_clock(
         # sessions during a clock re-anchor.
         with ThreadPoolExecutor(max_workers=min(5, len(fragments))) as executor:
             downloaded = list(executor.map(download_fragment, fragments))
-        candidates = [
-            match_downloaded_fragment(fragment) for fragment in downloaded
+        futures = [
+            _NVDEC_FRAGMENT_MATCH_EXECUTOR.submit(
+                match_downloaded_fragment, fragment
+            )
+            for fragment in downloaded
         ]
+        candidates = [future.result() for future in futures]
     elif (
         len(fragments) > 1
         and http_get is requests.get
@@ -396,6 +414,12 @@ def get_video_session_hls_url(stream_name, max_fragments=4):
     )
     response.raise_for_status()
     payload = response.json()
+    discontinuity_mode = payload.get("discontinuityMode")
+    if (
+        discontinuity_mode is not None
+        and discontinuity_mode != "ON_DISCONTINUITY"
+    ):
+        raise ValueError("direct perception HLS discontinuity mode is unsafe")
     return payload["hlsUrl"]
 
 def get_kvs_hls_url(
@@ -447,7 +471,7 @@ def get_kvs_hls_url(
         StreamName=stream_name,
         PlaybackMode='LIVE',
         ContainerFormat='FRAGMENTED_MP4',
-        DiscontinuityMode='ALWAYS',
+        DiscontinuityMode='ON_DISCONTINUITY',
         DisplayFragmentTimestamp='ALWAYS',
         MaxMediaPlaylistFragmentResults=max_fragments,
     )

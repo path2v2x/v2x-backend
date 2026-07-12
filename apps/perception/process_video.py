@@ -1612,15 +1612,15 @@ class MultiCameraPipeline:
             "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 1
         ))
         clock_hls_fragments = int(env_float(
-            "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS", 5
+            "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS", 2
         ))
         if not 1 <= capture_hls_fragments <= 2:
             raise ValueError(
                 "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS must be 1 or 2"
             )
-        if not 4 <= clock_hls_fragments <= 5:
+        if not 2 <= clock_hls_fragments <= 5:
             raise ValueError(
-                "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS must be 4 or 5"
+                "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS must be between 2 and 5"
             )
         media_clock_min_latency_ms = env_float(
             "V2X_PERCEPTION_MEDIA_CLOCK_MIN_LATENCY_MS", -1_000.0

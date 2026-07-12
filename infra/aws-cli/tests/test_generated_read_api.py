@@ -332,6 +332,11 @@ class LiveVideoSessionTest(unittest.TestCase):
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(body["maxMediaPlaylistFragmentResults"], 1)
         self.assertEqual(body["delivery"], "DIRECT_KINESIS")
+        self.assertEqual(body["discontinuityMode"], "ON_DISCONTINUITY")
+        self.assertEqual(
+            self.archived.calls[-1]["DiscontinuityMode"],
+            "ON_DISCONTINUITY",
+        )
         self.assertIn(self.secret, body["hlsUrl"])
         self.assertEqual(len(self.s3.put_calls), 0)
         self.assertEqual(
@@ -343,6 +348,10 @@ class LiveVideoSessionTest(unittest.TestCase):
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
         self.assertEqual(body["delivery"], "SAME_ORIGIN_PROXY")
+        self.assertEqual(body["discontinuityMode"], "ALWAYS")
+        self.assertEqual(
+            self.archived.calls[-1]["DiscontinuityMode"], "ALWAYS"
+        )
         self.assertTrue(body["hlsUrl"].startswith("https://api.example.test/video/proxy/"))
         self.assertNotIn(self.secret, response["body"])
         self.assertEqual(len(self.s3.put_calls), 1)

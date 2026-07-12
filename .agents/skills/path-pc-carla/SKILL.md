@@ -91,6 +91,24 @@ section:
   minima 2.778/2.674/1.499/1.739 seconds and maxima
   7.028/7.771/8.221/7.654 seconds. This is not live acceptance; require a new
   canonical commit and repeat the controlled watches.
+  PR 27 merged the publication freeze as
+  `f2499bfd28a6cb9a9171798afdb768f4f087790c`. Its live watch kept clocks trusted
+  but correctly failed when ch2 could not re-anchor before the last trusted
+  frame became stale at 15.12 seconds. Retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T175400Z-clock-hold-live-watch/failure.json`
+  and
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T175248Z-perception-clock-hold-f2499bfd/`;
+  live was again restored to `d54f5df` without CARLA/Drive/web changes.
+  The root cause is the direct HLS session's `DiscontinuityMode=ALWAYS`, which
+  inserts a synthetic discontinuity at every normal two-second fragment. A
+  read-only 180-second ch1 session with `ON_DISCONTINUITY` stayed trusted at
+  3.19-9.57 seconds. A four-camera upload-disabled full detector canary using
+  direct AWS `ON_DISCONTINUITY` sessions then passed 120 strict accelerated
+  renewal samples with minima 1.932/2.579/0.657/2.457 seconds and maxima
+  8.865/7.905/7.025/8.690 seconds. The next release must change only direct
+  perception sessions to `ON_DISCONTINUITY`, leave the already-proven browser
+  proxy on `ALWAYS`, expose and verify the selected mode, and repeat API,
+  detector, controlled live, 30-minute, and 24-hour gates.
 
 - The post-hourly clean HLS watch is complete at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T150759Z-post-hourly-clean/`.

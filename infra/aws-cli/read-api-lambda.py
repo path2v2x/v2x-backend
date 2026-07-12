@@ -839,7 +839,9 @@ def _get_hls_session(event, camera_id, qs, *, browser_proxy=False):
             PlaybackMode="LIVE",
             Expires=VIDEO_HLS_EXPIRES_SECONDS,
             ContainerFormat="FRAGMENTED_MP4",
-            DiscontinuityMode="ALWAYS",
+            DiscontinuityMode=(
+                "ALWAYS" if browser_proxy else "ON_DISCONTINUITY"
+            ),
             DisplayFragmentTimestamp="ALWAYS",
             MaxMediaPlaylistFragmentResults=live_fragments,
         )["HLSStreamingSessionURL"]
@@ -864,6 +866,9 @@ def _get_hls_session(event, camera_id, qs, *, browser_proxy=False):
                 "delivery": delivery,
                 "expiresIn": VIDEO_HLS_EXPIRES_SECONDS,
                 "maxMediaPlaylistFragmentResults": live_fragments,
+                "discontinuityMode": (
+                    "ALWAYS" if browser_proxy else "ON_DISCONTINUITY"
+                ),
                 "region": VIDEO_AWS_REGION,
             },
         )

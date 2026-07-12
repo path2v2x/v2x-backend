@@ -193,14 +193,17 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
             StreamName="stream-ch1",
             PlaybackMode="LIVE",
             ContainerFormat="FRAGMENTED_MP4",
-            DiscontinuityMode="ALWAYS",
+            DiscontinuityMode="ON_DISCONTINUITY",
             DisplayFragmentTimestamp="ALWAYS",
             MaxMediaPlaylistFragmentResults=4,
         )
 
     @patch("kinesis_utils.requests.get")
     def test_read_api_live_session_requests_bounded_low_latency_playlist(self, get):
-        get.return_value.json.return_value = {"hlsUrl": "signed-session"}
+        get.return_value.json.return_value = {
+            "hlsUrl": "signed-session",
+            "discontinuityMode": "ON_DISCONTINUITY",
+        }
         with patch.dict(
             "kinesis_utils.os.environ",
             {"V2X_VIDEO_SESSION_API_BASE_URL": "https://api.invalid"},
@@ -217,6 +220,20 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
             timeout=10,
         )
         get.return_value.raise_for_status.assert_called_once_with()
+
+    @patch("kinesis_utils.requests.get")
+    def test_read_api_rejects_unsafe_direct_discontinuity_mode(self, get):
+        get.return_value.json.return_value = {
+            "hlsUrl": "signed-session",
+            "discontinuityMode": "ALWAYS",
+        }
+        with patch.dict(
+            "kinesis_utils.os.environ",
+            {"V2X_VIDEO_SESSION_API_BASE_URL": "https://api.invalid"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "discontinuity mode"):
+                get_video_session_hls_url("v2x-backend-cam-ch1", 4)
 
     def test_live_fragment_count_rejects_latency_weakening(self):
         with patch.dict(
