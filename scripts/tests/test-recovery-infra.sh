@@ -157,6 +157,13 @@ JSON
     etag="$(sha256sum "$path" | awk '{print $1}')"
     jq -nc --arg etag "\"${etag}\"" '{ETag:$etag}'
     ;;
+  s3api:get-bucket-lifecycle-configuration)
+    echo 'An error occurred (NoSuchLifecycleConfiguration) when calling GetBucketLifecycleConfiguration' >&2
+    exit 254
+    ;;
+  s3api:put-bucket-lifecycle-configuration)
+    printf '{}\n'
+    ;;
   s3api:copy-object)
     key="$(value_after --key "$@")"
     source="$(value_after --copy-source "$@")"
@@ -225,6 +232,7 @@ API_ID=w0j9m7dgpg RECONCILE_LAMBDA=false ATTACH_DDB_READ_POLICY=false PLAN_ONLY=
   "$ROOT/infra/aws-cli/provision-read-api.sh" >"$TMP/read-api-plan.txt"
 assert_contains "$TMP/read-api-plan.txt" 'reconcileLambda=false'
 assert_contains "$TMP/read-api-plan.txt" 'KEEP existing Lambda code, configuration, role, and policy'
+assert_contains "$TMP/read-api-plan.txt" 'CREATE route GET /video/proxy/{token}/{resource_id}'
 if grep -Eq 'lambda (update-function|create-function|add-permission|remove-permission)' "$MOCK_AWS_LOG"; then
   fail 'route-only plan attempted a Lambda mutation'
 fi
@@ -242,6 +250,20 @@ fi
 if grep -Eq 'lambda (update-function|create-function|add-permission|remove-permission)' "$MOCK_AWS_LOG"; then
   fail 'route-only apply attempted a Lambda mutation'
 fi
+
+# An explicitly requested read-role policy reconciliation must include the
+# observed prior inline-policy state in the reviewed hash before any apply.
+: >"$MOCK_AWS_LOG"
+PATH="$MOCK_BIN:$PATH" API_ID=w0j9m7dgpg RECONCILE_LAMBDA=true \
+ATTACH_DDB_READ_POLICY=true PLAN_ONLY=true \
+  "$ROOT/infra/aws-cli/provision-read-api.sh" >"$TMP/read-api-iam-plan.txt"
+assert_contains "$TMP/read-api-iam-plan.txt" 'observedInlinePolicyExists=false (included in currentStateHash)'
+assert_contains "$MOCK_AWS_LOG" 'iam get-role-policy --role-name read-role --policy-name v2x-backend-detections-ddb-read'
+PATH="$MOCK_BIN:$PATH" API_ID=w0j9m7dgpg RECONCILE_LAMBDA=true \
+ATTACH_DDB_READ_POLICY=false PLAN_ONLY=true \
+  "$ROOT/infra/aws-cli/provision-read-api.sh" >"$TMP/read-api-unprivileged-plan.txt"
+assert_contains "$TMP/read-api-unprivileged-plan.txt" \
+  'BLOCKED FOR APPLY: HLS proxy state access has not been reconciled'
 
 # IAM apply must be preceded by a real-state review hash.
 : >"$MOCK_AWS_LOG"

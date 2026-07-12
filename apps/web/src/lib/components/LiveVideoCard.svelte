@@ -11,13 +11,15 @@
 
 	let { cameraId, streamUrl = '', sourceLabel = 'Raw' }: Props = $props();
 
-	let videoEl = $state<HTMLVideoElement | null>(null);
+	let videoElA = $state<HTMLVideoElement | null>(null);
+	let videoElB = $state<HTMLVideoElement | null>(null);
+	let activeVideoIndex = $state<0 | 1>(0);
 	let loading = $state(false);
 	let error = $state<string | null>(null);
 	let connected = $state(false);
 	let sessionExpiresIn = $state<number | null>(null);
 	let mjpegUrl = $state('');
-	let hls: Hls | null = null;
+	let players: [Hls | null, Hls | null] = [null, null];
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let connectionKey = '';
 	let connectionRevision = 0;
@@ -29,27 +31,118 @@
 		}
 	}
 
+	function renewalLeadSeconds(): number {
+		// Four cards are normally mounted together. Deterministic spacing avoids
+		// briefly doubling all four decoders and starving the streams that are
+		// still visible. Unknown camera IDs retain the conservative middle lead.
+		const cameraOrder = ['ch1', 'ch2', 'ch3', 'ch4'];
+		const cameraIndex = cameraOrder.indexOf(cameraId);
+		return cameraIndex < 0 ? 45 : 60 - cameraIndex * 10;
+	}
+
 	function scheduleRefresh(expiresIn: number | null) {
 		clearRefreshTimer();
-		if (!expiresIn || expiresIn <= 20) return;
+		const leadSeconds = renewalLeadSeconds();
+		if (!expiresIn || expiresIn <= leadSeconds + 5) return;
 		refreshTimer = setTimeout(() => {
-			void connect();
-		}, (expiresIn - 15) * 1000);
+			void renewSession();
+		}, (expiresIn - leadSeconds) * 1000);
+	}
+
+	function videoAt(index: 0 | 1): HTMLVideoElement | null {
+		return index === 0 ? videoElA : videoElB;
+	}
+
+	function destroySlot(index: 0 | 1) {
+		if (players[index]) {
+			players[index]?.destroy();
+			players[index] = null;
+		}
+		const video = videoAt(index);
+		if (video) {
+			video.pause();
+			video.removeAttribute('src');
+			video.load();
+		}
 	}
 
 	function destroyPlayer() {
 		clearRefreshTimer();
 		mjpegUrl = '';
-		if (hls) {
-			hls.destroy();
-			hls = null;
-		}
-		if (videoEl) {
-			videoEl.pause();
-			videoEl.removeAttribute('src');
-			videoEl.load();
-		}
+		destroySlot(0);
+		destroySlot(1);
 		connected = false;
+	}
+
+	async function attachHls(url: string, index: 0 | 1) {
+		destroySlot(index);
+		const video = videoAt(index);
+		if (!video) throw new Error('Video element unavailable');
+
+		if (Hls.isSupported()) {
+			const player = new Hls({
+				enableWorker: true,
+				lowLatencyMode: false
+			});
+			players[index] = player;
+			player.loadSource(url);
+			player.attachMedia(video);
+		} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+			video.src = url;
+		} else {
+			throw new Error('HLS playback is not supported in this browser');
+		}
+
+		// The play promise resolves only once playback has actually begun. This
+		// makes a standby player safe to reveal during a session handoff.
+		let playbackTimeout: ReturnType<typeof setTimeout> | null = null;
+		try {
+			await Promise.race([
+				video.play(),
+				new Promise<never>((_resolve, reject) => {
+					playbackTimeout = setTimeout(
+						() => reject(new Error('Timed out preparing video session')),
+						20_000
+					);
+				})
+			]);
+		} finally {
+			if (playbackTimeout) clearTimeout(playbackTimeout);
+		}
+	}
+
+	async function renewSession() {
+		const revision = connectionRevision;
+		const oldIndex = activeVideoIndex;
+		const standbyIndex: 0 | 1 = oldIndex === 0 ? 1 : 0;
+		try {
+			const session = await fetchVideoSession(cameraId);
+			if (revision !== connectionRevision) return;
+			await attachHls(session.hlsUrl, standbyIndex);
+			if (revision !== connectionRevision) {
+				destroySlot(standbyIndex);
+				return;
+			}
+
+			// Switch only after the replacement stream is already playing, then
+			// retire the old expiring session on the next render turn.
+			activeVideoIndex = standbyIndex;
+			sessionExpiresIn = session.expiresIn;
+			error = null;
+			connected = true;
+			scheduleRefresh(session.expiresIn);
+			await tick();
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			if (revision === connectionRevision) destroySlot(oldIndex);
+		} catch (err) {
+			if (revision !== connectionRevision) return;
+			destroySlot(standbyIndex);
+			error = err instanceof Error ? err.message : 'Video session renewal failed';
+			// Keep the still-playing active session and retry while its early-renewal
+			// safety margin remains available.
+			clearRefreshTimer();
+			refreshTimer = setTimeout(() => void renewSession(), 5_000);
+		}
 	}
 
 	function isImageStream(url: string): boolean {
@@ -95,24 +188,12 @@
 				return;
 			}
 
-			if (!videoEl) {
-				throw new Error('Video element unavailable');
-			}
-
-			if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-				videoEl.src = hlsUrl;
-			} else if (Hls.isSupported()) {
-				hls = new Hls({
-					enableWorker: true,
-					lowLatencyMode: false,
-				});
-				hls.loadSource(hlsUrl);
-				hls.attachMedia(videoEl);
-			} else {
-				throw new Error('HLS playback is not supported in this browser');
-			}
-
-			await videoEl.play().catch(() => {});
+			// Prefer hls.js whenever Media Source Extensions are available. Recent
+			// Chromium builds report native HLS support on Linux but intermittently
+			// fail fMP4 Kinesis playlists with a non-recovering demux/ORB error.
+			// Safari has no hls.js MSE path and falls through to native HLS.
+			activeVideoIndex = 0;
+			await attachHls(hlsUrl, 0);
 			if (revision !== connectionRevision) return;
 			connected = true;
 		} catch (err) {
@@ -174,8 +255,20 @@
 			/>
 		{:else}
 			<video
-				bind:this={videoEl}
-				class="h-full w-full object-cover"
+				bind:this={videoElA}
+				class="absolute inset-0 h-full w-full object-cover transition-opacity duration-150"
+				class:opacity-0={activeVideoIndex !== 0}
+				class:opacity-100={activeVideoIndex === 0}
+				aria-hidden={activeVideoIndex !== 0}
+				playsinline
+				muted
+			></video>
+			<video
+				bind:this={videoElB}
+				class="absolute inset-0 h-full w-full object-cover transition-opacity duration-150"
+				class:opacity-0={activeVideoIndex !== 1}
+				class:opacity-100={activeVideoIndex === 1}
+				aria-hidden={activeVideoIndex !== 1}
 				playsinline
 				muted
 			></video>

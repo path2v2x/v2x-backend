@@ -102,11 +102,13 @@ Provision the read routes:
 ```bash
 cd infra/aws-cli
 AWS_PROFILE="your-profile" AWS_REGION=us-west-1 \
-RECONCILE_LAMBDA=true PLAN_ONLY=true ./provision-read-api.sh
+RECONCILE_LAMBDA=true ATTACH_DDB_READ_POLICY=true PLAN_ONLY=true \
+  ./provision-read-api.sh
 # Review the exact Lambda/integration/route/stage plan and copy its state hash,
 # then apply the same inputs explicitly:
 AWS_PROFILE="your-profile" AWS_REGION=us-west-1 \
 RECONCILE_LAMBDA=true PLAN_ONLY=false \
+ATTACH_DDB_READ_POLICY=true \
 EXPECTED_CURRENT_STATE_HASH=<reviewed-hash> ./provision-read-api.sh
 ```
 
@@ -121,7 +123,11 @@ Lambda retains its execution role. Creating the read Lambda requires an
 explicit, pre-provisioned `READ_LAMBDA_ROLE_ARN`; the script will not infer the
 ingest role or create a role. Set `ATTACH_DDB_READ_POLICY=true` only in a
 separately approved IAM gate after reviewing the generated least-privilege
-inline policy.
+inline policy. The same reviewed gate is mandatory when deploying the HLS proxy
+Lambda because its opaque session state requires prefix-scoped S3
+get/put/delete access. A code apply with `RECONCILE_LAMBDA=true` fails closed
+unless that policy reconciliation is explicit. The prior named inline policy
+is included in the reviewed state hash and rollback evidence.
 
 For the current recovery, the surgically deployed read Lambda is already the
 accepted code/configuration. Reconcile only HTTP API integrations, routes, and
@@ -142,6 +148,8 @@ mutation. It contains redacted Lambda metadata/configuration/policy, complete
 API/integration/route/stage JSON, inputs, and SHA-256 evidence. When
 `RECONCILE_LAMBDA=true`, it also immediately downloads the expiring prior
 Lambda artifact as `lambda-before.zip`; `Code.Location` is never persisted.
+When execution-role policy reconciliation is requested, the prior named inline
+policy (or its proven absence) is also retained.
 Route-only recovery does not alter Lambda code, configuration, role, or
 resource policy.
 
@@ -161,10 +169,11 @@ Optional env vars for `provision-read-api.sh` include:
 - `EXPECTED_CURRENT_STATE_HASH` (required for apply; copied from the reviewed plan)
 - `PLAN_ONLY` (defaults to `true`; apply requires an explicit `false`)
 
-Tracked read routes include `/drive-config`, `/detections/timeline`, and
-`/video/coverage/{camera_id}` in addition to the state, snapshot, detection,
-demo-video, and HLS-session routes. After applying, capture route-to-integration
-parity with:
+Tracked read routes include `/drive-config`, `/detections/timeline`,
+`/video/coverage/{camera_id}`, and the opaque
+`/video/proxy/{token}/{resource_id}` route in addition to the state, snapshot,
+detection, demo-video, and HLS-session routes. After applying, capture
+route-to-integration parity with:
 
 ```bash
 api_id="$(aws apigatewayv2 get-apis \
@@ -207,6 +216,11 @@ update/inspect the existing `v2x-backend-read` Lambda and its API Gateway
 invoke permission. It cannot create a Lambda, delete API Gateway resources,
 modify IAM, or pass a role. `iam:PassRole` is unnecessary because the existing
 read Lambda keeps its current execution role.
+
+The role also has read-only CloudWatch metric access and read-only access to
+the exact `/aws/lambda/v2x-backend-read` log group so a release gate can retain
+error/throttle and failure-signature evidence. It has no CloudWatch or Logs
+write actions and no access to other log groups.
 
 Configure an AWS CLI role profile whose source profile is the existing
 `rfs-v2x-service` credential chain, then force the known API ID so the read
@@ -314,23 +328,38 @@ Defaults:
 The read API also exposes:
 
 - `GET /video/session/{camera_id}`
+- `GET /video/proxy/{token}/{resource_id}` (opaque URLs returned by the session endpoint)
 - `GET /video/coverage/{camera_id}?start=<ISO-8601>&end=<ISO-8601>`
 
-The session endpoint returns a short-lived signed HLS URL for `ch1` through
-`ch4`. Live sessions default to five minutes; archived sessions require both
-`start` and `end` and are limited to a 24-hour window. Never cache, log, commit,
-or paste the signed query string. Request a new session when it expires.
+The session endpoint returns a short-lived same-origin proxy URL for `ch1`
+through `ch4`; it never returns the signed Kinesis URL. The Lambda stores the
+Kinesis session token in a private, encrypted `hls-proxy/v1/` state object,
+rewrites master and media playlists recursively, and authenticates each opaque
+child descriptor with a key derived from that unexposed session token. Proxy
+requests accept only the exact Kinesis Video origin and HLS resource allowlist,
+reject redirects, and cap playlists at 1 MiB and binary fragments at 4 MiB.
+Live sessions default to five minutes; archived sessions require both `start`
+and `end` and are limited to a 24-hour window. Expired proxy state is rejected
+and deleted when accessed. A bucket lifecycle rule for the dedicated
+`hls-proxy/v1/` prefix remains recommended as defense-in-depth cleanup for
+expired sessions that are never requested again.
+
+The 4 MiB raw-fragment limit is below Lambda's synchronous base64 response
+ceiling. Treat an observed larger fragment as a failed release gate requiring
+lower producer fragment size/bitrate or a streaming proxy service; do not raise
+the limit past the Lambda/API Gateway transport bound.
 
 An HTTP 200 or advancing MJPEG byte count does not prove a live source. HLS
 acceptance requires all four camera producer timestamps to remain recent and
 advance across two samples, real frame content to change, and the perception
 service to recover after a forced session expiry without accumulating
-`CLOSE_WAIT` sockets. Redact `hlsUrl` when collecting evidence:
+`CLOSE_WAIT` sockets. The returned `hlsUrl` is safe to identify as a proxy URL,
+but do not retain the opaque token path in durable evidence:
 
 ```bash
 for camera in ch1 ch2 ch3 ch4; do
   curl -fsS "https://<api-id>.execute-api.us-west-1.amazonaws.com/video/session/${camera}" \
-    | jq '{cameraId,playbackMode,expiresIn,hlsUrlPresent:(.hlsUrl|type == "string" and length > 0)}'
+    | jq '{cameraId,playbackMode,delivery,expiresIn,hlsUrlPresent:(.hlsUrl|type == "string" and length > 0)}'
 done
 ```
 
