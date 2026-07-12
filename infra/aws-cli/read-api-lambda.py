@@ -60,6 +60,7 @@ HLS_ALLOWED_BASENAMES = {
     "getMP4MediaFragment.mp4": "mp4",
     "getTSFragment": "ts",
 }
+HLS_TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 if (
     not re.fullmatch(r"[A-Za-z0-9/_-]{1,128}/", HLS_PROXY_PREFIX)
@@ -365,26 +366,42 @@ def _decode_hls_resource(session, resource_id):
 def _fetch_hls_upstream(url, kind):
     max_bytes = HLS_PROXY_PLAYLIST_MAX_BYTES if kind == "playlist" else HLS_PROXY_SEGMENT_MAX_BYTES
     request = Request(url, headers={"Accept-Encoding": "identity", "User-Agent": "v2x-hls-proxy/1"})
-    try:
-        with HLS_PROXY_OPENER.open(request, timeout=HLS_PROXY_FETCH_TIMEOUT_SECONDS) as response:
-            status = getattr(response, "status", response.getcode())
-            if status != 200:
-                raise HlsProxyError(502, "hls_upstream_unavailable")
-            encoding = (response.headers.get("content-encoding") or "identity").lower()
-            if encoding != "identity":
-                raise HlsProxyError(502, "hls_upstream_response_invalid")
-            length = response.headers.get("content-length")
-            if length:
-                try:
-                    if int(length) > max_bytes:
-                        raise HlsProxyError(502, "hls_upstream_response_too_large")
-                except ValueError as exc:
-                    raise HlsProxyError(502, "hls_upstream_response_invalid") from exc
-            body = response.read(max_bytes + 1)
-    except HlsProxyError:
-        raise
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise HlsProxyError(502, "hls_upstream_unavailable") from exc
+    body = None
+    for attempt in range(3):
+        try:
+            with HLS_PROXY_OPENER.open(request, timeout=HLS_PROXY_FETCH_TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", response.getcode())
+                if status != 200:
+                    raise HlsProxyError(502, "hls_upstream_unavailable")
+                encoding = (response.headers.get("content-encoding") or "identity").lower()
+                if encoding != "identity":
+                    raise HlsProxyError(502, "hls_upstream_response_invalid")
+                length = response.headers.get("content-length")
+                if length:
+                    try:
+                        if int(length) > max_bytes:
+                            raise HlsProxyError(502, "hls_upstream_response_too_large")
+                    except ValueError as exc:
+                        raise HlsProxyError(502, "hls_upstream_response_invalid") from exc
+                body = response.read(max_bytes + 1)
+            break
+        except HlsProxyError:
+            raise
+        except HTTPError as exc:
+            retryable = exc.code in HLS_TRANSIENT_HTTP_STATUS_CODES
+            if not retryable or attempt == 2:
+                raise HlsProxyError(502, "hls_upstream_unavailable") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            if attempt == 2:
+                raise HlsProxyError(502, "hls_upstream_unavailable") from exc
+
+        # Keep all three attempts within API Gateway's integration bound. The
+        # jitter also prevents four camera cards from retrying in lockstep.
+        jitter = 0.5 + (secrets.randbelow(501) / 1000.0)
+        time.sleep(0.2 * (2 ** attempt) * jitter)
+
+    if body is None:
+        raise HlsProxyError(502, "hls_upstream_unavailable")
     if len(body) > max_bytes:
         raise HlsProxyError(502, "hls_upstream_response_too_large")
     return body

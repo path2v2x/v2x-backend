@@ -596,6 +596,69 @@ class HlsProxyTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "hls_upstream_response_too_large")
 
+    def test_transient_upstream_http_error_is_retried_then_recovers(self):
+        class PlaylistResponse:
+            status = 200
+            headers = {"content-encoding": "identity"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _size):
+                return b"#EXTM3U\n"
+
+        calls = []
+
+        def open_upstream(request, **_kwargs):
+            calls.append(request.full_url)
+            if len(calls) < 3:
+                raise self.module["HTTPError"](
+                    request.full_url, 502, "Bad Gateway", {}, None
+                )
+            return PlaylistResponse()
+
+        self.module["HLS_PROXY_OPENER"] = types.SimpleNamespace(open=open_upstream)
+        with patch.object(self.module["time"], "sleep") as sleep, patch.object(
+            self.module["secrets"], "randbelow", return_value=0
+        ):
+            body = self.module["_fetch_hls_upstream"](
+                "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                f"getHLSMediaPlaylist.m3u8?SessionToken={self.secret}",
+                "playlist",
+            )
+
+        self.assertEqual(body, b"#EXTM3U\n")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.1, 0.2])
+
+    def test_nontransient_upstream_http_error_fails_without_retry(self):
+        calls = []
+
+        def open_upstream(request, **_kwargs):
+            calls.append(request.full_url)
+            raise self.module["HTTPError"](
+                request.full_url, 403, "Forbidden", {}, None
+            )
+
+        self.module["HLS_PROXY_OPENER"] = types.SimpleNamespace(open=open_upstream)
+        with patch.object(self.module["time"], "sleep") as sleep:
+            with self.assertRaises(self.module["HlsProxyError"]) as raised:
+                self.module["_fetch_hls_upstream"](
+                    "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                    f"getHLSMediaPlaylist.m3u8?SessionToken={self.secret}",
+                    "playlist",
+                )
+
+        self.assertEqual(raised.exception.code, "hls_upstream_unavailable")
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+
     def test_redirect_handler_never_forwards_signed_request(self):
         redirect = self.module["_RejectRedirects"]()
         self.assertIsNone(
