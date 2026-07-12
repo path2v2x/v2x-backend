@@ -38,6 +38,14 @@ production or live service mutation is authorized by this document.
   `Roads_Marking` hierarchies. This is enough to justify an isolated editor
   migration/visual test, but it is not raw authoring source, survey truth, or
   acceptance evidence.
+- The hash-bound road-core materialization at
+  `/mnt/v2x-ue5/evidence/april-road-core-dependencies/` verifies 29/29 LFS
+  objects from `d14da5b` with zero primary material/texture import gaps for the
+  level, scene, road, curb, gutter, sidewalk, and two marking layers. This is
+  sufficient for the first UE5 topology rejection test. It is not a complete
+  Richmond dependency graph, cooked package, or survey proof; thousands of
+  unrelated prop assets remain unmaterialized and cannot be omitted from a
+  production candidate.
 - The retained UE4 import metadata names the missing original export exactly:
   `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. The file is not
   present in the repository, Path PC V2X-owned directories, or the Path PC's
@@ -116,12 +124,13 @@ homographies.
 
 ## Current executable action
 
-Complete the hash-bound LFS materialization at Richmond commit `d14da5b`, finish
-the clean CARLA `ue5-dev` plus `CarlaUnreal/UnrealEngine` `ue5-dev-carla`
-workspace, and migrate a copy of the latest retained `New_RFS` dependency graph
-into the isolated UE5.5 editor. Render the four fixed camera regions and first
-test crosswalk/road topology on fit/development imagery. Reject the retained
-asset route if the same camera-independent topology contradiction remains.
-Even if the visual topology improves, production remains closed until the
-independent survey and measured-intrinsics gates are supplied and pass. Do not
-deploy a camera pose or place acceptance actors before those gates.
+Finish the clean `CarlaUnreal/UnrealEngine` `ue5-dev-carla` dependencies and
+bounded build, then migrate the verified 29-file road core into a copy of the
+actual CARLA `ue5-dev` project. First create an isolated road-only topology
+probe, render the four fixed camera regions, and test crosswalk/road topology on
+fit/development imagery. Reject the retained asset route immediately if the
+same camera-independent contradiction remains. Only if that probe improves may
+the full Richmond dependency graph be materialized, migrated, and cooked as a
+complete fingerprinted CARLA package. Even then, production remains closed
+until independent survey and measured-intrinsics gates are supplied and pass.
+Do not deploy a camera pose or place acceptance actors before those gates.

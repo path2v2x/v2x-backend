@@ -9,7 +9,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed through 2026-07-12 13:48 UTC; verify rather than assume:
+Observed through 2026-07-12 15:00 UTC; verify rather than assume:
 
 - Canonical `origin/main`, the clean live checkout, the Amplify mirror, and
   successful production Amplify job 202 are exact commit
@@ -41,6 +41,34 @@ Observed through 2026-07-12 13:48 UTC; verify rather than assume:
   no health outage and per-channel maximum latency below 5.75 seconds. Re-run
   that complete gate after any merged perception deployment; old evidence does
   not transfer to a new fingerprint.
+- Newest browser/API state overrides older HLS chronology below. The read
+  Lambda was updated at 14:28 UTC from state hash
+  `5958dd663b35bc3dbaf9ffd9d64181892efa957f695b3bb69e053fc2e1cdcb6e`;
+  its narrow upstream retry covers only HTTP 429/5xx and network timeouts,
+  while 4xx, invalid content, redirects, bounds, and auth/config failures still
+  fail immediately. The verified rollback bundle is
+  `/home/path/V2XCarla/v2x-backend-backups/read-api-reconciliation/v2x-backend-read-20260712T142822Z-5958dd663b35/`.
+  A real playlist 502 and a measured 6.70-second all-camera simultaneous-renew
+  outage remain retained failures at
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260712T142114Z-seamless-failed-upstream502/`
+  and
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260712T142909Z-post-retry-failed-simultaneous-renewal/`.
+  The current web candidate double-buffers each HLS session and staggers ch1–ch4
+  renewals by ten seconds. By 14:59 UTC its attended Playwright probe had five
+  renewal rounds per camera, zero console errors, all session calls 200, and a
+  worst measured availability gap of 1.45 seconds. Do not call the run complete
+  before its 30-minute endpoint or before retaining final network/screenshot
+  evidence. The candidate is isolated in commit `748d02e` on
+  `codex/v2x-hls-release`, draft PR 22; 132 web tests, clean build/type checks,
+  22 generated-Lambda tests, and recovery-infrastructure tests pass.
+  Direct Amplify attachment to `path2v2x/v2x-backend` failed before metadata
+  mutation because the organization disables deploy keys; do not weaken that
+  policy. The current owner-controlled fallback
+  `michaelvu1207/v2x-backend-amplify` is proven exact to canonical `main`, has
+  an active push webhook and sync workflow, and Amplify jobs 193–202 succeeded.
+  Repository-apply rollback metadata is
+  `/home/path/V2XCarla/v2x-backend-backups/amplify-repository/d1ugco1rmb7yjj-20260712T145830Z-289164f0714ea21fb4b5a419fd11c60218dec0498eb7b487345db2a3b7530a1c.json`;
+  the failed canonical update left Amplify repository metadata unchanged.
 - Public `/timeline` is not currently an acceptance pass. The earlier
   Playwright evidence at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T063328Z-current-baseline/`
@@ -191,8 +219,15 @@ Observed through 2026-07-12 13:48 UTC; verify rather than assume:
   `2ac0528831e08e80784df2759db9a2c592d3bd4d`; fork dependencies are downloading
   at background CPU/disk priority and the checkout must eventually be named
   `/mnt/v2x-ue5/src/UnrealEngine5_carla`. The clean Richmond source checkout is
-  fixed at `d14da5b57bbe4356930a2b9a926a675692e18547`; its full LFS pull is still
-  materializing 7,063 Content files. A probe proved the latest retained
+  fixed at `d14da5b57bbe4356930a2b9a926a675692e18547`. The complete 29-file April
+  road-core subset—level, scene, road/curb/gutter/sidewalk and both marking
+  layers plus their primary materials/textures—matches every recorded LFS SHA
+  and has zero missing material/texture imports in UE Viewer. Retained evidence
+  is `/mnt/v2x-ue5/evidence/april-road-core-dependencies/`. Thousands of
+  unrelated prop assets remain pointers and are not acceptance-ready; do not
+  mislabel the road-core subset as a complete final map package. Engine fork
+  dependencies were about 31% complete at 14:52 UTC and continue at background
+  priority. A probe proved the latest retained
   `Richmond_NR.umap` references
   `New_RFS/Richmond_Field_Station_Richmond_CA.uasset`; that scene asset retains
   a distinct newer source path,
