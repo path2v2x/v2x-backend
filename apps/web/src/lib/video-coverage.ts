@@ -8,8 +8,8 @@ export type CoverageFetcher = (
 
 /**
  * Fetch one camera's coverage chunks sequentially. Kinesis Video Streams can
- * reject concurrent ListFragments calls for the same stream, while different
- * camera streams remain safe to fetch in parallel at the caller.
+ * reject concurrent ListFragments calls. The timeline caller also serializes
+ * cameras because the observed connection limit is account-wide.
  */
 export async function fetchCameraCoverageSequentially(
 	cameraId: string,

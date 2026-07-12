@@ -72,25 +72,19 @@
 		// per camera and merge the intervals client-side.
 		const CHUNK_MS = 4 * 60 * 60 * 1000;
 		try {
-			// Run different streams in parallel, but never overlap ListFragments
-			// calls for the same Kinesis stream.
-			const results = await Promise.allSettled(
-				cameraIds.map((cameraId) =>
-					fetchCameraCoverageSequentially(
-						cameraId,
-						start,
-						end,
-						CHUNK_MS,
-						fetchVideoCoverage
-					)
-				)
-			);
+			// Kinesis Video Streams applies ListFragments connection limits across
+			// the account, not only within one stream. Keep the optional coverage
+			// overlay globally sequential so it cannot disturb live HLS sessions.
 			const next: Record<string, VideoCoverage> = { ...coverageByCamera };
-			results.forEach((result, i) => {
-				if (result.status === 'fulfilled') {
-					next[cameraIds[i]] = result.value;
-				}
-			});
+			for (const cameraId of cameraIds) {
+				next[cameraId] = await fetchCameraCoverageSequentially(
+					cameraId,
+					start,
+					end,
+					CHUNK_MS,
+					fetchVideoCoverage
+				);
+			}
 			coverageByCamera = next;
 		} finally {
 			coverageLoading = false;

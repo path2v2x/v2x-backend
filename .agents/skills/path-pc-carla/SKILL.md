@@ -70,8 +70,9 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   first proxy canary rollback, but it does not replace the 30-minute/24-hour
   production watch gates. The same browser watch later exposed two transient
   CH2 `/video/coverage` 502s because the page issued six ListFragments windows
-  concurrently for each stream. The next source candidate serializes chunks
-  within each camera while retaining cross-camera parallelism and refuses
+  concurrently for each stream. A follow-up watch proved the connection limit
+  is account-wide when overlapping ch2/ch3 calls still returned 502. The next
+  source candidate serializes all coverage chunks globally and refuses
   overlapping refreshes. Also retain the deployment-compatibility fix: new HLS
   proxy settings have safe defaults and existing Lambda configuration is
   reconciled before new code. The 12:40 apply briefly produced two
