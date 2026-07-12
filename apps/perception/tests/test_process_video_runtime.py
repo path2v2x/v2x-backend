@@ -349,8 +349,12 @@ class LivePipelineTimestampTests(unittest.TestCase):
             return frame
 
     class FakeReader:
+        instances = []
+
         def __init__(self, **_kwargs):
             self.snapshot_calls = 0
+            self.kwargs = _kwargs
+            self.instances.append(self)
 
         def start(self):
             return None
@@ -374,6 +378,7 @@ class LivePipelineTimestampTests(unittest.TestCase):
 
     @patch("process_video.LiveStreamReader", FakeReader)
     def test_pipeline_uses_per_camera_capture_time_and_source_age(self):
+        self.FakeReader.instances.clear()
         detector = self.FakeDetector()
         pipeline = object.__new__(MultiCameraPipeline)
         pipeline.detectors = [detector]
@@ -400,6 +405,11 @@ class LivePipelineTimestampTests(unittest.TestCase):
             detector.event_times[0][0],
         )
         self.assertAlmostEqual(health["cameras"]["ch1"]["age_seconds"], 0.1)
+        self.assertEqual(len(self.FakeReader.instances), 1)
+        self.assertEqual(
+            self.FakeReader.instances[0].kwargs["connection_max_age_seconds"],
+            240.0,
+        )
 
 
 if __name__ == "__main__":

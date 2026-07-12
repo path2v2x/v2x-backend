@@ -351,13 +351,23 @@ def get_video_session_hls_url(stream_name, max_fragments=4):
     payload = response.json()
     return payload["hlsUrl"]
 
-def get_kvs_hls_url(stream_name, region_name="us-west-2"):
+def get_kvs_hls_url(
+    stream_name,
+    region_name="us-west-2",
+    max_fragments=None,
+):
+    """Return one bounded live session without retaining its signed URL.
+
+    The perception reader may use a two-fragment capture session alongside a
+    separate five-fragment exact-clock session.  The wider clock window keeps
+    the reference fragment available without forcing the decoder to begin
+    several fragments behind the live edge.
     """
-    Fetches a live HLS streaming session URL for a given Kinesis Video Stream.
-    """
-    max_fragments = int(os.getenv("V2X_PERCEPTION_LIVE_HLS_FRAGMENTS", "4"))
-    if not 4 <= max_fragments <= 5:
-        raise ValueError("V2X_PERCEPTION_LIVE_HLS_FRAGMENTS must be 4 or 5")
+    if max_fragments is None:
+        max_fragments = os.getenv("V2X_PERCEPTION_LIVE_HLS_FRAGMENTS", "4")
+    max_fragments = int(max_fragments)
+    if not 2 <= max_fragments <= 5:
+        raise ValueError("live HLS fragment count must be between 2 and 5")
     api_hls_url = get_video_session_hls_url(stream_name, max_fragments)
     if api_hls_url:
         return api_hls_url
