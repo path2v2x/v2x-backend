@@ -169,16 +169,16 @@ class LiveStreamReaderTests(unittest.TestCase):
         )
         reader.start()
         try:
-            self.assertTrue(self.wait_until(lambda: sum(
-                event["state"] == "connected" for event in states
-            ) >= 2))
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "renewed" for event in states
+            )))
             self.assertGreaterEqual(len(source_calls), 2)
             self.assertFalse(any(
                 event["state"] == "reconnecting" for event in states
             ))
-            self.assertGreaterEqual(sum(
+            self.assertEqual(sum(
                 event["state"] == "connected" for event in states
-            ), 2)
+            ), 1)
         finally:
             reader.stop(timeout=2.0)
 
@@ -227,9 +227,9 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertTrue(self.wait_until(lambda: len(captures) >= 2))
             self.assertTrue(self.wait_until(lambda: captures[1].count >= 5))
             release_replacement_clock.set()
-            self.assertTrue(self.wait_until(lambda: sum(
-                event["state"] == "connected" for event in states
-            ) >= 2))
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "renewed" for event in states
+            )))
             snapshot = reader.snapshot(0)
             self.assertIsNotNone(snapshot)
             self.assertIsNotNone(snapshot["media_clock"])

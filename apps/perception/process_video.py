@@ -1690,6 +1690,8 @@ class MultiCameraPipeline:
                         if stream_broadcaster:
                             stream_broadcaster.mark_connected(camera_ids[index])
                         return
+                    if state == "renewed":
+                        return
                     if stream_broadcaster:
                         stream_broadcaster.mark_reconnecting(
                             camera_ids[index], error, failures

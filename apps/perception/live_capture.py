@@ -505,7 +505,11 @@ class LiveStreamReader:
                             + self.connection_max_age_seconds
                             - self.connection_renewal_lead_seconds
                         )
-                        self._notify("connected")
+                        # The old connection remained healthy until this
+                        # atomic swap. Report the lifecycle event without
+                        # downgrading a published streaming state to the
+                        # cold-start/recovery-only "connected" state.
+                        self._notify("renewed")
 
                     identity = self.frame_identity(frame)
                     if identity in self._recent_frame_identity_set:
