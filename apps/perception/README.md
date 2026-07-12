@@ -92,7 +92,7 @@ python tools/verify_live_feeds.py https://<candidate-perception-host>
 
 The verifier samples raw capture timestamps three seconds apart because the
 measured live fragment cadence is about 2.002 seconds. It separately polls each
-raw capture counter for at most five seconds and each camera's explicit
+raw capture counter for at most ten seconds and each camera's explicit
 inference counter for at most ten seconds, so fragment-boundary jitter or a normal
 two-worker inference phase is not mistaken for a stalled camera. Health fails
 closed when any inference result is more than ten seconds old. The verifier

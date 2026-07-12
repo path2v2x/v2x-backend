@@ -159,7 +159,7 @@ class LiveFeedVerifierTests(unittest.TestCase):
 
     def test_verifies_advancing_times_and_two_changed_frames_per_camera(self):
         self.assertEqual(DEFAULT_SAMPLE_INTERVAL_SECONDS, 3.0)
-        self.assertEqual(DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS, 5.0)
+        self.assertEqual(DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS, 10.0)
         self.assertEqual(DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS, 10.0)
         result = verify_live_feeds(
             self.base_url,
@@ -198,6 +198,9 @@ class LiveFeedVerifierTests(unittest.TestCase):
                 sample_interval_seconds=0,
                 max_age_seconds=10,
                 timeout_seconds=2,
+                capture_progress_timeout_seconds=0.01,
+                inference_progress_timeout_seconds=0.01,
+                inference_poll_interval_seconds=0.001,
             )
 
     def test_polls_through_a_phase_aliased_inference_sample(self):

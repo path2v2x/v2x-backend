@@ -26,7 +26,7 @@ CAMERA_IDS = ("ch1", "ch2", "ch3", "ch4")
 # completed frame twice. This is an observation window, not a freshness gate;
 # the independent max-age and per-second health watches remain unchanged.
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 3.0
-DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS = 5.0
+DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS = 10.0
 DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS = 10.0
 INFERENCE_POLL_INTERVAL_SECONDS = 0.25
 
