@@ -45,11 +45,15 @@ override every older PR 32/candidate statement below.
   seconds, trusted matched media clocks, and decode latency in the unchanged
   -1,000/+10,000 ms range. It polls each inference counter for at most ten
   seconds, rejects regression immediately, and fails if any counter does not
-  advance. All 131 perception tests pass. This is source-only candidate
-  evidence: require an isolated four-camera stress canary, canonical merge, a
-  fresh rollback bundle, both live startup modes, the uninterrupted 600-sample
-  watch with decoder turnover, then attended 30-minute and automated 24-hour
-  gates before acceptance.
+  advance. All 131 perception tests pass. A production-like upload-disabled
+  canary then passed 120/120 strict one-second samples, ten inference-aware
+  four-feed checks, repeated accelerated 30-second decoder renewals, complete
+  initial-decoder turnover, and cleanup back to the baseline service. Evidence
+  is
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T203800Z-inference-health-canary/`.
+  Require canonical merge, a fresh rollback bundle, both live startup modes,
+  the uninterrupted 600-sample watch with decoder turnover, then attended
+  30-minute and automated 24-hour gates before acceptance.
 
 Observed through 2026-07-12 19:38 UTC; verify rather than assume. This section
 overrides older perception candidate and deployment statements below.
