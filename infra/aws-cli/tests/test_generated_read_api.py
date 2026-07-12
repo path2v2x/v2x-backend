@@ -1,10 +1,13 @@
 import base64
+import io
 import json
+import os
 import re
 import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class Condition:
@@ -28,6 +31,39 @@ class Key:
 
 class Attr(Key):
     pass
+
+
+class FakeClientError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class FakeS3:
+    def __init__(self):
+        self.objects = {}
+        self.put_calls = []
+        self.delete_calls = []
+
+    def put_object(self, **kwargs):
+        body = kwargs["Body"]
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.objects[kwargs["Key"]] = bytes(body)
+        self.put_calls.append(kwargs)
+        return {}
+
+    def get_object(self, **kwargs):
+        try:
+            body = self.objects[kwargs["Key"]]
+        except KeyError as exc:
+            raise FakeClientError("NoSuchKey") from exc
+        return {"Body": io.BytesIO(body)}
+
+    def delete_object(self, **kwargs):
+        self.objects.pop(kwargs["Key"], None)
+        self.delete_calls.append(kwargs)
+        return {}
 
 
 class FakeTable:
@@ -61,42 +97,93 @@ class FakeTable:
 
 
 def generated_lambda_source():
-    script = Path(__file__).resolve().parents[1] / "provision-read-api.sh"
-    text = script.read_text(encoding="utf-8")
-    match = re.search(
-        r'cat > "\$\{WORKDIR\}/index\.py" <<PY\n(?P<source>.*?)\nPY\n',
-        text,
-        re.DOTALL,
-    )
-    if not match:
-        raise AssertionError("could not extract generated read Lambda source")
-
-    source = match.group("source")
-    replacements = {
-        "${TABLE_NAME}": "test-detections",
-        "${VIDEO_AWS_REGION}": "us-west-2",
-        "${VIDEO_STREAM_PREFIX}": "test-camera-",
-        "${VIDEO_HLS_EXPIRES_SECONDS}": "300",
-        "${VIDEO_ONDEMAND_EXPIRES_SECONDS}": "3600",
-        "${SITE_GEOHASH}": "9q9p8",
-        "${STATE_BUCKET}": "test-state",
-        "${SNAPSHOT_URL_EXPIRES_SECONDS}": "300",
-        "${DEMO_VIDEOS_PREFIX}": "demo-videos/",
-        "${DEMO_VIDEO_URL_EXPIRES_SECONDS}": "3600",
-    }
-    for placeholder, value in replacements.items():
-        source = source.replace(placeholder, value)
+    root = Path(__file__).resolve().parents[1]
+    source_path = root / "read-api-lambda.py"
+    script = (root / "provision-read-api.sh").read_text(encoding="utf-8")
+    expected_install = 'install -m 0600 "${HERE}/read-api-lambda.py" "${WORKDIR}/index.py"'
+    if script.count(expected_install) != 1:
+        raise AssertionError("deployment does not package the tested Lambda source")
+    source = source_path.read_text(encoding="utf-8")
     if "${" in source:
-        raise AssertionError("unexpanded shell placeholder in generated Lambda")
+        raise AssertionError("shell interpolation is forbidden in Lambda source")
+    compile(source, str(source_path), "exec")
     return source
 
 
-def load_generated_lambda(fake_table):
+class DeploymentArtifactContractTest(unittest.TestCase):
+    def test_exact_source_is_compiled_before_packaging_and_iam(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "provision-read-api.sh").read_text(encoding="utf-8")
+        install_at = script.index(
+            'install -m 0600 "${HERE}/read-api-lambda.py" "${WORKDIR}/index.py"'
+        )
+        compile_at = script.index('python3 -m py_compile "${WORKDIR}/index.py"')
+        zip_at = script.index('zip -Xq function.zip index.py')
+        lambda_apply_at = min(
+            value
+            for value in (
+                script.find("aws lambda update-function-code", zip_at),
+                script.find("aws lambda create-function", zip_at),
+            )
+            if value >= 0
+        )
+        iam_apply_at = script.index("aws iam put-role-policy", lambda_apply_at)
+        self.assertLess(install_at, compile_at)
+        self.assertLess(compile_at, zip_at)
+        self.assertLess(zip_at, lambda_apply_at)
+        self.assertLess(lambda_apply_at, iam_apply_at)
+        self.assertNotIn("<<PY", script)
+
+    def test_existing_lambda_configuration_is_reconciled_before_new_code(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "provision-read-api.sh").read_text(encoding="utf-8")
+        existing_at = script.index('if [[ "${READ_LAMBDA_EXISTS}" == "true" ]]')
+        configuration_at = script.index(
+            "aws lambda update-function-configuration", existing_at
+        )
+        code_at = script.index("aws lambda update-function-code", existing_at)
+        self.assertLess(configuration_at, code_at)
+
+    def test_proxy_state_has_lifecycle_and_session_mint_throttle(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "provision-read-api.sh").read_text(encoding="utf-8")
+        self.assertIn('HLS_PROXY_LIFECYCLE_RULE_ID="v2x-hls-proxy-expiry-v1"', script)
+        self.assertIn("aws s3api get-bucket-lifecycle-configuration", script)
+        self.assertIn("aws s3api put-bucket-lifecycle-configuration", script)
+        self.assertIn('map(select(.ID != $rule_id))', script)
+        self.assertIn('--arg direct_route_key "GET /video/session/{camera_id}"', script)
+        self.assertIn('--arg browser_route_key "GET /video/browser-session/{camera_id}"', script)
+        self.assertIn("ThrottlingBurstLimit", script)
+        self.assertIn("ThrottlingRateLimit", script)
+
+
+TEST_ENVIRONMENT = {
+    "TABLE_NAME": "test-detections",
+    "VIDEO_AWS_REGION": "us-west-2",
+    "VIDEO_STREAM_PREFIX": "test-camera-",
+    "VIDEO_HLS_EXPIRES_SECONDS": "300",
+    "VIDEO_ONDEMAND_EXPIRES_SECONDS": "3600",
+    "HLS_PROXY_PREFIX": "hls-proxy/v1/",
+    "HLS_PROXY_FETCH_TIMEOUT_SECONDS": "8",
+    "HLS_PROXY_PLAYLIST_MAX_BYTES": "1048576",
+    "HLS_PROXY_SEGMENT_MAX_BYTES": "4194304",
+    "SITE_GEOHASH": "9q9p8",
+    "STATE_BUCKET": "test-state",
+    "SNAPSHOT_URL_EXPIRES_SECONDS": "300",
+    "DEMO_VIDEOS_PREFIX": "demo-videos/",
+    "DEMO_VIDEO_URL_EXPIRES_SECONDS": "3600",
+}
+
+
+def load_generated_lambda(fake_table, fake_s3=None, environment=None):
+    fake_s3 = fake_s3 or FakeS3()
     boto3 = types.ModuleType("boto3")
     boto3.resource = lambda _service: types.SimpleNamespace(
         Table=lambda _name: fake_table
     )
-    boto3.client = lambda *_args, **_kwargs: types.SimpleNamespace()
+    boto3.client = lambda service, *_args, **_kwargs: (
+        fake_s3 if service == "s3" else types.SimpleNamespace()
+    )
 
     conditions = types.ModuleType("boto3.dynamodb.conditions")
     conditions.Attr = Attr
@@ -105,7 +192,7 @@ def load_generated_lambda(fake_table):
     botocore_config = types.ModuleType("botocore.config")
     botocore_config.Config = lambda **kwargs: kwargs
     botocore_exceptions = types.ModuleType("botocore.exceptions")
-    botocore_exceptions.ClientError = type("ClientError", (Exception,), {})
+    botocore_exceptions.ClientError = FakeClientError
 
     previous = {
         name: sys.modules.get(name)
@@ -126,7 +213,12 @@ def load_generated_lambda(fake_table):
     sys.modules["botocore.exceptions"] = botocore_exceptions
     try:
         namespace = {"__name__": "generated_read_api"}
-        exec(compile(generated_lambda_source(), "generated-index.py", "exec"), namespace)
+        with patch.dict(
+            os.environ,
+            TEST_ENVIRONMENT if environment is None else environment,
+            clear=True,
+        ):
+            exec(compile(generated_lambda_source(), "generated-index.py", "exec"), namespace)
         return namespace
     finally:
         for name, module in previous.items():
@@ -134,6 +226,25 @@ def load_generated_lambda(fake_table):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+
+class DeploymentCompatibilityTest(unittest.TestCase):
+    def test_new_proxy_settings_have_safe_old_environment_defaults(self):
+        old_environment = dict(TEST_ENVIRONMENT)
+        for name in (
+            "HLS_PROXY_PREFIX",
+            "HLS_PROXY_FETCH_TIMEOUT_SECONDS",
+            "HLS_PROXY_PLAYLIST_MAX_BYTES",
+            "HLS_PROXY_SEGMENT_MAX_BYTES",
+        ):
+            old_environment.pop(name)
+        module = load_generated_lambda(
+            FakeTable(), FakeS3(), environment=old_environment
+        )
+        self.assertEqual(module["HLS_PROXY_PREFIX"], "hls-proxy/v1/")
+        self.assertEqual(module["HLS_PROXY_FETCH_TIMEOUT_SECONDS"], 8)
+        self.assertEqual(module["HLS_PROXY_PLAYLIST_MAX_BYTES"], 1048576)
+        self.assertEqual(module["HLS_PROXY_SEGMENT_MAX_BYTES"], 4194304)
 
 
 class RecentDetectionsTest(unittest.TestCase):
@@ -182,22 +293,35 @@ class RecentDetectionsTest(unittest.TestCase):
 
 class LiveVideoSessionTest(unittest.TestCase):
     def setUp(self):
-        self.module = load_generated_lambda(FakeTable())
+        self.s3 = FakeS3()
+        self.module = load_generated_lambda(FakeTable(), self.s3)
         self.archived = types.SimpleNamespace()
         self.archived.calls = []
+        self.secret = "s" * 64
 
         def session(**kwargs):
             self.archived.calls.append(kwargs)
-            return {"HLSStreamingSessionURL": "signed-session"}
+            return {
+                "HLSStreamingSessionURL": (
+                    "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                    f"getHLSMasterPlaylist.m3u8?SessionToken={self.secret}"
+                )
+            }
 
         self.archived.get_hls_streaming_session_url = session
         self.module["_archived_media_client"] = lambda *_args: self.archived
 
-    def invoke(self, value):
+    def invoke(self, value, *, browser=False):
         response = self.module["handler"](
             {
-                "rawPath": "/video/session/ch1",
+                "rawPath": (
+                    "/video/browser-session/ch1" if browser else "/video/session/ch1"
+                ),
                 "queryStringParameters": {"max_fragments": value},
+                "requestContext": {
+                    "domainName": "api.example.test",
+                    "stage": "$default",
+                },
             },
             None,
         )
@@ -207,15 +331,339 @@ class LiveVideoSessionTest(unittest.TestCase):
         response, body = self.invoke("2")
         self.assertEqual(response["statusCode"], 200)
         self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
+        self.assertEqual(body["delivery"], "DIRECT_KINESIS")
+        self.assertIn(self.secret, body["hlsUrl"])
+        self.assertEqual(len(self.s3.put_calls), 0)
         self.assertEqual(
             self.archived.calls[-1]["MaxMediaPlaylistFragmentResults"], 2
         )
+
+    def test_browser_gets_opaque_same_origin_proxy(self):
+        response, body = self.invoke("2", browser=True)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(body["maxMediaPlaylistFragmentResults"], 2)
+        self.assertEqual(body["delivery"], "SAME_ORIGIN_PROXY")
+        self.assertTrue(body["hlsUrl"].startswith("https://api.example.test/video/proxy/"))
+        self.assertNotIn(self.secret, response["body"])
+        self.assertEqual(len(self.s3.put_calls), 1)
 
     def test_live_fragment_count_is_bounded(self):
         response, body = self.invoke("1")
         self.assertEqual(response["statusCode"], 400)
         self.assertEqual(body["error"], "invalid_max_fragments")
         self.assertEqual(self.archived.calls, [])
+
+
+class VideoCoverageRetryTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_generated_lambda(FakeTable())
+        self.calls = 0
+        self.archived = types.SimpleNamespace()
+        self.module["_archived_media_client"] = lambda *_args: self.archived
+        self.query = {
+            "start": "2026-07-10T05:00:00Z",
+            "end": "2026-07-10T09:00:00Z",
+        }
+
+    def invoke(self):
+        return self.module["_get_video_coverage"]("ch1", self.query)
+
+    def test_transient_client_limit_is_retried_then_recovers(self):
+        def list_fragments(**_kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise FakeClientError("ClientLimitExceededException")
+            return {"Fragments": []}
+
+        self.archived.list_fragments = list_fragments
+        with patch.object(self.module["time"], "sleep") as sleep, patch.object(
+            self.module["secrets"], "randbelow", return_value=0
+        ):
+            response = self.invoke()
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(self.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
+
+    def test_nontransient_error_fails_without_retry(self):
+        def list_fragments(**_kwargs):
+            self.calls += 1
+            raise FakeClientError("AccessDeniedException")
+
+        self.archived.list_fragments = list_fragments
+        with patch.object(self.module["time"], "sleep") as sleep:
+            response = self.invoke()
+
+        self.assertEqual(response["statusCode"], 502)
+        self.assertEqual(self.calls, 1)
+        sleep.assert_not_called()
+
+    def test_transient_retry_exhaustion_remains_fail_closed(self):
+        def list_fragments(**_kwargs):
+            self.calls += 1
+            raise FakeClientError("ClientLimitExceededException")
+
+        self.archived.list_fragments = list_fragments
+        with patch.object(self.module["time"], "sleep") as sleep, patch.object(
+            self.module["secrets"], "randbelow", return_value=0
+        ):
+            response = self.invoke()
+
+        self.assertEqual(response["statusCode"], 502)
+        self.assertEqual(self.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+
+class HlsProxyTest(unittest.TestCase):
+    def setUp(self):
+        self.s3 = FakeS3()
+        self.module = load_generated_lambda(FakeTable(), self.s3)
+        self.secret = "v" * 64
+        self.archived = types.SimpleNamespace()
+        self.archived.get_hls_streaming_session_url = lambda **_kwargs: {
+            "HLSStreamingSessionURL": (
+                "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                f"getHLSMasterPlaylist.m3u8?SessionToken={self.secret}"
+            )
+        }
+        self.module["_archived_media_client"] = lambda *_args: self.archived
+        self.context = {
+            "domainName": "api.example.test",
+            "stage": "$default",
+        }
+
+    def new_session(self):
+        response = self.module["handler"](
+            {
+                "rawPath": "/video/browser-session/ch4",
+                "queryStringParameters": {
+                    "start": "2026-07-10T05:00:00Z",
+                    "end": "2026-07-10T05:15:00Z",
+                },
+                "requestContext": self.context,
+            },
+            None,
+        )
+        self.assertEqual(response["statusCode"], 200)
+        body = json.loads(response["body"])
+        self.assertEqual(body["delivery"], "SAME_ORIGIN_PROXY")
+        self.assertNotIn(self.secret, response["body"])
+        return body["hlsUrl"]
+
+    def invoke_proxy(self, url):
+        path = url.split("api.example.test", 1)[-1]
+        return self.module["handler"](
+            {"rawPath": path, "requestContext": self.context}, None
+        )
+
+    @staticmethod
+    def decoded(response):
+        return base64.b64decode(response["body"])
+
+    @staticmethod
+    def first_proxy_url(playlist, marker="/video/proxy/"):
+        for line in playlist.decode("utf-8").splitlines():
+            if marker in line:
+                match = re.search(r'https://[^" ]+/video/proxy/[^" ]+', line)
+                if match:
+                    return match.group(0)
+        raise AssertionError("rewritten proxy URL not found")
+
+    def test_recursively_rewrites_playlists_and_proxies_binary_without_secret(self):
+        master_url = self.new_session()
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n"
+            "getHLSMediaPlaylist.m3u8?"
+            f"SessionToken={self.secret}&Track=1\n"
+        ).encode("utf-8")
+        media = (
+            "#EXTM3U\n#EXT-X-MAP:URI=\"getMP4InitFragment.mp4?"
+            f"SessionToken={self.secret}&FragmentNumber=init\"\n"
+            "#EXTINF:2.0,\ngetMP4MediaFragment.mp4?"
+            f"SessionToken={self.secret}&FragmentNumber=123\n"
+        ).encode("utf-8")
+        calls = []
+
+        def fetch(url, kind):
+            calls.append((url, kind))
+            if "getHLSMasterPlaylist" in url:
+                return master
+            if "getHLSMediaPlaylist" in url:
+                return media
+            return b"fragment-bytes"
+
+        self.module["_fetch_hls_upstream"] = fetch
+        master_response = self.invoke_proxy(master_url)
+        self.assertEqual(master_response["statusCode"], 200)
+        self.assertEqual(
+            master_response["headers"]["content-type"],
+            "application/vnd.apple.mpegurl; charset=utf-8",
+        )
+        self.assertEqual(master_response["headers"]["access-control-allow-origin"], "*")
+        rewritten_master = self.decoded(master_response)
+        self.assertNotIn(self.secret.encode(), rewritten_master)
+
+        media_url = self.first_proxy_url(rewritten_master)
+        media_response = self.invoke_proxy(media_url)
+        self.assertEqual(media_response["statusCode"], 200)
+        rewritten_media = self.decoded(media_response)
+        self.assertNotIn(self.secret.encode(), rewritten_media)
+
+        segment_url = self.first_proxy_url(rewritten_media)
+        segment_response = self.invoke_proxy(segment_url)
+        self.assertEqual(segment_response["statusCode"], 200)
+        self.assertEqual(segment_response["headers"]["content-type"], "video/mp4")
+        self.assertEqual(self.decoded(segment_response), b"fragment-bytes")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(self.secret in url for url, _kind in calls))
+
+    def test_tampered_resource_is_rejected_before_upstream_fetch(self):
+        master_url = self.new_session()
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            f"getHLSMediaPlaylist.m3u8?SessionToken={self.secret}\n"
+        ).encode("utf-8")
+        self.module["_fetch_hls_upstream"] = lambda _url, _kind: master
+        media_url = self.first_proxy_url(self.decoded(self.invoke_proxy(master_url)))
+        tampered = media_url[:-1] + ("0" if media_url[-1] != "0" else "1")
+        calls = []
+        self.module["_fetch_hls_upstream"] = lambda *args: calls.append(args)
+        response = self.invoke_proxy(tampered)
+        self.assertEqual(response["statusCode"], 404)
+        self.assertEqual(calls, [])
+        self.assertNotIn(self.secret, response["body"])
+
+    def test_cross_origin_playlist_child_fails_closed_without_disclosure(self):
+        master_url = self.new_session()
+        self.module["_fetch_hls_upstream"] = lambda _url, _kind: (
+            b"#EXTM3U\nhttps://evil.example/getHLSMediaPlaylist.m3u8\n"
+        )
+        response = self.invoke_proxy(master_url)
+        self.assertEqual(response["statusCode"], 502)
+        self.assertEqual(json.loads(response["body"])["error"], "hls_upstream_origin_invalid")
+        self.assertNotIn("evil.example", response["body"])
+        self.assertNotIn(self.secret, response["body"])
+
+    def test_expired_server_side_session_is_deleted_and_returns_gone(self):
+        master_url = self.new_session()
+        state_key = next(iter(self.s3.objects))
+        state = json.loads(self.s3.objects[state_key])
+        state["expiresAtEpoch"] = 0
+        self.s3.objects[state_key] = json.dumps(state).encode("utf-8")
+        response = self.invoke_proxy(master_url)
+        self.assertEqual(response["statusCode"], 410)
+        self.assertEqual(json.loads(response["body"])["error"], "hls_proxy_session_expired")
+        self.assertNotIn(state_key, self.s3.objects)
+
+    def test_boolean_schema_version_cannot_spoof_proxy_state(self):
+        master_url = self.new_session()
+        state_key = next(iter(self.s3.objects))
+        state = json.loads(self.s3.objects[state_key])
+        state["schemaVersion"] = True
+        self.s3.objects[state_key] = json.dumps(state).encode("utf-8")
+        response = self.invoke_proxy(master_url)
+        self.assertEqual(response["statusCode"], 502)
+        self.assertEqual(json.loads(response["body"])["error"], "hls_proxy_state_invalid")
+
+    def test_upstream_content_length_bound_fails_before_body_read(self):
+        class OversizedResponse:
+            status = 200
+            headers = {
+                "content-length": str(4 * 1024 * 1024 + 1),
+                "content-encoding": "identity",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _size):
+                raise AssertionError("oversized body must not be read")
+
+        self.module["HLS_PROXY_OPENER"] = types.SimpleNamespace(
+            open=lambda *_args, **_kwargs: OversizedResponse()
+        )
+        with self.assertRaises(self.module["HlsProxyError"]) as raised:
+            self.module["_fetch_hls_upstream"](
+                "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                f"getMP4MediaFragment.mp4?SessionToken={self.secret}",
+                "mp4",
+            )
+        self.assertEqual(raised.exception.code, "hls_upstream_response_too_large")
+
+    def test_transient_upstream_http_error_is_retried_then_recovers(self):
+        class PlaylistResponse:
+            status = 200
+            headers = {"content-encoding": "identity"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _size):
+                return b"#EXTM3U\n"
+
+        calls = []
+
+        def open_upstream(request, **_kwargs):
+            calls.append(request.full_url)
+            if len(calls) < 3:
+                raise self.module["HTTPError"](
+                    request.full_url, 502, "Bad Gateway", {}, None
+                )
+            return PlaylistResponse()
+
+        self.module["HLS_PROXY_OPENER"] = types.SimpleNamespace(open=open_upstream)
+        with patch.object(self.module["time"], "sleep") as sleep, patch.object(
+            self.module["secrets"], "randbelow", return_value=0
+        ):
+            body = self.module["_fetch_hls_upstream"](
+                "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                f"getHLSMediaPlaylist.m3u8?SessionToken={self.secret}",
+                "playlist",
+            )
+
+        self.assertEqual(body, b"#EXTM3U\n")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.1, 0.2])
+
+    def test_nontransient_upstream_http_error_fails_without_retry(self):
+        calls = []
+
+        def open_upstream(request, **_kwargs):
+            calls.append(request.full_url)
+            raise self.module["HTTPError"](
+                request.full_url, 403, "Forbidden", {}, None
+            )
+
+        self.module["HLS_PROXY_OPENER"] = types.SimpleNamespace(open=open_upstream)
+        with patch.object(self.module["time"], "sleep") as sleep:
+            with self.assertRaises(self.module["HlsProxyError"]) as raised:
+                self.module["_fetch_hls_upstream"](
+                    "https://abc.kinesisvideo.us-west-2.amazonaws.com/"
+                    f"getHLSMediaPlaylist.m3u8?SessionToken={self.secret}",
+                    "playlist",
+                )
+
+        self.assertEqual(raised.exception.code, "hls_upstream_unavailable")
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+
+    def test_redirect_handler_never_forwards_signed_request(self):
+        redirect = self.module["_RejectRedirects"]()
+        self.assertIsNone(
+            redirect.redirect_request(None, None, 302, "Found", {}, "https://evil.example")
+        )
 
 
 class DetectionTimelineTrustTest(unittest.TestCase):

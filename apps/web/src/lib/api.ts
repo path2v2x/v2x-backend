@@ -90,7 +90,7 @@ export async function fetchVideoSession(
 ): Promise<VideoSession> {
 	const config = await loadRuntimeConfig();
 	const url = new URL(
-		`${config.apiBaseUrl.replace(/\/+$/, '')}/video/session/${encodeURIComponent(cameraId)}`
+		`${config.apiBaseUrl.replace(/\/+$/, '')}/video/browser-session/${encodeURIComponent(cameraId)}`
 	);
 	if (archiveWindow) {
 		url.searchParams.set('start', archiveWindow.start);
