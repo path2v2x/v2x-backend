@@ -7,11 +7,16 @@ import pytest
 from digital_twin_bridge import twin_camera_rig
 from digital_twin_bridge.twin_camera_rig import (
     TwinCameraRig,
+    absolute_twin_model,
+    camera_with_twin_pose,
+    configure_twin_camera_blueprint,
     compute_twin_camera_transform,
     heading_to_carla_yaw,
     horizontal_fov_deg,
     is_twin_supported_map,
     load_cameras_config,
+    twin_horizontal_fov_deg,
+    twin_pose_from_absolute,
 )
 
 from tests.conftest import MockLocation
@@ -58,6 +63,26 @@ class TestIntrinsics:
         assert fov == pytest.approx(2 * math.degrees(math.atan(1280 / 1325.4)))
         assert 87.0 < fov < 89.0
 
+    def test_twin_fov_applies_explicit_calibration_offset(self):
+        camera = {**CAMERA, "twin_pose": {"fov_offset_deg": -1.25}}
+        assert twin_horizontal_fov_deg(camera) == pytest.approx(
+            horizontal_fov_deg(CAMERA["intrinsics"]) - 1.25
+        )
+
+    def test_blueprint_preserves_actor_default_lens_and_rejects_overrides(self, mock_world):
+        blueprint = mock_world.get_blueprint_library().find("sensor.camera.rgb")
+        configure_twin_camera_blueprint(blueprint, CAMERA, 1280, 960, 12.0)
+        assert not any(
+            key.startswith("lens_") for key, _value in blueprint.set_attribute_calls
+        )
+        assert float(str(blueprint.get_attribute("sensor_tick"))) == pytest.approx(
+            1 / 12, abs=1e-6
+        )
+
+        measured = {**CAMERA, "twin_lens": {"lens_k": -0.2, "lens_kcube": 0.03}}
+        with pytest.raises(ValueError, match="lens overrides are held"):
+            configure_twin_camera_blueprint(blueprint, measured, 1280, 960)
+
 
 class TestMapGate:
     def test_rfs_map_supported(self):
@@ -81,6 +106,12 @@ class TestCamerasConfig:
 
 
 class TestComputeTransform:
+    def test_candidate_pose_is_isolated_from_source(self):
+        source = {**CAMERA, "twin_pose": {"forward_offset_m": 0.5}}
+        candidate = camera_with_twin_pose(source, {"yaw_offset_deg": 2.0})
+        assert candidate["twin_pose"]["yaw_offset_deg"] == 2.0
+        assert "yaw_offset_deg" not in source["twin_pose"]
+
     def test_pole_height_and_rotation(self, mock_world, monkeypatch):
         monkeypatch.setattr(
             twin_camera_rig, "gps_to_carla", lambda m, lat, lon: MockLocation(10.0, 20.0, 1.5)
@@ -90,6 +121,57 @@ class TestComputeTransform:
         assert transform.rotation.pitch == pytest.approx(-39.2)
         assert transform.rotation.yaw == pytest.approx(200.0 - 46.06 - 90.0)
         assert transform.rotation.roll == 0.0
+
+    def test_full_pose_offsets_include_right_translation_and_roll(self, mock_world, monkeypatch):
+        monkeypatch.setattr(
+            twin_camera_rig, "gps_to_carla", lambda m, lat, lon: MockLocation(10.0, 20.0, 1.5)
+        )
+        camera = {
+            **CAMERA,
+            "heading_deg": 90.0,
+            "yaw_deg": 0.0,
+            "twin_pose": {
+                "forward_offset_m": 2.0,
+                "right_offset_m": 1.0,
+                "height_offset_m": 0.5,
+                "roll_offset_deg": 3.0,
+            },
+        }
+        transform = compute_twin_camera_transform(mock_world.get_map(), SITE, camera)
+        assert transform.location.x == pytest.approx(12.0)
+        assert transform.location.y == pytest.approx(21.0)
+        assert transform.location.z == pytest.approx(9.0)
+        assert transform.rotation.roll == pytest.approx(3.0)
+
+    def test_missing_forward_offset_has_no_hidden_translation(self, mock_world, monkeypatch):
+        monkeypatch.setattr(
+            twin_camera_rig,
+            "gps_to_carla",
+            lambda m, lat, lon: MockLocation(10.0, 20.0, 1.5),
+        )
+        camera = {**CAMERA, "twin_pose": {}}
+        transform = compute_twin_camera_transform(mock_world.get_map(), SITE, camera)
+        assert transform.location.x == pytest.approx(10.0)
+        assert transform.location.y == pytest.approx(20.0)
+
+    def test_absolute_fit_roundtrips_through_shared_production_math(self):
+        base = {
+            "pitch_deg": -39.2,
+            "yaw_deg": 63.94,
+            "roll_deg": 0.0,
+            "fov_deg": 88.0,
+        }
+        anchor = [10.0, 20.0, 8.5]
+        target = [11.3, 19.2, 9.1]
+        pose = twin_pose_from_absolute(
+            anchor, base, target, -35.0, 71.0, 2.0, 91.0
+        )
+        absolute = absolute_twin_model(anchor, base, pose)
+        assert absolute["location"] == pytest.approx(target)
+        assert absolute["pitch_deg"] == pytest.approx(-35.0)
+        assert absolute["yaw_deg"] == pytest.approx(71.0)
+        assert absolute["roll_deg"] == pytest.approx(2.0)
+        assert absolute["fov_deg"] == pytest.approx(91.0)
 
 
 class TestTwinCameraRig:
@@ -220,7 +302,7 @@ class TestTwinCameraRig:
         assert model["image"]["width"] == 1280
         assert model["image"]["height"] == 960
         assert model["image"]["horizontal_fov_deg"] == pytest.approx(
-            round(horizontal_fov_deg(CAMERA["intrinsics"]), 2)
+            horizontal_fov_deg(CAMERA["intrinsics"]), abs=1e-6
         )
         assert model["lens"] == {
             "lens_k": -1.0,

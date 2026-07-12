@@ -28,6 +28,9 @@ class LiveFeedVerifierTests(unittest.TestCase):
             "event_samples": 0,
             "identical_frames": False,
             "advance_timestamps": True,
+            "media_clock_ready": True,
+            "trusted_media_clock": True,
+            "decode_latency_ms": 2_500.0,
             "base_time": datetime.now(timezone.utc) - timedelta(seconds=1),
         }
         state = self.state
@@ -59,12 +62,24 @@ class LiveFeedVerifierTests(unittest.TestCase):
                     self.send_json({
                         "status": "ok",
                         "ready": True,
+                        "media_clock_ready": state["media_clock_ready"],
                         "cameras": {
                             camera_id: {
                                 "state": "streaming",
                                 "fresh": True,
                                 "source_updated_at": timestamp,
                                 "frame_count": 100 + sample,
+                                "media_clock_status": (
+                                    "matched"
+                                    if state["trusted_media_clock"]
+                                    else "unavailable"
+                                ),
+                                "media_time_trusted": state[
+                                    "trusted_media_clock"
+                                ],
+                                "decode_latency_ms": state[
+                                    "decode_latency_ms"
+                                ],
                             }
                             for camera_id in CAMERA_IDS
                         },
@@ -119,7 +134,10 @@ class LiveFeedVerifierTests(unittest.TestCase):
                 self.end_headers()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
+        # Join every request handler during tearDown so a deliberate verifier
+        # failure cannot leave a client/server socket for a later test's GC.
+        self.server.daemon_threads = False
+        self.server.block_on_close = True
         self.thread = threading.Thread(
             target=self.server.serve_forever, daemon=True
         )
@@ -143,6 +161,7 @@ class LiveFeedVerifierTests(unittest.TestCase):
             camera = result[camera_id]
             self.assertEqual(len(camera["capture_times"]), 2)
             self.assertEqual(len(camera["event_times"]), 2)
+            self.assertEqual(camera["decode_latency_ms"], [2_500.0, 2_500.0])
             self.assertEqual(len(camera["frame_sha256"]), 2)
             self.assertNotEqual(
                 camera["frame_sha256"][0], camera["frame_sha256"][1]
@@ -168,6 +187,37 @@ class LiveFeedVerifierTests(unittest.TestCase):
                 sample_interval_seconds=0,
                 max_age_seconds=10,
                 timeout_seconds=2,
+            )
+
+    def test_global_media_clock_readiness_fails_closed(self):
+        self.state["media_clock_ready"] = False
+        with self.assertRaisesRegex(VerificationError, "media clock is not ready"):
+            verify_live_feeds(
+                self.base_url,
+                sample_interval_seconds=0,
+                max_age_seconds=10,
+                timeout_seconds=2,
+            )
+
+    def test_untrusted_camera_media_clock_fails_closed(self):
+        self.state["trusted_media_clock"] = False
+        with self.assertRaisesRegex(VerificationError, "trusted matched"):
+            verify_live_feeds(
+                self.base_url,
+                sample_interval_seconds=0,
+                max_age_seconds=10,
+                timeout_seconds=2,
+            )
+
+    def test_decode_latency_outside_bound_fails_closed(self):
+        self.state["decode_latency_ms"] = 5_001.0
+        with self.assertRaisesRegex(VerificationError, "decode latency"):
+            verify_live_feeds(
+                self.base_url,
+                sample_interval_seconds=0,
+                max_age_seconds=10,
+                timeout_seconds=2,
+                max_decode_latency_ms=5_000.0,
             )
 
     def test_query_or_signed_input_is_rejected_without_echoing_it(self):

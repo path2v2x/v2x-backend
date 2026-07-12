@@ -21,7 +21,10 @@ import uuid
 
 import websockets
 
-from digital_twin_bridge.twin_camera_rig import TWIN_LENS_ATTRIBUTE_KEYS
+from digital_twin_bridge.twin_camera_rig import (
+    CARLA_DEFAULT_PINHOLE_LENS,
+    TWIN_LENS_ATTRIBUTE_KEYS,
+)
 
 
 DEFAULT_TWIN_YOLO_PYTHON = Path("/home/path/V2XCarla/perception-venv/bin/python")
@@ -267,21 +270,6 @@ def _carla_rotation_axes(rotation):
         (cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr),
         (-cy * sp * cr - sy * sr, -sy * sp * cr + cy * sr, cp * cr),
     )
-
-
-CARLA_DEFAULT_PINHOLE_LENS = {
-    # A CARLA sensor maintainer confirms the 0.9.x default tuple is the
-    # undistorted pinhole state (carla-simulator/carla#3198).  The parameters
-    # are not OpenCV Brown-Conrady coefficients (#3130).  UE5/0.10 equivalence
-    # is still enforced empirically by the unchanged visual/motion gates.
-    # Accept only actor-observed defaults; every other tuple remains fail closed.
-    "lens_k": -1.0,
-    "lens_kcube": 0.0,
-    "lens_circle_falloff": 5.0,
-    "lens_circle_multiplier": 0.0,
-    "lens_x_size": 0.08,
-    "lens_y_size": 0.08,
-}
 
 
 def project_world_xyz(point, camera_model):
@@ -1008,9 +996,16 @@ def expected_twin_camera_transform(world, path, camera_id):
         location.z += float(camera["height_m"]) + float(
             pose.get("height_offset_m", 0.0)
         )
-        forward = float(pose.get("forward_offset_m", 0.5))
-        location.x += forward * math.cos(math.radians(yaw))
-        location.y += forward * math.sin(math.radians(yaw))
+        yaw_radians = math.radians(yaw)
+        forward = float(pose.get("forward_offset_m", 0.0))
+        right = float(pose.get("right_offset_m", 0.0))
+        location.x += forward * math.cos(yaw_radians)
+        location.y += forward * math.sin(yaw_radians)
+        location.x -= right * math.sin(yaw_radians)
+        location.y += right * math.cos(yaw_radians)
+        roll = float(camera.get("roll_deg", 0.0)) + float(
+            pose.get("roll_offset_deg", 0.0)
+        )
     except (KeyError, OSError, StopIteration, TypeError, ValueError) as exc:
         raise VerificationError(
             "tracked camera transform cannot be independently recomputed"
@@ -1021,7 +1016,7 @@ def expected_twin_camera_transform(world, path, camera_id):
             "y": float(location.y),
             "z": float(location.z),
         },
-        "rotation": {"pitch": pitch, "yaw": yaw, "roll": 0.0},
+        "rotation": {"pitch": pitch, "yaw": yaw, "roll": roll},
     }
     return _finite_transform_payload(expected, "tracked camera transform")
 
@@ -1094,6 +1089,15 @@ def validate_twin_camera_model(
         for value in lens.values()
     ):
         raise VerificationError("twin camera model lens geometry is invalid")
+    if any(
+        not math.isclose(
+            float(lens[key]), expected, rel_tol=0.0, abs_tol=1e-9
+        )
+        for key, expected in CARLA_DEFAULT_PINHOLE_LENS.items()
+    ):
+        raise VerificationError(
+            "twin camera model rejects a non-default CARLA lens model"
+        )
     return {
         "camera_id": expected_camera_id,
         "actor_id": actor_id,
@@ -1377,6 +1381,26 @@ def validate_twin_object_sample(
     reported = _finite_transform_payload(
         item.get("carla_transform"), "twin_status object"
     )
+    raw_location = item.get("raw_carla_location")
+    target_location = item.get("target_carla_location")
+    if not isinstance(raw_location, dict) or not isinstance(target_location, dict):
+        raise VerificationError(
+            "twin object has no raw/target CARLA placement evidence"
+        )
+    try:
+        raw_x = float(raw_location["x"])
+        raw_y = float(raw_location["y"])
+        target_x = float(target_location["x"])
+        target_y = float(target_location["y"])
+        reported_raw_to_target = float(item.get("raw_to_target_planar_m"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VerificationError(
+            "twin object raw placement evidence is invalid"
+        ) from exc
+    if not all(math.isfinite(value) for value in (
+        raw_x, raw_y, target_x, target_y, reported_raw_to_target
+    )):
+        raise VerificationError("twin object raw placement evidence is invalid")
     try:
         snapshot = world.get_snapshot().find(actor_id)
     except (AttributeError, RuntimeError):
@@ -1419,6 +1443,15 @@ def validate_twin_object_sample(
         for axis in ("pitch", "yaw", "roll")
     }
     rotation_error = max(rotation_errors.values())
+    raw_planar_error = math.hypot(target_x - raw_x, target_y - raw_y)
+    if (
+        raw_planar_error > 0.10
+        or reported_raw_to_target > 0.10
+        or abs(raw_planar_error - reported_raw_to_target) > 0.01
+    ):
+        raise VerificationError(
+            "twin actor planar placement diverges from GPS-derived CARLA location"
+        )
     if position_error > position_tolerance_m or rotation_error > rotation_tolerance_deg:
         raise VerificationError(
             "twin_status transform does not match the mapped UE5 CARLA actor: "
@@ -1442,6 +1475,9 @@ def validate_twin_object_sample(
         "transform_source": transform_source,
         "position_error_m": round(position_error, 3),
         "rotation_error_deg": round(rotation_error, 3),
+        "raw_to_target_planar_m": round(raw_planar_error, 3),
+        "placement_accuracy_claimed": False,
+        "target_location": {"x": target_x, "y": target_y},
     }
 
 

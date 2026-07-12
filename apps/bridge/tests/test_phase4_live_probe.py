@@ -262,6 +262,10 @@ def twin_status(
                 "actor_id": actor_id,
                 "actor_present": True,
                 "actor_type": actor_type,
+                "raw_carla_location": {"x": x, "y": y, "z": 0.0},
+                "target_carla_location": {"x": x, "y": y, "z": 0.3},
+                "raw_to_target_planar_m": 0.0,
+                "placement_planar_error_m": None,
                 "carla_transform": {
                     "location": {"x": x, "y": y, "z": 0.3},
                     "rotation": {"pitch": 0.0, "yaw": 12.0, "roll": 0.0},
@@ -318,6 +322,13 @@ def test_rejects_incomplete_or_nonfinite_twin_lens_model(mutate):
     hello = twin_camera_hello()
     mutate(hello)
     with pytest.raises(VerificationError, match="lens geometry is invalid"):
+        validate_twin_camera_model(hello, "ch1")
+
+
+def test_metadata_canary_rejects_complete_nondefault_twin_lens_model():
+    hello = twin_camera_hello()
+    hello["camera_model"]["lens"]["lens_k"] = -0.9
+    with pytest.raises(VerificationError, match="non-default CARLA lens model"):
         validate_twin_camera_model(hello, "ch1")
 
 
@@ -839,6 +850,21 @@ def test_exact_twin_sample_proves_actor_role_type_and_transform():
     assert sample["role_name"] == "twin_object"
     assert sample["position_error_m"] == 0.0
     assert sample["rotation_error_deg"] == 0.0
+    assert sample["raw_to_target_planar_m"] == 0.0
+    assert sample["placement_accuracy_claimed"] is False
+
+
+def test_twin_object_rejects_planar_lane_snap_masking():
+    status = twin_status()
+    status["objects"][0]["raw_carla_location"]["x"] = 7.0
+    with pytest.raises(VerificationError, match="planar placement diverges"):
+        validate_twin_object_sample(
+            status,
+            "global_car_run_1",
+            FakeWorld([FakeActor()]),
+            position_tolerance_m=0.5,
+            rotation_tolerance_deg=1.0,
+        )
 
 
 @pytest.mark.parametrize(
