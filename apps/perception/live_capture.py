@@ -455,6 +455,7 @@ class LiveStreamReader:
                     clock_source = None
 
                 connected = False
+                has_trusted_media_clock = self.media_clock_factory is None
                 connection_started = self.monotonic()
                 renewal_deadline = (
                     None
@@ -515,6 +516,10 @@ class LiveStreamReader:
                         previous, cap = cap, replacement
                         previous.release()
                         media_clock = prepared_media_clock
+                        has_trusted_media_clock = (
+                            prepared_media_clock is not None
+                            or self.media_clock_factory is None
+                        )
                         clock_resolution = None
                         last_capture_position = prepared_position
                         connection_started = self.monotonic()
@@ -633,6 +638,15 @@ class LiveStreamReader:
                             + self.media_clock_retry_seconds
                         )
                         continue
+                    if self.media_clock_factory is not None:
+                        if frame_media_clock is None and has_trusted_media_clock:
+                            # Once this reader has published a trusted clock,
+                            # never replace it with an unclocked frame during
+                            # re-anchor. The retained frame still ages normally
+                            # and becomes stale if recovery exceeds the bound.
+                            continue
+                        if frame_media_clock is not None:
+                            has_trusted_media_clock = True
                     self._remember_frame_identity(identity)
                     self._consecutive_duplicate_frames = 0
                     self.recovery.record_success()

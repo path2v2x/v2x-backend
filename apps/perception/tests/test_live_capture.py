@@ -48,6 +48,21 @@ class FakeMediaClock:
         }
 
 
+class SequencedMediaClock:
+    def __init__(self, timestamps):
+        self.timestamps = list(timestamps)
+
+    def metadata_at(self, position_milliseconds):
+        timestamp = self.timestamps.pop(0) if len(self.timestamps) > 1 else self.timestamps[0]
+        return {
+            "media_timestamp_utc": timestamp,
+            "media_clock": {
+                "source": "hls_ext_x_program_date_time",
+                "position_milliseconds": position_milliseconds,
+            },
+        }
+
+
 class GatedPositionCapture:
     def __init__(self, frames, positions, next_frame_gate):
         self.frames = list(frames)
@@ -339,6 +354,63 @@ class LiveStreamReaderTests(unittest.TestCase):
             )
             self.assertGreaterEqual(len(clock_calls), 2)
         finally:
+            reader.stop(timeout=2.0)
+
+    def test_reanchor_retains_last_trusted_frame_until_valid_clock(self):
+        capture = ContinuousCapture("clock-hold")
+        reanchor_started = threading.Event()
+        release_reanchor = threading.Event()
+        calls = []
+        valid = "2026-07-10T03:57:23.388Z"
+        invalid = "2026-07-10T03:57:30.000Z"
+
+        def media_clock_factory(*_args):
+            calls.append(len(calls) + 1)
+            if len(calls) == 1:
+                return SequencedMediaClock([valid, invalid])
+            reanchor_started.set()
+            release_reanchor.wait(1.0)
+            return FakeMediaClock(timestamp=valid)
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=media_clock_factory,
+            media_clock_validator=lambda clock, _epoch: (
+                clock["media_timestamp_utc"] == valid
+            ),
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_retry_seconds=0.1,
+        )
+        reader.start()
+        try:
+            sequence = 0
+            trusted = None
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                candidate = reader.wait_for_frame(sequence, timeout=0.2)
+                if candidate is None:
+                    continue
+                sequence = candidate["sequence"]
+                if candidate.get("media_clock") is not None:
+                    trusted = candidate
+                    break
+            self.assertIsNotNone(trusted)
+            self.assertTrue(reanchor_started.wait(1.0))
+            time.sleep(0.05)
+            self.assertIsNone(reader.snapshot(trusted["sequence"]))
+
+            release_reanchor.set()
+            replacement = reader.wait_for_frame(
+                trusted["sequence"], timeout=2.0
+            )
+            self.assertIsNotNone(replacement)
+            self.assertEqual(
+                replacement["media_clock"]["media_timestamp_utc"], valid
+            )
+        finally:
+            release_reanchor.set()
             reader.stop(timeout=2.0)
 
     def test_clock_resolution_uses_independent_connection_local_source(self):
