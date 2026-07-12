@@ -9,7 +9,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed through 2026-07-12 12:20 UTC; verify rather than assume:
+Observed through 2026-07-12 12:45 UTC; verify rather than assume:
 
 - Canonical `origin/main`, the clean live checkout, the Amplify mirror, and
   successful production Amplify job 202 are exact commit
@@ -41,14 +41,38 @@ Observed through 2026-07-12 12:20 UTC; verify rather than assume:
   no health outage and per-channel maximum latency below 5.75 seconds. Re-run
   that complete gate after any merged perception deployment; old evidence does
   not transfer to a new fingerprint.
-- Public `/timeline` is not currently an acceptance pass. Playwright evidence at
+- Public `/timeline` is not currently an acceptance pass. The earlier
+  Playwright evidence at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T063328Z-current-baseline/`
   shows only CH2 visible while CH1/CH3/CH4 remain black and the header reports
-  zero cameras/FPS. CLI HTTP 200 responses do not override the browser failure.
-  The integration branch contains a source-only same-origin HLS proxy, a
-  deterministic standalone Lambda artifact, prefix-scoped one-day S3 expiry,
-  and per-route session-mint throttling. None is deployed; pass the complete
-  plan/apply/rollback/browser gate before promotion.
+  zero cameras/FPS. A first proxy canary then broke perception when the legacy
+  `/video/session/{camera_id}` contract was changed in place; it was rolled back
+  exactly and perception recovered without a restart. Commit `141a317` fixes
+  the contract split: backend perception retains direct signed Kinesis delivery
+  at `/video/session/{camera_id}`, while browsers use opaque same-origin delivery
+  at `/video/browser-session/{camera_id}` and child resources remain under
+  `/video/proxy/{token}/{resource_id}`. The split Lambda/routes, prefix-scoped
+  IAM, one-day state expiry, and independent route throttles were deployed at
+  12:40 UTC from reviewed state hash
+  `8aa9f567c48dcc4c3bc708d89040e3ef25b50a320cee5b78828f5b49f67b5396`.
+  Rollback evidence is
+  `/home/path/V2XCarla/v2x-backend-backups/read-api-reconciliation/v2x-backend-read-20260712T124017Z-8aa9f567c48d/`.
+  Real API proof passed direct ch1 plus opaque proxy master/media playlist reads
+  for ch1-ch4. A local production build passed Playwright with four simultaneous
+  2560x1920 videos at `readyState=4`, no media errors, all four browser-session
+  calls returning 200, and 138 events / 3,806 detections in 24 hours; evidence
+  is `/home/path/V2XCarla/v2x-evidence/playwright/20260712T124500Z-local-hls-split/`.
+  At 12:46 UTC, more than six minutes after the API apply and therefore beyond
+  the producer's 240-second renewal interval, the local four-feed verifier again
+  passed with advancing timestamps and distinct JPEGs on every channel;
+  `v2x-perception.service` remained active with `NRestarts=0` and current schema-v2
+  uploads continued. This specifically closes the regression that forced the
+  first proxy canary rollback, but it does not replace the 30-minute/24-hour
+  production watch gates.
+  This is a candidate-browser pass, not a public-production pass: Amplify is
+  still connected to `michaelvu1207/v2x-backend-amplify` at main commit
+  `d54f5df`, so the public app has not yet received the browser-route change.
+  Require a clean source-controlled Amplify release and repeat the public gate.
 - The clean integration worktree is
   `/home/path/.codex/worktrees/v2x-calibration-integration` on
   `codex/v2x-calibration-integration`. It layers the fail-closed calibration,
@@ -508,15 +532,20 @@ Expected endpoints:
 - `/detections/latest`
 - `/streams/ch1.mjpg` through `/streams/ch4.mjpg`
 
-Validate video delivery separately through the read API. The currently deployed
-direct-Kinesis response is diagnostic-only; the accepted proxy candidate must
-report `delivery=SAME_ORIGIN_PROXY`:
+Validate video delivery separately through both read-API contracts. Perception
+must receive direct Kinesis delivery and must never create proxy state; the
+browser-only contract must report `delivery=SAME_ORIGIN_PROXY` without exposing
+the Kinesis origin or signed query. Never point perception at the browser route:
 
 ```bash
+api=https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com
+curl -fsS "${api}/video/session/ch1?max_fragments=2" \
+  | jq '{cameraId,playbackMode,delivery,maxMediaPlaylistFragmentResults}'
 for camera in ch1 ch2 ch3 ch4; do
-  curl -fsS \
-    "https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com/video/session/${camera}" \
-    | jq '{cameraId,playbackMode,delivery,expiresIn,hlsUrlPresent:(.hlsUrl|length>0)}'
+  curl -fsS "${api}/video/browser-session/${camera}?max_fragments=2" \
+    | jq '{cameraId,playbackMode,delivery,expiresIn,
+           proxyOrigin:(.hlsUrl|split("/video/proxy/")[0]),
+           leaksSignedOrigin:(.hlsUrl|contains("kinesisvideo") or contains("SessionToken"))}'
 done
 ```
 
