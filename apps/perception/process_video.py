@@ -12,6 +12,7 @@ import time
 import requests
 import tracking_utils
 import kinesis_utils
+from ffmpeg_capture import FfmpegNvdecCapture
 from live_capture import LiveStreamReader
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -906,6 +907,16 @@ class MultiCameraPipeline:
         media_clock_max_latency_ms = env_float(
             "V2X_PERCEPTION_MEDIA_CLOCK_MAX_LATENCY_MS", 120_000.0
         )
+        capture_backend = os.getenv(
+            "V2X_PERCEPTION_CAPTURE_BACKEND", "opencv"
+        ).strip().lower()
+        if capture_backend not in {"opencv", "ffmpeg_nvdec"}:
+            raise ValueError(
+                "V2X_PERCEPTION_CAPTURE_BACKEND must be opencv or ffmpeg_nvdec"
+            )
+        ffmpeg_binary = os.getenv(
+            "V2X_PERCEPTION_FFMPEG_BIN", "/usr/bin/ffmpeg"
+        )
         caps = [None] * len(video_paths)
         buffered_frames = [None] * len(video_paths)
         buffered_msecs = [-1.0] * len(video_paths)
@@ -932,6 +943,14 @@ class MultiCameraPipeline:
             if not live:
                 return cv2.VideoCapture(source)
 
+            if capture_backend == "ffmpeg_nvdec":
+                return FfmpegNvdecCapture(
+                    source,
+                    open_timeout_ms=open_timeout_ms,
+                    read_timeout_ms=read_timeout_ms,
+                    ffmpeg_binary=ffmpeg_binary,
+                )
+
             params = []
             open_timeout_property = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
             read_timeout_property = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
@@ -950,6 +969,8 @@ class MultiCameraPipeline:
                         if stream_broadcaster:
                             stream_broadcaster.mark_connected(camera_ids[index])
                         return
+                    if state == "renewed":
+                        return
                     if stream_broadcaster:
                         stream_broadcaster.mark_reconnecting(
                             camera_ids[index], error, failures
@@ -967,7 +988,11 @@ class MultiCameraPipeline:
                     capture_factory=lambda source: _open_capture(source, True),
                     recovery=recovery,
                     state_callback=_state_callback(index),
-                    media_clock_factory=kinesis_utils.resolve_hls_media_clock,
+                    media_clock_factory=(
+                        kinesis_utils.resolve_hls_media_clock_nvdec
+                        if capture_backend == "ffmpeg_nvdec"
+                        else kinesis_utils.resolve_hls_media_clock
+                    ),
                     media_clock_source_factory=(
                         lambda index=index: _clock_source_for(index)
                     ),
@@ -977,6 +1002,7 @@ class MultiCameraPipeline:
                     frame_identity_history_size=frame_identity_history_size,
                     duplicate_frame_limit=duplicate_frame_limit,
                     connection_max_age_seconds=proactive_renew_seconds,
+                    connection_initial_renewal_delay_seconds=index * 10.0,
                 )
                 live_readers.append(reader)
         else:

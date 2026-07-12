@@ -78,6 +78,29 @@ class GatedPositionCapture:
         self.released = True
 
 
+class ContinuousCapture:
+    def __init__(self, prefix):
+        self.prefix = prefix
+        self.count = 0
+        self.released = False
+
+    def isOpened(self):
+        return not self.released
+
+    def read(self):
+        if self.released:
+            return False, None
+        time.sleep(0.002)
+        self.count += 1
+        return True, f"{self.prefix}-frame-{self.count}"
+
+    def get(self, _property):
+        return self.count * 50.0
+
+    def release(self):
+        self.released = True
+
+
 class LiveStreamReaderTests(unittest.TestCase):
     def wait_until(self, predicate, timeout=2.0):
         deadline = time.monotonic() + timeout
@@ -146,13 +169,16 @@ class LiveStreamReaderTests(unittest.TestCase):
         )
         reader.start()
         try:
-            self.assertTrue(self.wait_until(lambda: len(source_calls) >= 2))
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "renewed" for event in states
+            )))
+            self.assertGreaterEqual(len(source_calls), 2)
             self.assertFalse(any(
                 event["state"] == "reconnecting" for event in states
             ))
-            self.assertGreaterEqual(sum(
+            self.assertEqual(sum(
                 event["state"] == "connected" for event in states
-            ), 2)
+            ), 1)
         finally:
             reader.stop(timeout=2.0)
 
@@ -164,6 +190,60 @@ class LiveStreamReaderTests(unittest.TestCase):
                 recovery=StreamRecovery(0.1, 0.1),
                 connection_max_age_seconds=0,
             )
+
+    def test_proactive_handover_drains_replacement_until_clock_is_ready(self):
+        source_calls = []
+        captures = []
+        states = []
+        release_replacement_clock = threading.Event()
+
+        def source_factory():
+            source = f"signed-session-{len(source_calls) + 1}"
+            source_calls.append(source)
+            return source
+
+        def capture_factory(source):
+            capture = ContinuousCapture(source)
+            captures.append(capture)
+            return capture
+
+        def media_clock_factory(source, *_args):
+            if source == "signed-session-2":
+                release_replacement_clock.wait(1.0)
+            return FakeMediaClock()
+
+        reader = LiveStreamReader(
+            source_factory=source_factory,
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            media_clock_factory=media_clock_factory,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            connection_max_age_seconds=0.15,
+            connection_renewal_lead_seconds=0.05,
+        )
+        reader.start()
+        try:
+            self.assertTrue(self.wait_until(lambda: len(captures) >= 2))
+            self.assertTrue(self.wait_until(lambda: captures[1].count >= 5))
+            release_replacement_clock.set()
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "renewed" for event in states
+            )))
+            snapshot = reader.snapshot(0)
+            self.assertIsNotNone(snapshot)
+            self.assertIsNotNone(snapshot["media_clock"])
+            replacement_frame_number = int(
+                snapshot["frame"].rsplit("-", 1)[1]
+            )
+            self.assertGreaterEqual(replacement_frame_number, 5)
+            self.assertTrue(captures[0].released)
+            self.assertFalse(any(
+                event["state"] == "reconnecting" for event in states
+            ))
+        finally:
+            release_replacement_clock.set()
+            reader.stop(timeout=2.0)
 
     def test_snapshot_never_relabels_the_same_frame_as_new(self):
         release_read = threading.Event()

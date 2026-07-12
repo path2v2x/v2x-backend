@@ -11,6 +11,8 @@ import boto3
 import requests
 from dotenv import load_dotenv
 
+from ffmpeg_capture import match_fragment_frame_nvdec
+
 load_dotenv()
 
 
@@ -274,10 +276,13 @@ def resolve_hls_media_clock(
         init_response.raise_for_status()
         init_cache[init_url] = _bounded_content(init_response)
 
-    def match_fragment(fragment):
+    def download_fragment(fragment):
         segment_response = http_get(fragment.segment_url, timeout=timeout)
         segment_response.raise_for_status()
-        segment_bytes = _bounded_content(segment_response)
+        return fragment, _bounded_content(segment_response)
+
+    def match_downloaded_fragment(downloaded):
+        fragment, segment_bytes = downloaded
         frame_offset = fragment_matcher(
             init_cache[fragment.init_url],
             segment_bytes,
@@ -292,12 +297,36 @@ def resolve_hls_media_clock(
     if (
         len(fragments) > 1
         and http_get is requests.get
+        and fragment_matcher is match_fragment_frame_nvdec
+    ):
+        # A live process already owns one NVDEC session per camera. Fetch the
+        # bounded fragment window concurrently, then decode candidates one at
+        # a time so four cameras cannot burst into 20 additional GPU decoder
+        # sessions during a clock re-anchor.
+        with ThreadPoolExecutor(max_workers=min(5, len(fragments))) as executor:
+            downloaded = list(executor.map(download_fragment, fragments))
+        candidates = [
+            match_downloaded_fragment(fragment) for fragment in downloaded
+        ]
+    elif (
+        len(fragments) > 1
+        and http_get is requests.get
         and fragment_matcher is _match_fragment_frame
     ):
         with ThreadPoolExecutor(max_workers=min(5, len(fragments))) as executor:
-            candidates = list(executor.map(match_fragment, fragments))
+            candidates = list(
+                executor.map(
+                    lambda fragment: match_downloaded_fragment(
+                        download_fragment(fragment)
+                    ),
+                    fragments,
+                )
+            )
     else:
-        candidates = [match_fragment(fragment) for fragment in fragments]
+        candidates = [
+            match_downloaded_fragment(download_fragment(fragment))
+            for fragment in fragments
+        ]
     matches = [candidate for candidate in candidates if candidate is not None]
 
     # Static/duplicate imagery can appear at several frame positions or in
@@ -318,6 +347,24 @@ def resolve_hls_media_clock(
         anchor_fragment_id=fragment.fragment_id,
         anchor_media_sequence=fragment.media_sequence,
         segment_duration_seconds=fragment.duration_seconds,
+    )
+
+
+def resolve_hls_media_clock_nvdec(
+    hls_url,
+    reference_frame,
+    capture_position_milliseconds,
+    frame_identity,
+    timeout=10,
+):
+    """Resolve an exact clock using the same pixels as the NVDEC live reader."""
+    return resolve_hls_media_clock(
+        hls_url,
+        reference_frame,
+        capture_position_milliseconds,
+        frame_identity,
+        timeout=timeout,
+        fragment_matcher=match_fragment_frame_nvdec,
     )
 
 def _camera_id_from_stream_name(stream_name):
