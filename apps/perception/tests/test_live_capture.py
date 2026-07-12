@@ -454,6 +454,65 @@ class LiveStreamReaderTests(unittest.TestCase):
         finally:
             reader.stop(timeout=2.0)
 
+    def test_persistent_invalid_clock_hot_prepares_a_fresh_session(self):
+        source_calls = []
+        captures = []
+        states = []
+        valid = "2026-07-10T03:57:23.388Z"
+        invalid = "2026-07-10T03:57:30.000Z"
+
+        def source_factory():
+            source = f"signed-session-{len(source_calls) + 1}"
+            source_calls.append(source)
+            return source
+
+        def capture_factory(source):
+            capture = ContinuousCapture(source)
+            captures.append(capture)
+            return capture
+
+        def media_clock_factory(source, *_args):
+            if source == "signed-session-1":
+                return SequencedMediaClock([valid, invalid])
+            return FakeMediaClock(timestamp=valid)
+
+        reader = LiveStreamReader(
+            source_factory=source_factory,
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            media_clock_factory=media_clock_factory,
+            media_clock_validator=lambda clock, _epoch: (
+                clock["media_timestamp_utc"] == valid
+            ),
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_invalid_grace_seconds=0.0,
+            connection_max_age_seconds=60.0,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            self.assertIn("signed-session-1", first["frame"])
+            self.assertTrue(self.wait_until(lambda: len(captures) >= 2))
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "renewed" for event in states
+            )))
+            replacement = reader.wait_for_frame(
+                first["sequence"], timeout=2.0
+            )
+            self.assertIsNotNone(replacement)
+            self.assertIn("signed-session-2", replacement["frame"])
+            self.assertEqual(
+                replacement["media_clock"]["media_timestamp_utc"], valid
+            )
+            self.assertTrue(captures[0].released)
+            self.assertFalse(any(
+                event["state"] == "reconnecting" for event in states
+            ))
+        finally:
+            reader.stop(timeout=2.0)
+
     def test_clock_resolution_uses_independent_connection_local_source(self):
         release_read = threading.Event()
         observed_sources = []

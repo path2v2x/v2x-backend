@@ -437,6 +437,20 @@ class LiveStreamReader:
         self._recent_frame_identities.append(identity)
         self._recent_frame_identity_set.add(identity)
 
+    def _prepare_replacement_capture(self):
+        return _AsyncCapturePreparation(
+            self.source_factory,
+            self.media_clock_source_factory,
+            self.capture_factory,
+            self.media_clock_factory,
+            self.media_clock_validator,
+            self.capture_position_milliseconds,
+            self.media_frame_identity,
+            self._stop_event,
+            self.wall_time,
+            self.monotonic,
+        )
+
     def _run(self):
         while not self._stop_event.is_set():
             now = self.monotonic()
@@ -489,17 +503,8 @@ class LiveStreamReader:
                         and proactive_preparation is None
                         and self.monotonic() >= renewal_deadline
                     ):
-                        proactive_preparation = _AsyncCapturePreparation(
-                            self.source_factory,
-                            self.media_clock_source_factory,
-                            self.capture_factory,
-                            self.media_clock_factory,
-                            self.media_clock_validator,
-                            self.capture_position_milliseconds,
-                            self.media_frame_identity,
-                            self._stop_event,
-                            self.wall_time,
-                            self.monotonic,
+                        proactive_preparation = (
+                            self._prepare_replacement_capture()
                         )
 
                     prepared = None
@@ -603,6 +608,7 @@ class LiveStreamReader:
                     if (
                         media_clock is None
                         and clock_resolution is None
+                        and proactive_preparation is None
                         and self.media_clock_factory is not None
                         and capture_position is not None
                         and source_monotonic >= next_media_clock_retry
@@ -675,6 +681,20 @@ class LiveStreamReader:
                         # trusted published frame remains subject to the normal
                         # freshness deadline, so a persistent fault still
                         # fails closed as stale.
+                        if (
+                            has_trusted_media_clock
+                            and self.connection_max_age_seconds is not None
+                            and proactive_preparation is None
+                        ):
+                            # Same-session exact re-anchoring can remain stuck
+                            # behind a wedged HLS reader. Validate a new signed
+                            # session off-thread while the old capture is still
+                            # drained. Publication stays frozen on the last
+                            # trusted frame and the normal stale gate remains
+                            # unchanged if hot recovery cannot finish in time.
+                            proactive_preparation = (
+                                self._prepare_replacement_capture()
+                            )
                         media_clock = None
                         clock_resolution = None
                         next_media_clock_retry = (

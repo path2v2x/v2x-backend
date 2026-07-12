@@ -7,6 +7,52 @@ description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252
 
 Treat this file as an operating procedure, not proof of current state. Re-run the read-only baseline before every intervention.
 
+## Newest perception release chronology
+
+Observed through 2026-07-12 18:46 UTC; verify rather than assume. This section
+overrides older perception candidate and deployment statements below.
+
+- PR 28 merged as canonical
+  `0bb596b227cad420c77e12516fb4dc77a11af5e0`. Its read Lambda code-only
+  deployment is backed up at
+  `/home/path/V2XCarla/v2x-backend-backups/read-api-code-only/v2x-backend-read-20260712T182245Z-0bb596b2/`.
+  The real API reports `DIRECT_KINESIS` plus `ON_DISCONTINUITY` for direct
+  perception sessions and `SAME_ORIGIN_PROXY` plus `ALWAYS` for browser
+  sessions; the browser response does not expose the signed Kinesis origin.
+- The controlled PR 28 perception deployment passed five strict startup
+  samples, the independent four-feed verifier, LIVE/zero-session twin
+  observation, and preserved CARLA/Drive/web fingerprints. Its ten-minute
+  watch then failed at sample 266: ch3's FFmpeg child stayed alive but stopped
+  publishing frames, so the last trusted frame aged from 8.43 to 15.43 seconds
+  and health correctly changed to `stale`. No reconnect or sanitized error was
+  surfaced. Retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T183001Z-continuous-pts-live-watch-10m/`.
+  The live checkout and installed perception unit were immediately restored to
+  `d54f5dfaec90e791af83105ff048e5dd3c6506a2`; only perception restarted, all
+  three timers were restored, and CARLA/Drive/web PIDs and restart counters
+  remained unchanged. Do not redeploy PR 28 unchanged.
+- Candidate `7dafc4e361f1a55f8512c5ffff283dcd2bb93b69` adds a seven-second
+  FFmpeg network-I/O timeout, a three-refresh nonadvancing-HLS bound, and a
+  renewable-session-only hot replacement when a previously trusted clock
+  becomes persistently invalid. It does not change the fixed -1/+10-second
+  clock or 15-second stale thresholds. All 94 perception tests pass. An
+  upload-disabled four-camera canary in an owned systemd cgroup passed 120
+  strict one-second samples with 30-second accelerated renewals, zero stale or
+  reconnect samples, and maxima ch1/ch2/ch3/ch4 =
+  9.134/8.614/8.771/9.999 seconds; every canary process was cleaned up.
+  Evidence is
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T184344Z-stalled-reader-recovery-canary/`.
+  The ch4 margin is only about 1 ms, so this is not a live pass. Require a
+  canonical merge, a new verified rollback bundle, a controlled zero-session
+  deployment, five strict startup samples, four changing feeds, LIVE/zero
+  sessions, a full ten-minute renewal watch, then attended 30-minute and
+  automated 24-hour watches. Roll back immediately on any unchanged gate.
+- The current rolled-back CPU-decoder service can again show missing clock
+  readiness and latency above ten seconds. This is retained baseline debt, not
+  evidence that the rejected PR 28 deployment should remain live. Do not claim
+  perception acceptance until a newer candidate passes every watch and a fresh
+  schema-v2 persisted vehicle is proven.
+
 ## Current deployed state and integration hold
 
 Observed through 2026-07-12 17:35 UTC; verify rather than assume. The following
