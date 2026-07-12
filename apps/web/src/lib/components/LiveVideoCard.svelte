@@ -31,12 +31,22 @@
 		}
 	}
 
+	function renewalLeadSeconds(): number {
+		// Four cards are normally mounted together. Deterministic spacing avoids
+		// briefly doubling all four decoders and starving the streams that are
+		// still visible. Unknown camera IDs retain the conservative middle lead.
+		const cameraOrder = ['ch1', 'ch2', 'ch3', 'ch4'];
+		const cameraIndex = cameraOrder.indexOf(cameraId);
+		return cameraIndex < 0 ? 45 : 60 - cameraIndex * 10;
+	}
+
 	function scheduleRefresh(expiresIn: number | null) {
 		clearRefreshTimer();
-		if (!expiresIn || expiresIn <= 50) return;
+		const leadSeconds = renewalLeadSeconds();
+		if (!expiresIn || expiresIn <= leadSeconds + 5) return;
 		refreshTimer = setTimeout(() => {
 			void renewSession();
-		}, (expiresIn - 45) * 1000);
+		}, (expiresIn - leadSeconds) * 1000);
 	}
 
 	function videoAt(index: 0 | 1): HTMLVideoElement | null {
