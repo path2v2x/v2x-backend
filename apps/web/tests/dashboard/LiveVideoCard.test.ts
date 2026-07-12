@@ -7,6 +7,10 @@ const hlsMocks = vi.hoisted(() => ({
 	loadSource: vi.fn()
 }));
 
+const apiMocks = vi.hoisted(() => ({
+	fetchVideoSession: vi.fn()
+}));
+
 vi.mock('hls.js', () => ({
 	default: class MockHls {
 		static isSupported() {
@@ -19,6 +23,10 @@ vi.mock('hls.js', () => ({
 	}
 }));
 
+vi.mock('$lib/api', () => ({
+	fetchVideoSession: apiMocks.fetchVideoSession
+}));
+
 import LiveVideoCard from '$lib/components/LiveVideoCard.svelte';
 
 beforeEach(() => {
@@ -28,6 +36,7 @@ beforeEach(() => {
 	hlsMocks.attachMedia.mockReset();
 	hlsMocks.destroy.mockReset();
 	hlsMocks.loadSource.mockReset();
+	apiMocks.fetchVideoSession.mockReset();
 });
 
 afterEach(() => {
@@ -106,5 +115,56 @@ describe('LiveVideoCard camera selection', () => {
 			)
 		);
 		expect(hlsMocks.attachMedia).toHaveBeenCalledWith(expect.any(HTMLVideoElement));
+	});
+
+	it('keeps the active stream alive until a renewed session is already playing', async () => {
+		vi.useFakeTimers();
+		apiMocks.fetchVideoSession
+			.mockResolvedValueOnce({
+				cameraId: 'ch1',
+				streamName: 'camera-ch1',
+				playbackMode: 'LIVE',
+				hlsUrl: 'https://video.example.test/session-1.m3u8',
+				expiresIn: 51,
+				region: 'us-west-1'
+			})
+			.mockResolvedValueOnce({
+				cameraId: 'ch1',
+				streamName: 'camera-ch1',
+				playbackMode: 'LIVE',
+				hlsUrl: 'https://video.example.test/session-2.m3u8',
+				expiresIn: 51,
+				region: 'us-west-1'
+			});
+
+		let releaseRenewal!: () => void;
+		const play = vi
+			.spyOn(HTMLMediaElement.prototype, 'play')
+			.mockResolvedValueOnce(undefined)
+			.mockImplementationOnce(
+				() => new Promise<void>((resolve) => (releaseRenewal = resolve))
+			);
+
+		render(LiveVideoCard, { props: { cameraId: 'ch1' } });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(apiMocks.fetchVideoSession).toHaveBeenCalledTimes(1);
+		expect(hlsMocks.loadSource).toHaveBeenCalledWith(
+			'https://video.example.test/session-1.m3u8'
+		);
+
+		await vi.advanceTimersByTimeAsync(6_000);
+		expect(apiMocks.fetchVideoSession).toHaveBeenCalledTimes(2);
+		expect(hlsMocks.loadSource).toHaveBeenCalledWith(
+			'https://video.example.test/session-2.m3u8'
+		);
+		expect(play).toHaveBeenCalledTimes(2);
+		expect(hlsMocks.destroy).not.toHaveBeenCalled();
+
+		releaseRenewal();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(hlsMocks.destroy).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(200);
+		expect(hlsMocks.destroy).toHaveBeenCalledTimes(1);
+		vi.useRealTimers();
 	});
 });
