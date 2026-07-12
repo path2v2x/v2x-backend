@@ -89,4 +89,22 @@ describe('LiveVideoCard camera selection', () => {
 		expect(hlsMocks.attachMedia).toHaveBeenCalledWith(expect.any(HTMLVideoElement));
 		expect(screen.queryByRole('img')).not.toBeInTheDocument();
 	});
+
+	it('prefers hls.js when Chromium also claims native HLS support', async () => {
+		vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('probably');
+
+		render(LiveVideoCard, {
+			props: {
+				cameraId: 'ch2',
+				streamUrl: 'https://video.example.test/streams/ch2.m3u8'
+			}
+		});
+
+		await waitFor(() =>
+			expect(hlsMocks.loadSource).toHaveBeenCalledWith(
+				'https://video.example.test/streams/ch2.m3u8'
+			)
+		);
+		expect(hlsMocks.attachMedia).toHaveBeenCalledWith(expect.any(HTMLVideoElement));
+	});
 });

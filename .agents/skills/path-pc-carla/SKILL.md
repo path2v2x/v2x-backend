@@ -77,6 +77,12 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   reconciled before new code. The 12:40 apply briefly produced two
   `HLS_PROXY_PREFIX` import failures while code preceded environment; do not
   call that canary a clean 30-minute pass or repeat the unsafe order.
+  A subsequent local watch found Chromium 145 claiming native HLS support but
+  leaving ch1 paused with `DEMUXER_ERROR_COULD_NOT_PARSE` after an opaque media
+  playlist was blocked by ORB. The accepted browser candidate must prefer
+  hls.js whenever Media Source Extensions are supported and reserve native HLS
+  for Safari/fallback. Require all four video elements to remain playing with
+  no media error across the renewed clean watch.
   This is a candidate-browser pass, not a public-production pass: Amplify is
   still connected to `michaelvu1207/v2x-backend-amplify` at main commit
   `d54f5df`, so the public app has not yet received the browser-route change.
@@ -147,8 +153,11 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   `/mnt/v2x-capacity/v2x-ue5-build.ext4` on the secondary Windows volume. The
   outer NTFS mount intentionally uses `ntfs-3g`; the kernel `ntfs3` driver
   materialized the whole sparse file during the first bounded attempt, which
-  was stopped and removed before retrying. The accepted image initially used
-  about 10 MB physical space and left existing Windows data unchanged. Clean
+  was stopped and removed before retrying. A second `largefile4` format was
+  also rejected after clean checkout proved its low inode count unsuitable for
+  UE's 183,000+ source files; only partial V2X clones existed and were discarded.
+  The current normal ext4 image exposes about 32 million inodes, initially used
+  about 10 MB physical space, and left existing Windows data unchanged. Clean
   Epic UE 5.5.4, CARLA `ue5-dev`, and Richmond `d14da5b` inputs are being cloned
   only into this V2X mount. The root filesystem and all UE6/comparison paths
   remain excluded. After any reboot, verify both mounts and the image allocation

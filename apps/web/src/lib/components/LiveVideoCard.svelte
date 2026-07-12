@@ -99,15 +99,19 @@
 				throw new Error('Video element unavailable');
 			}
 
-			if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-				videoEl.src = hlsUrl;
-			} else if (Hls.isSupported()) {
+			// Prefer hls.js whenever Media Source Extensions are available. Recent
+			// Chromium builds report native HLS support on Linux but intermittently
+			// fail fMP4 Kinesis playlists with a non-recovering demux/ORB error.
+			// Safari has no hls.js MSE path and falls through to native HLS.
+			if (Hls.isSupported()) {
 				hls = new Hls({
 					enableWorker: true,
 					lowLatencyMode: false,
 				});
 				hls.loadSource(hlsUrl);
 				hls.attachMedia(videoEl);
+			} else if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+				videoEl.src = hlsUrl;
 			} else {
 				throw new Error('HLS playback is not supported in this browser');
 			}
