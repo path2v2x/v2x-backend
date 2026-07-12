@@ -354,6 +354,66 @@ class LiveVideoSessionTest(unittest.TestCase):
         self.assertEqual(self.archived.calls, [])
 
 
+class VideoCoverageRetryTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_generated_lambda(FakeTable())
+        self.calls = 0
+        self.archived = types.SimpleNamespace()
+        self.module["_archived_media_client"] = lambda *_args: self.archived
+        self.query = {
+            "start": "2026-07-10T05:00:00Z",
+            "end": "2026-07-10T09:00:00Z",
+        }
+
+    def invoke(self):
+        return self.module["_get_video_coverage"]("ch1", self.query)
+
+    def test_transient_client_limit_is_retried_then_recovers(self):
+        def list_fragments(**_kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise FakeClientError("ClientLimitExceededException")
+            return {"Fragments": []}
+
+        self.archived.list_fragments = list_fragments
+        with patch.object(self.module["time"], "sleep") as sleep, patch.object(
+            self.module["secrets"], "randbelow", return_value=0
+        ):
+            response = self.invoke()
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(self.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
+
+    def test_nontransient_error_fails_without_retry(self):
+        def list_fragments(**_kwargs):
+            self.calls += 1
+            raise FakeClientError("AccessDeniedException")
+
+        self.archived.list_fragments = list_fragments
+        with patch.object(self.module["time"], "sleep") as sleep:
+            response = self.invoke()
+
+        self.assertEqual(response["statusCode"], 502)
+        self.assertEqual(self.calls, 1)
+        sleep.assert_not_called()
+
+    def test_transient_retry_exhaustion_remains_fail_closed(self):
+        def list_fragments(**_kwargs):
+            self.calls += 1
+            raise FakeClientError("ClientLimitExceededException")
+
+        self.archived.list_fragments = list_fragments
+        with patch.object(self.module["time"], "sleep") as sleep, patch.object(
+            self.module["secrets"], "randbelow", return_value=0
+        ):
+            response = self.invoke()
+
+        self.assertEqual(response["statusCode"], 502)
+        self.assertEqual(self.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+
 class HlsProxyTest(unittest.TestCase):
     def setUp(self):
         self.s3 = FakeS3()

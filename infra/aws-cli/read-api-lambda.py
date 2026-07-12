@@ -44,6 +44,12 @@ s3_client = boto3.client("s3")
 
 ALLOWED_CAMERA_IDS = {"ch1", "ch2", "ch3", "ch4"}
 ALLOWED_DEMO_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v"}
+KINESIS_TRANSIENT_ERROR_CODES = {
+    "ClientLimitExceededException",
+    "InternalFailure",
+    "ServiceUnavailableException",
+    "ThrottlingException",
+}
 HLS_PROXY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 HLS_PROXY_RESOURCE_RE = re.compile(r"^(?:master|[A-Za-z0-9_-]{1,4096}\.[0-9a-f]{64})$")
 HLS_URI_ATTRIBUTE_RE = re.compile(r'URI="([^"]+)"')
@@ -715,6 +721,28 @@ def _archived_media_client(stream_name, api_name):
         config=BotoConfig(retries={"max_attempts": 3}),
     )
 
+def _call_kinesis_with_backoff(operation, *, max_attempts=3):
+    """Retry transient Kinesis Video limits inside API Gateway's time bound.
+
+    Botocore does not consistently classify ClientLimitExceededException as
+    retryable for archived-media calls. Coverage refreshes can therefore fail
+    even when the next call a fraction of a second later succeeds. Keep this
+    retry narrow, jittered, and bounded so permission/configuration failures
+    still fail immediately and the Lambda cannot overrun its integration
+    deadline.
+    """
+    for attempt in range(max_attempts):
+        try:
+            return operation()
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "ClientError")
+            if error_code not in KINESIS_TRANSIENT_ERROR_CODES or attempt + 1 >= max_attempts:
+                raise
+            # 250-500 ms, then 500-1000 ms. secrets is already used for HLS
+            # tokens and gives process-independent jitter across Lambda workers.
+            jitter = 0.5 + (secrets.randbelow(501) / 1000.0)
+            time.sleep(0.5 * (2 ** attempt) * jitter)
+
 def _get_hls_session(event, camera_id, qs, *, browser_proxy=False):
     if camera_id not in ALLOWED_CAMERA_IDS:
         return _resp(404, {"error": "camera_not_found", "cameraId": camera_id})
@@ -842,7 +870,9 @@ def _get_video_coverage(camera_id, qs):
         return err
 
     try:
-        archived_media = _archived_media_client(stream_name, "LIST_FRAGMENTS")
+        archived_media = _call_kinesis_with_backoff(
+            lambda: _archived_media_client(stream_name, "LIST_FRAGMENTS")
+        )
         fragments = []
         next_token = None
         pages = 0
@@ -865,7 +895,9 @@ def _get_video_coverage(camera_id, qs):
             }
             if next_token:
                 kwargs["NextToken"] = next_token
-            resp = archived_media.list_fragments(**kwargs)
+            resp = _call_kinesis_with_backoff(
+                lambda: archived_media.list_fragments(**kwargs)
+            )
             fragments.extend(resp.get("Fragments", []) or [])
             next_token = resp.get("NextToken")
             pages += 1
