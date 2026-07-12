@@ -987,6 +987,13 @@ class MultiCameraPipeline:
             raise ValueError(
                 "V2X_PERCEPTION_PROACTIVE_RENEW_SEC must be between 30 and 270"
             )
+        terminal_read_failover_seconds = env_float(
+            "V2X_PERCEPTION_TERMINAL_READ_FAILOVER_SEC", 5.0
+        )
+        if not 0.0 <= terminal_read_failover_seconds <= 10.0:
+            raise ValueError(
+                "V2X_PERCEPTION_TERMINAL_READ_FAILOVER_SEC must be between 0 and 10"
+            )
         capture_hls_fragments = int(env_float(
             "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 1
         ))
@@ -1165,6 +1172,9 @@ class MultiCameraPipeline:
                     duplicate_frame_limit=duplicate_frame_limit,
                     connection_max_age_seconds=proactive_renew_seconds,
                     connection_initial_renewal_delay_seconds=index * 10.0,
+                    terminal_read_failover_seconds=(
+                        terminal_read_failover_seconds
+                    ),
                 )
                 live_readers.append(reader)
         else:

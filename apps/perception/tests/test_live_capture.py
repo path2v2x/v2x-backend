@@ -144,6 +144,7 @@ class LiveStreamReaderTests(unittest.TestCase):
             capture_factory=capture_factory,
             recovery=StreamRecovery(0.1, 0.1),
             state_callback=lambda **event: states.append(event),
+            terminal_read_failover_seconds=0.0,
         )
         reader.start()
         try:
@@ -157,6 +158,61 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertTrue(any(event["state"] == "reconnecting" for event in states))
         finally:
             reader.stop(timeout=2.0)
+
+    def test_terminal_read_hot_failover_keeps_streaming_state_and_clock(self):
+        captures = []
+        states = []
+
+        def source_factory():
+            return f"signed-session-{len(captures) + 1}"
+
+        def capture_factory(source):
+            if not captures:
+                capture = ScriptedCapture([f"{source}-primary"])
+                capture.get = lambda _property: 0.0
+            else:
+                capture = ContinuousCapture(source)
+            captures.append(capture)
+            return capture
+
+        reader = LiveStreamReader(
+            source_factory=source_factory,
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            media_clock_factory=lambda *_args: FakeMediaClock(),
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            terminal_read_failover_seconds=0.5,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            replacement = reader.wait_for_frame(first["sequence"], timeout=2.0)
+            self.assertIsNotNone(replacement)
+            self.assertIn("signed-session-2", replacement["frame"])
+            self.assertIsNotNone(replacement["media_clock"])
+            self.assertTrue(captures[0].released)
+            self.assertTrue(any(
+                event["state"] == "renewed" for event in states
+            ))
+            self.assertFalse(any(
+                event["state"] == "reconnecting" for event in states
+            ))
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_terminal_read_failover_bound_must_be_finite_and_limited(self):
+        for invalid in (-0.1, 10.1, float("inf")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "between 0 and 10"):
+                    LiveStreamReader(
+                        source_factory=lambda: "signed-session",
+                        capture_factory=lambda _source: ScriptedCapture([]),
+                        recovery=StreamRecovery(0.1, 0.1),
+                        terminal_read_failover_seconds=invalid,
+                    )
 
     def test_proactive_renewal_rotates_source_without_reconnecting_state(self):
         source_calls = []
@@ -799,6 +855,7 @@ class LiveStreamReaderTests(unittest.TestCase):
             state_callback=lambda **event: states.append(event),
             wall_time=wall_time,
             duplicate_frame_limit=5,
+            terminal_read_failover_seconds=0.0,
         )
         reader.start()
         try:

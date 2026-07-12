@@ -77,6 +77,8 @@ class _AsyncCapturePreparation:
         self._wall_time = wall_time
         self._monotonic = monotonic
         self._done = threading.Event()
+        self._discarded = threading.Event()
+        self._result_lock = threading.Lock()
         self._result = None
         self._failed = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -99,7 +101,9 @@ class _AsyncCapturePreparation:
                 raise RuntimeError("capture open failed")
 
             latest = None
-            while not self._stop_event.is_set():
+            while not (
+                self._stop_event.is_set() or self._discarded.is_set()
+            ):
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     raise RuntimeError("frame read failed")
@@ -114,8 +118,11 @@ class _AsyncCapturePreparation:
                 latest = (frame, source_epoch, source_monotonic, position)
 
                 if self._media_clock_factory is None:
-                    self._result = (capture, *latest, None)
-                    capture = None
+                    with self._result_lock:
+                        if self._discarded.is_set():
+                            return
+                        self._result = (capture, *latest, None)
+                        capture = None
                     return
                 if position is None:
                     continue
@@ -160,15 +167,18 @@ class _AsyncCapturePreparation:
                     # never hand an invalid clock to the active reader.
                     clock_resolution = None
                     continue
-                self._result = (
-                    capture,
-                    frame,
-                    source_epoch,
-                    source_monotonic,
-                    position,
-                    media_clock,
-                )
-                capture = None
+                with self._result_lock:
+                    if self._discarded.is_set():
+                        return
+                    self._result = (
+                        capture,
+                        frame,
+                        source_epoch,
+                        source_monotonic,
+                        position,
+                        media_clock,
+                    )
+                    capture = None
                 return
             raise RuntimeError("capture preparation stopped")
         except Exception:
@@ -188,16 +198,22 @@ class _AsyncCapturePreparation:
     def poll(self):
         if not self._done.is_set():
             return False, None, False
-        return True, self._result, self._failed
+        with self._result_lock:
+            return True, self._result, self._failed
 
     def take(self):
-        result, self._result = self._result, None
-        return result
+        with self._result_lock:
+            result, self._result = self._result, None
+            return result
 
     def discard(self):
-        if self._done.is_set() and self._result is not None:
-            capture = self._result[0]
-            self._result = None
+        self._discarded.set()
+        capture = None
+        with self._result_lock:
+            if self._result is not None:
+                capture = self._result[0]
+                self._result = None
+        if capture is not None:
             capture.release()
 
 
@@ -315,6 +331,7 @@ class LiveStreamReader:
         connection_max_age_seconds=None,
         connection_renewal_lead_seconds=15.0,
         connection_initial_renewal_delay_seconds=0.0,
+        terminal_read_failover_seconds=5.0,
     ):
         self.source_factory = source_factory
         self.capture_factory = capture_factory
@@ -366,6 +383,15 @@ class LiveStreamReader:
                     "connection_initial_renewal_delay_seconds must be between 0 and 30"
                 )
             self.connection_initial_renewal_delay_seconds = initial_delay
+        failover_seconds = float(terminal_read_failover_seconds)
+        if (
+            not math.isfinite(failover_seconds)
+            or not 0.0 <= failover_seconds <= 10.0
+        ):
+            raise ValueError(
+                "terminal_read_failover_seconds must be between 0 and 10"
+            )
+        self.terminal_read_failover_seconds = failover_seconds
 
         self._condition = threading.Condition()
         self._stop_event = threading.Event()
@@ -453,6 +479,42 @@ class LiveStreamReader:
             self.monotonic,
         )
 
+    def _recover_terminal_read(self, preparation):
+        """Return one fully validated replacement within a strict time bound.
+
+        A live FFmpeg FIFO can close on a single HLS discontinuity while the
+        source itself is still available.  Keep the last trusted frame aging
+        normally while a new signed session and exact media clock are prepared.
+        No unclocked frame is published, and failure to validate inside this
+        bound falls through to the normal reconnect/staleness path.
+        """
+        if self.terminal_read_failover_seconds <= 0.0:
+            if preparation is not None:
+                preparation.discard()
+            return None
+
+        deadline = self.monotonic() + self.terminal_read_failover_seconds
+        candidate = preparation or self._prepare_replacement_capture()
+        while not self._stop_event.is_set():
+            done, result, failed = candidate.poll()
+            if done:
+                if not failed and result is not None:
+                    return candidate.take()
+                candidate.discard()
+                if self.monotonic() >= deadline:
+                    return None
+                candidate = self._prepare_replacement_capture()
+                continue
+
+            remaining = deadline - self.monotonic()
+            if remaining <= 0.0:
+                candidate.discard()
+                return None
+            self._stop_event.wait(min(0.01, remaining))
+
+        candidate.discard()
+        return None
+
     def _run(self):
         while not self._stop_event.is_set():
             now = self.monotonic()
@@ -528,7 +590,13 @@ class LiveStreamReader:
                     if prepared is None:
                         ret, frame = cap.read()
                         if not ret or frame is None:
-                            raise RuntimeError("frame read failed")
+                            prepared = self._recover_terminal_read(
+                                proactive_preparation
+                            )
+                            proactive_preparation = None
+                            if prepared is None:
+                                raise RuntimeError("frame read failed")
+                    if prepared is None:
                         source_epoch = None
                         source_monotonic = None
                         prepared_position = None
@@ -554,7 +622,9 @@ class LiveStreamReader:
                         last_capture_position = prepared_position
                         connection_started = self.monotonic()
                         renewal_deadline = (
-                            connection_started
+                            None
+                            if self.connection_max_age_seconds is None
+                            else connection_started
                             + self.connection_max_age_seconds
                             - self.connection_renewal_lead_seconds
                         )

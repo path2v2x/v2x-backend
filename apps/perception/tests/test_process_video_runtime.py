@@ -524,6 +524,12 @@ class LivePipelineTimestampTests(unittest.TestCase):
             self.FakeReader.instances[0].kwargs["connection_max_age_seconds"],
             240.0,
         )
+        self.assertEqual(
+            self.FakeReader.instances[0].kwargs[
+                "terminal_read_failover_seconds"
+            ],
+            5.0,
+        )
         self.assertTrue(callable(
             self.FakeReader.instances[0].kwargs["frame_callback"]
         ))
