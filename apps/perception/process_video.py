@@ -978,6 +978,8 @@ class MultiCameraPipeline:
             )["trusted"]
 
         if live_mode:
+            last_stream_publish_monotonic = [float("-inf")] * len(video_paths)
+
             def _state_callback(index):
                 def callback(state, error, failures, delay_seconds):
                     if state == "connected":
@@ -996,6 +998,39 @@ class MultiCameraPipeline:
                     )
                 return callback
 
+            def _frame_callback(index):
+                def callback(
+                    frame,
+                    source_epoch,
+                    source_monotonic,
+                    frame_media_clock,
+                ):
+                    if stream_broadcaster is None:
+                        return
+                    source_monotonic = float(source_monotonic)
+                    if (
+                        source_monotonic
+                        - last_stream_publish_monotonic[index]
+                        < 0.2
+                    ):
+                        return
+                    media_clock_health = assess_media_clock(
+                        frame_media_clock,
+                        source_epoch,
+                        media_clock_min_latency_ms,
+                        media_clock_max_latency_ms,
+                    )
+                    stream_broadcaster.publish(
+                        camera_ids[index],
+                        cv2.resize(frame, (640, 480)),
+                        utc_iso(source_epoch),
+                        source_monotonic=source_monotonic,
+                        media_clock_health=media_clock_health,
+                    )
+                    last_stream_publish_monotonic[index] = source_monotonic
+
+                return callback
+
             for index in range(len(video_paths)):
                 recovery = StreamRecovery(reconnect_initial, reconnect_max)
                 reader = LiveStreamReader(
@@ -1003,6 +1038,7 @@ class MultiCameraPipeline:
                     capture_factory=lambda source: _open_capture(source, True),
                     recovery=recovery,
                     state_callback=_state_callback(index),
+                    frame_callback=_frame_callback(index),
                     media_clock_factory=(
                         kinesis_utils.resolve_hls_media_clock_nvdec
                         if capture_backend == "ffmpeg_nvdec"
@@ -1186,25 +1222,10 @@ class MultiCameraPipeline:
 
                     raw_buffer.extend(det_3d)
 
-                    if show_live or writer or output_image or stream_broadcaster:
+                    if show_live or writer or output_image:
                         annotated = detector.draw_detections_3d(frame, det_3d)
                         annotated = cv2.resize(annotated, (640, 480))
-                        if stream_broadcaster:
-                            media_clock_health = assess_media_clock(
-                                frame_media_clocks[i],
-                                source_epochs[i],
-                                media_clock_min_latency_ms,
-                                media_clock_max_latency_ms,
-                            )
-                            stream_broadcaster.publish(
-                                camera_ids[i],
-                                annotated,
-                                frame_utc_str,
-                                source_monotonic=source_monotonic[i],
-                                media_clock_health=media_clock_health,
-                            )
-                        if show_live or writer or output_image:
-                            annotated_frames.append(annotated)
+                        annotated_frames.append(annotated)
                     if stream_broadcaster:
                         stream_broadcaster.publish_detections(
                             camera_ids[i], det_3d, frame_utc_str

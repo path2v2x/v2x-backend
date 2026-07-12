@@ -357,6 +357,14 @@ class LivePipelineTimestampTests(unittest.TestCase):
             self.instances.append(self)
 
         def start(self):
+            callback = self.kwargs.get("frame_callback")
+            if callback is not None:
+                callback(
+                    np.zeros((8, 8, 3), dtype=np.uint8),
+                    1_000.25,
+                    500.0,
+                    None,
+                )
             return None
 
         def snapshot(self, _after_sequence):
@@ -423,6 +431,9 @@ class LivePipelineTimestampTests(unittest.TestCase):
             self.FakeReader.instances[0].kwargs["connection_max_age_seconds"],
             240.0,
         )
+        self.assertTrue(callable(
+            self.FakeReader.instances[0].kwargs["frame_callback"]
+        ))
 
     @patch("process_video.LiveStreamReader", ThrottledFakeReader)
     def test_live_throttle_does_not_consume_skipped_camera_sequence(self):

@@ -298,6 +298,7 @@ class LiveStreamReader:
         capture_factory,
         recovery,
         state_callback=None,
+        frame_callback=None,
         wall_time=None,
         monotonic=None,
         frame_identity=None,
@@ -319,6 +320,7 @@ class LiveStreamReader:
         self.capture_factory = capture_factory
         self.recovery = recovery
         self.state_callback = state_callback
+        self.frame_callback = frame_callback
         self.wall_time = wall_time or time.time
         self.monotonic = monotonic or time.monotonic
         self.frame_identity = frame_identity or bounded_frame_identity
@@ -747,6 +749,19 @@ class LiveStreamReader:
                             frame_media_clock,
                         )
                         self._condition.notify_all()
+                    if self.frame_callback is not None:
+                        try:
+                            self.frame_callback(
+                                frame,
+                                source_epoch,
+                                source_monotonic,
+                                frame_media_clock,
+                            )
+                        except Exception:
+                            # UI publication is observational and must never
+                            # tear down a trusted capture reader. Health will
+                            # naturally become stale if callbacks keep failing.
+                            pass
             except _ProactiveRenewal:
                 # Keep the broadcaster in its current streaming state and the
                 # latest trusted frame available while a fresh signed session

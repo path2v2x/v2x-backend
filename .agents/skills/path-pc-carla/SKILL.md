@@ -9,8 +9,39 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-12 19:15 UTC; verify rather than assume. This section
+Observed through 2026-07-12 19:27 UTC; verify rather than assume. This section
 overrides older perception candidate and deployment statements below.
+
+- PR 30 merged as canonical
+  `ec3cd60f639e7d591607474d2302b48f73f2fcfe`. Its controlled deployment
+  used verified rollback bundle
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T191545Z/`.
+  Upload-disabled startup, five strict samples, three exact feed verifiers, and
+  LIVE/zero-session observation passed. Upload-enabled startup and five more
+  strict samples also passed, followed by two exact feed verifiers; the third
+  rejected ch1 because its capture timestamp did not advance across two
+  seconds. The candidate was explicitly rolled back to `d54f5df`; the prior
+  unit/environment and all timers are restored, while CARLA/Drive/web remain
+  unchanged. Do not redeploy PR 30 unchanged.
+- The remaining feed failure was an architecture seam: MJPEG publication
+  waited behind four sequential YOLO calls even when the trusted reader was
+  healthy. Candidate `7193bfd8ad1162a33afb7cf535ca8b56bad5f952`
+  publishes a rate-limited raw physical frame directly from each accepted
+  reader callback, with unchanged media-clock assessment, while detection and
+  annotated/offline outputs stay separate. Callback failures cannot reconnect
+  a trusted reader; health becomes stale naturally if publication actually
+  stops. All 97 perception tests pass. An upload-disabled four-camera canary
+  passed 30/30 consecutive exact feed verifiers and 120/120 strict one-second
+  samples across 30-second renewals, with zero reconnects/errors/stale samples,
+  latency maxima ch1/ch2/ch3/ch4 = 7.055/8.376/9.275/8.553 seconds, and
+  publication-age maxima = 3.075/6.296/6.368/5.774 seconds. Cleanup passed.
+  Evidence is
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T192226Z-raw-feed-decoupling-canary/`.
+  This is not live acceptance. Require canonical merge, another fresh verified
+  rollback bundle, upload-disabled then upload-enabled startup, repeated exact
+  feed verifiers, LIVE/zero sessions, a ten-minute renewal watch, and the
+  attended 30-minute plus automated 24-hour gates. Roll back immediately on
+  any unchanged gate.
 
 - PR 29 merged as canonical
   `9d541d2cdc2dfd3fcf86dfbb867129c94c38d12b`. Its controlled deployment

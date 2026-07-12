@@ -319,6 +319,30 @@ class LiveStreamReaderTests(unittest.TestCase):
             release_read.set()
             reader.stop(timeout=2.0)
 
+    def test_frame_callback_receives_each_accepted_frame(self):
+        release_read = threading.Event()
+        callbacks = []
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: ScriptedCapture(
+                ["frame-1"], block_after_frames=release_read
+            ),
+            recovery=StreamRecovery(0.1, 0.1),
+            wall_time=lambda: 1000.25,
+            monotonic=lambda: 500.0,
+            frame_callback=lambda *values: callbacks.append(values),
+        )
+        reader.start()
+        try:
+            self.assertIsNotNone(reader.wait_for_frame(0, timeout=1.0))
+            self.assertTrue(self.wait_until(lambda: len(callbacks) == 1))
+            self.assertEqual(callbacks[0], (
+                "frame-1", 1000.25, 500.0, None
+            ))
+        finally:
+            release_read.set()
+            reader.stop(timeout=2.0)
+
     def test_snapshot_keeps_media_time_separate_from_decode_receipt_time(self):
         release_read = threading.Event()
         clock = FakeMediaClock()
