@@ -339,8 +339,8 @@ def get_video_session_hls_url(stream_name, max_fragments=4):
         max_fragments = int(max_fragments)
     except (TypeError, ValueError) as exc:
         raise ValueError("live HLS fragment count must be an integer") from exc
-    if not 2 <= max_fragments <= 5:
-        raise ValueError("live HLS fragment count must be between 2 and 5")
+    if not 1 <= max_fragments <= 5:
+        raise ValueError("live HLS fragment count must be between 1 and 5")
     response = requests.get(
         f"{api_base_url}/video/session/{camera_id}",
         params={"max_fragments": str(max_fragments)},
@@ -358,7 +358,7 @@ def get_kvs_hls_url(
 ):
     """Return one bounded live session without retaining its signed URL.
 
-    The perception reader may use a two-fragment capture session alongside a
+    The perception reader may use a one-fragment capture session alongside a
     separate five-fragment exact-clock session.  The wider clock window keeps
     the reference fragment available without forcing the decoder to begin
     several fragments behind the live edge.
@@ -366,8 +366,8 @@ def get_kvs_hls_url(
     if max_fragments is None:
         max_fragments = os.getenv("V2X_PERCEPTION_LIVE_HLS_FRAGMENTS", "4")
     max_fragments = int(max_fragments)
-    if not 2 <= max_fragments <= 5:
-        raise ValueError("live HLS fragment count must be between 2 and 5")
+    if not 1 <= max_fragments <= 5:
+        raise ValueError("live HLS fragment count must be between 1 and 5")
     api_hls_url = get_video_session_hls_url(stream_name, max_fragments)
     if api_hls_url:
         return api_hls_url

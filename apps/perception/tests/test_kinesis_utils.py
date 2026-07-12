@@ -224,17 +224,17 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
             {"V2X_VIDEO_SESSION_API_BASE_URL": "https://api.invalid"},
             clear=False,
         ):
-            with self.assertRaisesRegex(ValueError, "between 2 and 5"):
-                get_video_session_hls_url("v2x-backend-cam-ch1", 1)
+            with self.assertRaisesRegex(ValueError, "between 1 and 5"):
+                get_video_session_hls_url("v2x-backend-cam-ch1", 0)
 
     @patch("kinesis_utils.get_video_session_hls_url")
     def test_perception_rejects_fragment_counts_outside_api_bound(self, api):
         with patch.dict(
             "kinesis_utils.os.environ",
-            {"V2X_PERCEPTION_LIVE_HLS_FRAGMENTS": "1"},
+            {"V2X_PERCEPTION_LIVE_HLS_FRAGMENTS": "0"},
             clear=False,
         ):
-            with self.assertRaisesRegex(ValueError, "between 2 and 5"):
+            with self.assertRaisesRegex(ValueError, "between 1 and 5"):
                 get_kvs_hls_url("v2x-backend-cam-ch1")
         api.assert_not_called()
 
@@ -242,7 +242,7 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
     def test_explicit_capture_and_clock_fragment_windows(self, api):
         api.side_effect = ["capture-session", "clock-session"]
         self.assertEqual(
-            get_kvs_hls_url("v2x-backend-cam-ch1", max_fragments=2),
+            get_kvs_hls_url("v2x-backend-cam-ch1", max_fragments=1),
             "capture-session",
         )
         self.assertEqual(
@@ -251,7 +251,7 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
         )
         self.assertEqual(
             [call.args[1] for call in api.call_args_list],
-            [2, 5],
+            [1, 5],
         )
 
 
