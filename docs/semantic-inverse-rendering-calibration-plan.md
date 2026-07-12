@@ -10,8 +10,10 @@ Scope: Path PC V2X UE5.5 worker only. No UE6 resources.
   holdout sets before optimization.
 - Record the UE5 image, binary, map, OpenDRIVE, camera config, service restart,
   timer, and zero-session fingerprints before every rendering window.
-- Use only temporary owned sensors and actors. Destroy them in `finally`; restore
-  timers and LIVE/zero-session state after every window.
+- Run the packaged UE5.5 image as a separate calibration worker on loopback-only
+  ports, with restart disabled and a bounded lifetime. Never point the optimizer
+  at production ports 2000-2002. Use only temporary owned sensors and actors and
+  destroy them in `finally`.
 
 Exit: immutable source corpus, disjoint splits, and a clean safety baseline.
 
@@ -32,7 +34,9 @@ Exit: deterministic candidate rendering plus hash-bound paired semantic targets.
 
 ## 3. Optimize each fixed camera from static geometry
 
-- Search absolute x/y/z, pitch/yaw/roll, and FOV coarse-to-fine. Keep principal
+- Fix the global site/map gauge with surveyed anchors (or one jointly fitted,
+  frozen site SE(2) transform) before interpreting per-camera XY/yaw. Search
+  absolute x/y/z, pitch/yaw/roll, and FOV coarse-to-fine. Keep principal
   point and distortion as sensitivity variables until physically measured.
 - Score class-specific symmetric distance transforms, oriented edge agreement,
   horizon/vanishing-direction error, landmark reprojection, and visible-area
@@ -49,7 +53,7 @@ and does not regress any held-out view.
 
 ## 4. Static held-out acceptance gate
 
-- On untouched frames and annotations require road-geometry RMSE/max <= 6/12 px
+- On untouched frames and annotations require road-boundary P95/max <= 6/12 px
   at 1280 width (scaled at native resolution), point RMSE/P95/max <= 10/16/24 px,
   stable horizon/vanishing directions, and retained four-camera overlays.
 - Report errors per semantic class, spatial quadrant, time window, and camera.
