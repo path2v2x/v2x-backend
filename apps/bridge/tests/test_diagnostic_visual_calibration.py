@@ -16,11 +16,21 @@ from collect_twin_roadline_cloud import (  # noqa: E402
     rgb_road_marking_mask,
 )
 from fit_diagnostic_visual_calibration import (  # noqa: E402
+    CAMERA_FREE_PARAMETERS,
+    LOWER_DELTAS,
+    UPPER_DELTAS,
     candidate_twin_pose,
     line_residual_values,
     nearest_world_points,
     project,
 )
+
+
+def test_diagnostic_bounds_cover_observed_rotation_and_fov_failures():
+    assert LOWER_DELTAS[3] == -45.0 and UPPER_DELTAS[3] == 45.0
+    assert LOWER_DELTAS[5] == -25.0 and UPPER_DELTAS[5] == 25.0
+    assert LOWER_DELTAS[6] == -35.0 and UPPER_DELTAS[6] == 35.0
+    assert all(tuple(indices) == (3, 4, 5, 6) for indices in CAMERA_FREE_PARAMETERS.values())
 
 
 def test_decode_depth_uses_carla_bgra_order():
