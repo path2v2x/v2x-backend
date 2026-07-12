@@ -294,6 +294,53 @@ class LiveStreamReaderTests(unittest.TestCase):
             release_read.set()
             reader.stop(timeout=2.0)
 
+    def test_invalid_clock_mapping_is_discarded_and_reanchored(self):
+        capture = ContinuousCapture("clock-validation")
+        clock_calls = []
+
+        def media_clock_factory(*_args):
+            timestamp = (
+                "2026-07-10T03:57:30.000Z"
+                if not clock_calls
+                else "2026-07-10T03:57:23.388Z"
+            )
+            clock_calls.append(timestamp)
+            return FakeMediaClock(timestamp=timestamp)
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=media_clock_factory,
+            media_clock_validator=lambda clock, _epoch: (
+                clock["media_timestamp_utc"]
+                == "2026-07-10T03:57:23.388Z"
+            ),
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_retry_seconds=0.1,
+        )
+        reader.start()
+        try:
+            sequence = 0
+            snapshot = None
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                candidate = reader.wait_for_frame(sequence, timeout=0.2)
+                if candidate is None:
+                    continue
+                sequence = candidate["sequence"]
+                if candidate.get("media_clock") is not None:
+                    snapshot = candidate
+                    break
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(
+                snapshot["media_clock"]["media_timestamp_utc"],
+                "2026-07-10T03:57:23.388Z",
+            )
+            self.assertGreaterEqual(len(clock_calls), 2)
+        finally:
+            reader.stop(timeout=2.0)
+
     def test_clock_resolution_uses_independent_connection_local_source(self):
         release_read = threading.Event()
         observed_sources = []
