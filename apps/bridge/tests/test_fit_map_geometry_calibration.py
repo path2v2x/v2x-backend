@@ -14,6 +14,7 @@ from fit_map_geometry_calibration import (  # noqa: E402
     fitted_image_line,
     fold_consistency,
     leave_one_polyline_annotations,
+    validate_vanishing_pixel,
     resample_path,
     resolve_polyline,
 )
@@ -135,3 +136,9 @@ def test_fold_consistency_fails_pose_spread_without_weakening_thresholds():
     assert result["passed"] is False
     assert "unstable_forward_offset_m" in result["reasons"]
     assert "unstable_pitch_offset_deg" in result["reasons"]
+
+
+def test_vanishing_point_can_be_outside_image_but_not_unbounded():
+    validate_vanishing_pixel([-150.0, 8.0], 640, 480, "vp")
+    with pytest.raises(ValueError, match="vanishing point"):
+        validate_vanishing_pixel([-7000.0, 8.0], 640, 480, "vp")
