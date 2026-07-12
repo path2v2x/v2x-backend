@@ -962,6 +962,14 @@ class MultiCameraPipeline:
                 return cv2.VideoCapture(source, cv2.CAP_FFMPEG, params)
             return cv2.VideoCapture(source)
 
+        def _validate_media_clock(frame_media_clock, source_epoch):
+            return assess_media_clock(
+                frame_media_clock,
+                source_epoch,
+                minimum_latency_ms=media_clock_min_latency_ms,
+                maximum_latency_ms=media_clock_max_latency_ms,
+            )["trusted"]
+
         if live_mode:
             def _state_callback(index):
                 def callback(state, error, failures, delay_seconds):
@@ -993,6 +1001,7 @@ class MultiCameraPipeline:
                         if capture_backend == "ffmpeg_nvdec"
                         else kinesis_utils.resolve_hls_media_clock
                     ),
+                    media_clock_validator=_validate_media_clock,
                     media_clock_source_factory=(
                         lambda index=index: _clock_source_for(index)
                     ),

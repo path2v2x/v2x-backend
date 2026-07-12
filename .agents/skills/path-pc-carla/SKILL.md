@@ -9,12 +9,12 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed through 2026-07-12 16:55 UTC; verify rather than assume. The following
+Observed through 2026-07-12 17:35 UTC; verify rather than assume. The following
 newest chronology overrides older candidate/deployment statements later in this
 section:
 
 - Canonical `origin/main` is
-  `828bd341d3b700bd9186587317a4589233e43aad` after merged PRs 22-24. The public
+  `e64b9abe559853bfe6b186822996d47778c655c9` after merged PRs 22-25. The public
   browser release was independently proven at merged PR 22 commit
   `d9a6ad8e7d83acad25c315b1f41e7b80cbb4f2d8`: Amplify job 203 succeeded at that
   exact commit and refreshed Playwright CLI evidence at
@@ -55,9 +55,26 @@ section:
   120-second diagnostic completed one staggered, pre-clocked handover per
   camera with zero untrusted/stale samples after initial acquisition, zero
   reconnects, and maxima 5.936/5.665/5.939/8.494 seconds. Treat this as a
-  transport diagnostic only until it passes the full detector pipeline from a
-  clean canonical release branch, source review/tests, controlled live gate,
-  30-minute watch, and 24-hour watch.
+  full detector rerun then passed 120 consecutive strict samples across all
+  four staggered handovers with maxima 8.950/7.431/6.240/5.608 seconds and
+  seven upload-disabled objects. PR 25 merged that candidate as canonical
+  `e64b9abe`.
+  Its controlled live deployment passed startup and the four-feed/zero-session
+  gates, but the strict watch rejected one ch3 frame whose exact media mapping
+  was 3.044 seconds ahead of receipt, outside the existing -1 second trust
+  floor. The deployment was immediately rolled back to `d54f5df`; only
+  perception restarted and CARLA/Drive/web fingerprints plus all timers were
+  preserved. Do not redeploy `e64b9abe` unchanged. Retain the failure at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T172900Z-nvdec-live-renewal-watch/failure.json`
+  and rollback bundle at
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260712T172427Z-perception-nvdec-e64b9abe/`.
+  Kinesis `ListFragments` over 30 minutes showed producer timestamps 0.65-0.76
+  seconds behind AWS server time, while host chrony offset was below 0.3 ms;
+  the rejected -3 second value is therefore an intermittent decoder PTS mapping
+  fault, not a stable physical-camera clock offset. The next candidate must
+  validate every resolved clock before publication/handover, discard and
+  re-anchor an out-of-window mapping, and still pass full detector, controlled
+  live, 30-minute, and 24-hour gates without weakening -1/+10 second bounds.
 
 - The post-hourly clean HLS watch is complete at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T150759Z-post-hourly-clean/`.

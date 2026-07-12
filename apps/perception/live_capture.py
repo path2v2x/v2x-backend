@@ -59,6 +59,7 @@ class _AsyncCapturePreparation:
         clock_source_factory,
         capture_factory,
         media_clock_factory,
+        media_clock_validator,
         capture_position_milliseconds,
         media_frame_identity,
         stop_event,
@@ -69,6 +70,7 @@ class _AsyncCapturePreparation:
         self._clock_source_factory = clock_source_factory
         self._capture_factory = capture_factory
         self._media_clock_factory = media_clock_factory
+        self._media_clock_validator = media_clock_validator
         self._capture_position_milliseconds = capture_position_milliseconds
         self._media_frame_identity = media_frame_identity
         self._stop_event = stop_event
@@ -138,6 +140,18 @@ class _AsyncCapturePreparation:
                 frame_clock = media_clock.metadata_at(position)
                 if frame_clock is None:
                     raise RuntimeError("media clock metadata failed")
+                if (
+                    self._media_clock_validator is not None
+                    and not self._media_clock_validator(
+                        frame_clock, source_epoch
+                    )
+                ):
+                    # A decoder PTS discontinuity can occasionally map a
+                    # genuine frame outside the fixed receipt-time trust
+                    # window. Keep draining and establish a new exact anchor;
+                    # never hand an invalid clock to the active reader.
+                    clock_resolution = None
+                    continue
                 self._result = (
                     capture,
                     frame,
@@ -156,6 +170,7 @@ class _AsyncCapturePreparation:
             self._clock_source_factory = None
             self._capture_factory = None
             self._media_clock_factory = None
+            self._media_clock_validator = None
             self._capture_position_milliseconds = None
             self._media_frame_identity = None
             if capture is not None:
@@ -279,6 +294,7 @@ class LiveStreamReader:
         monotonic=None,
         frame_identity=None,
         media_clock_factory=None,
+        media_clock_validator=None,
         media_clock_source_factory=None,
         capture_position_milliseconds=None,
         media_frame_identity=None,
@@ -298,6 +314,7 @@ class LiveStreamReader:
         self.monotonic = monotonic or time.monotonic
         self.frame_identity = frame_identity or bounded_frame_identity
         self.media_clock_factory = media_clock_factory
+        self.media_clock_validator = media_clock_validator
         self.media_clock_source_factory = media_clock_source_factory
         self.capture_position_milliseconds = capture_position_milliseconds
         self.media_frame_identity = media_frame_identity or exact_frame_identity
@@ -459,6 +476,7 @@ class LiveStreamReader:
                             self.media_clock_source_factory,
                             self.capture_factory,
                             self.media_clock_factory,
+                            self.media_clock_validator,
                             self.capture_position_milliseconds,
                             self.media_frame_identity,
                             self._stop_event,
@@ -596,6 +614,25 @@ class LiveStreamReader:
                             )
                         except (AttributeError, TypeError, ValueError):
                             frame_media_clock = None
+                    if (
+                        frame_media_clock is not None
+                        and self.media_clock_validator is not None
+                        and not self.media_clock_validator(
+                            frame_media_clock, source_epoch
+                        )
+                    ):
+                        # Discard only the frame carrying the invalid mapping
+                        # and re-anchor from a later exact frame. The last
+                        # trusted published frame remains subject to the normal
+                        # freshness deadline, so a persistent fault still
+                        # fails closed as stale.
+                        media_clock = None
+                        clock_resolution = None
+                        next_media_clock_retry = (
+                            self.monotonic()
+                            + self.media_clock_retry_seconds
+                        )
+                        continue
                     self._remember_frame_identity(identity)
                     self._consecutive_duplicate_frames = 0
                     self.recovery.record_success()
