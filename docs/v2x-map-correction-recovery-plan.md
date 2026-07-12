@@ -1,7 +1,7 @@
 # V2X Richmond UE5.5 map-correction recovery plan
 
-Status: acceptance-blocking, source-only plan. No production or live service
-mutation is authorized by this document.
+Status: acceptance-blocking, isolated UE5.5 migration in progress. No
+production or live service mutation is authorized by this document.
 
 ## Proven failure
 
@@ -30,6 +30,14 @@ mutation is authorized by this document.
   `New_RFS/Richmond_Field_Station_Richmond_CA.uasset`, but its complete Git tree
   has no `.rrscene`, FBX, OBJ, USD, glTF, OpenDRIVE, GIS, Blender, Maya, or 3ds
   Max source for Richmond.
+- The latest retained `Richmond_NR.umap` and
+  `New_RFS/Richmond_Field_Station_Richmond_CA.uasset` are materially distinct
+  from the older deployed import. The scene asset preserves a newer source
+  filename (`C:/Users/123/Downloads/Unreal_Exports/` followed by
+  `Richmond_Field_Station_Richmond_CA.fbx`) and explicit `Terrain_Marking` and
+  `Roads_Marking` hierarchies. This is enough to justify an isolated editor
+  migration/visual test, but it is not raw authoring source, survey truth, or
+  acceptance evidence.
 - The retained UE4 import metadata names the missing original export exactly:
   `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. The file is not
   present in the repository, Path PC V2X-owned directories, or the Path PC's
@@ -46,13 +54,15 @@ mutation is authorized by this document.
 - A local UE5.5 comparison workspace belongs to the separate UE6 comparison
   task and uses cross-task content. It is excluded from V2X inspection,
   modification, build, and evidence.
-- The Path PC root filesystem currently has about 6 GB free. Its second NVMe
-  has an unmounted Windows NTFS volume with about 877 GB free; a read-only audit
-  found no Richmond source and left it unmounted. A dedicated clean CARLA UE5.5
-  source plus engine/content build needs roughly 250 GB on a Linux-compatible
-  filesystem. Reserving a large loop-backed ext4 image or repartitioning the
-  Windows volume is a separate storage authorization; do not assume it, and do
-  not reuse, delete, or mutate another task's workspace to manufacture capacity.
+- The root filesystem remains intentionally unused for the build. The approved
+  secondary-volume route is now implemented as one removable 500 GB sparse
+  ext4 image at `/mnt/v2x-capacity/v2x-ue5-build.ext4`, mounted at
+  `/mnt/v2x-ue5` through an `ntfs-3g` outer mount. The normal ext4 format has
+  about 32 million inodes and currently leaves more than 400 GB free. The first
+  kernel-`ntfs3` attempt and a second low-inode `largefile4` attempt were
+  discarded without touching pre-existing Windows data. No persistent mount
+  entry exists; both mounts and physical sparse allocation must be verified
+  after reboot.
 
 ## Accepted recovery routes
 
@@ -79,8 +89,8 @@ homographies.
 ## Implementation gate
 
 1. Provision at least 250 GB of dedicated Linux-compatible free space without
-   deleting another task's data. The unused Windows volume is a capacity option
-   only after explicit authorization of its storage impact.
+   deleting another task's data. **Satisfied for isolated build work** by the
+   removable `/mnt/v2x-ue5` image above; this does not authorize production.
 2. Create a dedicated clean V2X CARLA `ue5-dev` worktree and dedicated CARLA
    Unreal Engine 5.5 build path. It may not share content, build products,
    processes, ports, or evidence with UE6.
@@ -106,8 +116,12 @@ homographies.
 
 ## Current executable action
 
-Remain fail-closed. Recover the exact original `Richmond.fbx`/RoadRunner source
-or Route B survey control, restore access to the recorded 158 GB export if it
-contains that source, and provision dedicated disk capacity. Until both source
-truth and capacity exist, continue only hash-bound offline evidence/tooling and
-regression work; do not deploy a camera pose or place acceptance actors.
+Complete the hash-bound LFS materialization at Richmond commit `d14da5b`, finish
+the clean CARLA `ue5-dev` plus `CarlaUnreal/UnrealEngine` `ue5-dev-carla`
+workspace, and migrate a copy of the latest retained `New_RFS` dependency graph
+into the isolated UE5.5 editor. Render the four fixed camera regions and first
+test crosswalk/road topology on fit/development imagery. Reject the retained
+asset route if the same camera-independent topology contradiction remains.
+Even if the visual topology improves, production remains closed until the
+independent survey and measured-intrinsics gates are supplied and pass. Do not
+deploy a camera pose or place acceptance actors before those gates.

@@ -9,7 +9,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed through 2026-07-12 12:45 UTC; verify rather than assume:
+Observed through 2026-07-12 13:48 UTC; verify rather than assume:
 
 - Canonical `origin/main`, the clean live checkout, the Amplify mirror, and
   successful production Amplify job 202 are exact commit
@@ -84,6 +84,27 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   hls.js whenever Media Source Extensions are supported and reserve native HLS
   for Safari/fallback. Require all four video elements to remain playing with
   no media error across the renewed clean watch.
+  The globally serialized browser candidate later exposed two isolated
+  `/video/coverage` 502s at 13:31 UTC. Both responses had the exact 100-byte
+  `video_coverage_unavailable` shape for
+  `ClientLimitExceededException`, after 4.81/3.74-second requests. Commit
+  `fda0d41` adds a narrow, jittered three-attempt retry for only transient
+  Kinesis conditions; authorization/configuration errors still fail
+  immediately. It was deployed at 13:40 UTC from reviewed state hash
+  `dff605961d94b4b7616f752f41a74baee66451dc1f12f6c96420f1998c6f04de`.
+  Rollback evidence, including the prior Lambda zip and prior IAM/API state, is
+  `/home/path/V2XCarla/v2x-backend-backups/read-api-reconciliation/v2x-backend-read-20260712T134008Z-dff605961d94/`.
+  Immediate post-apply canaries passed all four direct sessions, all four
+  browser sessions, and all four four-hour coverage calls. Commit `b25720c`
+  removes the underlying continuous-load pattern by aligning four-hour windows,
+  caching complete historical chunks, re-fetching only the live-edge chunk,
+  and refreshing optional coverage every five minutes. Web tests are 130/130,
+  the production build is clean, and `svelte-check` reports zero errors and
+  zero warnings. A fresh Playwright CLI watch started at 13:44:42 UTC; its
+  initial 28 aligned historical/live-edge calls all returned 200 and all four
+  2560x1920 videos played without media error. Do not call it a 30-minute pass
+  until the full interval and renewal/refresh cycles complete, and still require
+  the separate 24-hour watch.
   This is a candidate-browser pass, not a public-production pass: Amplify is
   still connected to `michaelvu1207/v2x-backend-amplify` at main commit
   `d54f5df`, so the public app has not yet received the browser-route change.
@@ -109,6 +130,11 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   denominators/minimum sample counts, blind identity adjudication, per-axis
   pixel scaling, and 30-minute plus 24-hour deployment watches. Do not use an
   older plan as authority.
+  Fresh high-effort Fable review attempts after the 13:48 UTC map-plan update
+  still fail before reading the file because Claude CLI reports an expired,
+  non-refreshable OAuth session. Do not describe the updated map plan as newly
+  Fable-reviewed until that external authentication works; retain the fixed
+  contract and continue only work that cannot weaken its gates.
 - Current static evidence still fails. Clean, vehicle-resistant fit/dev/holdout
   composites from three independent KVS windows per camera are retained at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260712T072000Z-temporal-static-targets-v3/`.
@@ -159,8 +185,27 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   UE's 183,000+ source files; only partial V2X clones existed and were discarded.
   The current normal ext4 image exposes about 32 million inodes, initially used
   about 10 MB physical space, and left existing Windows data unchanged. Clean
-  Epic UE 5.5.4, CARLA `ue5-dev`, and Richmond `d14da5b` inputs are being cloned
-  only into this V2X mount. The root filesystem and all UE6/comparison paths
+  CARLA `ue5-dev` commit `6279162d1836024488474d3e5b2a5737ce57bb63`
+  is complete. The engine checkout has been corrected from stock Epic 5.5.4 to
+  CARLA's required `CarlaUnreal/UnrealEngine` `ue5-dev-carla` commit
+  `2ac0528831e08e80784df2759db9a2c592d3bd4d`; fork dependencies are downloading
+  at background CPU/disk priority and the checkout must eventually be named
+  `/mnt/v2x-ue5/src/UnrealEngine5_carla`. The clean Richmond source checkout is
+  fixed at `d14da5b57bbe4356930a2b9a926a675692e18547`; its full LFS pull is still
+  materializing 7,063 Content files. A probe proved the latest retained
+  `Richmond_NR.umap` references
+  `New_RFS/Richmond_Field_Station_Richmond_CA.uasset`; that scene asset retains
+  a distinct newer source path,
+  `C:/Users/123/Downloads/Unreal_Exports/Richmond_Field_Station_Richmond_CA.fbx`,
+  plus `Terrain_Marking` and `Roads_Marking` scene hierarchies. This is a real
+  candidate map revision, not accepted geometry and not a substitute for the
+  independent survey gate. A clean 64-bit UE Viewer build at source commit
+  `a0bfb468d42be831b126632fd8a0ae6b3614f981` can enumerate the UE4.26 assets,
+  bounds, imports, and source models, but reports zero cooked/render LODs for
+  the editor-only road meshes and therefore cannot export their vertices. Do
+  not mislabel that as an empty map; it proves the CARLA UE5.5 editor migration
+  remains necessary. All inputs and build products remain only in this
+  V2X mount. The root filesystem and all UE6/comparison paths
   remain excluded. After any reboot, verify both mounts and the image allocation
   before resuming; no persistent mount entry has been installed yet. The UE4
   import metadata names the missing authoring file
@@ -222,13 +267,14 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   placed and road/crosswalk geometry is misregistered. Treat this as
   counter-evidence, not acceptance. Refresh the browser evidence after any
   deployed candidate; prior screenshots never transfer to a new fingerprint.
-- Fresh local Playwright CLI baseline at
+- The superseded local Playwright CLI baseline at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T122000Z-calibration-baseline/`
   shows all four `/live` physical feeds visible, but `/timeline` still renders
   only ch2 while ch1/ch3/ch4 are black, the global header reports zero cameras
-  and zero FPS, and the object table is stale. This is current counter-evidence;
-  infrastructure HTTP success and the passing four-feed CLI verifier do not
-  make the timeline UI an acceptance pass.
+  and zero FPS, and the object table is stale. Infrastructure HTTP success and
+  the passing four-feed CLI verifier did not make that timeline UI an
+  acceptance pass. Use the newer 13:44 UTC candidate watch described above;
+  retain this black-frame result as before-state evidence.
 
 ## Safety boundaries
 
