@@ -134,6 +134,16 @@ class DeploymentArtifactContractTest(unittest.TestCase):
         self.assertLess(lambda_apply_at, iam_apply_at)
         self.assertNotIn("<<PY", script)
 
+    def test_existing_lambda_configuration_is_reconciled_before_new_code(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "provision-read-api.sh").read_text(encoding="utf-8")
+        existing_at = script.index('if [[ "${READ_LAMBDA_EXISTS}" == "true" ]]')
+        configuration_at = script.index(
+            "aws lambda update-function-configuration", existing_at
+        )
+        code_at = script.index("aws lambda update-function-code", existing_at)
+        self.assertLess(configuration_at, code_at)
+
     def test_proxy_state_has_lifecycle_and_session_mint_throttle(self):
         root = Path(__file__).resolve().parents[1]
         script = (root / "provision-read-api.sh").read_text(encoding="utf-8")
@@ -165,7 +175,7 @@ TEST_ENVIRONMENT = {
 }
 
 
-def load_generated_lambda(fake_table, fake_s3=None):
+def load_generated_lambda(fake_table, fake_s3=None, environment=None):
     fake_s3 = fake_s3 or FakeS3()
     boto3 = types.ModuleType("boto3")
     boto3.resource = lambda _service: types.SimpleNamespace(
@@ -203,7 +213,11 @@ def load_generated_lambda(fake_table, fake_s3=None):
     sys.modules["botocore.exceptions"] = botocore_exceptions
     try:
         namespace = {"__name__": "generated_read_api"}
-        with patch.dict(os.environ, TEST_ENVIRONMENT, clear=False):
+        with patch.dict(
+            os.environ,
+            TEST_ENVIRONMENT if environment is None else environment,
+            clear=True,
+        ):
             exec(compile(generated_lambda_source(), "generated-index.py", "exec"), namespace)
         return namespace
     finally:
@@ -212,6 +226,25 @@ def load_generated_lambda(fake_table, fake_s3=None):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+
+class DeploymentCompatibilityTest(unittest.TestCase):
+    def test_new_proxy_settings_have_safe_old_environment_defaults(self):
+        old_environment = dict(TEST_ENVIRONMENT)
+        for name in (
+            "HLS_PROXY_PREFIX",
+            "HLS_PROXY_FETCH_TIMEOUT_SECONDS",
+            "HLS_PROXY_PLAYLIST_MAX_BYTES",
+            "HLS_PROXY_SEGMENT_MAX_BYTES",
+        ):
+            old_environment.pop(name)
+        module = load_generated_lambda(
+            FakeTable(), FakeS3(), environment=old_environment
+        )
+        self.assertEqual(module["HLS_PROXY_PREFIX"], "hls-proxy/v1/")
+        self.assertEqual(module["HLS_PROXY_FETCH_TIMEOUT_SECONDS"], 8)
+        self.assertEqual(module["HLS_PROXY_PLAYLIST_MAX_BYTES"], 1048576)
+        self.assertEqual(module["HLS_PROXY_SEGMENT_MAX_BYTES"], 4194304)
 
 
 class RecentDetectionsTest(unittest.TestCase):

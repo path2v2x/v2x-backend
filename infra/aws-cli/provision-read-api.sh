@@ -736,17 +736,6 @@ if [[ "${READ_LAMBDA_EXISTS}" == "true" ]]; then
     '{Variables: ((.Configuration.Environment.Variables // {}) + $desired[0])}' \
     <<<"${READ_FUNCTION_JSON}" >"${environment_file}"
 
-  candidate_sha256="$(openssl dgst -sha256 -binary "${WORKDIR}/function.zip" | base64 -w 0)"
-  current_sha256="$(jq -r '.Configuration.CodeSha256 // ""' <<<"${READ_FUNCTION_JSON}")"
-  if [[ "${candidate_sha256}" != "${current_sha256}" ]]; then
-    aws lambda update-function-code \
-      --function-name "${READ_LAMBDA_NAME}" \
-      --zip-file "fileb://${WORKDIR}/function.zip" >/dev/null
-    aws lambda wait function-updated --function-name "${READ_LAMBDA_NAME}"
-  else
-    echo "Lambda code already matches the deterministic package; keeping it unchanged."
-  fi
-
   current_timeout="$(jq -r '.Configuration.Timeout // 0' <<<"${READ_FUNCTION_JSON}")"
   current_environment="$(jq -Sc '.Configuration.Environment.Variables // {}' <<<"${READ_FUNCTION_JSON}")"
   desired_environment="$(jq -Sc '.Variables' "${environment_file}")"
@@ -758,6 +747,20 @@ if [[ "${READ_LAMBDA_EXISTS}" == "true" ]]; then
     aws lambda wait function-updated --function-name "${READ_LAMBDA_NAME}"
   else
     echo "Lambda configuration already matches; keeping it unchanged."
+  fi
+
+  # Existing code tolerates additional environment variables, while the new
+  # artifact may require them. Reconcile configuration first so no invocation
+  # can observe new code with the old environment during an in-place update.
+  candidate_sha256="$(openssl dgst -sha256 -binary "${WORKDIR}/function.zip" | base64 -w 0)"
+  current_sha256="$(jq -r '.Configuration.CodeSha256 // ""' <<<"${READ_FUNCTION_JSON}")"
+  if [[ "${candidate_sha256}" != "${current_sha256}" ]]; then
+    aws lambda update-function-code \
+      --function-name "${READ_LAMBDA_NAME}" \
+      --zip-file "fileb://${WORKDIR}/function.zip" >/dev/null
+    aws lambda wait function-updated --function-name "${READ_LAMBDA_NAME}"
+  else
+    echo "Lambda code already matches the deterministic package; keeping it unchanged."
   fi
 else
   jq -n --slurpfile desired "${desired_vars_file}" '{Variables: $desired[0]}' >"${environment_file}"

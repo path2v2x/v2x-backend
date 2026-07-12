@@ -68,7 +68,15 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   `v2x-perception.service` remained active with `NRestarts=0` and current schema-v2
   uploads continued. This specifically closes the regression that forced the
   first proxy canary rollback, but it does not replace the 30-minute/24-hour
-  production watch gates.
+  production watch gates. The same browser watch later exposed two transient
+  CH2 `/video/coverage` 502s because the page issued six ListFragments windows
+  concurrently for each stream. The next source candidate serializes chunks
+  within each camera while retaining cross-camera parallelism and refuses
+  overlapping refreshes. Also retain the deployment-compatibility fix: new HLS
+  proxy settings have safe defaults and existing Lambda configuration is
+  reconciled before new code. The 12:40 apply briefly produced two
+  `HLS_PROXY_PREFIX` import failures while code preceded environment; do not
+  call that canary a clean 30-minute pass or repeat the unsafe order.
   This is a candidate-browser pass, not a public-production pass: Amplify is
   still connected to `michaelvu1207/v2x-backend-amplify` at main commit
   `d54f5df`, so the public app has not yet received the browser-route change.
@@ -133,12 +141,19 @@ Observed through 2026-07-12 12:45 UTC; verify rather than assume:
   editor assets but remains UE4.26 and has no raw RoadRunner/FBX/OBJ/USD/GIS
   source. The production image is cooked-only. The only local comparison
   workspace with UE5.5 source belongs to the separate UE6 comparison task and
-  is ineligible for V2X. A dedicated clean V2X UE5.5 source/engine build needs
-  roughly 250 GB; the Path PC root currently has about 6 GB free. A read-only
-  audit found 877 GB free on the unmounted Windows NTFS volume, but no Richmond
-  source; it was unmounted unchanged and is not a Linux build volume without a
-  separate storage decision. Do not delete or reuse another task's workspace
-  to create capacity. The UE4 import metadata names the missing authoring file
+  is ineligible for V2X. Do not delete, inspect, or reuse it. A dedicated clean
+  V2X UE5.5 migration workspace now exists at `/mnt/v2x-ue5` on a 500 GB
+  loop-backed ext4 image stored as the single removable file
+  `/mnt/v2x-capacity/v2x-ue5-build.ext4` on the secondary Windows volume. The
+  outer NTFS mount intentionally uses `ntfs-3g`; the kernel `ntfs3` driver
+  materialized the whole sparse file during the first bounded attempt, which
+  was stopped and removed before retrying. The accepted image initially used
+  about 10 MB physical space and left existing Windows data unchanged. Clean
+  Epic UE 5.5.4, CARLA `ue5-dev`, and Richmond `d14da5b` inputs are being cloned
+  only into this V2X mount. The root filesystem and all UE6/comparison paths
+  remain excluded. After any reboot, verify both mounts and the image allocation
+  before resuming; no persistent mount entry has been installed yet. The UE4
+  import metadata names the missing authoring file
   as `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. A Drive
   inventory records a 158 GB Richmond export dated 2026-03-30, but its linked
   folder now returns 404 and read-only Drive/Slack searches found no replacement.

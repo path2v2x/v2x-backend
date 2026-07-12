@@ -6,10 +6,10 @@
 	import TimelineStrip from '$lib/components/TimelineStrip.svelte';
 	import RecentDetectionsPanel from '$lib/components/RecentDetectionsPanel.svelte';
 	import { fetchDetectionTimeline, fetchVideoCoverage } from '$lib/api';
+	import { fetchCameraCoverageSequentially } from '$lib/video-coverage';
 	import { loadRuntimeConfig, type RuntimeConfig } from '$lib/runtime-config';
 	import {
 		TIMELINE_SPAN_MS,
-		mergeCoverageIntervals,
 		parseIsoMs,
 		toIsoMillis,
 		windowForCursor,
@@ -31,6 +31,7 @@
 	let timeline = $state<DetectionTimeline | null>(null);
 	let coverageByCamera = $state<Record<string, VideoCoverage>>({});
 	let timelineError = $state<string | null>(null);
+	let coverageLoading = false;
 
 	let cameraIds = $derived(runtimeConfig?.videoCameraIds ?? ['ch1', 'ch2', 'ch3', 'ch4']);
 	// Quantised to 10s steps so playback doesn't re-query the DB on every tick.
@@ -62,52 +63,38 @@
 	}
 
 	async function loadCoverage() {
+		if (coverageLoading) return;
+		coverageLoading = true;
 		const end = Date.now();
 		const start = end - TIMELINE_SPAN_MS;
 		// The Lambda pages ListFragments sequentially and can't sweep 24h of
 		// ~2s fragments inside API Gateway's 30s limit — fan out 4h chunks
 		// per camera and merge the intervals client-side.
 		const CHUNK_MS = 4 * 60 * 60 * 1000;
-		const chunks: { start: number; end: number }[] = [];
-		for (let t = start; t < end; t += CHUNK_MS) {
-			chunks.push({ start: t, end: Math.min(t + CHUNK_MS, end) });
+		try {
+			// Run different streams in parallel, but never overlap ListFragments
+			// calls for the same Kinesis stream.
+			const results = await Promise.allSettled(
+				cameraIds.map((cameraId) =>
+					fetchCameraCoverageSequentially(
+						cameraId,
+						start,
+						end,
+						CHUNK_MS,
+						fetchVideoCoverage
+					)
+				)
+			);
+			const next: Record<string, VideoCoverage> = { ...coverageByCamera };
+			results.forEach((result, i) => {
+				if (result.status === 'fulfilled') {
+					next[cameraIds[i]] = result.value;
+				}
+			});
+			coverageByCamera = next;
+		} finally {
+			coverageLoading = false;
 		}
-		const results = await Promise.allSettled(
-			cameraIds.map(async (cameraId) => {
-				const parts = await Promise.allSettled(
-					chunks.map((chunk) =>
-						fetchVideoCoverage(cameraId, {
-							start: toIsoMillis(chunk.start),
-							end: toIsoMillis(chunk.end)
-						})
-					)
-				);
-				const intervals = parts.flatMap((part) =>
-					part.status === 'fulfilled' ? part.value.intervals : []
-				);
-				const fragmentCount = parts.reduce(
-					(sum, part) => sum + (part.status === 'fulfilled' ? part.value.fragmentCount : 0),
-					0
-				);
-				return {
-					cameraId,
-					start: toIsoMillis(start),
-					end: toIsoMillis(end),
-					intervals: mergeCoverageIntervals(intervals),
-					fragmentCount,
-					truncated: parts.some(
-						(part) => part.status === 'fulfilled' && part.value.truncated
-					)
-				} satisfies VideoCoverage;
-			})
-		);
-		const next: Record<string, VideoCoverage> = {};
-		results.forEach((result, i) => {
-			if (result.status === 'fulfilled') {
-				next[cameraIds[i]] = result.value;
-			}
-		});
-		coverageByCamera = next;
 	}
 
 	function goLive() {
