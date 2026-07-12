@@ -214,6 +214,34 @@ class LiveStreamReaderTests(unittest.TestCase):
             release_read.set()
             reader.stop(timeout=2.0)
 
+    def test_clock_resolution_uses_independent_connection_local_source(self):
+        release_read = threading.Event()
+        observed_sources = []
+
+        def resolve(source, _frame, _position, _identity):
+            observed_sources.append(source)
+            return FakeMediaClock()
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "capture-session",
+            capture_factory=lambda source: ScriptedCapture(
+                [f"{source}-frame"], block_after_frames=release_read
+            ),
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=resolve,
+            media_clock_source_factory=lambda: "clock-session",
+            capture_position_milliseconds=lambda _cap: 0.0,
+        )
+        reader.start()
+        try:
+            snapshot = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(snapshot)
+            self.assertIsNotNone(snapshot["media_clock"])
+            self.assertEqual(observed_sources, ["clock-session"])
+        finally:
+            release_read.set()
+            reader.stop(timeout=2.0)
+
     def test_media_clock_failure_does_not_hide_a_decodable_frame(self):
         release_read = threading.Event()
         reader = LiveStreamReader(
@@ -236,6 +264,39 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertIsNone(snapshot["media_clock"])
         finally:
             release_read.set()
+            reader.stop(timeout=2.0)
+
+    def test_slow_media_clock_resolution_does_not_pause_live_capture(self):
+        allow_next = threading.Event()
+        release_clock = threading.Event()
+        capture = GatedPositionCapture(
+            ["frame-1", "frame-2"], [0.0, 100.0], allow_next
+        )
+
+        def slow_clock(*_args):
+            release_clock.wait(1.0)
+            return FakeMediaClock()
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=slow_clock,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_initial_wait_seconds=0.0,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            self.assertIsNone(first["media_clock"])
+            allow_next.set()
+            second = reader.wait_for_frame(first["sequence"], timeout=0.5)
+            self.assertIsNotNone(second)
+            self.assertIsNone(second["media_clock"])
+        finally:
+            release_clock.set()
+            allow_next.set()
             reader.stop(timeout=2.0)
 
     def test_unmatched_clock_retries_on_a_later_frame(self):

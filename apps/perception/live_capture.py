@@ -19,6 +19,37 @@ class _ProactiveRenewal(Exception):
     """Internal control flow for rotating a signed source before expiry."""
 
 
+class _AsyncMediaClockResolution:
+    """Resolve one exact media-clock anchor without pausing live capture."""
+
+    def __init__(self, factory, args):
+        self._factory = factory
+        self._args = args
+        self._done = threading.Event()
+        self._result = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._result = self._factory(*self._args)
+        except Exception:
+            # Clock evidence is additive and fail-closed. The live reader must
+            # keep decoding while a bounded metadata fetch/match fails.
+            self._result = None
+        finally:
+            # Drop the signed source URL and reference frame as soon as the
+            # resolver finishes; neither value is published or logged.
+            self._factory = None
+            self._args = None
+            self._done.set()
+
+    def poll(self, timeout=0.0):
+        if not self._done.wait(max(0.0, float(timeout))):
+            return False, None
+        return True, self._result
+
+
 def _bounded_bytes(value, limit=32_768):
     """Return a bounded byte representation without copying a full frame."""
     if isinstance(value, bytes):
@@ -120,9 +151,11 @@ class LiveStreamReader:
         monotonic=None,
         frame_identity=None,
         media_clock_factory=None,
+        media_clock_source_factory=None,
         capture_position_milliseconds=None,
         media_frame_identity=None,
         media_clock_retry_seconds=2.0,
+        media_clock_initial_wait_seconds=0.05,
         frame_identity_history_size=256,
         duplicate_frame_limit=90,
         connection_max_age_seconds=None,
@@ -135,10 +168,14 @@ class LiveStreamReader:
         self.monotonic = monotonic or time.monotonic
         self.frame_identity = frame_identity or bounded_frame_identity
         self.media_clock_factory = media_clock_factory
+        self.media_clock_source_factory = media_clock_source_factory
         self.capture_position_milliseconds = capture_position_milliseconds
         self.media_frame_identity = media_frame_identity or exact_frame_identity
         self.media_clock_retry_seconds = max(
             0.1, float(media_clock_retry_seconds)
+        )
+        self.media_clock_initial_wait_seconds = max(
+            0.0, min(0.25, float(media_clock_initial_wait_seconds))
         )
         self.frame_identity_history_size = max(
             1, int(frame_identity_history_size)
@@ -234,11 +271,18 @@ class LiveStreamReader:
 
             cap = None
             try:
-                # Keep this signed URL only in the connection-local stack so an
-                # exact clock can be retried/re-anchored. Never publish, log, or
-                # retain it in reader state; renew it on every outer attempt.
+                # Keep signed URLs only in the connection-local stack. The
+                # optional longer clock window is independent of the shortest
+                # safe live-edge capture window. Never publish, log, or retain
+                # either URL in reader state; renew both on every outer attempt.
                 source = self.source_factory()
+                clock_source = (
+                    self.media_clock_source_factory()
+                    if self.media_clock_source_factory is not None
+                    else source
+                )
                 media_clock = None
+                clock_resolution = None
                 next_media_clock_retry = 0.0
                 last_capture_position = None
                 cap = self.capture_factory(source)
@@ -246,6 +290,7 @@ class LiveStreamReader:
                     raise RuntimeError("capture open failed")
                 if self.media_clock_factory is None:
                     source = None
+                    clock_source = None
 
                 connected = False
                 connection_started = self.monotonic()
@@ -289,31 +334,47 @@ class LiveStreamReader:
                         # A discontinuity/PTS reset invalidates the prior UTC
                         # mapping. Re-match this exact frame before trusting it.
                         media_clock = None
+                        clock_resolution = None
                         next_media_clock_retry = 0.0
                     if capture_position is not None:
                         last_capture_position = capture_position
+                    if media_clock is None and clock_resolution is not None:
+                        resolved, candidate = clock_resolution.poll()
+                        if resolved:
+                            clock_resolution = None
+                            media_clock = candidate
+                            if media_clock is None:
+                                next_media_clock_retry = (
+                                    self.monotonic()
+                                    + self.media_clock_retry_seconds
+                                )
                     if (
                         media_clock is None
+                        and clock_resolution is None
                         and self.media_clock_factory is not None
                         and capture_position is not None
                         and source_monotonic >= next_media_clock_retry
                     ):
-                        try:
-                            media_clock = self.media_clock_factory(
-                                source,
+                        clock_resolution = _AsyncMediaClockResolution(
+                            self.media_clock_factory,
+                            (
+                                clock_source,
                                 frame,
                                 capture_position,
                                 self.media_frame_identity,
-                            )
-                        except Exception:
-                            # Clock metadata is additive. A temporary playlist,
-                            # fragment, or match failure must not hide a
-                            # decodable safety feed.
-                            media_clock = None
-                        if media_clock is None:
-                            next_media_clock_retry = (
-                                self.monotonic() + self.media_clock_retry_seconds
-                            )
+                            ),
+                        )
+                        resolved, candidate = clock_resolution.poll(
+                            self.media_clock_initial_wait_seconds
+                        )
+                        if resolved:
+                            clock_resolution = None
+                            media_clock = candidate
+                            if media_clock is None:
+                                next_media_clock_retry = (
+                                    self.monotonic()
+                                    + self.media_clock_retry_seconds
+                                )
                     if (
                         media_clock is not None
                         and capture_position is not None

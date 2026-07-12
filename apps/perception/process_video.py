@@ -1600,6 +1600,27 @@ class MultiCameraPipeline:
         duplicate_frame_limit = int(env_float(
             "V2X_PERCEPTION_DUPLICATE_FRAME_LIMIT", 90
         ))
+        proactive_renew_seconds = env_float(
+            "V2X_PERCEPTION_PROACTIVE_RENEW_SEC", 240.0
+        )
+        if not 30.0 <= proactive_renew_seconds <= 270.0:
+            raise ValueError(
+                "V2X_PERCEPTION_PROACTIVE_RENEW_SEC must be between 30 and 270"
+            )
+        capture_hls_fragments = int(env_float(
+            "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 2
+        ))
+        clock_hls_fragments = int(env_float(
+            "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS", 5
+        ))
+        if not 2 <= capture_hls_fragments <= 3:
+            raise ValueError(
+                "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS must be 2 or 3"
+            )
+        if not 4 <= clock_hls_fragments <= 5:
+            raise ValueError(
+                "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS must be 4 or 5"
+            )
         media_clock_min_latency_ms = env_float(
             "V2X_PERCEPTION_MEDIA_CLOCK_MIN_LATENCY_MS", -1_000.0
         )
@@ -1615,7 +1636,17 @@ class MultiCameraPipeline:
         def _source_for(index):
             path = str(video_paths[index])
             if "v2x-backend-cam" in path:
-                return kinesis_utils.get_kvs_hls_url(path)
+                return kinesis_utils.get_kvs_hls_url(
+                    path, max_fragments=capture_hls_fragments
+                )
+            return path
+
+        def _clock_source_for(index):
+            path = str(video_paths[index])
+            if "v2x-backend-cam" in path:
+                return kinesis_utils.get_kvs_hls_url(
+                    path, max_fragments=clock_hls_fragments
+                )
             return path
 
         def _open_capture(source, live):
@@ -1658,11 +1689,15 @@ class MultiCameraPipeline:
                     recovery=recovery,
                     state_callback=_state_callback(index),
                     media_clock_factory=kinesis_utils.resolve_hls_media_clock,
+                    media_clock_source_factory=(
+                        lambda index=index: _clock_source_for(index)
+                    ),
                     capture_position_milliseconds=lambda cap: cap.get(
                         cv2.CAP_PROP_POS_MSEC
                     ),
                     frame_identity_history_size=frame_identity_history_size,
                     duplicate_frame_limit=duplicate_frame_limit,
+                    connection_max_age_seconds=proactive_renew_seconds,
                 )
                 live_readers.append(reader)
         else:
