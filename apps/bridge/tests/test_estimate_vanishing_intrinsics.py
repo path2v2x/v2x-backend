@@ -30,6 +30,7 @@ def physical_lines(vanishing_point, anchors, split_frames):
         toward = anchor + 0.25 * (vanishing - anchor)
         values.append({
             "id": f"line-{frame_id}-{index}",
+            "physical_line_id": f"paint-{frame_id}-{index}",
             "frame_id": frame_id,
             "endpoints": [anchor.tolist(), toward.tolist()],
             "uncertainty_px": 1.0,
@@ -104,6 +105,16 @@ def test_principal_point_sensitivity_is_reported():
     sensitivity = result["principal_point_sensitivity"]
     assert len(sensitivity["solutions"]) == 9
     assert math.isfinite(sensitivity["relative_focal_spread"])
+
+
+def test_near_collinear_fragments_cannot_inflate_line_count():
+    left, right, centre, width, height, _expected = synthetic_pair()
+    duplicate = dict(left[0])
+    duplicate["id"] = "fragment-with-a-new-id"
+    duplicate["physical_line_id"] = "fragment-with-a-new-physical-id"
+    duplicate["endpoints"] = [[320.0, 310.0], [270.0, 285.0]]
+    with pytest.raises(VanishingCalibrationError, match="near-collinear"):
+        evaluate_pair(left + [duplicate], right, centre, width, height)
 
 
 def test_cli_binds_distinct_frames_and_writes_initialization(tmp_path):
