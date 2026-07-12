@@ -235,6 +235,61 @@ def buffer_statistics(decoded):
     }
 
 
+def decode_rgb_depth_buffers(frames):
+    if set(frames) != {"rgb", "depth"}:
+        raise RenderError("RGB+depth mode received an unexpected sensor set")
+    raw = {name: bgra_array(frame) for name, frame in frames.items()}
+    rgb = raw["rgb"][:, :, :3][:, :, ::-1]
+    depth_bgra = raw["depth"].astype(np.float64)
+    normalized_depth = (
+        depth_bgra[:, :, 2]
+        + depth_bgra[:, :, 1] * 256.0
+        + depth_bgra[:, :, 0] * 65536.0
+    ) / 16777215.0
+    depth_m = (normalized_depth * 1000.0).astype(np.float32)
+    return raw, rgb, depth_m
+
+
+def rgb_depth_statistics(decoded):
+    _raw, _rgb, depth_m = decoded
+    finite_depth = depth_m[np.isfinite(depth_m)]
+    if finite_depth.size == 0:
+        raise RenderError("RGB+depth render has no finite depth values")
+    return {
+        "semantic_tags": {"captured": False, "usable_for_class_alignment": False},
+        "instance": {"captured": False, "usable_for_static_instances": False},
+        "depth_meters": {
+            "finite_fraction": float(finite_depth.size / depth_m.size),
+            "minimum": float(np.min(finite_depth)),
+            "median": float(np.median(finite_depth)),
+            "p99": float(np.quantile(finite_depth, 0.99)),
+            "maximum": float(np.max(finite_depth)),
+        },
+    }
+
+
+def validate_degenerate_segmentation_evidence(path):
+    path = Path(path).resolve()
+    raw = path.read_bytes()
+    report = json.loads(raw)
+    statistics = report.get("buffer_statistics") or {}
+    semantic = statistics.get("semantic_tags") or {}
+    instance = statistics.get("instance") or {}
+    if (
+        report.get("schema") != OUTPUT_SCHEMA
+        or report.get("acceptance_eligible") is not False
+        or report.get("map_name") != EXPECTED_MAP_NAME
+        or report.get("opendrive_sha256") != EXPECTED_OPENDRIVE_SHA256
+        or (report.get("worker") or {}).get("image_id") != EXPECTED_IMAGE_ID
+        or semantic.get("usable_for_class_alignment") is not False
+        or instance.get("usable_for_static_instances") is not False
+        or semantic.get("dominant_fraction", 0.0) < 0.999
+        or instance.get("sentinel_fraction", 0.0) < 0.999
+    ):
+        raise RenderError("segmentation-degeneracy evidence is invalid")
+    return {"path": str(path), "sha256": sha256_bytes(raw)}
+
+
 def wait_for_frame(sensor_queue, target_frame, timeout_seconds):
     while True:
         try:
@@ -300,10 +355,37 @@ def write_outputs(directory, frames, decoded):
     return output_file_metadata(directory, names)
 
 
+def write_rgb_depth_outputs(directory, frames, decoded):
+    raw, rgb, depth_m = decoded
+    Image.fromarray(rgb).save(directory / "rgb.png")
+    np.save(directory / "depth-meters.npy", depth_m, allow_pickle=False)
+    for name, value in raw.items():
+        (directory / f"{name}.bgra").write_bytes(value.tobytes(order="C"))
+    names = [
+        "rgb.png",
+        "depth-meters.npy",
+        *[f"{name}.bgra" for name in sorted(frames)],
+    ]
+    return output_file_metadata(directory, names)
+
+
 def render(args):
     validate_endpoint(args.host, args.port, args.container)
     if not args.authorized_isolated_worker:
         raise RenderError("--authorized-isolated-worker is required")
+    degeneration_evidence = None
+    sensor_blueprints = SENSOR_BLUEPRINTS
+    if args.rgb_depth_only:
+        if not args.known_degenerate_segmentation_render:
+            raise RenderError(
+                "RGB+depth mode requires --known-degenerate-segmentation-render"
+            )
+        degeneration_evidence = validate_degenerate_segmentation_evidence(
+            args.known_degenerate_segmentation_render
+        )
+        sensor_blueprints = {
+            key: SENSOR_BLUEPRINTS[key] for key in ("rgb", "depth")
+        }
     worker = inspect_worker(args.container)
     cameras_path = Path(args.cameras_json).resolve()
     cameras_bytes = cameras_path.read_bytes()
@@ -359,7 +441,7 @@ def render(args):
         world.apply_settings(synchronous_settings)
         transform = compute_twin_camera_transform(carla_map, config["site"], camera)
         library = world.get_blueprint_library()
-        for name, blueprint_id in SENSOR_BLUEPRINTS.items():
+        for name, blueprint_id in sensor_blueprints.items():
             blueprint = library.find(blueprint_id)
             configure_blueprint(
                 blueprint, camera, args.width, args.height, role_name
@@ -369,9 +451,14 @@ def render(args):
         frame_id, frames = capture_synchronized(
             world, sensors, args.timeout_seconds
         )
-        decoded = decode_buffers(frames)
-        files = write_outputs(temporary, frames, decoded)
-        statistics = buffer_statistics(decoded)
+        if args.rgb_depth_only:
+            decoded = decode_rgb_depth_buffers(frames)
+            files = write_rgb_depth_outputs(temporary, frames, decoded)
+            statistics = rgb_depth_statistics(decoded)
+        else:
+            decoded = decode_buffers(frames)
+            files = write_outputs(temporary, frames, decoded)
+            statistics = buffer_statistics(decoded)
         frame_timestamps = {
             name: float(frame.timestamp) for name, frame in frames.items()
         }
@@ -399,7 +486,7 @@ def render(args):
             result = actor.destroy() if actor.is_alive else True
             destroyed[name] = bool(result is not False and not actor.is_alive)
         world.apply_settings(original_settings)
-    if set(destroyed) != set(SENSOR_BLUEPRINTS) or not all(destroyed.values()):
+    if set(destroyed) != set(sensor_blueprints) or not all(destroyed.values()):
         shutil.rmtree(temporary, ignore_errors=True)
         raise RenderError("temporary calibration sensor cleanup failed")
     try:
@@ -429,16 +516,29 @@ def render(args):
         "twin_pose": twin_pose,
         "files": files,
         "buffer_statistics": statistics,
+        "modalities": sorted(sensor_blueprints),
+        "known_degenerate_segmentation_evidence": degeneration_evidence,
         "temporary_sensors_destroyed": destroyed,
         "buffer_encodings": {
             "raw": "CARLA BGRA uint8 row-major",
-            "semantic_tags": "CARLA semantic tag from raw R channel",
-            "instance_ids": "uint16 from raw G*256+B",
             "depth_meters": "float32 metric depth from CARLA 24-bit encoding",
+            **(
+                {}
+                if args.rgb_depth_only
+                else {
+                    "semantic_tags": "CARLA semantic tag from raw R channel",
+                    "instance_ids": "uint16 from raw G*256+B",
+                }
+            ),
         },
         "limitations": [
             "diagnostic_render_is_not_camera_calibration_acceptance",
             "physical_intrinsics_and_site_gauge_must_be_independently_constrained",
+            *(
+                ["segmentation_omitted_only_after_bound_degeneracy_evidence"]
+                if args.rgb_depth_only
+                else []
+            ),
         ],
     }
     (temporary / "render.json").write_text(
@@ -461,6 +561,8 @@ def main(argv=None):
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument("--authorized-isolated-worker", action="store_true")
+    parser.add_argument("--rgb-depth-only", action="store_true")
+    parser.add_argument("--known-degenerate-segmentation-render")
     args = parser.parse_args(argv)
     if not 320 <= args.width <= 2560 or not 240 <= args.height <= 1920:
         parser.error("render dimensions are outside the bounded range")

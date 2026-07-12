@@ -17,6 +17,8 @@ from render_semantic_calibration_candidate import (  # noqa: E402
     RenderError,
     buffer_statistics,
     decode_buffers,
+    decode_rgb_depth_buffers,
+    rgb_depth_statistics,
     validate_candidate,
     validate_endpoint,
     validate_worker_inspect,
@@ -135,3 +137,20 @@ def test_buffer_decoding_is_explicit_and_lossless():
     assert statistics["semantic_tags"]["usable_for_class_alignment"] is False
     assert statistics["instance"]["usable_for_static_instances"] is False
     assert statistics["depth_meters"]["finite_fraction"] == 1.0
+
+
+def test_rgb_depth_mode_rejects_extra_modalities_and_reports_missing_segmentation():
+    frames = {
+        "rgb": Frame([10, 20, 30, 255]),
+        "depth": Frame([0, 0, 0, 255]),
+    }
+    decoded = decode_rgb_depth_buffers(frames)
+    statistics = rgb_depth_statistics(decoded)
+    assert statistics["semantic_tags"] == {
+        "captured": False,
+        "usable_for_class_alignment": False,
+    }
+    assert statistics["depth_meters"]["finite_fraction"] == 1.0
+    frames["semantic"] = Frame([0, 0, 7, 255])
+    with pytest.raises(RenderError):
+        decode_rgb_depth_buffers(frames)
