@@ -47,6 +47,7 @@ expected_trusted_arn="arn:aws:iam::${ACCOUNT_ID}:user/${TRUSTED_USER_NAME}"
 expected_deploy_arn="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 expected_lambda_arn="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${READ_LAMBDA_NAME}"
 expected_api_root="arn:aws:apigateway:${AWS_REGION}::/apis/${API_ID}"
+expected_log_group="arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/${READ_LAMBDA_NAME}"
 
 if ! jq -e --arg arn "$expected_trusted_arn" '
   .Statement | length == 1
@@ -68,13 +69,31 @@ fi
 
 if ! jq -e \
   --arg lambda "$expected_lambda_arn" \
-  --arg api "$expected_api_root" '
+  --arg api "$expected_api_root" \
+  --arg logGroup "$expected_log_group" '
     any(.Statement[]; .Resource == $lambda)
     and any(.Statement[]; ((.Resource | arrays) // []) | any(. == $api))
+    and any(.Statement[];
+      ((.Action | arrays) // []) as $actions
+      | (($actions | index("cloudwatch:GetMetricStatistics")) != null)
+        and .Resource == "*")
+    and any(.Statement[];
+      ((.Action | arrays) // []) as $actions
+      | ((.Resource | arrays) // []) as $resources
+      | (($actions | index("logs:FilterLogEvents")) != null)
+        and (($resources | index($logGroup)) != null))
     and ([.Statement[].Action] | flatten | index("iam:PassRole") == null)
     and ([.Statement[].Action] | flatten | index("iam:*") == null)
     and ([.Statement[].Action] | flatten | index("lambda:CreateFunction") == null)
-    and ([.Statement[].Action] | flatten | index("apigateway:DELETE") == null)' \
+    and ([.Statement[].Action] | flatten | index("apigateway:DELETE") == null)
+    and ([.Statement[].Action] | flatten | map(select(startswith("cloudwatch:")))
+      | all(. == "cloudwatch:GetMetricData"
+        or . == "cloudwatch:GetMetricStatistics"
+        or . == "cloudwatch:ListMetrics"))
+    and ([.Statement[].Action] | flatten | map(select(startswith("logs:")))
+      | all(. == "logs:DescribeLogStreams"
+        or . == "logs:FilterLogEvents"
+        or . == "logs:GetLogEvents"))' \
   "$PERMISSIONS_POLICY_FILE" >/dev/null; then
   echo "Permissions policy is not the reviewed existing-resource-only V2X policy." >&2
   exit 3
@@ -87,6 +106,7 @@ echo "  trust=$expected_trusted_arn (only)"
 echo "  sourceUserPolicy=${TRUSTED_USER_NAME}/${ASSUME_USER_POLICY_NAME} (assume only this deploy role)"
 echo "  api=$API_ID region=$AWS_REGION"
 echo "  lambda=$READ_LAMBDA_NAME"
+echo "  observability=read-only CloudWatch metrics and /aws/lambda/$READ_LAMBDA_NAME logs"
 echo "  iamPassRole=omitted (existing Lambda keeps its role)"
 echo "  createFunction=denied"
 echo "  amplifyServiceRole=unchanged"
