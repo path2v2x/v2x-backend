@@ -9,6 +9,7 @@ and missing evidence.  It never changes either repository or a live service.
 
 import argparse
 import ast
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -16,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import re
 
 import numpy as np
 from scipy.optimize import minimize
@@ -131,6 +133,144 @@ def parse_runtime_camera_calls(path):
     if not cameras:
         raise ValueError("no legacy VideoObjectDetector camera definitions found")
     return cameras
+
+
+def parse_calibration_csv(path, image_width, image_height):
+    required = {
+        "Point_ID", "u_pixel", "v_pixel", "True_X_m", "True_Z_m",
+        "Pred_X_m", "Pred_Z_m", "Error_X_m", "Error_Z_m", "Total_Error_m",
+    }
+    with Path(path).open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        if set(reader.fieldnames or ()) != required:
+            raise ValueError(f"{path}: calibration CSV columns are unsupported")
+        rows = list(reader)
+    if len(rows) < 3:
+        raise ValueError(f"{path}: calibration CSV has fewer than three rows")
+    points, stored = [], []
+    for index, row in enumerate(rows, start=1):
+        if int(row["Point_ID"]) != index:
+            raise ValueError(f"{path}: Point_ID sequence is not contiguous")
+        values = {key: float(row[key]) for key in required - {"Point_ID"}}
+        if not all(math.isfinite(value) for value in values.values()):
+            raise ValueError(f"{path}: calibration CSV contains non-finite values")
+        if not 0 <= values["u_pixel"] < image_width or not 0 <= values["v_pixel"] < image_height:
+            raise ValueError(f"{path}: calibration pixel falls outside the nominal image")
+        recomputed = math.hypot(
+            values["Pred_X_m"] - values["True_X_m"],
+            values["Pred_Z_m"] - values["True_Z_m"],
+        )
+        if not math.isclose(recomputed, values["Total_Error_m"], abs_tol=0.002):
+            raise ValueError(f"{path}: stored total error is internally inconsistent")
+        points.append({
+            "u": values["u_pixel"],
+            "v": values["v_pixel"],
+            "true_X": values["True_X_m"],
+            "true_Z": values["True_Z_m"],
+        })
+        stored.append(values["Total_Error_m"])
+    return points, stored
+
+
+def normalized_angle_delta(left, right):
+    return (float(left) - float(right) + 180.0) % 360.0 - 180.0
+
+
+def rounded_csv_matches_script_points(csv_points, script_points):
+    if len(csv_points) != len(script_points):
+        return False
+    fields = ("u", "v", "true_X", "true_Z")
+    return all(
+        all(
+            math.isclose(
+                float(csv_point[field]), float(script_point[field]),
+                abs_tol=0.011 if field in {"u", "v"} else 0.00051,
+            )
+            for field in fields
+        )
+        for csv_point, script_point in zip(csv_points, script_points)
+    )
+
+
+def predict_local(matrix, point, height_m, pitch_deg, yaw_deg):
+    fx, fy = matrix[0, 0], matrix[1, 1]
+    cx, cy = matrix[0, 2], matrix[1, 2]
+    pitch, yaw = np.radians([pitch_deg, yaw_deg])
+    rx = np.asarray([
+        [1, 0, 0],
+        [0, math.cos(pitch), -math.sin(pitch)],
+        [0, math.sin(pitch), math.cos(pitch)],
+    ])
+    ry = np.asarray([
+        [math.cos(yaw), 0, math.sin(yaw)],
+        [0, 1, 0],
+        [-math.sin(yaw), 0, math.cos(yaw)],
+    ])
+    ray = ry @ rx @ np.asarray([
+        (point["u"] - cx) / fx,
+        (point["v"] - cy) / fy,
+        1.0,
+    ])
+    if ray[1] <= 1e-6:
+        return None
+    scale = height_m / ray[1]
+    return np.asarray([scale * ray[0], scale * ray[2]])
+
+
+def audit_csv_dataset(matrix, points, stored_errors, height_m, runtime_camera):
+    fitted = fit_pitch_yaw(matrix, points, height_m)
+    holdout_errors, parameters = [], []
+    for index, point in enumerate(points):
+        training = points[:index] + points[index + 1:]
+        fold = fit_pitch_yaw(matrix, training, height_m)
+        prediction = predict_local(
+            matrix, point, height_m, fold["pitch_deg"], fold["yaw_deg"]
+        )
+        if prediction is None:
+            holdout_errors.append(1_000_000.0)
+        else:
+            holdout_errors.append(float(np.linalg.norm(
+                prediction - np.asarray([point["true_X"], point["true_Z"]])
+            )))
+        parameters.append([fold["pitch_deg"], fold["yaw_deg"]])
+    parameters = np.asarray(parameters)
+    yaw_center = fitted["yaw_deg"]
+    normalized_yaw = np.asarray([
+        yaw_center + normalized_angle_delta(value, yaw_center)
+        for value in parameters[:, 1]
+    ])
+    holdout_errors = np.asarray(holdout_errors)
+    return {
+        "point_count": len(points),
+        "data_geometry": data_geometry(points, matrix[0, 2] * 2, matrix[1, 2] * 2),
+        "stored_error_m": {
+            "mean": float(np.mean(stored_errors)),
+            "rmse": float(math.sqrt(np.mean(np.asarray(stored_errors) ** 2))),
+            "max": float(np.max(stored_errors)),
+        },
+        "reproduced_fit": fitted,
+        "leave_one_out_error_m": {
+            "median": float(np.median(holdout_errors)),
+            "rmse": float(math.sqrt(np.mean(holdout_errors**2))),
+            "max": float(np.max(holdout_errors)),
+        },
+        "leave_one_out_parameter_range_deg": {
+            "pitch": float(np.ptp(parameters[:, 0])),
+            "yaw_normalized": float(np.ptp(normalized_yaw)),
+        },
+        "fit_minus_same_label_runtime_deg": {
+            "pitch": fitted["pitch_deg"] - float(runtime_camera["pitch_deg"]),
+            "yaw": normalized_angle_delta(fitted["yaw_deg"], runtime_camera["yaw_deg"]),
+        },
+        "acceptance_eligible": False,
+        "limitations": [
+            "no_source_frame_hash",
+            "no_global_landmark_ids",
+            "camera_local_coordinates_only",
+            "no_survey_method_or_units_artifact_beyond_column_names",
+            "csv_channel_label_not_bound_to_image_or_script_revision",
+        ],
+    }
 
 
 def data_geometry(points, image_width, image_height):
@@ -281,6 +421,7 @@ def build_report(
     camera_config,
     repository,
     camera_config_repository,
+    calibration_csvs=(),
 ):
     repository = Path(repository).resolve()
     calibration_binding = bind_repository_input(repository, calibration_script)
@@ -308,6 +449,34 @@ def build_report(
         raise ValueError("legacy calibration pixels fall outside current image bounds")
     geometry = data_geometry(points, image_width, image_height)
     fit = fit_pitch_yaw(matrix, points, float(runtime["ch4"]["height_m"]))
+    csv_reports = {}
+    active_csv_matches = []
+    for csv_path in calibration_csvs:
+        csv_path = Path(csv_path).resolve()
+        match = re.fullmatch(r"(ch[1-4])_calibration_errors\.csv", csv_path.name)
+        if not match:
+            raise ValueError(f"unexpected calibration CSV name: {csv_path.name}")
+        camera_id = match.group(1)
+        csv_points, stored_errors = parse_calibration_csv(
+            csv_path, image_width, image_height
+        )
+        csv_reports[camera_id] = {
+            "path": str(csv_path),
+            "sha256": sha256(csv_path),
+            **audit_csv_dataset(
+                matrix, csv_points, stored_errors,
+                float(runtime[camera_id]["height_m"]), runtime[camera_id],
+            ),
+        }
+        if rounded_csv_matches_script_points(csv_points, points):
+            active_csv_matches.append(camera_id)
+    declared_match = re.search(
+        r"Use these numbers for Channel\s+([1-4])!",
+        Path(calibration_script).read_text(),
+    )
+    declared_script_channel = (
+        f"ch{declared_match.group(1)}" if declared_match else None
+    )
     expected_matrix = np.asarray([
         [current_intrinsics["fx"], 0.0, current_intrinsics["cx"]],
         [0.0, current_intrinsics["fy"], current_intrinsics["cy"]],
@@ -327,6 +496,14 @@ def build_report(
         "no_survey_provenance",
         "camera_local_point_generation_may_be_circular",
     ])
+    if csv_reports and not active_csv_matches:
+        failures.append("active_script_points_match_no_preserved_channel_csv")
+    if (
+        declared_script_channel
+        and active_csv_matches
+        and declared_script_channel not in active_csv_matches
+    ):
+        failures.append("active_script_channel_comment_disagrees_with_matching_csv")
     if abs(fit["pitch_deg"] - runtime["ch4"]["pitch_deg"]) > 1.0:
         failures.append("reproduced_pitch_disagrees_with_runtime")
     if abs(fit["yaw_deg"] - runtime["ch4"]["yaw_deg"]) > 1.0:
@@ -362,6 +539,9 @@ def build_report(
         "data_geometry": geometry,
         "reproduced_ch4_fit": fit,
         "legacy_runtime_cameras": runtime,
+        "preserved_channel_csvs": csv_reports,
+        "active_script_points_match_csv_labels": active_csv_matches,
+        "active_script_declared_channel_comment": declared_script_channel,
         "current_ch4": {
             key: configured["ch4"][key]
             for key in ("height_m", "pitch_deg", "yaw_deg", "heading_deg", "intrinsics")
@@ -381,6 +561,7 @@ def parse_args():
     parser.add_argument("--runtime-script", type=Path, required=True)
     parser.add_argument("--camera-config", type=Path, required=True)
     parser.add_argument("--camera-config-repository", type=Path, required=True)
+    parser.add_argument("--calibration-csv", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -393,6 +574,7 @@ def main():
         args.camera_config,
         args.repository,
         args.camera_config_repository,
+        args.calibration_csv,
     )
     write_json_exclusive(args.output, report)
     print(json.dumps({
