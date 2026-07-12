@@ -14,6 +14,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 from verify_live_feeds import (  # noqa: E402
     CAMERA_IDS,
+    DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS,
     DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS,
     DEFAULT_SAMPLE_INTERVAL_SECONDS,
     VerificationError,
@@ -31,6 +32,7 @@ class LiveFeedVerifierTests(unittest.TestCase):
             "identical_frames": False,
             "advance_timestamps": True,
             "inference_hold_samples": 0,
+            "capture_hold_samples": 0,
             "decode_latency_ms": 500.0,
             "media_time_trusted": True,
             "base_time": datetime.now(timezone.utc) - timedelta(seconds=1),
@@ -60,7 +62,11 @@ class LiveFeedVerifierTests(unittest.TestCase):
                 if self.path == "/health":
                     state["health_samples"] += 1
                     sample = state["health_samples"]
-                    timestamp = self.timestamp(sample)
+                    capture_sample = max(
+                        1,
+                        sample - state["capture_hold_samples"],
+                    )
+                    timestamp = self.timestamp(capture_sample)
                     self.send_json({
                         "status": "ok",
                         "ready": True,
@@ -69,7 +75,7 @@ class LiveFeedVerifierTests(unittest.TestCase):
                                 "state": "streaming",
                                 "fresh": True,
                                 "source_updated_at": timestamp,
-                                "frame_count": 100 + sample,
+                                "frame_count": 100 + capture_sample,
                                 "inference_frame_count": 100 + max(
                                     1,
                                     sample - state["inference_hold_samples"],
@@ -153,6 +159,7 @@ class LiveFeedVerifierTests(unittest.TestCase):
 
     def test_verifies_advancing_times_and_two_changed_frames_per_camera(self):
         self.assertEqual(DEFAULT_SAMPLE_INTERVAL_SECONDS, 3.0)
+        self.assertEqual(DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS, 5.0)
         self.assertEqual(DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS, 10.0)
         result = verify_live_feeds(
             self.base_url,
@@ -207,6 +214,35 @@ class LiveFeedVerifierTests(unittest.TestCase):
             self.assertGreater(
                 camera["inference_frame_counts"][1],
                 camera["inference_frame_counts"][0],
+            )
+
+    def test_polls_through_a_phase_aliased_capture_sample(self):
+        self.state["capture_hold_samples"] = 2
+        result = verify_live_feeds(
+            self.base_url,
+            sample_interval_seconds=0,
+            max_age_seconds=10,
+            timeout_seconds=2,
+            capture_progress_timeout_seconds=1,
+            inference_progress_timeout_seconds=1,
+            inference_poll_interval_seconds=0,
+        )
+        for camera in result.values():
+            self.assertGreater(camera["capture_times"][1], camera["capture_times"][0])
+
+    def test_capture_progress_deadline_fails_closed(self):
+        self.state["capture_hold_samples"] = 1_000_000
+        with self.assertRaisesRegex(
+            VerificationError, "capture did not advance within deadline"
+        ):
+            verify_live_feeds(
+                self.base_url,
+                sample_interval_seconds=0,
+                max_age_seconds=10,
+                timeout_seconds=2,
+                capture_progress_timeout_seconds=0.005,
+                inference_progress_timeout_seconds=1,
+                inference_poll_interval_seconds=0.001,
             )
 
     def test_inference_progress_deadline_fails_closed(self):

@@ -12,6 +12,27 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 Observed through 2026-07-12 20:25 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
+- PR 33 merged as canonical
+  `001bc6a0401752b0cae1e9cebc5bd03c83c670ec`. Its controlled
+  upload-disabled startup passed inference-aware readiness, five strict
+  samples, five complete feed checks, and LIVE/zero sessions. After uploads
+  were enabled, readiness passed but the first fixed three-second feed pair
+  caught ch1 on the same completed-fragment boundary. The unchanged freshness,
+  trust, latency, and inference gates were still healthy. Automatic rollback
+  restored `d54f5df`, the old unit/environment, perception, and all timers;
+  retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T204500Z-pr33-canonical-startup/`.
+  Do not redeploy PR 33 with a fixed raw-capture sleep.
+- Candidate `eaba2d9ef78aead6a80627f0875924caddc049b4` also treats raw
+  progress as an explicit deadline. It keeps the initial three-second sample,
+  then polls the raw frame counter for at most five seconds—slightly more than
+  two measured 2.002-second fragments—while polling inference for at most ten.
+  It still rejects regression immediately and preserves the 15-second
+  timestamp, trusted-clock, and -1,000/+10,000 ms latency gates. All 133
+  perception tests pass. Require canonical merge and repeat the full controlled
+  startup/watch sequence; prior runtime canary evidence covers the unchanged
+  service code but does not replace a live verifier gate for this commit.
+
 - PR 32 merged as canonical
   `21554f18f523fdc577c8524623534a60b0ebf500`. A controlled live startup at
   `/home/path/V2XCarla/v2x-evidence/perception/20260712T200300Z-pr32-cadence-aware-startup/`

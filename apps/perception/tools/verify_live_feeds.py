@@ -26,6 +26,7 @@ CAMERA_IDS = ("ch1", "ch2", "ch3", "ch4")
 # completed frame twice. This is an observation window, not a freshness gate;
 # the independent max-age and per-second health watches remain unchanged.
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 3.0
+DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS = 5.0
 DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS = 10.0
 INFERENCE_POLL_INTERVAL_SECONDS = 0.25
 
@@ -305,6 +306,9 @@ def verify_live_feeds(
     max_age_seconds=15.0,
     timeout_seconds=20.0,
     stream_path_template="/streams/{camera_id}.mjpg",
+    capture_progress_timeout_seconds=(
+        DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS
+    ),
     inference_progress_timeout_seconds=(
         DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS
     ),
@@ -322,16 +326,22 @@ def verify_live_feeds(
     ):
         raise VerificationError("stream path template is invalid")
 
+    capture_progress_timeout_seconds = float(
+        capture_progress_timeout_seconds
+    )
     inference_progress_timeout_seconds = float(
         inference_progress_timeout_seconds
     )
     inference_poll_interval_seconds = float(inference_poll_interval_seconds)
+    if capture_progress_timeout_seconds <= 0:
+        raise VerificationError("capture progress timeout must be positive")
     if inference_progress_timeout_seconds <= 0:
         raise VerificationError("inference progress timeout must be positive")
     if inference_poll_interval_seconds < 0:
         raise VerificationError("inference poll interval cannot be negative")
 
     first = _collect_timestamp_sample(base_url, timeout_seconds)
+    capture_deadline = time.monotonic() + capture_progress_timeout_seconds
     inference_deadline = (
         time.monotonic() + inference_progress_timeout_seconds
     )
@@ -342,9 +352,19 @@ def verify_live_feeds(
         second,
         max_age_seconds,
         require_inference_progress=False,
+        require_capture_progress=False,
     )
 
-    progressed = {
+    capture_progressed = {
+        camera_id: second[camera_id]
+        for camera_id in CAMERA_IDS
+        if (
+            second[camera_id]["frame_count"]
+            > first[camera_id]["frame_count"]
+            and second[camera_id]["capture"] > first[camera_id]["capture"]
+        )
+    }
+    inference_progressed = {
         camera_id: second[camera_id]
         for camera_id in CAMERA_IDS
         if (
@@ -354,15 +374,38 @@ def verify_live_feeds(
         )
     }
     previous = second
-    while len(progressed) != len(CAMERA_IDS):
-        remaining = inference_deadline - time.monotonic()
-        if remaining <= 0:
-            missing = sorted(set(CAMERA_IDS) - set(progressed))
+    while (
+        len(capture_progressed) != len(CAMERA_IDS)
+        or len(inference_progressed) != len(CAMERA_IDS)
+    ):
+        now_monotonic = time.monotonic()
+        if (
+            len(capture_progressed) != len(CAMERA_IDS)
+            and now_monotonic >= capture_deadline
+        ):
+            missing = sorted(set(CAMERA_IDS) - set(capture_progressed))
+            raise VerificationError(
+                "capture did not advance within deadline for "
+                + ",".join(missing)
+            )
+        if (
+            len(inference_progressed) != len(CAMERA_IDS)
+            and now_monotonic >= inference_deadline
+        ):
+            missing = sorted(set(CAMERA_IDS) - set(inference_progressed))
             raise VerificationError(
                 "inference did not advance within deadline for "
                 + ",".join(missing)
             )
-        time.sleep(min(inference_poll_interval_seconds, remaining))
+        remaining_deadlines = []
+        if len(capture_progressed) != len(CAMERA_IDS):
+            remaining_deadlines.append(capture_deadline - now_monotonic)
+        if len(inference_progressed) != len(CAMERA_IDS):
+            remaining_deadlines.append(inference_deadline - now_monotonic)
+        time.sleep(min(
+            inference_poll_interval_seconds,
+            max(0.0, min(remaining_deadlines)),
+        ))
         current = _collect_timestamp_sample(base_url, timeout_seconds)
         _validate_timestamp_samples(
             previous,
@@ -372,20 +415,33 @@ def verify_live_feeds(
             require_capture_progress=False,
         )
         for camera_id in CAMERA_IDS:
-            if camera_id in progressed:
+            if (
+                camera_id not in capture_progressed
+                and current[camera_id]["frame_count"]
+                > first[camera_id]["frame_count"]
+                and current[camera_id]["capture"]
+                > first[camera_id]["capture"]
+            ):
+                capture_progressed[camera_id] = current[camera_id]
+            if camera_id in inference_progressed:
                 continue
             if (
                 current[camera_id]["inference_frame_count"]
                 > first[camera_id]["inference_frame_count"]
                 and current[camera_id]["event"] > first[camera_id]["event"]
             ):
-                progressed[camera_id] = current[camera_id]
+                inference_progressed[camera_id] = current[camera_id]
         previous = current
 
-    final = {
-        camera_id: progressed[camera_id]
-        for camera_id in CAMERA_IDS
-    }
+    final = {}
+    for camera_id in CAMERA_IDS:
+        final[camera_id] = dict(inference_progressed[camera_id])
+        final[camera_id]["capture"] = capture_progressed[camera_id][
+            "capture"
+        ]
+        final[camera_id]["frame_count"] = capture_progressed[camera_id][
+            "frame_count"
+        ]
     output = _validate_timestamp_samples(
         first,
         final,
@@ -429,6 +485,12 @@ def main(argv=None):
     )
     parser.add_argument("--max-age", type=float, default=15.0)
     parser.add_argument(
+        "--capture-progress-timeout",
+        type=float,
+        default=DEFAULT_CAPTURE_PROGRESS_TIMEOUT_SECONDS,
+        help="maximum seconds for every raw capture counter to advance",
+    )
+    parser.add_argument(
         "--inference-progress-timeout",
         type=float,
         default=DEFAULT_INFERENCE_PROGRESS_TIMEOUT_SECONDS,
@@ -446,6 +508,7 @@ def main(argv=None):
             max_age_seconds=args.max_age,
             timeout_seconds=args.timeout,
             stream_path_template=args.stream_path_template,
+            capture_progress_timeout_seconds=args.capture_progress_timeout,
             inference_progress_timeout_seconds=(
                 args.inference_progress_timeout
             ),
