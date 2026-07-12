@@ -9,8 +9,37 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-12 20:25 UTC; verify rather than assume. These items
+Observed through 2026-07-12 21:38 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
+
+- PR 34 merged as canonical
+  `b64f1f81e8d455c197cb5ac09a42ce4ec2a2b432`. After an unrelated
+  San Ramon/replay preflight block and the normal hourly Richmond reset, its
+  controlled upload-disabled and upload-enabled startup passed five strict
+  samples plus five complete feed checks in each mode. The uninterrupted
+  ten-minute watch then passed 600/600 strict samples, ten feed rounds, full
+  decoder turnover, fresh schema-v2 persistence, Richmond/LIVE/zero sessions,
+  and unchanged service fingerprints. Evidence is
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T210400Z-pr34-live-watch-10m/`.
+- The attended 30-minute watch passed 1,310 strict samples and 22 feed rounds,
+  then feed round 23 rejected ch2 because its raw frame counter did not advance
+  inside the five-second deadline. The retained one-second trace shows normal
+  updates followed by one frame held for 4.943 seconds; media remained trusted,
+  decode latency was 984.688 ms, inference age was 4.783 seconds, and reconnect
+  count stayed zero. The verifier's inherited rollback trap stopped perception,
+  so the concurrent sampler's connection refusal was a consequence, not an
+  independent crash. Automatic rollback restored `d54f5df`, the old
+  unit/environment, perception, and all timers. Retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T211600Z-pr34-live-watch-30m/`.
+  Do not deploy PR 34 unchanged.
+- Candidate `6ab99a8f7fb6d7028c225c2abef656cb8997f0f3` sets raw progress
+  to the same explicit ten-second deadline as inference. This remains stricter
+  than the unchanged 15-second freshness gate and matches the existing
+  +10-second trusted media-clock budget; timestamp/counter regression still
+  fails immediately. Runtime service code is unchanged from the passing
+  canary. All 133 perception tests pass. Require canonical merge and repeat the
+  full controlled startup, uninterrupted ten-minute, and attended 30-minute
+  gates before starting the automated 24-hour watch.
 
 - PR 33 merged as canonical
   `001bc6a0401752b0cae1e9cebc5bd03c83c670ec`. Its controlled
