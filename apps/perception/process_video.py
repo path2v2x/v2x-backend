@@ -703,7 +703,12 @@ def compute_geohash(lat, lon, precision=5):
     return "".join(geohash)
 
 class MultiCameraPipeline:
-    def __init__(self, detectors, perception_run_id=None):
+    def __init__(
+        self,
+        detectors,
+        perception_run_id=None,
+        cross_camera_vehicle_association=None,
+    ):
         """
         Initialize the MultiCameraPipeline.
 
@@ -722,6 +727,13 @@ class MultiCameraPipeline:
             uuid.UUID(str(perception_run_id or uuid.uuid4()))
         )
         self.perception_run_prefix = self.perception_run_id.replace("-", "")[:8]
+        if cross_camera_vehicle_association is None:
+            cross_camera_vehicle_association = env_bool(
+                "V2X_PERCEPTION_CROSS_CAMERA_VEHICLE_ASSOCIATION", False
+            )
+        self.cross_camera_vehicle_association = bool(
+            cross_camera_vehicle_association
+        )
         self.extractor = AppearanceExtractor()
 
     @staticmethod
@@ -773,6 +785,12 @@ class MultiCameraPipeline:
                 if new_det['device_id'] == existing_det['device_id']:
                     continue
 
+                if (
+                    new_det['object_type'] in {'car', 'truck', 'bus'}
+                    and not self.cross_camera_vehicle_association
+                ):
+                    continue
+
                 dist = self.haversine_distance_meters(
                     new_det['gps_location']['latitude'],
                     new_det['gps_location']['longitude'],
@@ -817,8 +835,27 @@ class MultiCameraPipeline:
                     if gid in claimed_gids:
                         continue
 
+                    # A second local track on the same physical camera is an
+                    # identity conflict, not cross-camera corroboration. Until
+                    # a separate, evidence-backed tracker-handoff model exists,
+                    # fail closed instead of merging two simultaneous/nearby
+                    # vehicles under one global object ID.
+                    device_track_id = track.get("device_tracks", {}).get(
+                        det["device_id"]
+                    )
+                    if (
+                        device_track_id is not None
+                        and device_track_id != det["track_id"]
+                    ):
+                        continue
+
                     t_type = track['type']
                     d_type = det['object_type']
+                    if (
+                        d_type in vehicle_classes
+                        and not self.cross_camera_vehicle_association
+                    ):
+                        continue
                     if t_type != d_type:
                         # Allow matches between vehicle types
                         if not (t_type in vehicle_classes and d_type in vehicle_classes):
@@ -867,6 +904,9 @@ class MultiCameraPipeline:
                         self.global_tracks[best_match_id]['embedding'] = det['embedding']
 
                 self.global_tracks[best_match_id]['last_seen'] = current_time_epoch
+                self.global_tracks[best_match_id].setdefault(
+                    'device_tracks', {}
+                )[det['device_id']] = det['track_id']
                 det['object_id'] = (
                     f"global_{self.global_tracks[best_match_id]['type']}_"
                     f"{self.perception_run_prefix}_{best_match_id}"
@@ -880,7 +920,10 @@ class MultiCameraPipeline:
                     'type': det['object_type'],
                     'kf': KalmanTracker(det['gps_location']['latitude'], det['gps_location']['longitude']),
                     'embedding': det.get('embedding'),
-                    'last_seen': current_time_epoch
+                    'last_seen': current_time_epoch,
+                    'device_tracks': {
+                        det['device_id']: det['track_id']
+                    },
                 }
                 det['object_id'] = (
                     f"global_{det['object_type']}_"

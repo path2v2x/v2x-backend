@@ -9,8 +9,41 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-12 21:38 UTC; verify rather than assume. These items
+Observed through 2026-07-12 22:31 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
+
+- PR 35 merged as canonical
+  `76e561cd41d070a6402c39c98847e646bd81cc9a`. Controlled startup
+  passed both upload modes. Its new ten-minute watch passed 600/600 strict
+  samples and ten feed rounds. Its attended 30-minute watch passed 1,800/1,800
+  strict samples, 30/30 feed rounds, complete decoder turnover, zero
+  reconnects, inference-age maxima 7.226–8.767 seconds, decode-latency maxima
+  4.839–6.108 seconds, Richmond/LIVE/zero sessions, unchanged service
+  fingerprints, and timer restoration. The bounded hourly hold replayed the
+  missed restart after the gate; the restart completed successfully and all
+  four twin counters advanced. Evidence is
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T215500Z-pr35-live-watch-30m/`.
+  This closes the attended perception/HLS gate only; the 24-hour monitor and
+  vehicle identity/calibration gates remain open.
+- Fresh object `global_car_b0678022_4` produced nine strict schema-v2 rows on
+  ch1, ch3, and ch2. Exact historical frame checks passed ch1 at 9 ms / YOLO
+  IoU 0.939 and ch3 at 16 ms / IoU 0.798. Three later ch2 local-track-53 rows
+  passed at 1–16 ms with IoU 0.986/0.867/0.888. Ch2 local-track-49 is rejected:
+  one row had zero bbox overlap at 13 ms and one row fell outside returned HLS
+  coverage. Evidence is
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T223000Z-object-b0678022-4-exact/`.
+  Do not use the shared global ID as same-car proof.
+- The root identity defect is the legacy vehicle slow path: vehicles have no
+  appearance embedding, yet any new local track could inherit a global vehicle
+  ID within 30 m for 40 seconds, including a different track on the same
+  camera. Candidate `745bae0ec04c868573d1f853dbfb4c9539d62c18`
+  rejects different same-camera track IDs and disables uncalibrated
+  cross-camera vehicle deduplication/tracking by default. It intentionally
+  splits uncertain identities until a held-out vehicle-ReID/geometric linker
+  exists. Generic MobileNet similarities on the exact views were only
+  0.24–0.53 for accepted same-car proposals, so no arbitrary appearance
+  threshold was deployed. All 136 perception tests pass. Require isolated and
+  live gates before deployment; this is not same-car acceptance.
 
 - PR 34 merged as canonical
   `b64f1f81e8d455c197cb5ac09a42ce4ec2a2b432`. After an unrelated

@@ -103,6 +103,13 @@ capture/event maximum age, trusted matched media clocks, and the unchanged
 The verifier refuses base URLs or stream templates containing credentials,
 queries, or fragments and prints only per-camera timestamps and SHA-256 hashes.
 
+Cross-camera vehicle association is fail-closed by default. Camera-local tracker
+IDs remain stable within a feed, but detections from different cameras (or a
+new local track on the same camera) receive distinct global IDs until an
+independently validated vehicle-ReID/geometric linker is deployed. Set
+`V2X_PERCEPTION_CROSS_CAMERA_VEHICLE_ASSOCIATION=true` only inside an explicit
+candidate gate; the legacy 30 m/40 s spatial heuristic is not acceptance-grade.
+
 ---
 
 ## Table of Contents

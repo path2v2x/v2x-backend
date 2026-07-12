@@ -279,6 +279,7 @@ class RunScopedIdentityTests(unittest.TestCase):
         pipeline.next_global_id = 0
         pipeline.perception_run_id = run_id
         pipeline.perception_run_prefix = run_id.replace("-", "")[:8]
+        pipeline.cross_camera_vehicle_association = False
         return pipeline
 
     @staticmethod
@@ -316,9 +317,11 @@ class RunScopedIdentityTests(unittest.TestCase):
 
     def test_cross_camera_winner_keeps_one_consistent_media_observation(self):
         run_id = "123e4567-e89b-12d3-a456-426614174000"
+        pipeline = self.pipeline(run_id)
+        pipeline.cross_camera_vehicle_association = True
         older = self.detection("ch1", 0.7, "older")
         winner = self.detection("ch2", 0.9, "winner")
-        result = self.pipeline(run_id).deduplicate(
+        result = pipeline.deduplicate(
             [copy.deepcopy(older), copy.deepcopy(winner)], 1_000.0
         )[0]
 
@@ -326,6 +329,48 @@ class RunScopedIdentityTests(unittest.TestCase):
         self.assertEqual(result["timestamp_utc"], "winner")
         self.assertEqual(result["media_timestamp_utc"], "winner")
         self.assertEqual(result["event_id"], "event-ch2")
+
+    def test_same_camera_new_track_cannot_inherit_existing_global_id(self):
+        run_id = "123e4567-e89b-12d3-a456-426614174000"
+        pipeline = self.pipeline(run_id)
+        first = pipeline.deduplicate(
+            [self.detection("ch2")], 1_000.0
+        )[0]
+        replacement = self.detection("ch2")
+        replacement["track_id"] = 53
+        second = pipeline.deduplicate([replacement], 1_001.0)[0]
+
+        self.assertEqual(first["object_id"], "global_car_123e4567_1")
+        self.assertEqual(second["object_id"], "global_car_123e4567_2")
+        self.assertNotEqual(first["object_id"], second["object_id"])
+
+    def test_same_camera_same_track_keeps_existing_global_id(self):
+        run_id = "123e4567-e89b-12d3-a456-426614174000"
+        pipeline = self.pipeline(run_id)
+        first = pipeline.deduplicate(
+            [self.detection("ch2")], 1_000.0
+        )[0]
+        second = pipeline.deduplicate(
+            [self.detection("ch2")], 1_001.0
+        )[0]
+
+        self.assertEqual(first["object_id"], second["object_id"])
+
+    def test_cross_camera_vehicle_association_is_fail_closed_by_default(self):
+        run_id = "123e4567-e89b-12d3-a456-426614174000"
+        pipeline = self.pipeline(run_id)
+        ch1 = self.detection("ch1", 0.9, "same-time")
+        ch2 = self.detection("ch2", 0.8, "same-time")
+
+        result = pipeline.deduplicate(
+            [copy.deepcopy(ch1), copy.deepcopy(ch2)], 1_000.0
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            {item["object_id"] for item in result},
+            {"global_car_123e4567_1", "global_car_123e4567_2"},
+        )
 
 
 class BatchUploadTests(unittest.TestCase):
