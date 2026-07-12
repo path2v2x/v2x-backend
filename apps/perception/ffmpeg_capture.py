@@ -28,6 +28,8 @@ import requests
 
 _PROTOCOL_WHITELIST = "file,crypto,data,http,https,tcp,tls"
 _MASTER_PLAYLIST_LIMIT = 64 * 1024
+_HLS_IO_TIMEOUT_MICROSECONDS = 7_000_000
+_HLS_HOLD_COUNTERS = 3
 
 
 class NvdecCaptureError(RuntimeError):
@@ -146,8 +148,16 @@ def build_nvdec_command(ffmpeg_binary, input_reference, fifo_path, *, hls):
             [
                 "-protocol_whitelist",
                 _PROTOCOL_WHITELIST,
+                # OpenCV reads a local FIFO and cannot reliably interrupt an
+                # upstream HLS socket still owned by the child. Bound both a
+                # blocked network operation and a live playlist that reloads
+                # without advancing so the FIFO closes before freshness fails.
+                "-rw_timeout",
+                str(_HLS_IO_TIMEOUT_MICROSECONDS),
                 "-f",
                 "hls",
+                "-m3u8_hold_counters",
+                str(_HLS_HOLD_COUNTERS),
             ]
         )
     command.extend(
