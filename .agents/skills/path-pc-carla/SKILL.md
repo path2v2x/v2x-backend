@@ -9,7 +9,55 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Current deployed state and integration hold
 
-Observed through 2026-07-12 15:42 UTC; verify rather than assume:
+Observed through 2026-07-12 16:55 UTC; verify rather than assume. The following
+newest chronology overrides older candidate/deployment statements later in this
+section:
+
+- Canonical `origin/main` is
+  `828bd341d3b700bd9186587317a4589233e43aad` after merged PRs 22-24. The public
+  browser release was independently proven at merged PR 22 commit
+  `d9a6ad8e7d83acad25c315b1f41e7b80cbb4f2d8`: Amplify job 203 succeeded at that
+  exact commit and refreshed Playwright CLI evidence at
+  `/home/path/V2XCarla/v2x-evidence/playwright/20260712T155049Z-public-release/`
+  shows HTTP 200 on `/drive`, `/live`, and `/timeline`, four playing native
+  2560x1920 timeline videos, four current live snapshots, and zero browser
+  warnings or errors. This is browser-release evidence, not static calibration
+  or same-car placement acceptance.
+- PR 23 (`5513c8e890d8836c1b142fa6d7d31664c851c4e5`) separated the short live
+  capture playlist from the five-fragment exact-clock playlist and restored
+  proactive 240-second renewal. Its isolated canary passed, but the strict live
+  watch failed immediately at 10.127 seconds on ch2 and 10.585 seconds on ch3.
+  The live checkout and perception unit were rolled back without restarting
+  CARLA, Drive, or web. Retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T162000Z-live-edge-renewal-watch/failure.json`.
+- PR 24 (`828bd341d3b700bd9186587317a4589233e43aad`) reduced only the direct
+  perception capture session to one fragment while keeping the exact-clock
+  session at five. The Lambda code-only apply is backed up at
+  `/home/path/V2XCarla/v2x-backend-backups/read-api-code-only/v2x-backend-read-20260712T163322Z-148b13bbdcad/`;
+  its isolated four-camera canary stayed below 7.64 seconds. The subsequent
+  strict live watch nevertheless failed at sample 132 when ch1 reached
+  10.075919 seconds. It was rolled back exactly to
+  `d54f5dfaec90e791af83105ff048e5dd3c6506a2`; all three timers were restored and
+  the CARLA/Drive/web PIDs and restart counters remained unchanged. The current
+  clean live checkout is therefore deliberately behind canonical main at
+  `d54f5df`; do not redeploy PR 23 or PR 24 unchanged. Retain the failure at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T164000Z-one-fragment-renewal-watch/failure.json`
+  and rollback bundle at
+  `/home/path/V2XCarla/v2x-backend-backups/perception-one-fragment/20260712T163710Z-828bd341d3b7/`.
+- Playlist timestamps prove Kinesis is normally within roughly one completed
+  two-second fragment of wall time; the remaining 10-second tail is local CPU
+  decode backlog from four 2560x1920 streams plus inference. A source candidate
+  uses host `/usr/bin/ffmpeg` NVDEC through an anonymous memfd master playlist
+  and timestamped local NUT FIFO, keeps signed URLs out of command lines and
+  disk, and uses the same NVDEC pixels for exact fragment matching. A real
+  upload-disabled four-camera diagnostic ran 90 seconds with zero reconnects
+  and maxima ch1/ch2/ch3/ch4 = 5.838/7.559/8.024/6.673 seconds. A second
+  120-second diagnostic completed one staggered, pre-clocked handover per
+  camera with zero untrusted/stale samples after initial acquisition, zero
+  reconnects, and maxima 5.936/5.665/5.939/8.494 seconds. Treat this as a
+  transport diagnostic only until it passes the full detector pipeline from a
+  clean canonical release branch, source review/tests, controlled live gate,
+  30-minute watch, and 24-hour watch.
 
 - The post-hourly clean HLS watch is complete at
   `/home/path/V2XCarla/v2x-evidence/playwright/20260712T150759Z-post-hourly-clean/`.

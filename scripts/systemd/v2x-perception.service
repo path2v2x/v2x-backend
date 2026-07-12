@@ -31,12 +31,15 @@ Environment=V2X_PERCEPTION_LIVE_HLS_FRAGMENTS=4
 Environment=V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS=1
 Environment=V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS=5
 Environment=V2X_PERCEPTION_PROACTIVE_RENEW_SEC=240
+Environment=V2X_PERCEPTION_CAPTURE_BACKEND=ffmpeg_nvdec
+Environment=V2X_PERCEPTION_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment="OPENCV_FFMPEG_CAPTURE_OPTIONS=live_start_index;-1"
 Environment=V2X_DETECTIONS_ENDPOINT=https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com/detections
 EnvironmentFile=-/etc/v2x-perception.env
 ExecStartPre=/usr/bin/test -x /home/path/V2XCarla/perception-venv/bin/python
 ExecStartPre=/usr/bin/test -r /home/path/V2XCarla/v2x-backend/apps/perception/yolov8n.pt
 ExecStartPre=/usr/bin/test -r /home/path/.cache/torch/hub/checkpoints/mobilenet_v3_small-047dcff4.pth
+ExecStartPre=/usr/bin/test -x /usr/bin/ffmpeg
 ExecStart=/home/path/V2XCarla/v2x-backend/scripts/launch-perception.sh
 Restart=always
 RestartSec=10
