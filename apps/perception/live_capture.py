@@ -312,6 +312,8 @@ class LiveStreamReader:
         media_clock_invalid_grace_seconds=2.0,
         frame_identity_history_size=256,
         duplicate_frame_limit=90,
+        pace_frames_by_position=False,
+        frame_pacing_max_delay_seconds=0.25,
         connection_max_age_seconds=None,
         connection_renewal_lead_seconds=15.0,
         connection_initial_renewal_delay_seconds=0.0,
@@ -345,6 +347,13 @@ class LiveStreamReader:
             1, int(frame_identity_history_size)
         )
         self.duplicate_frame_limit = max(1, int(duplicate_frame_limit))
+        self.pace_frames_by_position = bool(pace_frames_by_position)
+        pacing_max_delay = float(frame_pacing_max_delay_seconds)
+        if not math.isfinite(pacing_max_delay) or not 0.0 < pacing_max_delay <= 1.0:
+            raise ValueError(
+                "frame_pacing_max_delay_seconds must be between 0 and 1"
+            )
+        self.frame_pacing_max_delay_seconds = pacing_max_delay
         if connection_max_age_seconds is None:
             self.connection_max_age_seconds = None
             self.connection_renewal_lead_seconds = 0.0
@@ -489,6 +498,8 @@ class LiveStreamReader:
                 connected = False
                 has_trusted_media_clock = self.media_clock_factory is None
                 invalid_clock_started = None
+                pacing_anchor_position = None
+                pacing_anchor_monotonic = None
                 connection_started = self.monotonic()
                 renewal_deadline = (
                     None
@@ -552,6 +563,8 @@ class LiveStreamReader:
                         invalid_clock_started = None
                         clock_resolution = None
                         last_capture_position = prepared_position
+                        pacing_anchor_position = prepared_position
+                        pacing_anchor_monotonic = self.monotonic()
                         connection_started = self.monotonic()
                         renewal_deadline = (
                             connection_started
@@ -601,6 +614,41 @@ class LiveStreamReader:
                         clock_resolution = None
                         next_media_clock_retry = 0.0
                     if capture_position is not None:
+                        if self.pace_frames_by_position:
+                            pacing_now = self.monotonic()
+                            if (
+                                pacing_anchor_position is None
+                                or pacing_anchor_monotonic is None
+                                or capture_position
+                                < pacing_anchor_position - 0.5
+                            ):
+                                pacing_anchor_position = capture_position
+                                pacing_anchor_monotonic = pacing_now
+                            else:
+                                pacing_target = (
+                                    pacing_anchor_monotonic
+                                    + (capture_position - pacing_anchor_position)
+                                    / 1000.0
+                                )
+                                pacing_delay = pacing_target - pacing_now
+                                if (
+                                    0.0
+                                    < pacing_delay
+                                    <= self.frame_pacing_max_delay_seconds
+                                ):
+                                    self._stop_event.wait(pacing_delay)
+                                elif (
+                                    pacing_delay
+                                    < -self.frame_pacing_max_delay_seconds
+                                    or pacing_delay
+                                    > self.frame_pacing_max_delay_seconds
+                                ):
+                                    # Never accumulate latency after a cursor
+                                    # jump or scheduler stall. Re-anchor pacing
+                                    # only; exact UTC clock validation remains
+                                    # separate and unchanged below.
+                                    pacing_anchor_position = capture_position
+                                    pacing_anchor_monotonic = pacing_now
                         last_capture_position = capture_position
                     if media_clock is None and clock_resolution is not None:
                         resolved, candidate = clock_resolution.poll()

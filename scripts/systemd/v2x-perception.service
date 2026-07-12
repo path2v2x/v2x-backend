@@ -36,6 +36,7 @@ Environment=V2X_PERCEPTION_MEDIA_CLOCK_MIN_LATENCY_MS=-1000
 Environment=V2X_PERCEPTION_MEDIA_CLOCK_MAX_LATENCY_MS=10000
 Environment=V2X_PERCEPTION_CAPTURE_BACKEND=ffmpeg_nvdec
 Environment=V2X_PERCEPTION_INFERENCE_WORKERS=2
+Environment=V2X_PERCEPTION_PACE_BY_PTS=true
 Environment=V2X_PERCEPTION_FFMPEG_BIN=/usr/bin/ffmpeg
 Environment="OPENCV_FFMPEG_CAPTURE_OPTIONS=live_start_index;-1"
 Environment=V2X_DETECTIONS_ENDPOINT=https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com/detections

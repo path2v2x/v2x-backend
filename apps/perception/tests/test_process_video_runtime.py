@@ -411,6 +411,11 @@ class LivePipelineTimestampTests(unittest.TestCase):
                 "source_monotonic": 500.0 + index,
             }
 
+    @patch.dict(
+        "os.environ",
+        {"V2X_PERCEPTION_CAPTURE_BACKEND": "ffmpeg_nvdec"},
+        clear=False,
+    )
     @patch("process_video.LiveStreamReader", FakeReader)
     def test_pipeline_uses_per_camera_capture_time_and_source_age(self):
         self.FakeReader.instances.clear()
@@ -448,6 +453,9 @@ class LivePipelineTimestampTests(unittest.TestCase):
         self.assertTrue(callable(
             self.FakeReader.instances[0].kwargs["frame_callback"]
         ))
+        self.assertTrue(
+            self.FakeReader.instances[0].kwargs["pace_frames_by_position"]
+        )
 
     @patch("process_video.LiveStreamReader", ThrottledFakeReader)
     def test_live_throttle_does_not_consume_skipped_camera_sequence(self):

@@ -343,6 +343,29 @@ class LiveStreamReaderTests(unittest.TestCase):
             release_read.set()
             reader.stop(timeout=2.0)
 
+    def test_position_pacing_smooths_a_decoded_frame_burst(self):
+        release_read = threading.Event()
+        callbacks = []
+        capture = GatedPositionCapture(
+            ["frame-1", "frame-2"], [0.0, 100.0], threading.Event()
+        )
+        capture.next_frame_gate.set()
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            pace_frames_by_position=True,
+            frame_callback=lambda *_values: callbacks.append(time.monotonic()),
+        )
+        reader.start()
+        try:
+            self.assertTrue(self.wait_until(lambda: len(callbacks) >= 2))
+            self.assertGreaterEqual(callbacks[1] - callbacks[0], 0.075)
+        finally:
+            release_read.set()
+            reader.stop(timeout=2.0)
+
     def test_snapshot_keeps_media_time_separate_from_decode_receipt_time(self):
         release_read = threading.Event()
         clock = FakeMediaClock()

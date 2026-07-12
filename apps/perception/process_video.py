@@ -932,6 +932,10 @@ class MultiCameraPipeline:
         ffmpeg_binary = os.getenv(
             "V2X_PERCEPTION_FFMPEG_BIN", "/usr/bin/ffmpeg"
         )
+        pace_live_frames = env_bool(
+            "V2X_PERCEPTION_PACE_BY_PTS",
+            capture_backend == "ffmpeg_nvdec",
+        )
         caps = [None] * len(video_paths)
         buffered_frames = [None] * len(video_paths)
         buffered_msecs = [-1.0] * len(video_paths)
@@ -1064,6 +1068,7 @@ class MultiCameraPipeline:
                     ),
                     frame_identity_history_size=frame_identity_history_size,
                     duplicate_frame_limit=duplicate_frame_limit,
+                    pace_frames_by_position=pace_live_frames,
                     connection_max_age_seconds=proactive_renew_seconds,
                     connection_initial_renewal_delay_seconds=index * 10.0,
                 )
