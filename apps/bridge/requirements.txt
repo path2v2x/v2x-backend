@@ -8,3 +8,4 @@ pytest-asyncio
 scipy
 laspy[lazrs]
 pyproj
+cryptography>=41

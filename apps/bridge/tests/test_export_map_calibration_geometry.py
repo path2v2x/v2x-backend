@@ -11,6 +11,7 @@ from export_map_calibration_geometry import (  # noqa: E402
     bind_sampled_road_marks,
     canonical_hash,
     lane_geometry_from_waypoints,
+    objects_from_source,
     opendrive_road_mark_ranges,
     split_crosswalk_polygons,
     stable_crosswalk_id,
@@ -76,6 +77,33 @@ class ExportMapCalibrationGeometryTests(unittest.TestCase):
         reversed_polygon = list(reversed(polygon))
         self.assertEqual(stable_crosswalk_id(polygon), stable_crosswalk_id(rotated))
         self.assertEqual(stable_crosswalk_id(polygon), stable_crosswalk_id(reversed_polygon))
+
+    def test_object_category_is_derived_from_exact_native_semantics(self):
+        objects = objects_from_source([{
+            "source_object_id": "signal-1", "name": "signal",
+            "category": "StableLandmark",
+            "semantic_source": {
+                "schema": "v2x-carla-native-environment-object/v1",
+                "api": "carla.World.get_environment_objects",
+                "native_type": "CityObjectLabel.TrafficLight",
+                "native_subtype": None,
+            },
+            "center_world": [1, 2, 3], "extent": [0.1, 0.2, 1.0],
+        }])
+        self.assertEqual(objects[0]["category"], "TrafficLight")
+        self.assertEqual(objects[0]["id"], "environment-TrafficLight-signal-1")
+
+    def test_caller_stable_landmark_label_without_native_semantics_fails(self):
+        with self.assertRaises(RuntimeError):
+            objects_from_source([{
+                "source_object_id": "caller-1", "name": "caller",
+                "category": "StableLandmark",
+                "semantic_source": {
+                    "schema": "caller-defined", "api": "caller",
+                    "native_type": "StableLandmark", "native_subtype": "fixed",
+                },
+                "center_world": [1, 2, 3], "extent": [0.1, 0.2, 1.0],
+            }])
 
     def test_lane_export_preserves_every_contiguous_road_mark_range(self):
         waypoints = [

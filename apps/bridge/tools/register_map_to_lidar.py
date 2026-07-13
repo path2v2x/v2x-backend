@@ -14,12 +14,26 @@ from collections import Counter, defaultdict
 import csv
 from datetime import datetime, timezone
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
+import sys
 import xml.etree.ElementTree as ET
+
+# Import numerical libraries only after establishing deterministic single-thread
+# defaults. Explicit non-1 caller values are rejected by the toolchain gate.
+for _thread_variable in (
+    "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_thread_variable, "1")
+# The retained NumPy wheel uses DYNAMIC_ARCH OpenBLAS. Pin one supported kernel
+# family so identical x86_64 hosts cannot silently choose different kernels.
+os.environ.setdefault("OPENBLAS_CORETYPE", "Haswell")
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -29,6 +43,20 @@ ANNOTATION_SCHEMA = "v2x-map-lidar-registration-annotations/v1"
 REPORT_SCHEMA = "v2x-map-lidar-registration-report/v1"
 GEOMETRY_SCHEMA = "v2x-map-calibration-geometry/v1"
 SURVEY_SCHEMA = "v2x-current-horizontal-survey/v2"
+SURVEY_AUTHORITY_ATTESTATION_SCHEMA = "v2x-survey-authority-attestation/v1"
+CRS_AUTHORITY_ATTESTATION_SCHEMA = "v2x-crs-authority-attestation/v1"
+ANNOTATION_AUTHORITY_ATTESTATION_SCHEMA = "v2x-annotation-authority-attestation/v1"
+LIDAR_VALIDATION_AUTHORITY_ATTESTATION_SCHEMA = (
+    "v2x-lidar-validation-authority-attestation/v1"
+)
+VERTICAL_DATUM_RECONCILIATION_SCHEMA = "v2x-vertical-datum-reconciliation/v1"
+VERTICAL_DATUM_AUTHORITY_ATTESTATION_SCHEMA = (
+    "v2x-vertical-datum-authority-attestation/v1"
+)
+ANNOTATION_REVIEW_SCHEMA = "v2x-map-lidar-annotation-review/v1"
+HOLDOUT_LEDGER_SCHEMA = "v2x-map-lidar-holdout-ledger/v1"
+HOLDOUT_BURN_RECEIPT_SCHEMA = "v2x-map-lidar-holdout-burn-receipt/v1"
+TOOLCHAIN_LOCK_SCHEMA = "v2x-map-lidar-toolchain-lock/v1"
 
 HORIZONTAL_RMSE_MAX_M = 0.25
 HORIZONTAL_MAX_M = 0.50
@@ -47,6 +75,7 @@ EVALUATION_SPACING_M = 0.10
 MIN_APPROACHES = 4
 MIN_FIT_FEATURES = 4
 MIN_HOLDOUT_FEATURES = 4
+MIN_ANNOTATED_POINTS_PER_FEATURE = 3
 TRANSLATION_BOUND_RADIUS_M = 25.0
 YAW_BOUND_RADIUS_DEG = 15.0
 Z_BIAS_BOUND_RADIUS_M = 10.0
@@ -58,8 +87,27 @@ SPATIAL_EXCLUSION_BUFFER_M = 0.50
 MAX_SURVEY_CONTROL_UNCERTAINTY_M = 0.10
 MIN_SURVEY_FIT_CONTROLS = 10
 MIN_SURVEY_HOLDOUT_CONTROLS = 4
-MIN_SURVEY_STABLE_LANDMARKS = 6
-STABLE_LANDMARK_CATEGORIES = {"StableLandmark", "TrafficLight", "TrafficSigns"}
+MIN_SURVEY_STABLE_LANDMARKS = MIN_SURVEY_FIT_CONTROLS + MIN_SURVEY_HOLDOUT_CONTROLS
+MIN_CRS_AUTHORITY_CHECKPOINTS = 6
+MIN_VERTICAL_AUTHORITY_CHECKPOINTS = 6
+ANNOTATION_REPEATABILITY_MAX_M = 0.10
+MIN_AUTHORITY_PDF_BYTES = 4096
+AUTHORITY_ATTESTATION_MAX_AGE_DAYS = 90.0
+AUTHORITY_ATTESTATION_MAX_VALIDITY_DAYS = 366.0
+NATIVE_OBJECT_SEMANTIC_SCHEMA = "v2x-carla-native-environment-object/v1"
+NATIVE_OBJECT_API = "carla.World.get_environment_objects"
+STABLE_NATIVE_TYPES = {
+    "CityObjectLabel.TrafficLight": "TrafficLight",
+    "CityObjectLabel.TrafficSigns": "TrafficSigns",
+}
+# Real authority keys must be reviewed and pinned in source before deployment.
+# Empty defaults deliberately keep production acceptance closed; tests install
+# explicit ephemeral test-only keys through monkeypatching.
+TRUSTED_SURVEY_AUTHORITY_SIGNERS = {}
+TRUSTED_CRS_AUTHORITY_SIGNERS = {}
+TRUSTED_ANNOTATION_AUTHORITY_SIGNERS = {}
+TRUSTED_LIDAR_VALIDATION_SIGNERS = {}
+TRUSTED_VERTICAL_DATUM_SIGNERS = {}
 SURVEY_DELIVERABLE_ROLES = {
     "raw_observations", "survey_license", "instrument_calibration"
 }
@@ -92,6 +140,155 @@ def canonical_hash(value) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _parse_authority_time(value, label: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise RegistrationError(f"{label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RegistrationError(f"{label} is malformed") from exc
+    if parsed.tzinfo is None:
+        raise RegistrationError(f"{label} has no timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _verify_detached_attestation(attestation_path: Path | None,
+                                 signature_path: Path | None,
+                                 trusted_signers: dict, expected_schema: str,
+                                 label: str) -> tuple[dict, dict]:
+    """Verify exact signed bytes against a source-pinned Ed25519 authority key."""
+    if attestation_path is None or signature_path is None:
+        raise RegistrationError(f"{label} detached authority evidence is required")
+    attestation_path, signature_path = attestation_path.resolve(), signature_path.resolve()
+    if not attestation_path.is_file() or not signature_path.is_file():
+        raise RegistrationError(f"{label} detached authority evidence is unavailable")
+    attestation_bytes, signature = attestation_path.read_bytes(), signature_path.read_bytes()
+    if not attestation_bytes or len(signature) != 64:
+        raise RegistrationError(f"{label} detached signature is malformed")
+    try:
+        attestation = json.loads(attestation_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RegistrationError(f"{label} attestation is malformed") from exc
+    if not isinstance(attestation, dict) or attestation.get("schema") != expected_schema:
+        raise RegistrationError(f"{label} attestation schema is unsupported")
+    key_id = attestation.get("signing_key_id")
+    signer = trusted_signers.get(key_id) if isinstance(key_id, str) else None
+    if not isinstance(signer, dict):
+        raise RegistrationError(f"{label} signer is not pinned and trusted")
+    if (
+        attestation.get("producer") != signer.get("producer")
+        or attestation.get("source") != signer.get("source")
+    ):
+        raise RegistrationError(f"{label} producer/source is not allowlisted")
+    pem = signer.get("public_key_pem")
+    if isinstance(pem, str):
+        pem = pem.encode("ascii")
+    if not isinstance(pem, bytes) or not pem:
+        raise RegistrationError(f"{label} pinned public key is unavailable")
+    key_hash = hashlib.sha256(pem).hexdigest()
+    if attestation.get("public_key_sha256") != key_hash:
+        raise RegistrationError(f"{label} pinned public key fingerprint is not bound")
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as exc:
+        raise RegistrationError(
+            f"{label} signature verification dependency is unavailable"
+        ) from exc
+    try:
+        public_key = serialization.load_pem_public_key(pem)
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise RegistrationError(f"{label} pinned key is not Ed25519")
+        public_key.verify(signature, attestation_bytes)
+    except InvalidSignature as exc:
+        raise RegistrationError(f"{label} detached signature is invalid") from exc
+    except RegistrationError:
+        raise
+    except Exception as exc:
+        raise RegistrationError(f"{label} pinned public key is malformed") from exc
+    verified = _parse_authority_time(attestation.get("verified_at_utc"), f"{label} verification time")
+    expires = _parse_authority_time(attestation.get("expires_at_utc"), f"{label} expiry time")
+    now = datetime.now(timezone.utc)
+    age_days = (now - verified).total_seconds() / 86400
+    validity_days = (expires - verified).total_seconds() / 86400
+    if (
+        age_days < -(5.0 / 1440.0)
+        or age_days > AUTHORITY_ATTESTATION_MAX_AGE_DAYS
+        or expires <= now
+        or validity_days <= 0
+        or validity_days > AUTHORITY_ATTESTATION_MAX_VALIDITY_DAYS
+    ):
+        raise RegistrationError(f"{label} verification time window is invalid")
+    return attestation, {
+        "attestation_path": str(attestation_path),
+        "attestation_sha256": hashlib.sha256(attestation_bytes).hexdigest(),
+        "signature_path": str(signature_path),
+        "signature_sha256": hashlib.sha256(signature).hexdigest(),
+        "signing_key_id": key_id,
+        "public_key_sha256": key_hash,
+        "producer": signer["producer"],
+        "source": signer["source"],
+        "verified_at_utc": attestation["verified_at_utc"],
+        "expires_at_utc": attestation["expires_at_utc"],
+    }
+
+
+def _runtime_toolchain_identity() -> dict:
+    try:
+        configuration = np.show_config(mode="dicts")
+        blas = configuration["Build Dependencies"]["blas"]
+    except (KeyError, TypeError) as exc:
+        raise RegistrationError("numerical BLAS identity is unavailable") from exc
+    return {
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+        },
+        "platform": {
+            "system": platform.system(),
+            "machine": platform.machine(),
+        },
+        "packages": {
+            name: importlib_metadata.version(distribution)
+            for name, distribution in {
+                "numpy": "numpy", "scipy": "scipy", "laspy": "laspy",
+                "pyproj": "pyproj", "Pillow": "Pillow",
+                "cryptography": "cryptography",
+            }.items()
+        },
+        "blas": {
+            "name": blas.get("name"),
+            "version": blas.get("version"),
+            "configuration": blas.get("openblas configuration"),
+        },
+        "thread_environment": {
+            name: os.environ.get(name)
+            for name in (
+                "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_CORETYPE",
+            )
+        },
+    }
+
+
+def validate_toolchain_lock() -> dict:
+    lock_path = Path(__file__).with_name("map_lidar_toolchain_lock.json").resolve()
+    if not lock_path.is_file():
+        raise RegistrationError("tracked deterministic toolchain lock is missing")
+    lock = json.loads(lock_path.read_text())
+    actual = _runtime_toolchain_identity()
+    if lock.get("schema") != TOOLCHAIN_LOCK_SCHEMA or lock.get("runtime") != actual:
+        raise RegistrationError("runtime does not match tracked deterministic toolchain lock")
+    return {
+        "passed": True,
+        "lock_path": str(lock_path),
+        "lock_sha256": sha256(lock_path),
+        "registration_tool_sha256": sha256(Path(__file__)),
+        "runtime": actual,
+    }
 
 
 def percentile(values, fraction):
@@ -186,7 +383,44 @@ def _semantic_crs_equal(left, right) -> bool:
         raise RegistrationError(f"unable to parse declared LiDAR CRS: {exc}") from exc
 
 
-def load_lidar_tile(lidar_path: Path, validation_path: Path) -> dict:
+def _verify_lidar_validation_authority(lidar_path: Path, validation_path: Path,
+                                       validation: dict, lidar_hash: str,
+                                       crs_wkt: str, point_count: int,
+                                       attestation_path: Path | None,
+                                       signature_path: Path | None) -> dict | None:
+    if attestation_path is None and signature_path is None:
+        return None
+    attestation, evidence = _verify_detached_attestation(
+        attestation_path, signature_path, TRUSTED_LIDAR_VALIDATION_SIGNERS,
+        LIDAR_VALIDATION_AUTHORITY_ATTESTATION_SCHEMA,
+        "LiDAR validation authority",
+    )
+    expected = {
+        "lidar_sha256": lidar_hash,
+        "lidar_bytes": lidar_path.stat().st_size,
+        "validation_sha256": sha256(validation_path),
+        "validation_payload_sha256": canonical_hash(validation),
+        "point_count": point_count,
+        "crs_wkt_sha256": hashlib.sha256(crs_wkt.encode()).hexdigest(),
+        "bounds_sha256": canonical_hash({
+            "mins": validation.get("mins"), "maxs": validation.get("maxs"),
+        }),
+    }
+    if any(attestation.get(key) != value for key, value in expected.items()):
+        raise RegistrationError(
+            "LiDAR authority attestation does not bind exact validation evidence"
+        )
+    if attestation.get("verification_result") != {
+        "source_data_status": "authoritative",
+        "validation_status": "verified",
+    }:
+        raise RegistrationError("LiDAR authority verification result is not accepted")
+    return {**evidence, **expected, "verification_result": attestation["verification_result"]}
+
+
+def load_lidar_tile(lidar_path: Path, validation_path: Path,
+                    authority_attestation_path: Path | None = None,
+                    authority_signature_path: Path | None = None) -> dict:
     try:
         import laspy
     except ImportError as exc:
@@ -245,6 +479,10 @@ def load_lidar_tile(lidar_path: Path, validation_path: Path) -> dict:
     declared_crs = validation.get("crs") or validation.get("crs_wkt")
     if not declared_crs or not _semantic_crs_equal(declared_crs, crs):
         raise RegistrationError(f"{lidar_path}: validation CRS mismatch")
+    authority_evidence = _verify_lidar_validation_authority(
+        lidar_path, validation_path, validation, lidar_hash, crs.to_wkt(),
+        len(points), authority_attestation_path, authority_signature_path,
+    )
     return {
         "path": str(lidar_path.resolve()),
         "sha256": lidar_hash,
@@ -263,7 +501,10 @@ def load_lidar_tile(lidar_path: Path, validation_path: Path) -> dict:
         "horizontal_crs_wkt": horizontal_crs.to_wkt(),
         "horizontal_datum": horizontal_crs.datum.name if horizontal_crs.datum else None,
         "vertical_datum": vertical_crs.datum.name if vertical_crs.datum else None,
+        "vertical_crs_wkt": vertical_crs.to_wkt(),
         "horizontal_coordinate_epoch": _coordinate_epoch(horizontal_crs),
+        "vertical_coordinate_epoch": _coordinate_epoch(vertical_crs),
+        "validation_authority_attestation": authority_evidence,
     }
 
 
@@ -434,7 +675,7 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
     ):
         raise RegistrationError("map geometry top-level pair/camera binding mismatch")
     if (
-        carla_source.get("schema") != "v2x-retained-carla-map-export/v1"
+        carla_source.get("schema") != "v2x-retained-carla-map-export/v2"
         or carla_source.get("map") != geometry.get("map")
         or carla_source.get("opendrive_sha256") != opendrive["sha256"]
         or carla_source.get("radius_m") != geometry.get("radius_m")
@@ -525,7 +766,17 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
         ):
             raise RegistrationError("lane road-mark references do not reproduce exporter output")
     for item in payload["objects"]:
-        if item["id"] != f"environment-{item.get('category')}-{item.get('source_object_id')}":
+        try:
+            derived_category = exporter.native_object_category(item.get("semantic_source"))
+        except RuntimeError as exc:
+            raise RegistrationError(
+                "map environment-object native semantic provenance is invalid"
+            ) from exc
+        if (
+            item.get("category") != derived_category
+            or item["id"]
+            != f"environment-{derived_category}-{item.get('source_object_id')}"
+        ):
             raise RegistrationError("map environment-object stable identity mismatch")
         finite_xyz([item.get("center_world"), [
             item["center_world"][0] + 1.0, item["center_world"][1], item["center_world"][2]
@@ -660,6 +911,11 @@ def load_features(annotation: dict, geometry: dict, tiles: dict) -> list[dict]:
         identities.add(identity)
         map_reference = raw.get("map", {})
         map_points = resolve_map_polyline(geometry, map_reference, identity)
+        if len(map_points) < MIN_ANNOTATED_POINTS_PER_FEATURE:
+            raise RegistrationError(
+                f"{identity}: map polyline has fewer than "
+                f"{MIN_ANNOTATED_POINTS_PER_FEATURE} independently retained vertices"
+            )
         map_identity = (
             map_reference.get("collection"), map_reference.get("feature_id"),
             map_reference.get("polyline_field"),
@@ -693,6 +949,7 @@ def load_features(annotation: dict, geometry: dict, tiles: dict) -> list[dict]:
         recorded = finite_xyz(lidar.get("xyz"), f"{identity} recorded LiDAR polyline")
         if (
             not isinstance(point_indices, list)
+            or len(recorded) < MIN_ANNOTATED_POINTS_PER_FEATURE
             or len(point_indices) != len(recorded)
             or len(point_indices) != len(set(point_indices))
             or any(not isinstance(index, int) or index < 0 or index >= tile["point_count"] for index in point_indices)
@@ -804,12 +1061,333 @@ def polylines_geometrically_duplicate(left: np.ndarray, right: np.ndarray) -> bo
     )
 
 
-def minimum_polyline_distance(left: np.ndarray, right: np.ndarray) -> float:
-    left_samples, right_samples = resample_polyline(left), resample_polyline(right)
-    return float(min(
-        np.min(nearest_segments(left_samples, right_samples)["horizontal"]),
-        np.min(nearest_segments(right_samples, left_samples)["horizontal"]),
+def _point_segment_distance_2d(point: np.ndarray, start: np.ndarray,
+                               end: np.ndarray) -> float:
+    delta = end - start
+    squared_length = float(np.dot(delta, delta))
+    if squared_length <= 1e-24:
+        return float(np.linalg.norm(point - start))
+    fraction = float(np.dot(point - start, delta) / squared_length)
+    projected = start + min(1.0, max(0.0, fraction)) * delta
+    return float(np.linalg.norm(point - projected))
+
+
+def _point_on_segment_2d(point: np.ndarray, start: np.ndarray,
+                         end: np.ndarray) -> bool:
+    delta, offset = end - start, point - start
+    scale = max(1.0, float(np.linalg.norm(delta)), float(np.linalg.norm(offset)))
+    tolerance = 1e-12 * scale * scale
+    cross = float(delta[0] * offset[1] - delta[1] * offset[0])
+    return bool(
+        abs(cross) <= tolerance
+        and np.all(point >= np.minimum(start, end) - tolerance)
+        and np.all(point <= np.maximum(start, end) + tolerance)
+    )
+
+
+def _segment_segment_distance_2d(left_start: np.ndarray, left_end: np.ndarray,
+                                 right_start: np.ndarray, right_end: np.ndarray) -> float:
+    left_degenerate = np.linalg.norm(left_end - left_start) <= 1e-12
+    right_degenerate = np.linalg.norm(right_end - right_start) <= 1e-12
+    if left_degenerate and right_degenerate:
+        return float(np.linalg.norm(left_start - right_start))
+    if left_degenerate:
+        return _point_segment_distance_2d(left_start, right_start, right_end)
+    if right_degenerate:
+        return _point_segment_distance_2d(right_start, left_start, left_end)
+
+    def orientation(start, end, point):
+        cross = float(
+            (end[0] - start[0]) * (point[1] - start[1])
+            - (end[1] - start[1]) * (point[0] - start[0])
+        )
+        scale = max(
+            1.0, float(np.linalg.norm(end - start)), float(np.linalg.norm(point - start))
+        )
+        tolerance = 1e-12 * scale * scale
+        return 0 if abs(cross) <= tolerance else (1 if cross > 0 else -1)
+
+    left_right_start = orientation(left_start, left_end, right_start)
+    left_right_end = orientation(left_start, left_end, right_end)
+    right_left_start = orientation(right_start, right_end, left_start)
+    right_left_end = orientation(right_start, right_end, left_end)
+    intersects = (
+        left_right_start * left_right_end < 0
+        and right_left_start * right_left_end < 0
+    ) or any((
+        left_right_start == 0 and _point_on_segment_2d(right_start, left_start, left_end),
+        left_right_end == 0 and _point_on_segment_2d(right_end, left_start, left_end),
+        right_left_start == 0 and _point_on_segment_2d(left_start, right_start, right_end),
+        right_left_end == 0 and _point_on_segment_2d(left_end, right_start, right_end),
     ))
+    if intersects:
+        return 0.0
+    return min(
+        _point_segment_distance_2d(left_start, right_start, right_end),
+        _point_segment_distance_2d(left_end, right_start, right_end),
+        _point_segment_distance_2d(right_start, left_start, left_end),
+        _point_segment_distance_2d(right_end, left_start, left_end),
+    )
+
+
+def minimum_polyline_distance(left: np.ndarray, right: np.ndarray) -> float:
+    left_xy, right_xy = np.asarray(left, dtype=float)[:, :2], np.asarray(right, dtype=float)[:, :2]
+    if len(left_xy) < 2 or len(right_xy) < 2:
+        raise RegistrationError("polyline distance requires two finite vertices per polyline")
+    if not np.isfinite(left_xy).all() or not np.isfinite(right_xy).all():
+        raise RegistrationError("polyline distance received non-finite coordinates")
+    minimum = math.inf
+    for left_start, left_end in zip(left_xy[:-1], left_xy[1:]):
+        for right_start, right_end in zip(right_xy[:-1], right_xy[1:]):
+            minimum = min(
+                minimum,
+                _segment_segment_distance_2d(
+                    left_start, left_end, right_start, right_end
+                ),
+            )
+            if minimum == 0.0:
+                return 0.0
+    return float(minimum)
+
+
+def annotation_holdout_set_sha256(features: list[dict]) -> str:
+    return canonical_hash([
+        {
+            "id": item["id"],
+            "approach_id": item["approach_id"],
+            "map_reference": item["map_reference"],
+            "map_points": item["map_points"].tolist(),
+            "lidar_tile_sha256": item["lidar_tile_sha256"],
+            "lidar_point_indices": item["lidar_point_indices"],
+            "physical_control_ids": item["physical_control_ids"],
+            "lidar_points": item["lidar_points"].tolist(),
+        }
+        for item in features if item["split"] == "holdout"
+    ])
+
+
+def validate_annotation_review(annotation_path: Path, review_path: Path | None,
+                               features: list[dict]) -> dict:
+    if review_path is None:
+        return {
+            "present": False, "passed": False,
+            "reasons": ["annotation_interreview_missing"],
+            "holdout_set_sha256": annotation_holdout_set_sha256(features),
+        }
+    review_path = review_path.resolve()
+    review = json.loads(review_path.read_text())
+    if (
+        review.get("schema") != ANNOTATION_REVIEW_SCHEMA
+        or review.get("annotation_sha256") != sha256(annotation_path)
+    ):
+        raise RegistrationError("annotation inter-review binding is invalid")
+    reviewers = review.get("reviewers")
+    if not isinstance(reviewers, list) or len(reviewers) != 2:
+        raise RegistrationError("annotation review requires exactly two reviewers")
+    identities, organizations, reviewer_features = set(), set(), []
+    expected_ids = {item["id"] for item in features}
+    now = datetime.now(timezone.utc)
+    for reviewer in reviewers:
+        if not isinstance(reviewer, dict):
+            raise RegistrationError("annotation reviewer record is malformed")
+        identity, organization = reviewer.get("reviewer_id"), reviewer.get("organization")
+        if (
+            not isinstance(identity, str) or not identity or identity in identities
+            or not isinstance(organization, str) or not organization
+            or organization in organizations
+        ):
+            raise RegistrationError("annotation reviewers are not independent")
+        reviewed = _parse_authority_time(
+            reviewer.get("reviewed_at_utc"), "annotation review time"
+        )
+        age_days = (now - reviewed).total_seconds() / 86400
+        if age_days < -(5.0 / 1440.0) or age_days > AUTHORITY_ATTESTATION_MAX_AGE_DAYS:
+            raise RegistrationError("annotation review is not current")
+        values = reviewer.get("features")
+        if not isinstance(values, list):
+            raise RegistrationError("annotation reviewer feature evidence is missing")
+        by_id = {
+            item.get("feature_id"): item for item in values if isinstance(item, dict)
+        }
+        if set(by_id) != expected_ids or len(by_id) != len(values):
+            raise RegistrationError("annotation reviewer feature denominator is not exact")
+        reviewer_features.append(by_id)
+        identities.add(identity)
+        organizations.add(organization)
+
+    deviations = []
+    for feature in features:
+        feature_id = feature["id"]
+        reviewed_arrays = []
+        for by_id in reviewer_features:
+            record = by_id[feature_id]
+            map_points = np.asarray(record.get("map_xyz"), dtype=float)
+            lidar_points = np.asarray(record.get("lidar_xyz"), dtype=float)
+            if (
+                map_points.shape != feature["map_points"].shape
+                or lidar_points.shape != feature["lidar_points"].shape
+                or not np.isfinite(map_points).all()
+                or not np.isfinite(lidar_points).all()
+            ):
+                raise RegistrationError("annotation reviewer geometry shape is not exact")
+            reviewed_arrays.append((map_points, lidar_points))
+            deviations.extend(np.linalg.norm(
+                map_points - feature["map_points"], axis=1
+            ).tolist())
+            deviations.extend(np.linalg.norm(
+                lidar_points - feature["lidar_points"], axis=1
+            ).tolist())
+        deviations.extend(np.linalg.norm(
+            reviewed_arrays[0][0] - reviewed_arrays[1][0], axis=1
+        ).tolist())
+        deviations.extend(np.linalg.norm(
+            reviewed_arrays[0][1] - reviewed_arrays[1][1], axis=1
+        ).tolist())
+    maximum = max(deviations, default=math.inf)
+    rmse = math.sqrt(float(np.mean(np.square(deviations)))) if deviations else math.inf
+    if not math.isfinite(maximum) or maximum > ANNOTATION_REPEATABILITY_MAX_M:
+        raise RegistrationError("annotation inter-review repeatability exceeds fixed limit")
+    return {
+        "present": True, "passed": True,
+        "path": str(review_path), "sha256": sha256(review_path),
+        "annotation_sha256": sha256(annotation_path),
+        "reviewers": [
+            {
+                "reviewer_id": item["reviewer_id"],
+                "organization": item["organization"],
+                "reviewed_at_utc": item["reviewed_at_utc"],
+            }
+            for item in reviewers
+        ],
+        "feature_count": len(features),
+        "repeatability_rmse_m": rmse,
+        "repeatability_max_m": maximum,
+        "repeatability_max_allowed_m": ANNOTATION_REPEATABILITY_MAX_M,
+        "holdout_set_sha256": annotation_holdout_set_sha256(features),
+        "reasons": [],
+    }
+
+
+def validate_holdout_ledger(annotation_path: Path, ledger_path: Path | None,
+                            review: dict) -> dict:
+    if ledger_path is None:
+        return {
+            "present": False, "passed": False,
+            "reasons": ["holdout_evaluation_ledger_missing"],
+        }
+    ledger_path = ledger_path.resolve()
+    ledger = json.loads(ledger_path.read_text())
+    authorized = _parse_authority_time(
+        ledger.get("authorized_at_utc"), "holdout authorization time"
+    )
+    expires = _parse_authority_time(
+        ledger.get("expires_at_utc"), "holdout authorization expiry"
+    )
+    now = datetime.now(timezone.utc)
+    receipt_value = ledger.get("burn_receipt_path")
+    receipt_path = Path(receipt_value) if isinstance(receipt_value, str) else None
+    if (
+        ledger.get("schema") != HOLDOUT_LEDGER_SCHEMA
+        or ledger.get("annotation_sha256") != sha256(annotation_path)
+        or ledger.get("holdout_set_sha256") != review.get("holdout_set_sha256")
+        or not isinstance(ledger.get("evaluation_id"), str)
+        or not ledger["evaluation_id"].strip()
+        or ledger.get("purpose") != "final_acceptance"
+        or ledger.get("prior_evaluation_count") != 0
+        or ledger.get("maximum_evaluation_count") != 1
+        or ledger.get("prior_evaluation_ids") != []
+        or receipt_path is None or not receipt_path.is_absolute()
+        or receipt_path.parent != ledger_path.parent
+        or receipt_path.suffix != ".json"
+        or authorized > now
+        or expires <= now
+        or (expires - authorized).total_seconds() > 30 * 86400
+    ):
+        raise RegistrationError("holdout one-time evaluation ledger is invalid")
+    if receipt_path.exists():
+        raise RegistrationError("holdout evaluation authorization was already burned")
+    return {
+        "present": True, "passed": True,
+        "path": str(ledger_path), "sha256": sha256(ledger_path),
+        "evaluation_id": ledger["evaluation_id"],
+        "holdout_set_sha256": ledger["holdout_set_sha256"],
+        "burn_receipt_path": str(receipt_path),
+        "reasons": [],
+    }
+
+
+def validate_annotation_authority(annotation_path: Path, review: dict, ledger: dict,
+                                  attestation_path: Path | None,
+                                  signature_path: Path | None) -> dict | None:
+    if attestation_path is None and signature_path is None:
+        return None
+    if not review.get("passed") or not ledger.get("passed"):
+        raise RegistrationError(
+            "annotation authority evidence requires review and holdout ledger"
+        )
+    attestation, evidence = _verify_detached_attestation(
+        attestation_path, signature_path, TRUSTED_ANNOTATION_AUTHORITY_SIGNERS,
+        ANNOTATION_AUTHORITY_ATTESTATION_SCHEMA, "annotation authority",
+    )
+    expected = {
+        "annotation_sha256": sha256(annotation_path),
+        "annotation_review_sha256": review["sha256"],
+        "holdout_ledger_sha256": ledger["sha256"],
+        "holdout_set_sha256": review["holdout_set_sha256"],
+        "reviewers": review["reviewers"],
+    }
+    if any(attestation.get(key) != value for key, value in expected.items()):
+        raise RegistrationError(
+            "annotation authority attestation does not bind exact review evidence"
+        )
+    if attestation.get("verification_result") != {
+        "annotation_status": "verified",
+        "interreview_status": "independent",
+        "holdout_status": "authorized_once",
+    }:
+        raise RegistrationError("annotation authority verification result is not accepted")
+    if evidence["producer"] in {item["organization"] for item in review["reviewers"]}:
+        raise RegistrationError("annotation authority is not independent from reviewers")
+    return {**evidence, **expected, "verification_result": attestation["verification_result"]}
+
+
+def burn_holdout_evaluation(ledger: dict, annotation_authority: dict) -> dict:
+    receipt_path = Path(ledger["burn_receipt_path"])
+    receipt = {
+        "schema": HOLDOUT_BURN_RECEIPT_SCHEMA,
+        "burned_at_utc": utc_now(),
+        "evaluation_id": ledger["evaluation_id"],
+        "holdout_ledger_sha256": ledger["sha256"],
+        "holdout_set_sha256": ledger["holdout_set_sha256"],
+        "annotation_authority_attestation_sha256": annotation_authority[
+            "attestation_sha256"
+        ],
+        "status": "evaluation_started_holdout_burned",
+    }
+    write_json_exclusive(receipt_path, receipt)
+    return {
+        **ledger,
+        "burned": True,
+        "burn_receipt_sha256": sha256(receipt_path),
+    }
+
+
+def authorize_and_burn_holdout(review: dict, ledger: dict,
+                               annotation_authority: dict | None) -> dict:
+    """Fail closed before any CLI path can compute sealed holdout metrics."""
+    if not review.get("passed"):
+        raise RegistrationError(
+            "refusing to evaluate sealed holdout without independent annotation review"
+        )
+    if not ledger.get("passed"):
+        raise RegistrationError(
+            "refusing to evaluate sealed holdout without one-time authorization ledger"
+        )
+    if annotation_authority is None:
+        raise RegistrationError(
+            "refusing to evaluate sealed holdout without authenticated annotation authority"
+        )
+    return burn_holdout_evaluation(ledger, annotation_authority)
 
 
 def transform_points(points: np.ndarray, parameters: np.ndarray) -> np.ndarray:
@@ -1167,6 +1745,25 @@ def resolve_map_control(geometry: dict, reference: dict, label: str) -> np.ndarr
     return point
 
 
+def eligible_stable_landmark(item: dict) -> bool:
+    semantic = item.get("semantic_source") if isinstance(item, dict) else None
+    if not isinstance(semantic, dict) or set(semantic) != {
+        "schema", "api", "native_type", "native_subtype"
+    }:
+        return False
+    category = STABLE_NATIVE_TYPES.get(semantic.get("native_type"))
+    source_id = item.get("source_object_id")
+    return bool(
+        semantic.get("schema") == NATIVE_OBJECT_SEMANTIC_SCHEMA
+        and semantic.get("api") == NATIVE_OBJECT_API
+        and semantic.get("native_subtype") is None
+        and category is not None
+        and item.get("category") == category
+        and isinstance(source_id, str) and source_id
+        and item.get("id") == f"environment-{category}-{source_id}"
+    )
+
+
 def _weighted_se2(map_xy: np.ndarray, surveyed_xy: np.ndarray,
                   uncertainty_m: np.ndarray) -> np.ndarray:
     weights = 1.0 / np.square(uncertainty_m)
@@ -1271,14 +1868,24 @@ def _survey_deliverable_evidence(survey: dict, deliverable_paths: list[Path] | N
         content = path.read_bytes()
         digest = hashlib.sha256(content).hexdigest()
         declared = declared_by_hash.get(digest)
-        if (
-            not content or declared is None or declared.get("file_name") != path.name
-            or int(declared.get("bytes", -1)) != len(content)
-        ):
+        try:
+            declared_bytes = int((declared or {}).get("bytes", -1))
+        except (TypeError, ValueError) as exc:
+            raise RegistrationError(
+                "licensed survey raw deliverable byte count is malformed"
+            ) from exc
+        if not content or declared is None or declared.get("file_name") != path.name or declared_bytes != len(content):
             raise RegistrationError("licensed survey raw deliverable hash/size/name mismatch")
         if declared["role"] in {"survey_license", "instrument_calibration"}:
-            if path.suffix.lower() != ".pdf" or not content.startswith(b"%PDF-"):
-                raise RegistrationError("licensed survey authority evidence must be retained PDF")
+            if (
+                path.suffix.lower() != ".pdf"
+                or len(content) < MIN_AUTHORITY_PDF_BYTES
+                or not content.startswith(b"%PDF-")
+                or not content.rstrip().endswith(b"%%EOF")
+            ):
+                raise RegistrationError(
+                    "licensed survey authority evidence is not a substantive retained PDF"
+                )
         actual.append({
             "path": str(path), "file_name": path.name, "sha256": digest,
             "bytes": len(content), "role": declared["role"],
@@ -1288,12 +1895,16 @@ def _survey_deliverable_evidence(survey: dict, deliverable_paths: list[Path] | N
         raise RegistrationError("licensed survey deliverable roles are incomplete")
     observation_digest = sha256(observations_path)
     observation_binding = survey.get("observations")
+    try:
+        observation_bytes = int((observation_binding or {}).get("bytes", -1))
+    except (TypeError, ValueError) as exc:
+        raise RegistrationError("licensed survey observation byte count is malformed") from exc
     if (
         not isinstance(observation_binding, dict)
         or observation_binding.get("format") != "csv"
         or observation_binding.get("sha256") != observation_digest
         or observation_binding.get("file_name") != observations_path.name
-        or int(observation_binding.get("bytes", -1)) != observations_path.stat().st_size
+        or observation_bytes != observations_path.stat().st_size
         or declared_by_hash[observation_digest].get("role") != "raw_observations"
     ):
         raise RegistrationError("licensed survey observation binding mismatch")
@@ -1345,12 +1956,73 @@ def _survey_identity(survey: dict, deliverable_evidence: dict) -> dict:
     }
 
 
+def _verify_survey_authority_attestation(survey_path: Path,
+                                         deliverable_evidence: dict,
+                                         source_identity: dict,
+                                         attestation_path: Path | None,
+                                         signature_path: Path | None) -> dict:
+    attestation, evidence = _verify_detached_attestation(
+        attestation_path, signature_path, TRUSTED_SURVEY_AUTHORITY_SIGNERS,
+        SURVEY_AUTHORITY_ATTESTATION_SCHEMA, "survey authority",
+    )
+    expected_identity = {
+        "provider": source_identity["provider"],
+        "source_id": source_identity["source_id"],
+        "project_id": source_identity["project_id"],
+        "surveyor": {
+            "name": source_identity["surveyor_name"],
+            "license_number": source_identity["surveyor_license"],
+            "licensing_authority": source_identity["licensing_authority"],
+        },
+        "instrument": {
+            "manufacturer": source_identity["instrument"]["manufacturer"],
+            "model": source_identity["instrument"]["model"],
+            "serial_number": source_identity["instrument"]["serial_number"],
+        },
+    }
+    expected_deliverables = sorted([
+        {
+            key: item[key]
+            for key in ("role", "file_name", "sha256", "bytes")
+        }
+        for item in deliverable_evidence["deliverables"]
+    ], key=lambda item: item["role"])
+    if (
+        attestation.get("survey_manifest_sha256") != sha256(survey_path)
+        or attestation.get("licensed_source") != expected_identity
+        or attestation.get("deliverables") != expected_deliverables
+        or attestation.get("verification_result") != {
+            "provider_status": "verified",
+            "surveyor_license_status": "active",
+            "instrument_calibration_status": "valid",
+            "deliverable_integrity_status": "verified",
+        }
+    ):
+        raise RegistrationError(
+            "survey authority attestation does not bind the exact verified evidence"
+        )
+    if (
+        evidence["producer"] == source_identity["provider"]
+        or evidence["source"] == source_identity["source_id"]
+    ):
+        raise RegistrationError(
+            "survey authority attestation is not independent from the survey source"
+        )
+    return {
+        **evidence,
+        "survey_manifest_sha256": attestation["survey_manifest_sha256"],
+        "verification_result": attestation["verification_result"],
+    }
+
+
 def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: str,
                             opendrive_hash: str, horizontal_epsg: int | None,
                             deliverable_paths: list[Path] | None = None,
                             observations_path: Path | None = None,
                             horizontal_wkt: str | None = None,
-                            coordinate_epoch: float | None = None) -> dict:
+                            coordinate_epoch: float | None = None,
+                            authority_attestation_path: Path | None = None,
+                            authority_signature_path: Path | None = None) -> dict:
     if path is None:
         return {"present": False, "passed": False, "reasons": ["current_horizontal_survey_missing"]}
     survey = json.loads(path.read_text())
@@ -1376,6 +2048,16 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
     except RegistrationError:
         deliverable_evidence = source_identity = None
         reasons.append("current_horizontal_survey_licensed_deliverables")
+    try:
+        if deliverable_evidence is None or source_identity is None:
+            raise RegistrationError("survey source evidence is not independently verifiable")
+        authority_attestation = _verify_survey_authority_attestation(
+            path.resolve(), deliverable_evidence, source_identity,
+            authority_attestation_path, authority_signature_path,
+        )
+    except RegistrationError:
+        authority_attestation = None
+        reasons.append("current_horizontal_survey_authority_attestation")
     raw_controls = []
     age_days = None
     if deliverable_evidence is not None:
@@ -1440,7 +2122,7 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
             ]
             if (
                 len(landmark_matches) != 1
-                or landmark_matches[0].get("category") not in STABLE_LANDMARK_CATEGORIES
+                or not eligible_stable_landmark(landmark_matches[0])
             ):
                 raise RegistrationError(
                     "survey control does not reference an eligible stable landmark category"
@@ -1544,6 +2226,7 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
         "age_days": age_days,
         "crs": crs_summary,
         "licensed_source": source_identity,
+        "authority_attestation_evidence": authority_attestation,
         "raw_deliverable_evidence": deliverable_evidence,
         "raw_control_count": len(controls),
         "stable_landmark_count": len(stable_landmark_ids),
@@ -1551,6 +2234,7 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
         "holdout_control_ids": [item["id"] for item in holdout],
         "raw_control_coordinates": [{
             "observation_id": item["id"],
+            "physical_control_id": item["physical_control_id"],
             "stable_landmark_id": item["stable_landmark_id"],
             "split": item["split"],
             "map_xy": item["map_xyz"][:2].tolist(),
@@ -1565,15 +2249,53 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
         "recomputed_fit_metrics": fit_metrics,
         "recomputed_holdout_metrics": holdout_metrics,
         "raw_controls_recomputed": bool(
-            controls and transform is not None and deliverable_evidence and source_identity
+            controls and transform is not None and deliverable_evidence
+            and source_identity and authority_attestation
         ),
         "passed": not reasons,
         "reasons": sorted(set(reasons)),
     }
 
 
+def _verify_crs_authority_attestation(artifact_path: Path, artifact: dict,
+                                      attestation_path: Path | None,
+                                      signature_path: Path | None) -> dict:
+    attestation, evidence = _verify_detached_attestation(
+        attestation_path, signature_path, TRUSTED_CRS_AUTHORITY_SIGNERS,
+        CRS_AUTHORITY_ATTESTATION_SCHEMA, "CRS authority",
+    )
+    expected = {
+        "reconciliation_artifact_sha256": sha256(artifact_path),
+        "proj_pipeline_sha256": artifact.get("proj_pipeline_sha256"),
+        "source_crs_wkt_sha256": artifact.get("source_crs_wkt_sha256"),
+        "target_crs_wkt_sha256": artifact.get("target_crs_wkt_sha256"),
+        "source_coordinate_epoch": artifact.get("source_coordinate_epoch"),
+        "target_coordinate_epoch": artifact.get("target_coordinate_epoch"),
+        "authority": artifact.get("authority"),
+        "operation_id": artifact.get("operation_id"),
+        "check_points_sha256": canonical_hash(artifact.get("check_points")),
+    }
+    if any(attestation.get(key) != value for key, value in expected.items()):
+        raise RegistrationError(
+            "CRS authority attestation does not bind the exact transform evidence"
+        )
+    if attestation.get("verification_result") != {
+        "transform_source_status": "official",
+        "operation_status": "authorized",
+        "control_source_status": "independent",
+    }:
+        raise RegistrationError("CRS authority verification result is not accepted")
+    return {
+        **evidence,
+        "reconciliation_artifact_sha256": expected["reconciliation_artifact_sha256"],
+        "verification_result": attestation["verification_result"],
+    }
+
+
 def validate_crs_reconciliation(opendrive: dict, lidar_tile: dict, survey: dict,
-                                artifact_path: Path | None = None) -> dict:
+                                artifact_path: Path | None = None,
+                                authority_attestation_path: Path | None = None,
+                                authority_signature_path: Path | None = None) -> dict:
     from pyproj import CRS, Transformer
 
     lidar_crs = CRS.from_wkt(lidar_tile["horizontal_crs_wkt"])
@@ -1626,48 +2348,66 @@ def validate_crs_reconciliation(opendrive: dict, lidar_tile: dict, survey: dict,
         raise RegistrationError("CRS reconciliation pipeline/source/target binding mismatch")
     if any(
         not isinstance(artifact.get(key), str) or not artifact[key].strip()
-        for key in ("authority", "operation_id", "source_deliverable_sha256")
+        for key in ("authority", "operation_id")
     ):
         raise RegistrationError("CRS reconciliation authority identity is incomplete")
-    survey_hashes = {
-        item["sha256"] for item in (
-            survey.get("raw_deliverable_evidence") or {}
-        ).get("deliverables", [])
-    }
-    if artifact["source_deliverable_sha256"] not in survey_hashes:
-        raise RegistrationError("CRS reconciliation is not bound to a licensed deliverable")
+    authority_evidence = _verify_crs_authority_attestation(
+        artifact_path, artifact, authority_attestation_path, authority_signature_path
+    )
     checks = artifact.get("check_points")
-    if not isinstance(checks, list) or len(checks) < MIN_SURVEY_STABLE_LANDMARKS:
+    if not isinstance(checks, list) or len(checks) < MIN_CRS_AUTHORITY_CHECKPOINTS:
         raise RegistrationError("CRS reconciliation has insufficient independent check points")
-    identities, source_points, target_points = set(), [], []
-    survey_controls = {
-        item.get("observation_id"): item
-        for item in survey.get("raw_control_coordinates", [])
+    identities, physical_identities, source_points, target_points = set(), set(), [], []
+    survey_controls = [
+        item for item in survey.get("raw_control_coordinates", [])
         if isinstance(item, dict)
+    ]
+    survey_identities = {
+        value
+        for item in survey_controls
+        for value in (
+            item.get("observation_id"), item.get("physical_control_id"),
+            item.get("stable_landmark_id"),
+        )
+        if isinstance(value, str) and value
     }
     for item in checks:
         try:
             identity = item["id"]
+            physical_identity = item["physical_control_id"]
             source_xy = np.asarray(item["source_xy"], dtype=float)
             target_xy = np.asarray(item["target_xy"], dtype=float)
         except (KeyError, TypeError, ValueError) as exc:
             raise RegistrationError("CRS reconciliation check point is malformed") from exc
         if (
             not isinstance(identity, str) or not identity or identity in identities
+            or not isinstance(physical_identity, str) or not physical_identity
+            or physical_identity in physical_identities
+            or item.get("provenance") != "independent_authority_control"
             or source_xy.shape != (2,) or target_xy.shape != (2,)
             or not np.isfinite(source_xy).all() or not np.isfinite(target_xy).all()
         ):
             raise RegistrationError("CRS reconciliation check point is invalid")
-        raw_control = survey_controls.get(identity)
-        if (
-            raw_control is None
-            or not np.allclose(source_xy, raw_control.get("map_xy"), atol=1e-9, rtol=0)
-            or not np.allclose(target_xy, raw_control.get("survey_xy"), atol=1e-9, rtol=0)
-        ):
+        if identity in survey_identities or physical_identity in survey_identities:
             raise RegistrationError(
-                "CRS reconciliation check point does not reproduce licensed observations"
+                "CRS reconciliation controls are not independent from survey controls"
             )
+        for raw_control in survey_controls:
+            try:
+                map_xy = np.asarray(raw_control["map_xy"], dtype=float)
+                survey_xy = np.asarray(raw_control["survey_xy"], dtype=float)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RegistrationError("survey control evidence is malformed") from exc
+            if (
+                map_xy.shape != (2,) or survey_xy.shape != (2,)
+                or np.linalg.norm(source_xy - map_xy) <= SPATIAL_EXCLUSION_BUFFER_M
+                or np.linalg.norm(target_xy - survey_xy) <= SPATIAL_EXCLUSION_BUFFER_M
+            ):
+                raise RegistrationError(
+                    "CRS reconciliation controls are not independent from survey controls"
+                )
         identities.add(identity)
+        physical_identities.add(physical_identity)
         source_points.append(source_xy)
         target_points.append(target_xy)
     source_array, target_array = np.asarray(source_points), np.asarray(target_points)
@@ -1686,12 +2426,143 @@ def validate_crs_reconciliation(opendrive: dict, lidar_tile: dict, survey: dict,
     if not np.isfinite(residuals).all() or float(np.max(residuals)) > MAX_SURVEY_CONTROL_UNCERTAINTY_M:
         raise RegistrationError("CRS reconciliation independently recomputed residuals fail")
     return {
-        "method": "hash_bound_proj_pipeline", "passed": True,
+        "method": "signed_authority_proj_pipeline", "passed": True,
         "artifact_path": str(artifact_path), "artifact_sha256": sha256(artifact_path),
         "authority": artifact["authority"], "operation_id": artifact["operation_id"],
+        "authority_attestation_evidence": authority_evidence,
         "check_point_count": len(checks),
         "recomputed_horizontal_rmse_m": math.sqrt(float(np.mean(np.square(residuals)))),
         "recomputed_horizontal_max_m": float(np.max(residuals)),
+    }
+
+
+def validate_vertical_datum_reconciliation(opendrive: dict, lidar_tile: dict,
+                                           survey: dict,
+                                           artifact_path: Path | None = None,
+                                           authority_attestation_path: Path | None = None,
+                                           authority_signature_path: Path | None = None) -> dict:
+    if (
+        artifact_path is None and authority_attestation_path is None
+        and authority_signature_path is None
+    ):
+        return {
+            "present": False, "passed": False,
+            "reasons": ["vertical_datum_reconciliation_missing"],
+        }
+    if artifact_path is None:
+        raise RegistrationError("vertical datum reconciliation artifact is required")
+    artifact_path = artifact_path.resolve()
+    artifact = json.loads(artifact_path.read_text())
+    if artifact.get("schema") != VERTICAL_DATUM_RECONCILIATION_SCHEMA:
+        raise RegistrationError("vertical datum reconciliation schema is unsupported")
+    source_reference = artifact.get("source_vertical_reference")
+    target_reference = artifact.get("target_vertical_reference")
+    operation = artifact.get("operation")
+    if (
+        artifact.get("opendrive_sha256") != opendrive["sha256"]
+        or artifact.get("lidar_vertical_epsg") != lidar_tile.get("vertical_epsg")
+        or artifact.get("lidar_vertical_datum") != lidar_tile.get("vertical_datum")
+        or artifact.get("lidar_vertical_crs_wkt_sha256")
+        != hashlib.sha256(lidar_tile["vertical_crs_wkt"].encode()).hexdigest()
+        or not isinstance(source_reference, dict)
+        or source_reference.get("linear_units") != "metre"
+        or not isinstance(source_reference.get("datum"), str)
+        or not source_reference["datum"].strip()
+        or not isinstance(source_reference.get("source_artifact_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_reference["source_artifact_sha256"])
+        is None
+        or target_reference != {
+            "epsg": lidar_tile.get("vertical_epsg"),
+            "datum": lidar_tile.get("vertical_datum"),
+            "wkt_sha256": hashlib.sha256(
+                lidar_tile["vertical_crs_wkt"].encode()
+            ).hexdigest(),
+            "coordinate_epoch": lidar_tile.get("vertical_coordinate_epoch"),
+            "linear_units": "metre",
+        }
+        or not isinstance(operation, dict)
+        or operation.get("method") != "constant_offset"
+        or not isinstance(operation.get("offset_m"), (int, float))
+        or not math.isfinite(float(operation["offset_m"]))
+        or any(
+            not isinstance(artifact.get(key), str) or not artifact[key].strip()
+            for key in ("authority", "operation_id")
+        )
+    ):
+        raise RegistrationError("vertical datum reconciliation binding is invalid")
+    attestation, authority_evidence = _verify_detached_attestation(
+        authority_attestation_path, authority_signature_path,
+        TRUSTED_VERTICAL_DATUM_SIGNERS,
+        VERTICAL_DATUM_AUTHORITY_ATTESTATION_SCHEMA,
+        "vertical datum authority",
+    )
+    expected_attestation = {
+        "reconciliation_artifact_sha256": sha256(artifact_path),
+        "opendrive_sha256": opendrive["sha256"],
+        "lidar_vertical_crs_wkt_sha256": artifact["lidar_vertical_crs_wkt_sha256"],
+        "source_vertical_reference_sha256": canonical_hash(source_reference),
+        "target_vertical_reference_sha256": canonical_hash(target_reference),
+        "operation_sha256": canonical_hash(operation),
+        "authority": artifact["authority"],
+        "operation_id": artifact["operation_id"],
+        "check_points_sha256": canonical_hash(artifact.get("check_points")),
+    }
+    if any(attestation.get(key) != value for key, value in expected_attestation.items()):
+        raise RegistrationError(
+            "vertical authority attestation does not bind exact datum evidence"
+        )
+    if attestation.get("verification_result") != {
+        "vertical_source_status": "official",
+        "operation_status": "authorized",
+        "control_source_status": "independent",
+    }:
+        raise RegistrationError("vertical authority verification result is not accepted")
+    checks = artifact.get("check_points")
+    if not isinstance(checks, list) or len(checks) < MIN_VERTICAL_AUTHORITY_CHECKPOINTS:
+        raise RegistrationError("vertical datum reconciliation has insufficient controls")
+    survey_ids = {
+        value
+        for item in survey.get("raw_control_coordinates", [])
+        if isinstance(item, dict)
+        for value in (
+            item.get("observation_id"), item.get("physical_control_id"),
+            item.get("stable_landmark_id"),
+        )
+        if isinstance(value, str) and value
+    }
+    identities, physical_identities, residuals = set(), set(), []
+    for item in checks:
+        try:
+            identity, physical_identity = item["id"], item["physical_control_id"]
+            source_z, target_z = float(item["source_z_m"]), float(item["target_z_m"])
+            uncertainty = float(item["vertical_uncertainty_m"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RegistrationError("vertical datum control is malformed") from exc
+        if (
+            not isinstance(identity, str) or not identity or identity in identities
+            or not isinstance(physical_identity, str) or not physical_identity
+            or physical_identity in physical_identities
+            or identity in survey_ids or physical_identity in survey_ids
+            or item.get("provenance") != "independent_authority_control"
+            or not all(math.isfinite(value) for value in (source_z, target_z, uncertainty))
+            or uncertainty <= 0 or uncertainty > MAX_SURVEY_CONTROL_UNCERTAINTY_M
+        ):
+            raise RegistrationError("vertical datum control is invalid or not independent")
+        residuals.append(abs(source_z + float(operation["offset_m"]) - target_z))
+        identities.add(identity)
+        physical_identities.add(physical_identity)
+    if max(residuals) > VERTICAL_RMSE_MAX_M:
+        raise RegistrationError("vertical datum independently recomputed residuals fail")
+    return {
+        "present": True, "passed": True,
+        "artifact_path": str(artifact_path), "artifact_sha256": sha256(artifact_path),
+        "authority": artifact["authority"], "operation_id": artifact["operation_id"],
+        "authenticated_offset_m": float(operation["offset_m"]),
+        "control_count": len(checks),
+        "recomputed_vertical_rmse_m": math.sqrt(float(np.mean(np.square(residuals)))),
+        "recomputed_vertical_max_m": max(residuals),
+        "authority_attestation_evidence": authority_evidence,
+        "reasons": [],
     }
 
 
@@ -1754,6 +2625,30 @@ def register(annotation: dict, geometry: dict, tiles: dict, metadata_record: dic
     if old_ql2:
         reasons.append("2018_ql2_is_development_control_only")
     parameters = solution["x"]
+    if not all(item.get("validation_authority_attestation") for item in tiles.values()):
+        reasons.append("lidar_validation_authority_attestation_missing")
+    annotation_review = metadata_summary.get("annotation_review") or {}
+    if not annotation_review.get("passed"):
+        reasons.extend(annotation_review.get("reasons") or ["annotation_interreview_missing"])
+    holdout_evaluation = metadata_summary.get("holdout_evaluation") or {}
+    if not holdout_evaluation.get("passed") or not holdout_evaluation.get("burned"):
+        reasons.extend(
+            holdout_evaluation.get("reasons") or ["holdout_evaluation_burn_uncontrolled"]
+        )
+    if not metadata_summary.get("annotation_authority_attestation"):
+        reasons.append("annotation_authority_attestation_missing")
+    if not (metadata_summary.get("toolchain") or {}).get("passed"):
+        reasons.append("deterministic_toolchain_lock_missing")
+    vertical_reconciliation = metadata_summary.get("vertical_datum_reconciliation") or {}
+    if not vertical_reconciliation.get("passed"):
+        reasons.extend(
+            vertical_reconciliation.get("reasons")
+            or ["vertical_datum_reconciliation_missing"]
+        )
+    elif abs(
+        float(vertical_reconciliation["authenticated_offset_m"]) - float(parameters[3])
+    ) > VERTICAL_RMSE_MAX_M:
+        reasons.append("vertical_datum_registration_offset_disagreement")
     survey_transform = survey.get("recomputed_transform") if survey.get("passed") else None
     if survey.get("passed") and not survey.get("raw_controls_recomputed"):
         reasons.append("current_horizontal_survey_recomputation_missing")
@@ -1778,9 +2673,22 @@ def register(annotation: dict, geometry: dict, tiles: dict, metadata_record: dic
             reasons.append("current_horizontal_survey_registration_yaw")
     reasons.extend(survey["reasons"])
     reasons = sorted(set(reasons))
-    numerical_passed = not [reason for reason in reasons if reason not in {
-        "2018_ql2_is_development_control_only", "current_horizontal_survey_missing"
-    } and not reason.startswith("current_horizontal_survey_")]
+    acceptance_only_reasons = {
+        "2018_ql2_is_development_control_only",
+        "current_horizontal_survey_missing",
+        "lidar_validation_authority_attestation_missing",
+        "annotation_interreview_missing",
+        "holdout_evaluation_ledger_missing",
+        "holdout_evaluation_burn_uncontrolled",
+        "annotation_authority_attestation_missing",
+        "deterministic_toolchain_lock_missing",
+        "vertical_datum_reconciliation_missing",
+    }
+    numerical_passed = not [
+        reason for reason in reasons
+        if reason not in acceptance_only_reasons
+        and not reason.startswith("current_horizontal_survey_")
+    ]
     return {
         "schema": REPORT_SCHEMA,
         "acceptance_eligible": False if old_ql2 else not reasons,
@@ -1821,6 +2729,13 @@ def register(annotation: dict, geometry: dict, tiles: dict, metadata_record: dic
             "fold_translation_spread_max_m": FOLD_TRANSLATION_SPREAD_MAX_M,
             "fold_yaw_spread_max_deg": FOLD_YAW_SPREAD_MAX_DEG,
             "jacobian_condition_max": JACOBIAN_CONDITION_MAX,
+            "fit_holdout_spatial_exclusion_m": SPATIAL_EXCLUSION_BUFFER_M,
+            "annotation_repeatability_max_m": ANNOTATION_REPEATABILITY_MAX_M,
+            "survey_fit_control_minimum": MIN_SURVEY_FIT_CONTROLS,
+            "survey_holdout_control_minimum": MIN_SURVEY_HOLDOUT_CONTROLS,
+            "survey_distinct_stable_landmark_minimum": MIN_SURVEY_STABLE_LANDMARKS,
+            "crs_authority_checkpoint_minimum": MIN_CRS_AUTHORITY_CHECKPOINTS,
+            "vertical_authority_checkpoint_minimum": MIN_VERTICAL_AUTHORITY_CHECKPOINTS,
         },
         "evidence": metadata_summary,
         "feature_identities": {
@@ -1846,6 +2761,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lidar", action="append", type=Path, required=True)
     parser.add_argument("--lidar-validation", action="append", type=Path, required=True)
+    parser.add_argument(
+        "--lidar-validation-authority-attestation", action="append", type=Path
+    )
+    parser.add_argument(
+        "--lidar-validation-authority-signature", action="append", type=Path
+    )
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--opendrive", type=Path, required=True)
     parser.add_argument("--geometry", type=Path, required=True)
@@ -1853,10 +2774,21 @@ def parse_args():
     parser.add_argument("--cameras-json", type=Path, required=True)
     parser.add_argument("--carla-source-export", type=Path, required=True)
     parser.add_argument("--annotations", type=Path, required=True)
+    parser.add_argument("--annotation-review", type=Path)
+    parser.add_argument("--holdout-evaluation-ledger", type=Path)
+    parser.add_argument("--annotation-authority-attestation", type=Path)
+    parser.add_argument("--annotation-authority-signature", type=Path)
     parser.add_argument("--current-horizontal-survey", type=Path)
     parser.add_argument("--survey-deliverable", action="append", type=Path)
     parser.add_argument("--survey-observations", type=Path)
+    parser.add_argument("--survey-authority-attestation", type=Path)
+    parser.add_argument("--survey-authority-signature", type=Path)
     parser.add_argument("--crs-reconciliation", type=Path)
+    parser.add_argument("--crs-authority-attestation", type=Path)
+    parser.add_argument("--crs-authority-signature", type=Path)
+    parser.add_argument("--vertical-datum-reconciliation", type=Path)
+    parser.add_argument("--vertical-datum-authority-attestation", type=Path)
+    parser.add_argument("--vertical-datum-authority-signature", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--deployment-output", type=Path)
     parser.add_argument(
@@ -1883,9 +2815,27 @@ def write_registration_outputs(report: dict, survey: dict, output: Path,
             or survey.get("stable_landmark_count", 0) < MIN_SURVEY_STABLE_LANDMARKS
             or not survey.get("licensed_source")
             or not (survey.get("raw_deliverable_evidence") or {}).get("deliverables")
+            or not survey.get("authority_attestation_evidence")
         ):
             raise RegistrationError(
                 "refusing deployment output without licensed recomputed survey evidence"
+            )
+        evidence = report.get("evidence") or {}
+        lidar_evidence = evidence.get("lidar_tiles")
+        if (
+            not (evidence.get("toolchain") or {}).get("passed")
+            or not (evidence.get("annotation_review") or {}).get("passed")
+            or not (evidence.get("holdout_evaluation") or {}).get("burned")
+            or not evidence.get("annotation_authority_attestation")
+            or not (evidence.get("vertical_datum_reconciliation") or {}).get("passed")
+            or not isinstance(lidar_evidence, list) or not lidar_evidence
+            or not all(
+                item.get("validation_authority_attestation")
+                for item in lidar_evidence or []
+            )
+        ):
+            raise RegistrationError(
+                "refusing deployment output without authenticated evidence roots"
             )
         crs_evidence = (report.get("evidence") or {}).get("crs_reconciliation")
         if not isinstance(crs_evidence, dict) or crs_evidence.get("passed") is not True:
@@ -1905,9 +2855,25 @@ def main() -> int:
     args = parse_args()
     if len(args.lidar) != len(args.lidar_validation):
         raise SystemExit("one --lidar-validation is required for each --lidar")
-    tile_list = [load_lidar_tile(path.resolve(), validation.resolve()) for path, validation in zip(
-        args.lidar, args.lidar_validation
-    )]
+    authority_attestations = args.lidar_validation_authority_attestation or []
+    authority_signatures = args.lidar_validation_authority_signature or []
+    if bool(authority_attestations) != bool(authority_signatures) or (
+        authority_attestations and len(authority_attestations) != len(args.lidar)
+    ) or (
+        authority_signatures and len(authority_signatures) != len(args.lidar)
+    ):
+        raise SystemExit(
+            "one signed LiDAR validation authority pair is required per LiDAR tile"
+        )
+    toolchain = validate_toolchain_lock()
+    tile_list = [
+        load_lidar_tile(
+            path.resolve(), validation.resolve(),
+            authority_attestations[index].resolve() if authority_attestations else None,
+            authority_signatures[index].resolve() if authority_signatures else None,
+        )
+        for index, (path, validation) in enumerate(zip(args.lidar, args.lidar_validation))
+    ]
     tiles = {item["sha256"]: item for item in tile_list}
     if len(tiles) != len(tile_list):
         raise SystemExit("duplicate raw LiDAR tiles are not allowed")
@@ -1935,6 +2901,28 @@ def main() -> int:
         geometry, geometry_path, opendrive_path, opendrive, pair_path, cameras_path,
         carla_source_path,
     )
+    reviewed_features = load_features(annotation, geometry, tiles)
+    annotation_review = validate_annotation_review(
+        annotation_path,
+        args.annotation_review.resolve() if args.annotation_review else None,
+        reviewed_features,
+    )
+    holdout_evaluation = validate_holdout_ledger(
+        annotation_path,
+        args.holdout_evaluation_ledger.resolve()
+        if args.holdout_evaluation_ledger else None,
+        annotation_review,
+    )
+    annotation_authority = validate_annotation_authority(
+        annotation_path, annotation_review, holdout_evaluation,
+        args.annotation_authority_attestation.resolve()
+        if args.annotation_authority_attestation else None,
+        args.annotation_authority_signature.resolve()
+        if args.annotation_authority_signature else None,
+    )
+    holdout_evaluation = authorize_and_burn_holdout(
+        annotation_review, holdout_evaluation, annotation_authority
+    )
     metadata_record = select_metadata_record(metadata, annotation.get("metadata_selector", {}))
     if int(metadata_record.get("horiz_crs") or metadata_record.get("horizontal_epsg")) != horizontal_epsg:
         raise RegistrationError("authoritative metadata horizontal CRS differs from raw LiDAR")
@@ -1947,16 +2935,38 @@ def main() -> int:
         args.survey_observations.resolve() if args.survey_observations else None,
         tile_list[0]["horizontal_crs_wkt"],
         tile_list[0]["horizontal_coordinate_epoch"],
+        args.survey_authority_attestation.resolve()
+        if args.survey_authority_attestation else None,
+        args.survey_authority_signature.resolve()
+        if args.survey_authority_signature else None,
     )
     crs_reconciliation = validate_crs_reconciliation(
         opendrive, tile_list[0], survey,
         args.crs_reconciliation.resolve() if args.crs_reconciliation else None,
+        args.crs_authority_attestation.resolve()
+        if args.crs_authority_attestation else None,
+        args.crs_authority_signature.resolve()
+        if args.crs_authority_signature else None,
+    )
+    vertical_reconciliation = validate_vertical_datum_reconciliation(
+        opendrive, tile_list[0], survey,
+        args.vertical_datum_reconciliation.resolve()
+        if args.vertical_datum_reconciliation else None,
+        args.vertical_datum_authority_attestation.resolve()
+        if args.vertical_datum_authority_attestation else None,
+        args.vertical_datum_authority_signature.resolve()
+        if args.vertical_datum_authority_signature else None,
     )
     metadata_summary = {
         "annotations": {"path": str(annotation_path), "sha256": sha256(annotation_path)},
         "geometry": {"path": str(geometry_path), "sha256": sha256(geometry_path)},
         "geometry_provenance_validation": geometry_validation,
+        "toolchain": toolchain,
+        "annotation_review": annotation_review,
+        "holdout_evaluation": holdout_evaluation,
+        "annotation_authority_attestation": annotation_authority,
         "crs_reconciliation": crs_reconciliation,
+        "vertical_datum_reconciliation": vertical_reconciliation,
         "opendrive": opendrive,
         "metadata": {
             "path": str(metadata_path), "sha256": sha256(metadata_path),
@@ -1970,7 +2980,9 @@ def main() -> int:
                 "path", "sha256", "validation_path", "validation_sha256", "point_count",
                 "bytes", "bounds", "scales", "horizontal_epsg", "vertical_epsg",
                 "horizontal_units", "vertical_units", "horizontal_datum", "vertical_datum",
-                "horizontal_crs_wkt", "horizontal_coordinate_epoch",
+                "horizontal_crs_wkt", "vertical_crs_wkt",
+                "horizontal_coordinate_epoch", "vertical_coordinate_epoch",
+                "validation_authority_attestation",
             )} for item in tile_list
         ],
     }

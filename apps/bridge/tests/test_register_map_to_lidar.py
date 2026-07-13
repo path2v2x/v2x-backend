@@ -1,11 +1,13 @@
 import copy
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 import math
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import numpy as np
 import pytest
 
@@ -14,6 +16,76 @@ TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "register_map_to_lid
 SPEC = importlib.util.spec_from_file_location("register_map_to_lidar", TOOL_PATH)
 tool = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tool)
+
+
+SURVEY_AUTHORITY_KEY_ID = "test-survey-authority-ed25519"
+CRS_AUTHORITY_KEY_ID = "test-crs-authority-ed25519"
+ANNOTATION_AUTHORITY_KEY_ID = "test-annotation-authority-ed25519"
+LIDAR_AUTHORITY_KEY_ID = "test-lidar-authority-ed25519"
+VERTICAL_AUTHORITY_KEY_ID = "test-vertical-authority-ed25519"
+SURVEY_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
+CRS_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(33, 65)))
+ANNOTATION_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(65, 97)))
+LIDAR_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(97, 129)))
+VERTICAL_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(129, 161)))
+
+
+def public_key_pem(private_key):
+    return private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+@pytest.fixture(autouse=True)
+def pinned_test_authority_keys(monkeypatch):
+    monkeypatch.setattr(tool, "TRUSTED_SURVEY_AUTHORITY_SIGNERS", {
+        SURVEY_AUTHORITY_KEY_ID: {
+            "producer": "Independent State Survey Verification Service",
+            "source": "state-license-registry-test-fixture",
+            "public_key_pem": public_key_pem(SURVEY_AUTHORITY_PRIVATE_KEY),
+        },
+    })
+    monkeypatch.setattr(tool, "TRUSTED_CRS_AUTHORITY_SIGNERS", {
+        CRS_AUTHORITY_KEY_ID: {
+            "producer": "Independent Geodetic Authority",
+            "source": "official-operation-registry-test-fixture",
+            "public_key_pem": public_key_pem(CRS_AUTHORITY_PRIVATE_KEY),
+        },
+    })
+    monkeypatch.setattr(tool, "TRUSTED_ANNOTATION_AUTHORITY_SIGNERS", {
+        ANNOTATION_AUTHORITY_KEY_ID: {
+            "producer": "Independent Annotation Authority",
+            "source": "annotation-review-registry-test-fixture",
+            "public_key_pem": public_key_pem(ANNOTATION_AUTHORITY_PRIVATE_KEY),
+        },
+    })
+    monkeypatch.setattr(tool, "TRUSTED_LIDAR_VALIDATION_SIGNERS", {
+        LIDAR_AUTHORITY_KEY_ID: {
+            "producer": "Independent LiDAR Data Authority",
+            "source": "lidar-validation-registry-test-fixture",
+            "public_key_pem": public_key_pem(LIDAR_AUTHORITY_PRIVATE_KEY),
+        },
+    })
+    monkeypatch.setattr(tool, "TRUSTED_VERTICAL_DATUM_SIGNERS", {
+        VERTICAL_AUTHORITY_KEY_ID: {
+            "producer": "Independent Vertical Datum Authority",
+            "source": "vertical-operation-registry-test-fixture",
+            "public_key_pem": public_key_pem(VERTICAL_AUTHORITY_PRIVATE_KEY),
+        },
+    })
+
+
+def write_detached_attestation(path, value, private_key):
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    signature_path = path.with_suffix(".sig")
+    signature_path.write_bytes(private_key.sign(path.read_bytes()))
+    return path, signature_path
+
+
+def survey_authority_paths(survey_path):
+    attestation = survey_path.parent / "survey-authority-attestation.json"
+    return attestation, attestation.with_suffix(".sig")
 
 
 def apply_transform(points, tx=100.0, ty=-50.0, yaw_deg=2.0, z_bias=5.0):
@@ -73,8 +145,14 @@ def synthetic_evidence(warp_holdout=None, initial=None):
         [30.0, 45.0, 0.0], [35.0, 45.0, 0.0],
     ]
     objects = [{
-        "id": f"environment-StableLandmark-landmark-{index:02d}",
-        "source_object_id": f"landmark-{index:02d}", "category": "StableLandmark",
+        "id": f"environment-TrafficLight-landmark-{index:02d}",
+        "source_object_id": f"landmark-{index:02d}", "category": "TrafficLight",
+        "semantic_source": {
+            "schema": tool.NATIVE_OBJECT_SEMANTIC_SCHEMA,
+            "api": tool.NATIVE_OBJECT_API,
+            "native_type": "CityObjectLabel.TrafficLight",
+            "native_subtype": None,
+        },
         "name": f"survey monument {index:02d}", "center_world": point,
         "extent": [0.1, 0.1, 0.5],
     } for index, point in enumerate(landmark_coordinates)]
@@ -116,6 +194,39 @@ def run_synthetic(**kwargs):
     return tool.register(annotation, geometry, tiles, metadata, {"source": "synthetic"}, survey)
 
 
+def test_production_authority_allowlists_default_empty():
+    fresh_spec = importlib.util.spec_from_file_location("register_map_defaults", TOOL_PATH)
+    fresh = importlib.util.module_from_spec(fresh_spec)
+    fresh_spec.loader.exec_module(fresh)
+    assert fresh.TRUSTED_SURVEY_AUTHORITY_SIGNERS == {}
+    assert fresh.TRUSTED_CRS_AUTHORITY_SIGNERS == {}
+    assert fresh.TRUSTED_ANNOTATION_AUTHORITY_SIGNERS == {}
+    assert fresh.TRUSTED_LIDAR_VALIDATION_SIGNERS == {}
+    assert fresh.TRUSTED_VERTICAL_DATUM_SIGNERS == {}
+
+
+def test_tracked_deterministic_toolchain_lock_matches_current_runtime():
+    evidence = tool.validate_toolchain_lock()
+    assert evidence["passed"] is True
+    assert evidence["runtime"]["thread_environment"] == {
+        "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1", "OPENBLAS_CORETYPE": "Haswell",
+    }
+
+
+def test_toolchain_lock_rejects_nondeterministic_thread_override(monkeypatch):
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "4")
+    with pytest.raises(tool.RegistrationError, match="deterministic toolchain"):
+        tool.validate_toolchain_lock()
+
+
+def test_toolchain_lock_rejects_different_openblas_kernel(monkeypatch):
+    monkeypatch.setenv("OPENBLAS_CORETYPE", "SkylakeX")
+    with pytest.raises(tool.RegistrationError, match="deterministic toolchain"):
+        tool.validate_toolchain_lock()
+
+
 def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive_hash="opendrive",
                          corrupt_summary=False):
     from pyproj import CRS
@@ -151,8 +262,13 @@ def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive
         writer.writerows(rows)
     survey_license = tmp_path / "surveyor-license.pdf"
     instrument_calibration = tmp_path / "instrument-calibration.pdf"
-    survey_license.write_bytes(b"%PDF-1.7\nlicensed surveyor PLS-12345\n%%EOF\n")
-    instrument_calibration.write_bytes(b"%PDF-1.7\ninstrument TS-9000-001 calibration\n%%EOF\n")
+    survey_license.write_bytes(
+        b"%PDF-1.7\nlicensed surveyor PLS-12345\n%" + b"L" * 4096 + b"\n%%EOF\n"
+    )
+    instrument_calibration.write_bytes(
+        b"%PDF-1.7\ninstrument TS-9000-001 calibration\n%"
+        + b"C" * 4096 + b"\n%%EOF\n"
+    )
     deliverables = [observations, survey_license, instrument_calibration]
     roles = {
         observations: "raw_observations", survey_license: "survey_license",
@@ -200,6 +316,43 @@ def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive
         value.update({"horizontal_rmse_m": 0.0, "horizontal_max_m": 0.0})
     path = tmp_path / "survey.json"
     path.write_text(json.dumps(value))
+    now = datetime.now(timezone.utc)
+    attestation_value = {
+        "schema": tool.SURVEY_AUTHORITY_ATTESTATION_SCHEMA,
+        "signing_key_id": SURVEY_AUTHORITY_KEY_ID,
+        "public_key_sha256": tool.hashlib.sha256(
+            public_key_pem(SURVEY_AUTHORITY_PRIVATE_KEY)
+        ).hexdigest(),
+        "producer": "Independent State Survey Verification Service",
+        "source": "state-license-registry-test-fixture",
+        "verified_at_utc": now.isoformat(),
+        "expires_at_utc": (now + timedelta(days=30)).isoformat(),
+        "survey_manifest_sha256": tool.sha256(path),
+        "licensed_source": {
+            "provider": "Licensed Survey Provider LLC",
+            "source_id": "licensed-field-book-2026-07",
+            "project_id": "RICHMOND-V2X-2026",
+            "surveyor": {
+                "name": "Licensed Surveyor", "license_number": "PLS-12345",
+                "licensing_authority": "California Board for Professional Engineers",
+            },
+            "instrument": {
+                "manufacturer": "Leica", "model": "TS16",
+                "serial_number": "TS-9000-001",
+            },
+        },
+        "deliverables": sorted(value["raw_deliverables"], key=lambda item: item["role"]),
+        "verification_result": {
+            "provider_status": "verified",
+            "surveyor_license_status": "active",
+            "instrument_calibration_status": "valid",
+            "deliverable_integrity_status": "verified",
+        },
+    }
+    write_detached_attestation(
+        tmp_path / "survey-authority-attestation.json",
+        attestation_value, SURVEY_AUTHORITY_PRIVATE_KEY,
+    )
     return path, deliverables, observations
 
 
@@ -216,6 +369,126 @@ def rebind_observations(path, observations):
     path.write_text(json.dumps(value))
 
 
+def validate_written_survey(path, geometry, deliverables, observations,
+                            geometry_hash="geometry", opendrive_hash="opendrive",
+                            horizontal_epsg=26910, horizontal_wkt=None,
+                            coordinate_epoch=None):
+    attestation, signature = survey_authority_paths(path)
+    return tool.validate_current_survey(
+        path, geometry, geometry_hash, opendrive_hash, horizontal_epsg,
+        deliverables, observations, horizontal_wkt, coordinate_epoch,
+        attestation, signature,
+    )
+
+
+def write_crs_authority_attestation(tmp_path, artifact_path):
+    artifact = json.loads(artifact_path.read_text())
+    now = datetime.now(timezone.utc)
+    value = {
+        "schema": tool.CRS_AUTHORITY_ATTESTATION_SCHEMA,
+        "signing_key_id": CRS_AUTHORITY_KEY_ID,
+        "public_key_sha256": tool.hashlib.sha256(
+            public_key_pem(CRS_AUTHORITY_PRIVATE_KEY)
+        ).hexdigest(),
+        "producer": "Independent Geodetic Authority",
+        "source": "official-operation-registry-test-fixture",
+        "verified_at_utc": now.isoformat(),
+        "expires_at_utc": (now + timedelta(days=30)).isoformat(),
+        "reconciliation_artifact_sha256": tool.sha256(artifact_path),
+        "proj_pipeline_sha256": artifact["proj_pipeline_sha256"],
+        "source_crs_wkt_sha256": artifact["source_crs_wkt_sha256"],
+        "target_crs_wkt_sha256": artifact["target_crs_wkt_sha256"],
+        "source_coordinate_epoch": artifact["source_coordinate_epoch"],
+        "target_coordinate_epoch": artifact["target_coordinate_epoch"],
+        "authority": artifact["authority"],
+        "operation_id": artifact["operation_id"],
+        "check_points_sha256": tool.canonical_hash(artifact["check_points"]),
+        "verification_result": {
+            "transform_source_status": "official",
+            "operation_status": "authorized",
+            "control_source_status": "independent",
+        },
+    }
+    return write_detached_attestation(
+        tmp_path / "crs-authority-attestation.json", value,
+        CRS_AUTHORITY_PRIVATE_KEY,
+    )
+
+
+def write_annotation_review_bundle(tmp_path, annotation, features):
+    annotation_path = tmp_path / "annotations.json"
+    annotation_path.write_text(json.dumps(annotation))
+    now = datetime.now(timezone.utc)
+    reviewed_features = [{
+        "feature_id": item["id"],
+        "map_xyz": item["map_points"].tolist(),
+        "lidar_xyz": item["lidar_points"].tolist(),
+    } for item in features]
+    review_value = {
+        "schema": tool.ANNOTATION_REVIEW_SCHEMA,
+        "annotation_sha256": tool.sha256(annotation_path),
+        "reviewers": [{
+            "reviewer_id": "reviewer-a", "organization": "Review Org A",
+            "reviewed_at_utc": now.isoformat(),
+            "features": copy.deepcopy(reviewed_features),
+        }, {
+            "reviewer_id": "reviewer-b", "organization": "Review Org B",
+            "reviewed_at_utc": now.isoformat(),
+            "features": copy.deepcopy(reviewed_features),
+        }],
+    }
+    review_path = tmp_path / "annotation-review.json"
+    review_path.write_text(json.dumps(review_value))
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger_value = {
+        "schema": tool.HOLDOUT_LEDGER_SCHEMA,
+        "annotation_sha256": tool.sha256(annotation_path),
+        "holdout_set_sha256": review["holdout_set_sha256"],
+        "evaluation_id": "one-time-final-evaluation",
+        "purpose": "final_acceptance",
+        "prior_evaluation_count": 0,
+        "maximum_evaluation_count": 1,
+        "prior_evaluation_ids": [],
+        "authorized_at_utc": now.isoformat(),
+        "expires_at_utc": (now + timedelta(days=7)).isoformat(),
+        "burn_receipt_path": str(
+            (tmp_path / "one-time-final-evaluation-burn.json").resolve()
+        ),
+    }
+    ledger_path = tmp_path / "holdout-ledger.json"
+    ledger_path.write_text(json.dumps(ledger_value))
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    attestation_value = {
+        "schema": tool.ANNOTATION_AUTHORITY_ATTESTATION_SCHEMA,
+        "signing_key_id": ANNOTATION_AUTHORITY_KEY_ID,
+        "public_key_sha256": tool.hashlib.sha256(
+            public_key_pem(ANNOTATION_AUTHORITY_PRIVATE_KEY)
+        ).hexdigest(),
+        "producer": "Independent Annotation Authority",
+        "source": "annotation-review-registry-test-fixture",
+        "verified_at_utc": now.isoformat(),
+        "expires_at_utc": (now + timedelta(days=30)).isoformat(),
+        "annotation_sha256": tool.sha256(annotation_path),
+        "annotation_review_sha256": review["sha256"],
+        "holdout_ledger_sha256": ledger["sha256"],
+        "holdout_set_sha256": review["holdout_set_sha256"],
+        "reviewers": review["reviewers"],
+        "verification_result": {
+            "annotation_status": "verified",
+            "interreview_status": "independent",
+            "holdout_status": "authorized_once",
+        },
+    }
+    attestation_path, signature_path = write_detached_attestation(
+        tmp_path / "annotation-authority-attestation.json",
+        attestation_value, ANNOTATION_AUTHORITY_PRIVATE_KEY,
+    )
+    return (
+        annotation_path, review_path, ledger_path,
+        attestation_path, signature_path,
+    )
+
+
 def test_known_site_transform_passes_numerical_gates_but_2018_ql2_stays_ineligible():
     report = run_synthetic()
     transform = report["model"]["transform"]
@@ -227,6 +500,11 @@ def test_known_site_transform_passes_numerical_gates_but_2018_ql2_stays_ineligib
     assert report["acceptance_eligible"] is False
     assert "2018_ql2_is_development_control_only" in report["reasons"]
     assert "current_horizontal_survey_missing" in report["reasons"]
+    assert "lidar_validation_authority_attestation_missing" in report["reasons"]
+    assert "annotation_interreview_missing" in report["reasons"]
+    assert "holdout_evaluation_burn_uncontrolled" in report["reasons"]
+    assert "annotation_authority_attestation_missing" in report["reasons"]
+    assert "vertical_datum_reconciliation_missing" in report["reasons"]
     assert report["optimizer"]["jacobian_rank"] == 4
     assert report["leave_one_approach_out"]["translation_spread_m"] <= 0.10
     assert report["leave_one_approach_out"]["yaw_spread_deg"] <= 0.10
@@ -282,9 +560,12 @@ def test_map_polyline_identity_cannot_leak_between_fit_and_holdout():
 
 def test_source_feature_identity_cannot_leak_through_different_vertex_slices():
     annotation, geometry, tiles, _, _ = synthetic_evidence()
-    annotation["features"][0]["map"]["vertex_indices"] = [0, 1]
+    geometry["geometry"]["lanes"][0]["left_boundary_world"] = [
+        [0, 0, 0], [0, 4, 0], [0, 8, 0], [0, 12, 0], [0, 16, 0],
+    ]
+    annotation["features"][0]["map"]["vertex_indices"] = [0, 1, 2]
     annotation["features"][1]["map"] = copy.deepcopy(annotation["features"][0]["map"])
-    annotation["features"][1]["map"]["vertex_indices"] = [1, 2]
+    annotation["features"][1]["map"]["vertex_indices"] = [2, 3, 4]
     with pytest.raises(tool.RegistrationError, match="map source feature identity leaks"):
         tool.load_features(annotation, geometry, tiles)
 
@@ -330,7 +611,7 @@ def test_fit_holdout_endpoint_overlap_is_rejected_even_with_distinct_ids():
 
 def test_fit_holdout_polylines_inside_spatial_exclusion_buffer_are_rejected():
     annotation, geometry, tiles, _, _ = synthetic_evidence()
-    holdout_map = [[0.25, 0.0, 0.0], [0.25, 8.0, 0.0], [0.25, 16.0, 0.0]]
+    holdout_map = [[0.495, 0.0, 0.0], [0.495, 8.0, 0.0], [0.495, 16.0, 0.0]]
     geometry["geometry"]["lanes"][1]["left_boundary_world"] = holdout_map
     transformed = apply_transform(holdout_map)
     annotation["features"][1]["lidar"]["xyz"] = transformed.tolist()
@@ -340,10 +621,106 @@ def test_fit_holdout_polylines_inside_spatial_exclusion_buffer_are_rejected():
         tool.load_features(annotation, geometry, tiles)
 
 
+def test_exact_segment_distance_rejects_0_495_m_split_separation():
+    left = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    right = np.asarray([[0.123, 0.495, 0.0], [10.123, 0.495, 0.0]])
+    assert tool.minimum_polyline_distance(left, right) == pytest.approx(0.495)
+    assert tool.minimum_polyline_distance(left, right) <= tool.SPATIAL_EXCLUSION_BUFFER_M
+
+
+def test_exact_segment_distance_handles_intersections_and_degenerate_segments():
+    crossing = tool._segment_segment_distance_2d(
+        np.asarray([0.0, 0.0]), np.asarray([2.0, 2.0]),
+        np.asarray([0.0, 2.0]), np.asarray([2.0, 0.0]),
+    )
+    point_to_segment = tool._segment_segment_distance_2d(
+        np.asarray([0.0, 0.0]), np.asarray([0.0, 0.0]),
+        np.asarray([1.0, -1.0]), np.asarray([1.0, 1.0]),
+    )
+    two_points = tool._segment_segment_distance_2d(
+        np.asarray([0.0, 0.0]), np.asarray([0.0, 0.0]),
+        np.asarray([3.0, 4.0]), np.asarray([3.0, 4.0]),
+    )
+    assert crossing == 0.0
+    assert point_to_segment == pytest.approx(1.0)
+    assert two_points == pytest.approx(5.0)
+
+
+def test_annotation_interreview_and_one_time_holdout_burn_are_enforced(tmp_path):
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path = (
+        write_annotation_review_bundle(tmp_path, annotation, features)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    burned = tool.authorize_and_burn_holdout(review, ledger, authority)
+    assert review["repeatability_max_m"] == 0.0
+    assert authority["signing_key_id"] == ANNOTATION_AUTHORITY_KEY_ID
+    assert burned["burned"] is True
+    with pytest.raises(tool.RegistrationError, match="already burned"):
+        tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    copied_dir = tmp_path / "copied-ledger-bypass"
+    copied_dir.mkdir()
+    copied_ledger = copied_dir / ledger_path.name
+    copied_ledger.write_bytes(ledger_path.read_bytes())
+    with pytest.raises(tool.RegistrationError, match="ledger is invalid"):
+        tool.validate_holdout_ledger(annotation_path, copied_ledger, review)
+
+
+def test_cli_holdout_evaluation_fails_closed_before_any_metric_is_computed(tmp_path):
+    receipt_path = tmp_path / "burn.json"
+    review = {"passed": True}
+    ledger = {
+        "passed": True,
+        "burn_receipt_path": str(receipt_path),
+        "evaluation_id": "sealed-final-1",
+        "sha256": "ledger-hash",
+        "holdout_set_sha256": "holdout-hash",
+    }
+    authority = {"attestation_sha256": "authority-hash"}
+    with pytest.raises(tool.RegistrationError, match="independent annotation review"):
+        tool.authorize_and_burn_holdout({"passed": False}, ledger, authority)
+    with pytest.raises(tool.RegistrationError, match="one-time authorization ledger"):
+        tool.authorize_and_burn_holdout(review, {"passed": False}, authority)
+    with pytest.raises(tool.RegistrationError, match="authenticated annotation authority"):
+        tool.authorize_and_burn_holdout(review, ledger, None)
+    assert receipt_path.exists() is False
+
+
+def test_annotation_interreview_repeatability_above_fixed_limit_fails(tmp_path):
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, _, _, _ = write_annotation_review_bundle(
+        tmp_path, annotation, features
+    )
+    review = json.loads(review_path.read_text())
+    review["reviewers"][1]["features"][0]["lidar_xyz"][0][0] += 0.101
+    review_path.write_text(json.dumps(review))
+    with pytest.raises(tool.RegistrationError, match="repeatability"):
+        tool.validate_annotation_review(annotation_path, review_path, features)
+
+
 def test_automatic_or_unspecified_feature_provenance_is_rejected():
     annotation, geometry, tiles, _, _ = synthetic_evidence()
     annotation["features"][0]["provenance"] = "automatic_matcher"
     with pytest.raises(tool.RegistrationError, match="provenance"):
+        tool.load_features(annotation, geometry, tiles)
+
+
+def test_two_point_annotation_is_rejected_as_underconstrained():
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    feature = annotation["features"][0]
+    feature["map"]["vertex_indices"] = [0, 2]
+    feature["lidar"]["point_indices"] = feature["lidar"]["point_indices"][:2]
+    feature["lidar"]["physical_control_ids"] = (
+        feature["lidar"]["physical_control_ids"][:2]
+    )
+    feature["lidar"]["xyz"] = feature["lidar"]["xyz"][:2]
+    with pytest.raises(tool.RegistrationError, match="fewer than 3"):
         tool.load_features(annotation, geometry, tiles)
 
 
@@ -493,7 +870,7 @@ def strict_geometry_fixture(tmp_path):
     exact_ranges = exporter.opendrive_road_mark_ranges(xodr.read_bytes())
     marking = {"type": "solid", "color": "white", "width_m": 0.15, "lane_change": "both"}
     source_value = {
-        "schema": "v2x-retained-carla-map-export/v1",
+        "schema": exporter.CARLA_SOURCE_SCHEMA,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "map": "SyntheticMap", "opendrive_sha256": opendrive["sha256"],
         "radius_m": 80.0, "lane_spacing_m": 1.0,
@@ -512,7 +889,13 @@ def strict_geometry_fixture(tmp_path):
         }],
         "environment_objects": [{
             "source_object_id": "signal-1", "name": "signal",
-            "category": "TrafficLight", "center_world": [5.0, 0.0, 2.0],
+            "semantic_source": {
+                "schema": exporter.NATIVE_OBJECT_SEMANTIC_SCHEMA,
+                "api": exporter.NATIVE_OBJECT_API,
+                "native_type": "CityObjectLabel.TrafficLight",
+                "native_subtype": None,
+            },
+            "center_world": [5.0, 0.0, 2.0],
             "extent": [0.2, 0.2, 1.0],
         }],
     }
@@ -702,6 +1085,184 @@ def write_las_and_validation(tmp_path, scales=(0.01, 0.01, 0.01), crs_epsg=26910
     return path, validation
 
 
+def write_lidar_validation_attestation(tmp_path, lidar_path, validation_path):
+    import laspy
+
+    validation = json.loads(validation_path.read_text())
+    crs_wkt = laspy.read(lidar_path).header.parse_crs().to_wkt()
+    now = datetime.now(timezone.utc)
+    value = {
+        "schema": tool.LIDAR_VALIDATION_AUTHORITY_ATTESTATION_SCHEMA,
+        "signing_key_id": LIDAR_AUTHORITY_KEY_ID,
+        "public_key_sha256": tool.hashlib.sha256(
+            public_key_pem(LIDAR_AUTHORITY_PRIVATE_KEY)
+        ).hexdigest(),
+        "producer": "Independent LiDAR Data Authority",
+        "source": "lidar-validation-registry-test-fixture",
+        "verified_at_utc": now.isoformat(),
+        "expires_at_utc": (now + timedelta(days=30)).isoformat(),
+        "lidar_sha256": tool.sha256(lidar_path),
+        "lidar_bytes": lidar_path.stat().st_size,
+        "validation_sha256": tool.sha256(validation_path),
+        "validation_payload_sha256": tool.canonical_hash(validation),
+        "point_count": validation["points"],
+        "crs_wkt_sha256": tool.hashlib.sha256(crs_wkt.encode()).hexdigest(),
+        "bounds_sha256": tool.canonical_hash({
+            "mins": validation["mins"], "maxs": validation["maxs"],
+        }),
+        "verification_result": {
+            "source_data_status": "authoritative",
+            "validation_status": "verified",
+        },
+    }
+    return write_detached_attestation(
+        tmp_path / "lidar-validation-authority.json", value,
+        LIDAR_AUTHORITY_PRIVATE_KEY,
+    )
+
+
+def write_vertical_reconciliation_bundle(tmp_path, opendrive, tile):
+    now = datetime.now(timezone.utc)
+    source_reference = {
+        "datum": "Authenticated Richmond engineering datum",
+        "coordinate_epoch": 2026.5,
+        "linear_units": "metre",
+        "source_artifact_sha256": "a" * 64,
+    }
+    target_reference = {
+        "epsg": tile["vertical_epsg"], "datum": tile["vertical_datum"],
+        "wkt_sha256": tool.hashlib.sha256(tile["vertical_crs_wkt"].encode()).hexdigest(),
+        "coordinate_epoch": tile["vertical_coordinate_epoch"],
+        "linear_units": "metre",
+    }
+    operation = {"method": "constant_offset", "offset_m": 5.0}
+    check_points = [{
+        "id": f"vertical-control-{index}",
+        "physical_control_id": f"vertical-monument-{index}",
+        "provenance": "independent_authority_control",
+        "source_z_m": float(index), "target_z_m": float(index + 5),
+        "vertical_uncertainty_m": 0.02,
+    } for index in range(6)]
+    artifact_value = {
+        "schema": tool.VERTICAL_DATUM_RECONCILIATION_SCHEMA,
+        "opendrive_sha256": opendrive["sha256"],
+        "lidar_vertical_epsg": tile["vertical_epsg"],
+        "lidar_vertical_datum": tile["vertical_datum"],
+        "lidar_vertical_crs_wkt_sha256": tool.hashlib.sha256(
+            tile["vertical_crs_wkt"].encode()
+        ).hexdigest(),
+        "source_vertical_reference": source_reference,
+        "target_vertical_reference": target_reference,
+        "operation": operation,
+        "authority": "Independent Vertical Datum Authority",
+        "operation_id": "richmond-vertical-operation-test",
+        "check_points": check_points,
+    }
+    artifact_path = tmp_path / "vertical-datum-reconciliation.json"
+    artifact_path.write_text(json.dumps(artifact_value))
+    attestation_value = {
+        "schema": tool.VERTICAL_DATUM_AUTHORITY_ATTESTATION_SCHEMA,
+        "signing_key_id": VERTICAL_AUTHORITY_KEY_ID,
+        "public_key_sha256": tool.hashlib.sha256(
+            public_key_pem(VERTICAL_AUTHORITY_PRIVATE_KEY)
+        ).hexdigest(),
+        "producer": "Independent Vertical Datum Authority",
+        "source": "vertical-operation-registry-test-fixture",
+        "verified_at_utc": now.isoformat(),
+        "expires_at_utc": (now + timedelta(days=30)).isoformat(),
+        "reconciliation_artifact_sha256": tool.sha256(artifact_path),
+        "opendrive_sha256": opendrive["sha256"],
+        "lidar_vertical_crs_wkt_sha256": artifact_value[
+            "lidar_vertical_crs_wkt_sha256"
+        ],
+        "source_vertical_reference_sha256": tool.canonical_hash(source_reference),
+        "target_vertical_reference_sha256": tool.canonical_hash(target_reference),
+        "operation_sha256": tool.canonical_hash(operation),
+        "authority": artifact_value["authority"],
+        "operation_id": artifact_value["operation_id"],
+        "check_points_sha256": tool.canonical_hash(check_points),
+        "verification_result": {
+            "vertical_source_status": "official",
+            "operation_status": "authorized",
+            "control_source_status": "independent",
+        },
+    }
+    attestation_path, signature_path = write_detached_attestation(
+        tmp_path / "vertical-datum-authority.json", attestation_value,
+        VERTICAL_AUTHORITY_PRIVATE_KEY,
+    )
+    return artifact_path, attestation_path, signature_path
+
+
+def test_lidar_validation_requires_independently_signed_authority_for_acceptance(tmp_path):
+    path, validation = write_las_and_validation(tmp_path)
+    unsigned = tool.load_lidar_tile(path, validation)
+    assert unsigned["validation_authority_attestation"] is None
+    attestation, signature = write_lidar_validation_attestation(
+        tmp_path, path, validation
+    )
+    signed = tool.load_lidar_tile(path, validation, attestation, signature)
+    assert signed["validation_authority_attestation"]["signing_key_id"] == LIDAR_AUTHORITY_KEY_ID
+
+
+def test_lidar_validation_authority_signature_tamper_fails(tmp_path):
+    path, validation = write_las_and_validation(tmp_path)
+    attestation, signature = write_lidar_validation_attestation(
+        tmp_path, path, validation
+    )
+    signature.write_bytes(b"\x00" * 64)
+    with pytest.raises(tool.RegistrationError, match="detached signature"):
+        tool.load_lidar_tile(path, validation, attestation, signature)
+
+
+def test_vertical_datum_reconciliation_missing_stays_ineligible(tmp_path):
+    path, validation = write_las_and_validation(tmp_path)
+    tile = tool.load_lidar_tile(path, validation)
+    xodr = tmp_path / "map.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:26910</geoReference></header></OpenDRIVE>"
+    )
+    result = tool.validate_vertical_datum_reconciliation(
+        tool.parse_opendrive(xodr), tile, {"present": False}
+    )
+    assert result["passed"] is False
+    assert result["reasons"] == ["vertical_datum_reconciliation_missing"]
+
+
+def test_signed_vertical_datum_reconciliation_recomputes_independent_controls(tmp_path):
+    path, validation = write_las_and_validation(tmp_path)
+    tile = tool.load_lidar_tile(path, validation)
+    xodr = tmp_path / "map.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:26910</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(xodr)
+    artifact, attestation, signature = write_vertical_reconciliation_bundle(
+        tmp_path, opendrive, tile
+    )
+    result = tool.validate_vertical_datum_reconciliation(
+        opendrive, tile, {"present": False}, artifact, attestation, signature
+    )
+    assert result["passed"] is True
+    assert result["authenticated_offset_m"] == 5.0
+    assert result["recomputed_vertical_max_m"] == 0.0
+
+
+def test_self_declared_vertical_offset_without_pinned_signature_fails(tmp_path):
+    path, validation = write_las_and_validation(tmp_path)
+    tile = tool.load_lidar_tile(path, validation)
+    xodr = tmp_path / "map.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:26910</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(xodr)
+    artifact, _, _ = write_vertical_reconciliation_bundle(tmp_path, opendrive, tile)
+    with pytest.raises(tool.RegistrationError, match="vertical datum authority detached"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact
+        )
+
+
 def test_raw_las_crs_mismatch_is_rejected(tmp_path):
     path, validation = write_las_and_validation(tmp_path)
     value = json.loads(validation.read_text())
@@ -797,14 +1358,55 @@ def test_crs_reconciliation_pipeline_hash_and_licensed_source_are_fail_closed(tm
         tool.validate_crs_reconciliation(opendrive, lidar, survey, artifact)
 
 
-def test_hash_bound_crs_pipeline_recomputes_licensed_survey_check_points(tmp_path):
+def test_self_declared_arbitrary_crs_pipeline_without_pinned_signature_fails(tmp_path):
+    from pyproj import CRS
+
+    xodr = tmp_path / "self-declared.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:3857</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(xodr)
+    target_crs = CRS.from_epsg(26910)
+    lidar = {
+        "horizontal_crs_wkt": target_crs.to_wkt(), "horizontal_epsg": 26910,
+        "horizontal_datum": target_crs.datum.name,
+        "horizontal_coordinate_epoch": None,
+    }
+    pipeline = "+proj=pipeline +step +proj=affine +xoff=1 +yoff=2"
+    controls = [{
+        "id": f"caller-{index}", "physical_control_id": f"caller-physical-{index}",
+        "provenance": "independent_authority_control",
+        "source_xy": point, "target_xy": [point[0] + 1, point[1] + 2],
+    } for index, point in enumerate((
+        [0, 0], [10, 0], [0, 10], [10, 10], [5, 15], [15, 5]
+    ))]
+    artifact = tmp_path / "self-declared-reconciliation.json"
+    artifact.write_text(json.dumps({
+        "schema": "v2x-crs-reconciliation/v1", "proj_pipeline": pipeline,
+        "proj_pipeline_sha256": tool.hashlib.sha256(pipeline.encode()).hexdigest(),
+        "source_crs_wkt_sha256": tool.hashlib.sha256(
+            opendrive["georeference_wkt"].encode()
+        ).hexdigest(),
+        "target_crs_wkt_sha256": tool.hashlib.sha256(
+            lidar["horizontal_crs_wkt"].encode()
+        ).hexdigest(),
+        "source_coordinate_epoch": None, "target_coordinate_epoch": None,
+        "authority": "caller says official", "operation_id": "arbitrary-affine",
+        "check_points": controls,
+    }))
+    with pytest.raises(tool.RegistrationError, match="CRS authority detached"):
+        tool.validate_crs_reconciliation(
+            opendrive, lidar, {"present": False}, artifact
+        )
+
+
+def test_signed_crs_pipeline_recomputes_independent_authority_check_points(tmp_path):
     from pyproj import CRS
 
     _, geometry, _, _, _ = synthetic_evidence()
     survey_path, deliverables, observations = write_current_survey(tmp_path, geometry)
-    survey = tool.validate_current_survey(
-        survey_path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
+    survey = validate_written_survey(
+        survey_path, geometry, deliverables, observations
     )
     xodr = tmp_path / "different-crs.xodr"
     xodr.write_text(
@@ -822,6 +1424,13 @@ def test_hash_bound_crs_pipeline_recomputes_licensed_survey_check_points(tmp_pat
         "+proj=pipeline +step +proj=affine +xoff=100 +yoff=-50 "
         f"+s11={cosine} +s12={-sine} +s21={sine} +s22={cosine}"
     )
+    source_points = np.asarray([
+        [100.0, 100.0], [110.0, 100.0], [100.0, 110.0],
+        [110.0, 110.0], [105.0, 120.0], [120.0, 105.0],
+    ])
+    target_points = apply_transform(
+        np.column_stack((source_points, np.zeros(len(source_points))))
+    )[:, :2]
     artifact = tmp_path / "crs-reconciliation-valid.json"
     artifact.write_text(json.dumps({
         "schema": "v2x-crs-reconciliation/v1", "proj_pipeline": pipeline,
@@ -833,18 +1442,76 @@ def test_hash_bound_crs_pipeline_recomputes_licensed_survey_check_points(tmp_pat
             lidar["horizontal_crs_wkt"].encode()
         ).hexdigest(),
         "source_coordinate_epoch": None, "target_coordinate_epoch": None,
-        "authority": "Licensed Survey Provider LLC", "operation_id": "site-grid-2026",
-        "source_deliverable_sha256": tool.sha256(deliverables[1]),
+        "authority": "Independent Geodetic Authority", "operation_id": "site-grid-2026",
         "check_points": [{
-            "id": item["observation_id"], "source_xy": item["map_xy"],
-            "target_xy": item["survey_xy"],
-        } for item in survey["raw_control_coordinates"]],
+            "id": f"crs-control-{index}",
+            "physical_control_id": f"crs-monument-{index}",
+            "provenance": "independent_authority_control",
+            "source_xy": source.tolist(), "target_xy": target.tolist(),
+        } for index, (source, target) in enumerate(zip(source_points, target_points))],
     }))
-    result = tool.validate_crs_reconciliation(opendrive, lidar, survey, artifact)
+    authority_attestation, authority_signature = write_crs_authority_attestation(
+        tmp_path, artifact
+    )
+    result = tool.validate_crs_reconciliation(
+        opendrive, lidar, survey, artifact,
+        authority_attestation, authority_signature,
+    )
     assert result["passed"] is True
-    assert result["method"] == "hash_bound_proj_pipeline"
-    assert result["check_point_count"] == 14
+    assert result["method"] == "signed_authority_proj_pipeline"
+    assert result["check_point_count"] == 6
     assert result["recomputed_horizontal_max_m"] < 1e-8
+    assert result["authority_attestation_evidence"]["signing_key_id"] == CRS_AUTHORITY_KEY_ID
+
+
+def test_signed_crs_pipeline_cannot_reuse_renamed_survey_controls(tmp_path):
+    from pyproj import CRS
+
+    _, geometry, _, _, _ = synthetic_evidence()
+    survey_path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    survey = validate_written_survey(
+        survey_path, geometry, deliverables, observations
+    )
+    xodr = tmp_path / "disjoint-required.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:3857</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(xodr)
+    target_crs = CRS.from_epsg(26910)
+    lidar = {
+        "horizontal_crs_wkt": target_crs.to_wkt(), "horizontal_epsg": 26910,
+        "horizontal_datum": target_crs.datum.name,
+        "horizontal_coordinate_epoch": None,
+    }
+    cosine, sine = math.cos(math.radians(2.0)), math.sin(math.radians(2.0))
+    pipeline = (
+        "+proj=pipeline +step +proj=affine +xoff=100 +yoff=-50 "
+        f"+s11={cosine} +s12={-sine} +s21={sine} +s22={cosine}"
+    )
+    artifact = tmp_path / "reused-survey-controls.json"
+    artifact.write_text(json.dumps({
+        "schema": "v2x-crs-reconciliation/v1", "proj_pipeline": pipeline,
+        "proj_pipeline_sha256": tool.hashlib.sha256(pipeline.encode()).hexdigest(),
+        "source_crs_wkt_sha256": tool.hashlib.sha256(
+            opendrive["georeference_wkt"].encode()
+        ).hexdigest(),
+        "target_crs_wkt_sha256": tool.hashlib.sha256(
+            lidar["horizontal_crs_wkt"].encode()
+        ).hexdigest(),
+        "source_coordinate_epoch": None, "target_coordinate_epoch": None,
+        "authority": "Independent Geodetic Authority", "operation_id": "reused-controls",
+        "check_points": [{
+            "id": f"renamed-crs-{index}",
+            "physical_control_id": f"renamed-crs-physical-{index}",
+            "provenance": "independent_authority_control",
+            "source_xy": item["map_xy"], "target_xy": item["survey_xy"],
+        } for index, item in enumerate(survey["raw_control_coordinates"])],
+    }))
+    attestation, signature = write_crs_authority_attestation(tmp_path, artifact)
+    with pytest.raises(tool.RegistrationError, match="not independent from survey"):
+        tool.validate_crs_reconciliation(
+            opendrive, lidar, survey, artifact, attestation, signature
+        )
 
 
 def test_deployment_output_requires_current_survey(tmp_path):
@@ -868,11 +1535,22 @@ def test_deployment_output_requires_current_survey(tmp_path):
 
 def test_2018_ql2_cannot_emit_deployment_even_with_current_survey(tmp_path):
     report = run_synthetic()
-    report["evidence"]["crs_reconciliation"] = {"passed": True}
+    report["evidence"].update({
+        "crs_reconciliation": {"passed": True},
+        "toolchain": {"passed": True},
+        "annotation_review": {"passed": True},
+        "holdout_evaluation": {"passed": True, "burned": True},
+        "annotation_authority_attestation": {"signing_key_id": "pinned"},
+        "vertical_datum_reconciliation": {"passed": True},
+        "lidar_tiles": [{
+            "validation_authority_attestation": {"signing_key_id": "pinned"},
+        }],
+    })
     survey = {
-        "passed": True, "raw_controls_recomputed": True, "stable_landmark_count": 6,
+        "passed": True, "raw_controls_recomputed": True, "stable_landmark_count": 14,
         "licensed_source": {"provider": "licensed"},
         "raw_deliverable_evidence": {"deliverables": [{"sha256": "bound"}]},
+        "authority_attestation_evidence": {"signing_key_id": "pinned"},
         "reasons": [],
     }
     with pytest.raises(tool.RegistrationError, match="strict registration gates"):
@@ -906,10 +1584,7 @@ def test_current_survey_recomputes_raw_fit_and_holdout_controls(tmp_path):
     path, deliverables, observations = write_current_survey(
         tmp_path, geometry, corrupt_summary=True
     )
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is True
     assert survey["raw_controls_recomputed"] is True
     assert survey["raw_control_count"] == 14
@@ -917,6 +1592,60 @@ def test_current_survey_recomputes_raw_fit_and_holdout_controls(tmp_path):
     assert survey["recomputed_fit_metrics"]["horizontal_rmse_m"] < 1e-8
     assert survey["recomputed_holdout_metrics"]["horizontal_max_m"] < 1e-8
     assert survey["recomputed_transform"]["tx_m"] == pytest.approx(100.0)
+    assert survey["authority_attestation_evidence"]["signing_key_id"] == SURVEY_AUTHORITY_KEY_ID
+
+
+def test_self_declared_pdf_and_identity_strings_without_trusted_attestation_fail(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert survey["raw_deliverable_evidence"] is not None
+    assert survey["licensed_source"]["surveyor_license"] == "PLS-12345"
+    assert "current_horizontal_survey_authority_attestation" in survey["reasons"]
+
+
+def test_tiny_fake_pdf_is_rejected_even_when_caller_rebinds_its_hash(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    license_path = next(item for item in deliverables if item.name == "surveyor-license.pdf")
+    license_path.write_bytes(b"%PDF-1.7\ncaller says active PLS-12345\n%%EOF\n")
+    value = json.loads(path.read_text())
+    digest = tool.sha256(license_path)
+    declaration = next(
+        item for item in value["raw_deliverables"] if item["role"] == "survey_license"
+    )
+    declaration.update({"sha256": digest, "bytes": license_path.stat().st_size})
+    value["licensed_source"]["survey_license_deliverable_sha256"] = digest
+    path.write_text(json.dumps(value))
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
+
+
+def test_survey_authority_detached_signature_tamper_fails(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    _, signature = survey_authority_paths(path)
+    signature.write_bytes(b"\x00" * 64)
+    survey = validate_written_survey(path, geometry, deliverables, observations)
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_authority_attestation" in survey["reasons"]
+
+
+def test_removed_or_revoked_survey_authority_key_fails_closed(tmp_path, monkeypatch):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    monkeypatch.setattr(tool, "TRUSTED_SURVEY_AUTHORITY_SIGNERS", {})
+    survey = validate_written_survey(path, geometry, deliverables, observations)
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_authority_attestation" in survey["reasons"]
 
 
 def test_survey_raw_control_uncertainty_and_datum_fail_closed(tmp_path):
@@ -941,10 +1670,7 @@ def test_survey_raw_control_uncertainty_and_datum_fail_closed(tmp_path):
     observation_declaration["sha256"] = observation_hash
     observation_declaration["bytes"] = observations.stat().st_size
     path.write_text(json.dumps(value))
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is False
     assert "current_horizontal_survey_crs" in survey["reasons"]
     assert "current_horizontal_survey_raw_observations" in survey["reasons"]
@@ -955,10 +1681,7 @@ def test_survey_geometric_control_duplicate_across_splits_is_rejected(tmp_path):
     objects = geometry["geometry"]["objects"]
     objects[10]["center_world"] = list(objects[0]["center_world"])
     path, deliverables, observations = write_current_survey(tmp_path, geometry)
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is False
     assert "current_horizontal_survey_raw_observations" in survey["reasons"]
 
@@ -968,10 +1691,7 @@ def test_survey_raw_deliverable_byte_tamper_is_rejected(tmp_path):
     path, deliverables, observations = write_current_survey(tmp_path, geometry)
     license_path = next(item for item in deliverables if item.name == "surveyor-license.pdf")
     license_path.write_bytes(license_path.read_bytes() + b"tampered")
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is False
     assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
 
@@ -989,33 +1709,39 @@ def test_survey_observation_surveyor_instrument_and_source_identity_are_enforced
         writer.writeheader()
         writer.writerows(rows)
     rebind_observations(path, observations)
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is False
     assert "current_horizontal_survey_raw_observations" in survey["reasons"]
 
 
-def test_survey_requires_six_distinct_stable_landmark_controls(tmp_path):
+def test_survey_requires_one_distinct_stable_landmark_per_control(tmp_path):
     _, geometry, _, _, _ = synthetic_evidence()
     geometry["geometry"]["objects"] = geometry["geometry"]["objects"][:5]
     path, deliverables, observations = write_current_survey(tmp_path, geometry)
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is False
     assert "current_horizontal_survey_stable_landmark_count" in survey["reasons"]
 
 
-def test_survey_rejects_generic_environment_object_as_stable_landmark(tmp_path):
+def test_survey_rejects_caller_label_stable_landmark(tmp_path):
     _, geometry, _, _, _ = synthetic_evidence()
-    geometry["geometry"]["objects"][0]["category"] = "Other"
+    item = geometry["geometry"]["objects"][0]
+    item["category"] = "StableLandmark"
+    item["id"] = f"environment-StableLandmark-{item['source_object_id']}"
+    item.pop("semantic_source")
     path, deliverables, observations = write_current_survey(tmp_path, geometry)
-    survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910,
-        deliverables, observations,
-    )
+    survey = validate_written_survey(path, geometry, deliverables, observations)
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_raw_observations" in survey["reasons"]
+
+
+def test_survey_rejects_caller_traffic_light_without_native_semantics(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    geometry["geometry"]["objects"][0]["semantic_source"] = {
+        "schema": "caller-defined", "api": "caller",
+        "native_type": "CityObjectLabel.TrafficLight", "native_subtype": None,
+    }
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    survey = validate_written_survey(path, geometry, deliverables, observations)
     assert survey["passed"] is False
     assert "current_horizontal_survey_raw_observations" in survey["reasons"]

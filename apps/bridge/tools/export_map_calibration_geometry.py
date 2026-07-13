@@ -32,6 +32,14 @@ from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
 
 
 CAMERAS = ("ch1", "ch2", "ch3", "ch4")
+CARLA_SOURCE_SCHEMA = "v2x-retained-carla-map-export/v2"
+NATIVE_OBJECT_SEMANTIC_SCHEMA = "v2x-carla-native-environment-object/v1"
+NATIVE_OBJECT_API = "carla.World.get_environment_objects"
+NATIVE_OBJECT_CATEGORIES = {
+    "CityObjectLabel.TrafficLight": "TrafficLight",
+    "CityObjectLabel.TrafficSigns": "TrafficSigns",
+    "CityObjectLabel.Other": "Other",
+}
 
 
 def utc_now():
@@ -469,7 +477,12 @@ def static_object_source(world, label_name, anchor, radius_m):
         output.append({
             "source_object_id": str(item.id),
             "name": str(item.name),
-            "category": label_name,
+            "semantic_source": {
+                "schema": NATIVE_OBJECT_SEMANTIC_SCHEMA,
+                "api": NATIVE_OBJECT_API,
+                "native_type": f"CityObjectLabel.{label_name}",
+                "native_subtype": None,
+            },
             "center_world": [location.x, location.y, location.z],
             "extent": [
                 item.bounding_box.extent.x,
@@ -477,7 +490,29 @@ def static_object_source(world, label_name, anchor, radius_m):
                 item.bounding_box.extent.z,
             ],
         })
-    return sorted(output, key=lambda item: (item["category"], item["source_object_id"]))
+    return sorted(
+        output,
+        key=lambda item: (
+            item["semantic_source"]["native_type"], item["source_object_id"]
+        ),
+    )
+
+
+def native_object_category(semantic_source):
+    if (
+        not isinstance(semantic_source, dict)
+        or set(semantic_source) != {
+            "schema", "api", "native_type", "native_subtype"
+        }
+        or semantic_source.get("schema") != NATIVE_OBJECT_SEMANTIC_SCHEMA
+        or semantic_source.get("api") != NATIVE_OBJECT_API
+        or semantic_source.get("native_subtype") is not None
+        or semantic_source.get("native_type") not in NATIVE_OBJECT_CATEGORIES
+    ):
+        raise RuntimeError(
+            "retained CARLA object lacks recognized native object semantics"
+        )
+    return NATIVE_OBJECT_CATEGORIES[semantic_source["native_type"]]
 
 
 def objects_from_source(values):
@@ -491,14 +526,16 @@ def objects_from_source(values):
             or any(float(value) < 0 for value in extent)
         ):
             raise RuntimeError("retained CARLA environment object geometry is invalid")
-        source_id, category = item.get("source_object_id"), item.get("category")
-        if not isinstance(source_id, str) or not source_id or not isinstance(category, str) or not category:
+        source_id = item.get("source_object_id")
+        category = native_object_category(item.get("semantic_source"))
+        if not isinstance(source_id, str) or not source_id:
             raise RuntimeError("retained CARLA environment object identity is invalid")
         output.append({
             "id": f"environment-{category}-{source_id}",
             "source_object_id": source_id,
             "name": str(item.get("name", "")),
             "category": category,
+            "semantic_source": item["semantic_source"],
             "center_world": [float(value) for value in center],
             "extent": [float(value) for value in extent],
         })
@@ -509,7 +546,7 @@ def objects_from_source(values):
 
 
 def geometry_from_carla_source(source, exact_ranges):
-    if source.get("schema") != "v2x-retained-carla-map-export/v1":
+    if source.get("schema") != CARLA_SOURCE_SCHEMA:
         raise RuntimeError("retained CARLA map export schema is unsupported")
     polygons = []
     for points in source.get("crosswalk_polygons", []):
@@ -701,7 +738,7 @@ def main():
         static_object_source(world, "Other", anchor, min(args.radius_m, 30.0))
     )
     source_export = {
-        "schema": "v2x-retained-carla-map-export/v1",
+        "schema": CARLA_SOURCE_SCHEMA,
         "created_at_utc": utc_now(),
         "map": carla_map.name,
         "opendrive_sha256": hashlib.sha256(opendrive).hexdigest(),
