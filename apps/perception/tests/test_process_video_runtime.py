@@ -149,6 +149,30 @@ class FrameBroadcasterTests(unittest.TestCase):
         self.assertEqual(
             health["terminal_failover_last_evidence"], "exact_fragment_match"
         )
+        self.broadcaster.mark_terminal_failover(
+            "ch2", "succeeded", 2.0, "same_session_restart", "ready",
+            "exact_fragment_sequence",
+        )
+        self.assertEqual(
+            self.broadcaster.snapshot_health()["cameras"]["ch2"][
+                "terminal_failover_last_evidence"
+            ],
+            "exact_fragment_sequence",
+        )
+        self.broadcaster.mark_terminal_failover(
+            "ch2", "failed", 8.0, "same_session_restart",
+            "active_clock_cleanup",
+        )
+        self.broadcaster.mark_terminal_failover(
+            "ch2", "failed", 8.0, "same_session_restart",
+            "deadline_exceeded:clock_resolution",
+        )
+        self.assertEqual(
+            self.broadcaster.snapshot_health()["cameras"]["ch2"][
+                "terminal_failover_last_stage"
+            ],
+            "deadline_exceeded:clock_resolution",
+        )
 
         with self.assertRaisesRegex(ValueError, "outcome"):
             self.broadcaster.mark_terminal_failover(
@@ -171,6 +195,99 @@ class FrameBroadcasterTests(unittest.TestCase):
                 "ch1", "failed", 1.0, "same_session_restart", "failed",
                 "receipt_time_guess",
             )
+
+    def test_health_exposes_secret_free_anchor_match_frame_count(self):
+        self.broadcaster.publish(
+            "ch1",
+            self.frame,
+            media_clock_health={
+                "status": "matched",
+                "trusted": True,
+                "decode_latency_ms": 250.0,
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "anchor_match_frame_count": 3,
+                    "signed_url": (
+                        "https://example.invalid/?token=literal-secret"
+                    ),
+                },
+                "signed_url": "https://outer.invalid/?token=literal-secret",
+            },
+        )
+        camera = self.broadcaster.snapshot_health()["cameras"]["ch1"]
+        self.assertEqual(camera["anchor_match_frame_count"], 3)
+        rendered = repr(camera).lower()
+        self.assertNotIn("url", rendered)
+        self.assertNotIn("literal-secret", rendered)
+        self.assertNotIn("https://", rendered)
+
+        self.broadcaster.publish(
+            "ch2",
+            self.frame,
+            media_clock_health={
+                "status": "matched",
+                "trusted": True,
+                "media_clock": {"anchor_match_frame_count": 2},
+            },
+        )
+        self.assertIsNone(
+            self.broadcaster.snapshot_health()["cameras"]["ch2"][
+                "anchor_match_frame_count"
+            ]
+        )
+
+    def test_terminal_failover_stage_allowlist_is_finite(self):
+        base_stages = (
+            None,
+            "source",
+            "preparation_slot",
+            "clock_source",
+            "decoder_slot",
+            "capture_open",
+            "first_frame",
+            "capture_position",
+            "recent_exact_anchor",
+            "clock_resolution",
+            "clock_validation",
+            "ready",
+            "failed",
+            "old_capture_release",
+            "active_clock_cleanup",
+            "prior_terminal_cleanup",
+            "proactive_quiescence",
+            "preparation_deadline",
+            "proactive_cleanup",
+            "result_ownership",
+            "candidate_cleanup",
+        )
+        for stage in base_stages:
+            with self.subTest(stage=stage):
+                self.broadcaster.mark_terminal_failover(
+                    "ch1", "failed", 1.0, "same_session_restart", stage
+                )
+        for stage in (*base_stages[1:], "handover"):
+            deadline_stage = f"deadline_exceeded:{stage}"
+            with self.subTest(stage=deadline_stage):
+                self.broadcaster.mark_terminal_failover(
+                    "ch1", "failed", 1.0, "same_session_restart",
+                    deadline_stage,
+                )
+
+        rejected = (
+            "handover",
+            "deadline_exceeded:",
+            "deadline_exceeded:deadline_exceeded:ready",
+            "https://example.invalid/?token=literal-secret",
+            "ready\nliteral-secret",
+            7,
+            ["ready"],
+        )
+        for stage in rejected:
+            with self.subTest(stage=stage):
+                with self.assertRaisesRegex(ValueError, "stage"):
+                    self.broadcaster.mark_terminal_failover(
+                        "ch1", "failed", 1.0, "same_session_restart", stage
+                    )
 
     def test_health_age_uses_capture_time_not_inference_completion_time(self):
         self.broadcaster.mark_connected("ch1")

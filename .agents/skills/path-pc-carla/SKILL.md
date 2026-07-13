@@ -9,12 +9,12 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 06:02 UTC; verify rather than assume. These items
+Observed through 2026-07-13 06:16 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
 - Canonical source `origin/main` is now
-  `1c21694d1b175b0a5bbe5dd85e7d4c7ab0b79de0`, including PR 40 and its skill
-  follow-up; it is not the production deployment. A controlled zero-overlap
+  `7b74103c2811a22464755db40fdaf6d18be58333`, merged PR 42; it is not the
+  production deployment. The earlier controlled zero-overlap
   PR 40 replacement at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T050440Z-pr40-controlled-startup/`
   passed upload-disabled and upload-enabled four-reader readiness, strict feed
@@ -26,7 +26,7 @@ override every older PR 32/candidate statement below.
   never reached the reader kill because ch2 remained exact-clock unavailable
   for 150 seconds while ch1/ch3/ch4 were trusted; it also restored PR 35.
   Treat both as rejected release gates, not outages and not deployments.
-- Current unreleased branch `codex/v2x-perception-sequence-clock` addresses the
+- PR 42 addresses the
   intermittent initial anchor without weakening trust: the first unique exact
   frame attempt remains, but a failed attempt retries only with exactly three
   contiguous decoded frames. CPU and NVDEC fragment paths require one unique
@@ -43,16 +43,37 @@ override every older PR 32/candidate statement below.
   transports. A successful retry promotes only its paired clock source, while
   failed/stale clock URLs are dropped. Adversarial duplicate/cadence, active and
   proactive resolver-lifetime, source-promotion, static/invalid sequence, and
-  marker-persistence cases pass. The current local gate is 182 perception, 241
+  marker-persistence cases pass. Its source gate is 182 perception, 241
   Python-3.10 bridge, 23 recovery-infrastructure, and 132 web tests, zero Svelte
   diagnostics, and a successful web production build. Independent adversarial
   review found no remaining hard blocker and directly confirmed successful
-  clock-source promotion plus zero final cleanup/admission counters. This
-  branch is neither merged nor deployed; require canonical merge, a
-  zero-overlap upload-disabled all-four-clock startup, clean stop, forced-reader
-  recovery, upload-enabled fresh persistence when traffic exists, and exact
-  rollback evidence before promotion. Fable still fails authentication before
-  file access; never claim a Fable pass.
+  clock-source promotion plus zero final cleanup/admission counters.
+- The first exact PR 42 zero-overlap, upload-disabled startup is rejected. ch1
+  and ch2 anchored first, ch3 recovered next, and ch4 became trusted only at
+  about 158 seconds, beyond the unchanged 150-second startup gate. Uploads
+  stayed disabled, no forced reader was attempted, the candidate stopped
+  cleanly in two seconds, and the rollback restored exact PR 35 source, unit,
+  environment, and all three timers. CARLA, Drive, and web PIDs/restart counts
+  were unchanged; Richmond remained LIVE with zero sessions, actors, tracks,
+  or objects and about 4.1 GiB GPU memory free. Evidence and rollback are at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T060850Z-pr42-sequence-controlled-startup/`
+  and
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T060850Z-pr42-sequence/`.
+- Current unreleased follow-up branch
+  `codex/v2x-perception-sequence-evidence` fixes the discovered terminal
+  telemetry contract before any forced canary: `exact_fragment_sequence` and
+  every bounded internal failure/deadline stage are accepted while arbitrary
+  values remain rejected. `/health` now exposes per-camera, secret-free
+  `anchor_match_frame_count` as only `1`, `3`, or null, so the next startup can
+  prove which anchor path succeeded even with no detections. The local suite is
+  184 perception tests; independent review found no hard blocker, exhaustively
+  accepted only the finite internal stage/deadline set, rejected adversarial
+  URL/token/newline/nested/non-string values, and confirmed no injected secret
+  reaches health. Require canonical merge, another
+  zero-overlap upload-disabled all-four-clock startup within 150 seconds, clean
+  stop, forced-reader recovery, upload-enabled fresh persistence when traffic
+  exists, and exact rollback evidence before promotion. Fable still fails
+  authentication before file access; never claim a Fable pass.
 
 - Live production remains the verified PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`. At 03:23 UTC every production

@@ -306,6 +306,7 @@ class FrameBroadcaster:
                 "media_clock_status": "unavailable",
                 "media_time_trusted": False,
                 "decode_latency_ms": None,
+                "anchor_match_frame_count": None,
             }
             for camera_id in self.camera_ids
         }
@@ -355,6 +356,12 @@ class FrameBroadcaster:
                 ),
             })
             if isinstance(media_clock_health, dict):
+                safe_clock = media_clock_health.get("media_clock")
+                match_frame_count = (
+                    safe_clock.get("anchor_match_frame_count")
+                    if isinstance(safe_clock, dict)
+                    else None
+                )
                 camera_health.update({
                     "media_clock_status": media_clock_health.get(
                         "status", "unavailable"
@@ -364,6 +371,13 @@ class FrameBroadcaster:
                     ),
                     "decode_latency_ms": media_clock_health.get(
                         "decode_latency_ms"
+                    ),
+                    "anchor_match_frame_count": (
+                        match_frame_count
+                        if isinstance(match_frame_count, int)
+                        and not isinstance(match_frame_count, bool)
+                        and match_frame_count in (1, 3)
+                        else None
                     ),
                 })
             # A final genuine buffered frame may finish inference after the
@@ -457,11 +471,12 @@ class FrameBroadcaster:
             "fresh_session_replacement",
         }:
             raise ValueError("terminal failover method is invalid")
-        if stage not in {
+        base_stages = {
             None,
             "source",
             "preparation_slot",
             "clock_source",
+            "decoder_slot",
             "capture_open",
             "first_frame",
             "capture_position",
@@ -470,12 +485,31 @@ class FrameBroadcaster:
             "clock_validation",
             "ready",
             "failed",
-        }:
+            "old_capture_release",
+            "active_clock_cleanup",
+            "prior_terminal_cleanup",
+            "proactive_quiescence",
+            "preparation_deadline",
+            "proactive_cleanup",
+            "result_ownership",
+            "candidate_cleanup",
+        }
+        deadline_stage = (
+            isinstance(stage, str)
+            and stage.startswith("deadline_exceeded:")
+            and stage.removeprefix("deadline_exceeded:")
+            in (base_stages - {None}) | {"handover"}
+        )
+        if (
+            stage is not None
+            and not isinstance(stage, str)
+        ) or (stage not in base_stages and not deadline_stage):
             raise ValueError("terminal failover stage is invalid")
         if evidence not in {
             None,
             "recent_exact_sequence",
             "exact_fragment_match",
+            "exact_fragment_sequence",
             "no_media_clock",
         }:
             raise ValueError("terminal failover evidence is invalid")
@@ -575,6 +609,9 @@ class FrameBroadcaster:
                     "media_clock_status": entry["media_clock_status"],
                     "media_time_trusted": entry["media_time_trusted"],
                     "decode_latency_ms": entry["decode_latency_ms"],
+                    "anchor_match_frame_count": entry[
+                        "anchor_match_frame_count"
+                    ],
                 }
             decoder_topology = AUXILIARY_DECODER_ADMISSION.snapshot()
             decoder_topology.update(capture_preparation_topology())
