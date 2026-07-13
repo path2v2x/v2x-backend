@@ -6,6 +6,7 @@ import inspect
 import os
 import re
 import tempfile
+import threading
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import boto3
@@ -32,6 +33,12 @@ _NVDEC_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 # workers run only off the steady-state path while proactive preparations remain
 # serialized. They use the same matcher and ambiguity gate as the normal pool.
 _NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+# Normal and urgent pools keep terminal work from queueing behind proactive
+# work, but both must share one hard decoder envelope. This prevents a normal
+# exact-clock match and an urgent terminal match from creating four additional
+# NVDEC sessions beside the four live readers. Acquisition remains cancellable
+# so discarded preparations cannot wait indefinitely for a slot.
+_NVDEC_FRAGMENT_MATCH_SLOTS = threading.BoundedSemaphore(value=2)
 
 
 def shutdown_media_clock_executors():
@@ -40,6 +47,24 @@ def shutdown_media_clock_executors():
         wait=True, cancel_futures=True
     )
     _NVDEC_FRAGMENT_MATCH_EXECUTOR.shutdown(wait=True, cancel_futures=True)
+
+
+def _run_nvdec_fragment_match(
+    fragment_matcher, args, kwargs, cancel_event=None
+):
+    """Run one exact fragment decoder inside the process-wide NVDEC cap."""
+    acquired = False
+    try:
+        while not acquired:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("HLS media clock resolution cancelled")
+            acquired = _NVDEC_FRAGMENT_MATCH_SLOTS.acquire(timeout=0.05)
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("HLS media clock resolution cancelled")
+        return fragment_matcher(*args, **kwargs)
+    finally:
+        if acquired:
+            _NVDEC_FRAGMENT_MATCH_SLOTS.release()
 
 
 def _utc_iso(epoch):
@@ -382,13 +407,21 @@ def resolve_hls_media_clock(
             if accepts_keywords or "cancel_event" in parameters
             else {}
         )
-        frame_offset = fragment_matcher(
+        args = (
             init_cache[fragment.init_url],
             segment_bytes,
             target_identity,
             frame_identity,
-            **kwargs,
         )
+        if fragment_matcher is match_fragment_frame_nvdec:
+            frame_offset = _run_nvdec_fragment_match(
+                fragment_matcher,
+                args,
+                kwargs,
+                cancel_event=cancel_event,
+            )
+        else:
+            frame_offset = fragment_matcher(*args, **kwargs)
         return None if frame_offset is None else (fragment, frame_offset)
 
     # Signed KVS fragment requests can each block for several seconds. Fetch
