@@ -13,13 +13,19 @@
 
 ## Current evidence and honest status
 
-- Canonical/live/Amplify are exact
-  `d54f5dfaec90e791af83105ff048e5dd3c6506a2`. The clean integration branch
-  `codex/v2x-calibration-integration` layers the existing fail-closed manifest,
-  optimizer, runtime-depth revalidation, physical-intrinsics, trusted-clock,
-  rollback, ambiguity, and cross-camera identity gates onto that current main
-  while preserving its newer replay synchronization and actor-observed lens
-  safety model. The integration branch is tested but not deployed.
+- Canonical `origin/main` is
+  `d3821bfa807b47a30dcc68a18c0c2e7062a71511`; the clean live checkout is the
+  intentionally deployed PR 37 code fingerprint
+  `80db3de34870379ddaa6984497607726a563a17d`, because the intervening PR 38 is
+  documentation-only. The public browser release was independently proven at
+  `d9a6ad8e7d83acad25c315b1f41e7b80cbb4f2d8`, Amplify job 203. The clean
+  `codex/v2x-calibration-current` calibration code base at
+  `88799860099d182a0626a51d263a78185a237cd2` layers the existing fail-closed
+  manifest, optimizer, runtime-depth revalidation, physical-intrinsics, trusted-clock,
+  rollback, ambiguity, and cross-camera identity gates as 39 calibration-only
+  commits onto current main while preserving PR 37 perception/replay behavior
+  and the actor-observed lens safety model. The branch is tested but not
+  deployed.
 - Trusted physical frames and fresh direct UE5 renders are retained at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260711T0228Z-source-pairs`.
 - The similarly named UTC artifacts correctly cross the local midnight

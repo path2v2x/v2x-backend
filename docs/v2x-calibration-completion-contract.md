@@ -12,7 +12,10 @@ under test are not acceptance evidence.
 
 ## 0. Durable baseline and corpus
 
-- Work only in the clean `codex/v2x-calibration-integration` worktree.
+- Work only in the clean `codex/v2x-calibration-current` worktree at
+  `/home/path/.codex/worktrees/v2x-calibration-current`. Treat the superseded
+  `codex/v2x-calibration-integration` worktree as read-only evidence because it
+  contains untracked Playwright artifacts.
 - Freeze production source/config, UE5 image and binary, map/OpenDRIVE, service
   restart counters, timers, mode, session count, and rollback bundle before a
   mutation window.

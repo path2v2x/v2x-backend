@@ -261,7 +261,7 @@ place.
 
 ## Implementation checkpoint — 2026-07-11
 
-Implemented offline on `codex/v2x-calibration-integration`, not deployed:
+Implemented offline on `codex/v2x-calibration-current`, not deployed:
 
 - bounded hourly corpus exporter with pagination/timeline reconciliation,
   all-string URL sanitization, userinfo removal, exact echoed-window checks,
