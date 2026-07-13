@@ -392,6 +392,10 @@ class _AsyncCapturePreparation:
     def _run(self):
         capture = None
         clock_resolution = None
+        unclocked_frame_sequence = deque(maxlen=3)
+        next_clock_retry = 0.0
+        clock_attempted = False
+        resolution_clock_source = None
         preparation_slot_acquired = False
         try:
             if self._serialize_preparation:
@@ -413,7 +417,10 @@ class _AsyncCapturePreparation:
                 if self._clock_source_factory is not None
                 else source
             )
-            prepared_clock_source = clock_source
+            # Until an exact clock succeeds, the only source known to belong
+            # to this capture connection is the capture URL itself. Never
+            # retain/promote a failed auxiliary clock session.
+            prepared_clock_source = capture_source
             if self._reserve_decoder_slot:
                 self._set_stage("decoder_slot")
                 self._set_decoder_lease(acquire_auxiliary_decoder_slot(
@@ -469,7 +476,15 @@ class _AsyncCapturePreparation:
                 if position is None:
                     self._set_stage("capture_position")
                     continue
-                if clock_resolution is None:
+                unclocked_frame_sequence.append((frame, position))
+                if (
+                    clock_resolution is None
+                    and self._monotonic() >= next_clock_retry
+                    and (
+                        not clock_attempted
+                        or len(unclocked_frame_sequence) == 3
+                    )
+                ):
                     if clock_source is None:
                         clock_source = (
                             self._clock_source_factory()
@@ -484,10 +499,24 @@ class _AsyncCapturePreparation:
                             position,
                             self._media_frame_identity,
                         ),
+                        {
+                            "reference_sequence": tuple(
+                                unclocked_frame_sequence
+                            )
+                            if len(unclocked_frame_sequence) == 3
+                            else None,
+                        },
                     )
+                    resolution_clock_source = clock_source
                     self._track_clock_resolution(clock_resolution)
+                    clock_attempted = True
                     clock_source = None
                     self._set_stage("clock_resolution")
+                if clock_resolution is None:
+                    # A failed exact match is retried after a short backoff.
+                    # Keep draining frames without dereferencing an absent
+                    # resolver while that bounded retry delay is active.
+                    continue
                 resolved, media_clock = clock_resolution.poll()
                 if not resolved:
                     # Keep draining the replacement FIFO while its first exact
@@ -495,7 +524,11 @@ class _AsyncCapturePreparation:
                     # hidden decoder backlog before handover.
                     continue
                 if media_clock is None:
-                    raise RuntimeError("media clock resolution failed")
+                    self._quiesce_clock_resolution()
+                    clock_resolution = None
+                    resolution_clock_source = None
+                    next_clock_retry = self._monotonic() + 1.0
+                    continue
                 self._set_stage("clock_validation")
                 frame, source_epoch, source_monotonic, position = latest
                 frame_clock = media_clock.metadata_at(position)
@@ -511,8 +544,15 @@ class _AsyncCapturePreparation:
                     # genuine frame outside the fixed receipt-time trust
                     # window. Keep draining and establish a new exact anchor;
                     # never hand an invalid clock to the active reader.
+                    self._quiesce_clock_resolution()
                     clock_resolution = None
+                    resolution_clock_source = None
+                    next_clock_retry = self._monotonic() + 1.0
                     continue
+                prepared_clock_source = (
+                    resolution_clock_source or capture_source
+                )
+                resolution_clock_source = None
                 with self._result_lock:
                     if self._discarded.is_set():
                         return
@@ -528,7 +568,11 @@ class _AsyncCapturePreparation:
                     )
                     capture = None
                 self._set_stage("ready")
-                self._success_evidence = "exact_fragment_match"
+                self._success_evidence = (
+                    "exact_fragment_sequence"
+                    if getattr(media_clock, "anchor_match_frame_count", 1) == 3
+                    else "exact_fragment_match"
+                )
                 return
             raise RuntimeError("capture preparation stopped")
         except Exception:
@@ -646,6 +690,7 @@ class _AsyncCaptureRestart:
             recent_exact_media_anchors or ()
         )
         self._restart_exact_frames = deque(maxlen=3)
+        self._restart_fragment_frames = deque(maxlen=3)
         self._prior_media_clock = prior_media_clock
         self._prior_media_time_utc = None
         if (
@@ -744,6 +789,7 @@ class _AsyncCaptureRestart:
                 if position is None:
                     self._set_stage("capture_position")
                     continue
+                self._restart_fragment_frames.append((frame, position))
                 if (
                     self._recent_exact_media_anchors
                     and self._media_frame_identity is not None
@@ -864,6 +910,11 @@ class _AsyncCaptureRestart:
                                 self._prior_media_time_utc
                             ),
                             "urgent": True,
+                            "reference_sequence": tuple(
+                                self._restart_fragment_frames
+                            )
+                            if len(self._restart_fragment_frames) == 3
+                            else None,
                         },
                     )
                     self._track_clock_resolution(clock_resolution)
@@ -900,11 +951,15 @@ class _AsyncCaptureRestart:
                         position,
                         media_clock,
                         source,
-                        clock_source,
+                        resolution_sources[resolution_source_index],
                     )
                     capture = None
                 self._set_stage("ready")
-                self._success_evidence = "exact_fragment_match"
+                self._success_evidence = (
+                    "exact_fragment_sequence"
+                    if getattr(media_clock, "anchor_match_frame_count", 1) == 3
+                    else "exact_fragment_match"
+                )
                 return
             raise RuntimeError("capture restart stopped")
         except Exception:
@@ -918,6 +973,7 @@ class _AsyncCaptureRestart:
             self._media_clock_validator = None
             self._recent_exact_media_anchors = None
             self._restart_exact_frames = None
+            self._restart_fragment_frames = None
             self._prior_media_clock = None
             self._prior_media_time_utc = None
             self._capture_position_milliseconds = None
@@ -1263,6 +1319,7 @@ class LiveStreamReader:
     def _recover_terminal_read(
         self, preparation, source, clock_source, prior_media_clock,
         prior_capture_position, started=None, failed_capture=None,
+        active_clock_resolution=None,
     ):
         """Return one fully validated replacement within a strict time bound.
 
@@ -1277,6 +1334,7 @@ class LiveStreamReader:
         if self.terminal_read_failover_seconds <= 0.0:
             self._cleanup_capture_until(failed_capture, deadline)
             self._cleanup_candidate_until(preparation, deadline)
+            self._cleanup_candidate_until(active_clock_resolution, deadline)
             return None
 
         old_capture_cleanup = (
@@ -1285,6 +1343,15 @@ class LiveStreamReader:
             else _start_terminal_cleanup(
                 ("capture", id(failed_capture)), failed_capture.release
             )
+        )
+        active_clock_cleanup = (
+            None
+            if active_clock_resolution is None
+            else _start_candidate_cleanup(active_clock_resolution)
+        )
+        prior_cleanups, self._pending_terminal_cleanups = (
+            tuple(self._pending_terminal_cleanups),
+            [],
         )
         terminal_window = _begin_terminal_recovery()
         try:
@@ -1298,6 +1365,8 @@ class LiveStreamReader:
                 deadline,
                 terminal_window.preparations,
                 old_capture_cleanup,
+                active_clock_cleanup,
+                prior_cleanups,
             )
         finally:
             terminal_window.release()
@@ -1311,6 +1380,12 @@ class LiveStreamReader:
         return cleanup.succeeded()
 
     def _track_terminal_cleanup(self, cleanup):
+        self._pending_terminal_cleanups = [
+            pending for pending in self._pending_terminal_cleanups
+            if not pending.succeeded()
+        ]
+        if cleanup.succeeded():
+            return
         if cleanup not in self._pending_terminal_cleanups:
             self._pending_terminal_cleanups.append(cleanup)
 
@@ -1384,6 +1459,8 @@ class LiveStreamReader:
         deadline,
         proactive_preparations,
         old_capture_cleanup,
+        active_clock_cleanup,
+        prior_cleanups,
     ):
         """Recover while new proactive and normal auxiliary work is blocked."""
 
@@ -1413,12 +1490,40 @@ class LiveStreamReader:
             old_capture_released = old_capture_cleanup.succeeded()
             if not old_capture_released:
                 self._track_terminal_cleanup(old_capture_cleanup)
+        active_clock_released = True
+        if active_clock_cleanup is not None:
+            active_clock_cleanup.wait(
+                max(0.0, deadline - self.monotonic())
+            )
+            active_clock_released = active_clock_cleanup.succeeded()
+            if not active_clock_released:
+                self._track_terminal_cleanup(active_clock_cleanup)
+        prior_cleanups_released = True
+        for cleanup in prior_cleanups:
+            cleanup.wait(max(0.0, deadline - self.monotonic()))
+            if not cleanup.succeeded():
+                prior_cleanups_released = False
+                self._track_terminal_cleanup(cleanup)
         if not old_capture_released:
             return finish(
                 None,
                 "failed",
                 "same_session_restart",
                 "old_capture_release",
+            )
+        if not active_clock_released:
+            return finish(
+                None,
+                "failed",
+                "same_session_restart",
+                "active_clock_cleanup",
+            )
+        if not prior_cleanups_released:
+            return finish(
+                None,
+                "failed",
+                "same_session_restart",
+                "prior_terminal_cleanup",
             )
         if not quiesced:
             return finish(
@@ -1550,6 +1655,7 @@ class LiveStreamReader:
             capture_clock_source = None
             proactive_preparation = None
             clock_resolution = None
+            pending_clock_source = None
             try:
                 # Keep signed URLs only in the connection-local stack. The
                 # optional longer clock window is independent of the shortest
@@ -1562,11 +1668,13 @@ class LiveStreamReader:
                     if self.media_clock_source_factory is not None
                     else source
                 )
-                capture_clock_source = clock_source
+                capture_clock_source = capture_source
                 media_clock = None
                 clock_resolution = None
                 next_media_clock_retry = 0.0
                 last_capture_position = None
+                unclocked_frame_sequence = deque(maxlen=3)
+                media_clock_attempted = False
                 cap = self.capture_factory(source)
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("capture open failed")
@@ -1621,6 +1729,9 @@ class LiveStreamReader:
                         if not ret or frame is None:
                             terminal_started = self.monotonic()
                             failed_capture, cap = cap, None
+                            active_clock_resolution = clock_resolution
+                            clock_resolution = None
+                            pending_clock_source = None
                             prepared = self._recover_terminal_read(
                                 proactive_preparation,
                                 capture_source,
@@ -1629,6 +1740,9 @@ class LiveStreamReader:
                                 last_capture_position,
                                 started=terminal_started,
                                 failed_capture=failed_capture,
+                                active_clock_resolution=(
+                                    active_clock_resolution
+                                ),
                             )
                             proactive_preparation = None
                             if prepared is None:
@@ -1664,6 +1778,17 @@ class LiveStreamReader:
                         else:
                             if prepared_owner is not None:
                                 prepared_owner.adopt()
+                        if clock_resolution is not None:
+                            # A proactive handover can beat an active exact
+                            # matcher. Quarantine that superseded resolver so
+                            # its signed source/frame refs remain visible to
+                            # cleanup telemetry and shutdown waits for it.
+                            cleanup = _start_candidate_cleanup(
+                                clock_resolution
+                            )
+                            self._track_terminal_cleanup(cleanup)
+                            clock_resolution = None
+                            pending_clock_source = None
                         media_clock = prepared_media_clock
                         capture_source = prepared_source
                         capture_clock_source = prepared_clock_source
@@ -1673,6 +1798,8 @@ class LiveStreamReader:
                         )
                         invalid_clock_started = None
                         clock_resolution = None
+                        unclocked_frame_sequence.clear()
+                        media_clock_attempted = True
                         last_capture_position = prepared_position
                         connection_started = self.monotonic()
                         renewal_deadline = (
@@ -1687,6 +1814,50 @@ class LiveStreamReader:
                         # downgrading a published streaming state to the
                         # cold-start/recovery-only "connected" state.
                         self._notify("renewed")
+
+                    # Clock fallback evidence must follow the decoder's actual
+                    # contiguous frame sequence. Collect it before publication
+                    # duplicate suppression; otherwise A,B,B,C could be
+                    # misrepresented as A,B,C and anchor the wrong occurrence.
+                    capture_position = prepared_position
+                    if (
+                        capture_position is None
+                        and self.capture_position_milliseconds is not None
+                    ):
+                        try:
+                            capture_position = (
+                                self.capture_position_milliseconds(cap)
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            capture_position = None
+                    if (
+                        media_clock is not None
+                        and capture_position is not None
+                        and last_capture_position is not None
+                        and capture_position < last_capture_position - 0.5
+                    ):
+                        # A discontinuity/PTS reset invalidates the prior UTC
+                        # mapping. Re-match this exact frame before trusting it.
+                        media_clock = None
+                        if clock_resolution is not None:
+                            cleanup = _start_candidate_cleanup(
+                                clock_resolution
+                            )
+                            self._track_terminal_cleanup(cleanup)
+                        clock_resolution = None
+                        pending_clock_source = None
+                        unclocked_frame_sequence.clear()
+                        # A new PTS epoch gets one immediate exact-frame
+                        # attempt; only an ambiguous/missing result escalates
+                        # to the three-frame sequence fallback.
+                        media_clock_attempted = False
+                        next_media_clock_retry = 0.0
+                    if capture_position is not None:
+                        last_capture_position = capture_position
+                        if media_clock is None:
+                            unclocked_frame_sequence.append(
+                                (frame, capture_position)
+                            )
 
                     identity = self.frame_identity(frame)
                     if identity in self._recent_frame_identity_set:
@@ -1704,33 +1875,17 @@ class LiveStreamReader:
                         source_monotonic = self.monotonic()
 
                     frame_media_clock = None
-                    capture_position = prepared_position
-                    if (
-                        capture_position is None
-                        and self.capture_position_milliseconds is not None
-                    ):
-                        try:
-                            capture_position = self.capture_position_milliseconds(cap)
-                        except (AttributeError, TypeError, ValueError):
-                            capture_position = None
-                    if (
-                        media_clock is not None
-                        and capture_position is not None
-                        and last_capture_position is not None
-                        and capture_position < last_capture_position - 0.5
-                    ):
-                        # A discontinuity/PTS reset invalidates the prior UTC
-                        # mapping. Re-match this exact frame before trusting it.
-                        media_clock = None
-                        clock_resolution = None
-                        next_media_clock_retry = 0.0
-                    if capture_position is not None:
-                        last_capture_position = capture_position
                     if media_clock is None and clock_resolution is not None:
                         resolved, candidate = clock_resolution.poll()
                         if resolved:
                             clock_resolution = None
                             media_clock = candidate
+                            if media_clock is not None:
+                                capture_clock_source = (
+                                    pending_clock_source or capture_source
+                                )
+                                unclocked_frame_sequence.clear()
+                            pending_clock_source = None
                             if media_clock is None:
                                 next_media_clock_retry = (
                                     self.monotonic()
@@ -1743,6 +1898,10 @@ class LiveStreamReader:
                         and self.media_clock_factory is not None
                         and capture_position is not None
                         and source_monotonic >= next_media_clock_retry
+                        and (
+                            not media_clock_attempted
+                            or len(unclocked_frame_sequence) == 3
+                        )
                     ):
                         clock_source = (
                             clock_source
@@ -1761,7 +1920,16 @@ class LiveStreamReader:
                                 capture_position,
                                 self.media_frame_identity,
                             ),
+                            {
+                                "reference_sequence": tuple(
+                                    unclocked_frame_sequence
+                                )
+                                if len(unclocked_frame_sequence) == 3
+                                else None,
+                            },
                         )
+                        pending_clock_source = clock_source
+                        media_clock_attempted = True
                         clock_source = None
                         resolved, candidate = clock_resolution.poll(
                             self.media_clock_initial_wait_seconds
@@ -1769,6 +1937,12 @@ class LiveStreamReader:
                         if resolved:
                             clock_resolution = None
                             media_clock = candidate
+                            if media_clock is not None:
+                                capture_clock_source = (
+                                    pending_clock_source or capture_source
+                                )
+                                unclocked_frame_sequence.clear()
+                            pending_clock_source = None
                             if media_clock is None:
                                 next_media_clock_retry = (
                                     self.monotonic()
@@ -1840,7 +2014,16 @@ class LiveStreamReader:
                                 self._prepare_replacement_capture()
                             )
                         media_clock = None
+                        if clock_resolution is not None:
+                            cleanup = _start_candidate_cleanup(
+                                clock_resolution
+                            )
+                            self._track_terminal_cleanup(cleanup)
                         clock_resolution = None
+                        pending_clock_source = None
+                        capture_clock_source = capture_source
+                        unclocked_frame_sequence.clear()
+                        media_clock_attempted = False
                         next_media_clock_retry = (
                             self.monotonic()
                             + self.media_clock_retry_seconds

@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from ffmpeg_capture import (
+    FragmentFrameSequenceMatch,
     build_nvdec_frame_identity,
     match_fragment_frame_nvdec,
 )
@@ -98,6 +100,7 @@ class HlsMediaClock:
     anchor_fragment_id: str = None
     anchor_media_sequence: int = None
     segment_duration_seconds: float = None
+    anchor_match_frame_count: int = 1
 
     def reanchor_from_exact_match(
         self, previous_position_milliseconds, new_position_milliseconds
@@ -155,6 +158,9 @@ class HlsMediaClock:
             metadata["anchor_media_sequence"] = self.anchor_media_sequence
         if self.segment_duration_seconds is not None:
             metadata["segment_duration_seconds"] = self.segment_duration_seconds
+        metadata["anchor_match_frame_count"] = int(
+            self.anchor_match_frame_count
+        )
 
         return {
             "media_timestamp_utc": _utc_iso(
@@ -280,6 +286,14 @@ def _match_fragment_frame(
         capture = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
         if not capture.isOpened():
             return None
+        targets = (
+            tuple(target_identity)
+            if isinstance(target_identity, (tuple, list))
+            else (target_identity,)
+        )
+        if not targets:
+            return None
+        window = deque(maxlen=len(targets))
         matches = []
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -287,12 +301,33 @@ def _match_fragment_frame(
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
-            position = capture.get(cv2.CAP_PROP_POS_MSEC)
-            if frame_identity(frame) == target_identity:
-                matches.append(float(position))
-        if len(matches) == 1:
-            return matches[0]
-        return None
+            try:
+                position = float(capture.get(cv2.CAP_PROP_POS_MSEC))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(position) or position < 0.0:
+                return None
+            window.append((frame_identity(frame), position))
+            if len(window) < len(targets):
+                continue
+            matches_target = all(
+                item[0] == target
+                for item, target in zip(window, targets)
+            )
+            positions_increase = all(
+                later[1] > earlier[1]
+                for earlier, later in zip(window, tuple(window)[1:])
+            )
+            if matches_target and positions_increase:
+                matches.append(tuple(float(item[1]) for item in window))
+        if len(matches) != 1:
+            return None
+        if len(targets) == 1:
+            return matches[0][-1]
+        return FragmentFrameSequenceMatch(
+            frame_offset_milliseconds=matches[0][-1],
+            frame_positions_milliseconds=matches[0],
+        )
     finally:
         if capture is not None:
             capture.release()
@@ -314,8 +349,9 @@ def resolve_hls_media_clock(
     not_before_media_time_utc=None,
     urgent=False,
     cancel_event=None,
+    reference_sequence=None,
 ):
-    """Match one decoded frame to its exact HLS PDT/fragment position.
+    """Match a decoded frame/sequence to its exact HLS PDT position.
 
     OpenCV's live ``CAP_PROP_POS_MSEC`` starts at zero even when its first frame
     is late inside an fMP4 fragment, so playlist-start plus that cursor is not a
@@ -328,6 +364,31 @@ def resolve_hls_media_clock(
             raise RuntimeError("HLS media clock resolution cancelled")
 
     require_active()
+    sequence = tuple(reference_sequence or ())
+    if sequence:
+        if len(sequence) != 3:
+            return None
+        try:
+            reference_frames = tuple(item[0] for item in sequence)
+            sequence_positions = tuple(float(item[1]) for item in sequence)
+        except (IndexError, TypeError, ValueError):
+            return None
+        if (
+            not all(
+                math.isfinite(position) and position >= 0.0
+                for position in sequence_positions
+            )
+            or not all(
+                later > earlier
+                for earlier, later in zip(
+                    sequence_positions, sequence_positions[1:]
+                )
+            )
+        ):
+            return None
+        capture_position_milliseconds = sequence_positions[-1]
+    else:
+        reference_frames = (reference_frame,)
     response = http_get(hls_url, timeout=timeout)
     response.raise_for_status()
     require_active()
@@ -362,10 +423,26 @@ def resolve_hls_media_clock(
     if not fragments:
         return None
 
-    target_identity = (
-        build_nvdec_frame_identity(reference_frame, frame_identity)
+    target_identities = tuple(
+        build_nvdec_frame_identity(frame, frame_identity)
         if fragment_matcher is match_fragment_frame_nvdec
-        else frame_identity(reference_frame)
+        else frame_identity(frame)
+        for frame in reference_frames
+    )
+    if (
+        len(target_identities) > 1
+        and all(
+            identity == target_identities[0]
+            for identity in target_identities[1:]
+        )
+    ):
+        # A constant/static sequence carries no more temporal information than
+        # the ambiguous single frame that triggered this fallback.
+        return None
+    target_identity = (
+        target_identities[0]
+        if len(target_identities) == 1
+        else target_identities
     )
     init_cache = {}
     for init_url in {fragment.init_url for fragment in fragments}:
@@ -414,6 +491,46 @@ def resolve_hls_media_clock(
             )
         else:
             frame_offset = fragment_matcher(*args, **kwargs)
+        if sequence:
+            if not isinstance(frame_offset, FragmentFrameSequenceMatch):
+                return None
+            fragment_positions = tuple(
+                float(position)
+                for position in frame_offset.frame_positions_milliseconds
+            )
+            if (
+                len(fragment_positions) != len(sequence_positions)
+                or not all(
+                    math.isfinite(position) and position >= 0.0
+                    for position in fragment_positions
+                )
+                or not all(
+                    math.isclose(
+                        fragment_later - fragment_earlier,
+                        capture_later - capture_earlier,
+                        rel_tol=0.0,
+                        abs_tol=1.0,
+                    )
+                    for fragment_earlier, fragment_later,
+                    capture_earlier, capture_later in zip(
+                        fragment_positions,
+                        fragment_positions[1:],
+                        sequence_positions,
+                        sequence_positions[1:],
+                    )
+                )
+            ):
+                return None
+            frame_offset = frame_offset.frame_offset_milliseconds
+        elif isinstance(frame_offset, FragmentFrameSequenceMatch):
+            return None
+        if frame_offset is not None:
+            try:
+                frame_offset = float(frame_offset)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(frame_offset) or frame_offset < 0.0:
+                return None
         return None if frame_offset is None else (fragment, frame_offset)
 
     # Signed KVS fragment requests can each block for several seconds. Fetch
@@ -482,6 +599,7 @@ def resolve_hls_media_clock(
         anchor_fragment_id=fragment.fragment_id,
         anchor_media_sequence=fragment.media_sequence,
         segment_duration_seconds=fragment.duration_seconds,
+        anchor_match_frame_count=len(target_identities),
     )
 
 
@@ -494,6 +612,7 @@ def resolve_hls_media_clock_nvdec(
     not_before_media_time_utc=None,
     urgent=False,
     cancel_event=None,
+    reference_sequence=None,
 ):
     """Resolve an exact clock using the same pixels as the NVDEC live reader."""
     return resolve_hls_media_clock(
@@ -506,6 +625,7 @@ def resolve_hls_media_clock_nvdec(
         not_before_media_time_utc=not_before_media_time_utc,
         urgent=urgent,
         cancel_event=cancel_event,
+        reference_sequence=reference_sequence,
     )
 
 def _camera_id_from_stream_name(stream_name):

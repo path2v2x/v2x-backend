@@ -12,9 +12,11 @@ held in an anonymous memfd inherited by the FFmpeg child.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import inspect
+import math
 import os
 from pathlib import Path
 import shutil
@@ -44,6 +46,14 @@ class NvdecFrameIdentity:
 
     quick: bytes
     exact: bytes
+
+
+@dataclass(frozen=True)
+class FragmentFrameSequenceMatch:
+    """Exact contiguous match plus every decoded fragment-frame position."""
+
+    frame_offset_milliseconds: float
+    frame_positions_milliseconds: tuple
 
 
 def quick_frame_identity(frame, axis_samples=64):
@@ -413,7 +423,7 @@ def match_fragment_frame_nvdec(
     capture_factory=None,
     cancel_event=None,
 ):
-    """Match exactly one decoded frame using the same NVDEC pixel path."""
+    """Match one exact frame or contiguous frame sequence on the NVDEC path."""
     capture_factory = capture_factory or FfmpegNvdecCapture.from_file
     capture = None
     path = None
@@ -443,6 +453,14 @@ def match_fragment_frame_nvdec(
         capture = capture_factory(path, **kwargs)
         if capture is None or not capture.isOpened():
             return None
+        targets = (
+            tuple(target_identity)
+            if isinstance(target_identity, (tuple, list))
+            else (target_identity,)
+        )
+        if not targets:
+            return None
+        window = deque(maxlen=len(targets))
         matches = []
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -450,17 +468,49 @@ def match_fragment_frame_nvdec(
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
-            position = capture.get(cv2.CAP_PROP_POS_MSEC)
-            if isinstance(target_identity, NvdecFrameIdentity):
-                matches_target = (
-                    quick_frame_identity(frame) == target_identity.quick
-                    and frame_identity(frame) == target_identity.exact
+            try:
+                position = float(capture.get(cv2.CAP_PROP_POS_MSEC))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(position) or position < 0.0:
+                return None
+            if all(isinstance(target, NvdecFrameIdentity) for target in targets):
+                window.append((
+                    frame,
+                    position,
+                    quick_frame_identity(frame),
+                ))
+                if len(window) < len(targets):
+                    continue
+                matches_target = all(
+                    item[2] == target.quick
+                    for item, target in zip(window, targets)
+                ) and all(
+                    frame_identity(item[0]) == target.exact
+                    for item, target in zip(window, targets)
                 )
             else:
-                matches_target = frame_identity(frame) == target_identity
-            if matches_target:
-                matches.append(float(position))
-        return matches[0] if len(matches) == 1 else None
+                window.append((frame_identity(frame), position))
+                if len(window) < len(targets):
+                    continue
+                matches_target = all(
+                    item[0] == target
+                    for item, target in zip(window, targets)
+                )
+            positions_increase = all(
+                later[1] > earlier[1]
+                for earlier, later in zip(window, tuple(window)[1:])
+            )
+            if matches_target and positions_increase:
+                matches.append(tuple(float(item[1]) for item in window))
+        if len(matches) != 1:
+            return None
+        if len(targets) == 1:
+            return matches[0][-1]
+        return FragmentFrameSequenceMatch(
+            frame_offset_milliseconds=matches[0][-1],
+            frame_positions_milliseconds=matches[0],
+        )
     finally:
         if capture is not None:
             capture.release()

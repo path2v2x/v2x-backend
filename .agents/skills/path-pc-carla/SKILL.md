@@ -9,8 +9,50 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 05:02 UTC; verify rather than assume. These items
+Observed through 2026-07-13 06:02 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
+
+- Canonical source `origin/main` is now
+  `1c21694d1b175b0a5bbe5dd85e7d4c7ab0b79de0`, including PR 40 and its skill
+  follow-up; it is not the production deployment. A controlled zero-overlap
+  PR 40 replacement at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T050440Z-pr40-controlled-startup/`
+  passed upload-disabled and upload-enabled four-reader readiness, strict feed
+  samples, clean two-second shutdown, and clean decoder topology, but its fixed
+  three-minute upload window contained no eligible road detections, so fresh
+  persistence did not pass and the harness restored PR 35. A later forced
+  canary at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T051530Z-pr40-forced-terminal-canary-v2/`
+  never reached the reader kill because ch2 remained exact-clock unavailable
+  for 150 seconds while ch1/ch3/ch4 were trusted; it also restored PR 35.
+  Treat both as rejected release gates, not outages and not deployments.
+- Current unreleased branch `codex/v2x-perception-sequence-clock` addresses the
+  intermittent initial anchor without weakening trust: the first unique exact
+  frame attempt remains, but a failed attempt retries only with exactly three
+  contiguous decoded frames. CPU and NVDEC fragment paths require one unique
+  contiguous match, finite strictly increasing capture/fragment positions,
+  at least one changing exact identity, and per-frame capture/fragment cadence
+  agreement within 1 ms. Duplicate publication frames remain in clock evidence
+  so `A,B,B,C` cannot be relabeled as `A,B,C`. A sequence anchor publishes only
+  secret-free `anchor_match_frame_count=3` and terminal evidence
+  `exact_fragment_sequence`; signed URLs remain connection-local.
+- The same candidate quarantines any active exact-clock resolver superseded by
+  proactive or terminal handover. Terminal recovery waits for that resolver
+  inside its unchanged deadline or fails at `active_clock_cleanup`; reconnect
+  and shutdown wait for every tracked cleanup, including cancellation-insensitive
+  transports. A successful retry promotes only its paired clock source, while
+  failed/stale clock URLs are dropped. Adversarial duplicate/cadence, active and
+  proactive resolver-lifetime, source-promotion, static/invalid sequence, and
+  marker-persistence cases pass. The current local gate is 182 perception, 241
+  Python-3.10 bridge, 23 recovery-infrastructure, and 132 web tests, zero Svelte
+  diagnostics, and a successful web production build. Independent adversarial
+  review found no remaining hard blocker and directly confirmed successful
+  clock-source promotion plus zero final cleanup/admission counters. This
+  branch is neither merged nor deployed; require canonical merge, a
+  zero-overlap upload-disabled all-four-clock startup, clean stop, forced-reader
+  recovery, upload-enabled fresh persistence when traffic exists, and exact
+  rollback evidence before promotion. Fable still fails authentication before
+  file access; never claim a Fable pass.
 
 - Live production remains the verified PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`. At 03:23 UTC every production
@@ -800,8 +842,9 @@ section:
   is complete. The engine checkout has been corrected from stock Epic 5.5.4 to
   CARLA's required `CarlaUnreal/UnrealEngine` `ue5-dev-carla` commit
   `2ac0528831e08e80784df2759db9a2c592d3bd4d`; fork dependencies are downloading
-  at background CPU/disk priority and the checkout must eventually be named
-  `/mnt/v2x-ue5/src/UnrealEngine5_carla`. The clean Richmond source checkout is
+  at background CPU/disk priority in
+  `/mnt/v2x-ue5/src/UnrealEngine-5.5.4`; do not rename or duplicate the
+  in-progress tree. The clean Richmond source checkout is
   fixed at `d14da5b57bbe4356930a2b9a926a675692e18547`. The complete 29-file April
   road-core subset—level, scene, road/curb/gutter/sidewalk and both marking
   layers plus their primary materials/textures—matches every recorded LFS SHA
@@ -809,8 +852,9 @@ section:
   is `/mnt/v2x-ue5/evidence/april-road-core-dependencies/`. Thousands of
   unrelated prop assets remain pointers and are not acceptance-ready; do not
   mislabel the road-core subset as a complete final map package. Engine fork
-  dependencies were about 31% complete at 14:52 UTC and continue at background
-  priority. A probe proved the latest retained
+  dependencies completed and `Setup.sh` is now downloading the bundled Linux
+  clang toolchain at background priority; `GenerateProjectFiles.sh` and the
+  UnrealEditor build have not run yet. A probe proved the latest retained
   `Richmond_NR.umap` references
   `New_RFS/Richmond_Field_Station_Richmond_CA.uasset`; that scene asset retains
   a distinct newer source path,

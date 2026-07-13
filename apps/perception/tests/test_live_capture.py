@@ -356,6 +356,161 @@ class LiveStreamReaderTests(unittest.TestCase):
             AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"], 0
         )
 
+    def test_proactive_clock_retry_uses_latest_three_frame_sequence(self):
+        calls = []
+        clock_sources = []
+        monotonic_value = [0.0]
+
+        def monotonic():
+            monotonic_value[0] += 0.5
+            return monotonic_value[0]
+
+        def clock_source_factory():
+            source = f"clock-source-{len(clock_sources) + 1}"
+            clock_sources.append(source)
+            return source
+
+        def resolve_clock(source, _frame, _position, _identity, **kwargs):
+            calls.append((source, kwargs.get("reference_sequence")))
+            return None if len(calls) == 1 else FakeMediaClock()
+
+        preparation = _AsyncCapturePreparation(
+            source_factory=lambda: "capture-source",
+            clock_source_factory=clock_source_factory,
+            capture_factory=lambda _source: ContinuousCapture("prepared"),
+            media_clock_factory=resolve_clock,
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=monotonic,
+            serialize_preparation=False,
+        )
+        try:
+            self.assertTrue(self.wait_until(lambda: preparation.poll()[0]))
+            result = preparation.take()
+            self.assertIsNotNone(result)
+            self.assertEqual(calls[0], ("clock-source-1", None))
+            self.assertEqual(calls[1][0], "clock-source-2")
+            self.assertEqual(len(calls[1][1]), 3)
+            positions = tuple(
+                position for _frame, position in calls[1][1]
+            )
+            self.assertEqual(positions, tuple(sorted(positions)))
+            self.assertGreater(positions[-1], positions[0])
+            self.assertEqual(result[7], "clock-source-2")
+            result[0].release()
+        finally:
+            preparation.discard()
+
+    def test_proactive_handover_quarantines_active_clock_resolver(self):
+        active_entered = threading.Event()
+        release_active = threading.Event()
+        states = []
+        source_calls = []
+        clock_source_calls = []
+
+        def source_factory():
+            source = f"capture-source-{len(source_calls) + 1}"
+            source_calls.append(source)
+            return source
+
+        def clock_source_factory():
+            source = f"clock-source-{len(clock_source_calls) + 1}"
+            clock_source_calls.append(source)
+            return source
+
+        def resolve_clock(source, *_args, cancel_event=None, **_kwargs):
+            if source == "clock-source-1":
+                active_entered.set()
+                release_active.wait(2.0)
+                return None
+            return FakeMediaClock()
+
+        reader = LiveStreamReader(
+            source_factory=source_factory,
+            capture_factory=lambda source: ContinuousCapture(source),
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            media_clock_factory=resolve_clock,
+            media_clock_source_factory=clock_source_factory,
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            connection_max_age_seconds=0.15,
+            connection_renewal_lead_seconds=0.05,
+        )
+        reader.start()
+        try:
+            self.assertTrue(active_entered.wait(1.0))
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "renewed" for event in states
+            )))
+            self.assertGreaterEqual(
+                capture_preparation_topology()["terminal_cleanups"], 1
+            )
+            reader.request_stop()
+            reader.join(0.05)
+            self.assertTrue(reader.is_alive())
+        finally:
+            release_active.set()
+            reader.join(2.0)
+        self.assertFalse(reader.is_alive())
+        self.assertTrue(self.wait_until(lambda: (
+            capture_preparation_topology()["terminal_cleanups"] == 0
+        )))
+
+    def test_terminal_recovery_waits_for_active_clock_cleanup(self):
+        resolver_entered = threading.Event()
+        release_resolver = threading.Event()
+        states = []
+        captures = []
+
+        def capture_factory(_source):
+            capture = PositionedScriptedCapture(["primary"], [0.0])
+            captures.append(capture)
+            return capture
+
+        def resolve_clock(_source, *_args, cancel_event=None, **_kwargs):
+            resolver_entered.set()
+            # Deliberately model a transport that cannot observe cancellation
+            # until its bounded request returns.
+            release_resolver.wait(2.0)
+            return None
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "capture-signed-url",
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            media_clock_factory=resolve_clock,
+            media_clock_source_factory=lambda: "clock-signed-url",
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            terminal_read_failover_seconds=0.1,
+        )
+        reader.start()
+        try:
+            self.assertTrue(resolver_entered.wait(1.0))
+            self.assertTrue(self.wait_until(lambda: any(
+                event["state"] == "terminal_failover_failed"
+                and event["stage"] == "active_clock_cleanup"
+                for event in states
+            )))
+            self.assertEqual(len(captures), 1)
+            self.assertGreaterEqual(
+                capture_preparation_topology()["terminal_cleanups"], 1
+            )
+            reader.request_stop()
+            reader.join(0.05)
+            self.assertTrue(reader.is_alive())
+        finally:
+            release_resolver.set()
+            reader.join(2.0)
+        self.assertFalse(reader.is_alive())
+        self.assertTrue(self.wait_until(lambda: (
+            capture_preparation_topology()["terminal_cleanups"] == 0
+        )))
+
     def test_failed_reader_release_is_inside_terminal_deadline(self):
         captures = []
         states = []
@@ -895,6 +1050,7 @@ class LiveStreamReaderTests(unittest.TestCase):
     def test_terminal_read_hot_failover_keeps_streaming_state_and_clock(self):
         captures = []
         clock_sources = []
+        clock_sequences = []
         states = []
 
         def source_factory():
@@ -909,9 +1065,13 @@ class LiveStreamReaderTests(unittest.TestCase):
             captures.append(capture)
             return capture
 
-        def media_clock_factory(source, *_args):
+        def media_clock_factory(source, *_args, **kwargs):
             clock_sources.append(source)
-            return FakeMediaClock()
+            clock_sequences.append(kwargs.get("reference_sequence"))
+            clock = FakeMediaClock()
+            if kwargs.get("reference_sequence") is not None:
+                clock.anchor_match_frame_count = 3
+            return clock
 
         reader = LiveStreamReader(
             source_factory=source_factory,
@@ -947,12 +1107,18 @@ class LiveStreamReaderTests(unittest.TestCase):
             )
             self.assertEqual(terminal[0]["stage"], "ready")
             self.assertEqual(
-                terminal[0]["evidence"], "exact_fragment_match"
+                terminal[0]["evidence"], "exact_fragment_sequence"
             )
             self.assertEqual(len(clock_sources), 2)
             self.assertEqual(clock_sources, [
                 "clock-session-1", "signed-session-1"
             ])
+            self.assertIsNone(clock_sequences[0])
+            self.assertEqual(len(clock_sequences[1]), 3)
+            self.assertEqual(
+                tuple(position for _frame, position in clock_sequences[1]),
+                (50.0, 100.0, 150.0),
+            )
             self.assertFalse(any(
                 event["state"] == "reconnecting" for event in states
             ))
@@ -1820,7 +1986,9 @@ class LiveStreamReaderTests(unittest.TestCase):
     def test_unmatched_clock_retries_on_a_later_frame(self):
         allow_next = threading.Event()
         capture = GatedPositionCapture(
-            ["frame-1", "frame-2"], [0.0, 100.0], allow_next
+            ["frame-1", "frame-2", "frame-3"],
+            [0.0, 100.0, 200.0],
+            allow_next,
         )
         calls = []
         recovered_clock = FakeMediaClock("2026-07-10T03:57:24.000Z")
@@ -1843,7 +2011,8 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertIsNone(first["media_clock"])
             time.sleep(0.11)
             allow_next.set()
-            second = reader.wait_for_frame(first["sequence"], timeout=1.0)
+            self.assertTrue(self.wait_until(lambda: len(calls) == 2))
+            second = reader.snapshot(0)
             self.assertEqual(len(calls), 2)
             self.assertEqual(
                 second["media_clock"]["media_timestamp_utc"],
@@ -1851,6 +2020,79 @@ class LiveStreamReaderTests(unittest.TestCase):
             )
         finally:
             allow_next.set()
+            reader.stop(timeout=2.0)
+
+    def test_unmatched_startup_clock_retries_with_three_frame_sequence(self):
+        calls = []
+        recovered_clock = FakeMediaClock("2026-07-10T03:57:24.000Z")
+
+        def media_clock_factory(_source, _frame, _position, _identity, **kwargs):
+            calls.append(kwargs.get("reference_sequence"))
+            return None if len(calls) == 1 else recovered_clock
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda source: ContinuousCapture(source),
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=media_clock_factory,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_retry_seconds=0.1,
+        )
+        reader.start()
+        try:
+            self.assertTrue(self.wait_until(lambda: len(calls) >= 2))
+            self.assertIsNone(calls[0])
+            self.assertEqual(len(calls[1]), 3)
+            positions = tuple(position for _frame, position in calls[1])
+            self.assertEqual(positions, tuple(sorted(positions)))
+            self.assertGreater(positions[-1], positions[0])
+            self.assertTrue(self.wait_until(lambda: (
+                (reader.snapshot(0) or {}).get("media_clock") is not None
+            )))
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_sequence_fallback_preserves_raw_duplicate_contiguity(self):
+        release_read = threading.Event()
+        calls = []
+
+        class PacedCapture(PositionedScriptedCapture):
+            def read(self):
+                time.sleep(0.06)
+                return super().read()
+
+        capture = PacedCapture(
+            ["A", "B", "B", "C"],
+            [50.0, 100.0, 150.0, 200.0],
+            block_after_frames=release_read,
+        )
+
+        def resolve_clock(_source, _frame, _position, _identity, **kwargs):
+            calls.append(kwargs.get("reference_sequence"))
+            return None if len(calls) == 1 else FakeMediaClock()
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            frame_identity=lambda frame: frame,
+            media_clock_factory=resolve_clock,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_clock_retry_seconds=0.1,
+        )
+        reader.start()
+        try:
+            self.assertTrue(self.wait_until(lambda: len(calls) >= 2))
+            self.assertIsNone(calls[0])
+            self.assertEqual(calls[1], (
+                ("B", 100.0), ("B", 150.0), ("C", 200.0)
+            ))
+            self.assertNotEqual(
+                tuple(frame for frame, _position in calls[1]),
+                ("A", "B", "C"),
+            )
+        finally:
+            release_read.set()
             reader.stop(timeout=2.0)
 
     def test_capture_position_reset_forces_an_exact_reanchor(self):
