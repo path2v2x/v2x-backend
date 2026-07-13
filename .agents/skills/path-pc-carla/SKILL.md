@@ -9,7 +9,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 04:58 UTC; verify rather than assume. These items
+Observed through 2026-07-13 05:02 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
 - Live production remains the verified PR 35 rollback
@@ -44,8 +44,10 @@ override every older PR 32/candidate statement below.
   and
   `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T034307Z-pr39-terminal-recovery/`.
   Do not redeploy `56199fe` unchanged.
-- The newest isolated terminal-recovery candidate is
-  `b788faa4e0ae0faa5d468596e79c398790a28803`. It retains signed capture and
+- PR 40 is merged as canonical source release
+  `c29f4f4f5533d07fd0621d9f20458fbd96fc0c12` (implementation commit
+  `b788faa4e0ae0faa5d468596e79c398790a28803`). It is not deployed; production
+  remains the verified PR 35 rollback. The release retains signed capture and
   clock URLs only inside one reader, exposes secret-safe stage/evidence plus
   process-wide decoder-topology telemetry, and never accepts a prior decoder
   cursor or prior clock as a new anchor. A same-session restart must match a
@@ -79,7 +81,7 @@ override every older PR 32/candidate statement below.
   inference advanced, and final readiness/media-clock readiness were true.
   That transient service did not stop cleanly because it predates the final
   cooperative shutdown changes, so it is recovery evidence only. Candidate
-  `b788faa` passes 173 perception tests; its inherited base passes 241
+  `c29f4f4` passes 173 perception tests; its inherited base passes 241
   Python-3.10 bridge, 23 recovery-infrastructure, and 132 web tests plus zero
   Svelte diagnostics and the web production build. The strict deadline,
   cancellation-insensitive resolver, claimed-handover, urgent-batch,
