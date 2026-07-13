@@ -621,6 +621,7 @@ class MediaClockPersistenceTests(unittest.TestCase):
                 "media_clock": {
                     "source": "hls_ext_x_program_date_time",
                     "schema_version": 1,
+                    "session_id": "session-frag-123",
                     "anchor_program_date_time_utc": (
                         "2026-07-10T03:57:23.138Z"
                     ),
@@ -655,6 +656,7 @@ class MediaClockPersistenceTests(unittest.TestCase):
                 "media_clock": {
                     "source": "hls_ext_x_program_date_time",
                     "schema_version": 1,
+                    "session_id": "session-transport-1",
                     "anchor_program_date_time_utc": (
                         "2026-07-10T03:57:23.138Z"
                     ),
@@ -700,6 +702,7 @@ class MediaClockPersistenceTests(unittest.TestCase):
                 "media_clock": {
                     "source": "hls_ext_x_program_date_time",
                     "schema_version": 1,
+                    "session_id": "session-inconsistent-anchor",
                     "anchor_program_date_time_utc": "2026-07-10T03:57:23.138Z",
                     "anchor_fragment_id": "frag-123",
                     "position_milliseconds": 250.5,
@@ -766,6 +769,7 @@ class MediaClockPersistenceTests(unittest.TestCase):
                 "media_clock": {
                     "source": "hls_ext_x_program_date_time",
                     "schema_version": 1,
+                    "session_id": "session-inconsistent-provenance",
                     "anchor_program_date_time_utc": "2026-07-10T03:57:20.000Z",
                     "position_milliseconds": 100.0,
                 },

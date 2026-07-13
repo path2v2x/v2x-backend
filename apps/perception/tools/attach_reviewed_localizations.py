@@ -41,13 +41,14 @@ from digital_twin_bridge.reviewed_localization import (  # noqa: E402
     TRAJECTORY_SCHEMA,
     canonical_json_bytes,
     canonical_object_sha256,
-    load_authority_keys,
+    load_authority_registry,
     placement_key_sha256,
     seal_contract,
     sha256_bytes,
     validate_measured_intrinsics,
     validate_static_calibration,
     validate_contract,
+    verify_authenticated_artifact,
 )
 
 
@@ -56,7 +57,9 @@ CONSENSUS_SCHEMA = "v2x-reviewed-footprint-consensus/v1"
 FACTOR_SCHEMA = "v2x-reviewed-detection-factor-graph/v1"
 IDENTITY_SCHEMA = "v2x-reviewed-trajectory-identity/v1"
 REFERENCE_SCHEMA = "v2x-independent-vehicle-reference/v1"
+REFERENCE_MEASUREMENTS_SCHEMA = "v2x-independent-rtk-measurements/v1"
 BLUEPRINT_CATALOG_SCHEMA = "v2x-reviewed-ue5-blueprint-catalog/v1"
+APPEARANCE_MODEL_SCHEMA = "v2x-pinned-vehicle-appearance-model/v1"
 
 
 class AttachmentError(RuntimeError):
@@ -131,6 +134,220 @@ def verify_bound_image(raw, resolution, label, *, require_nonempty=False):
             raise AttachmentError(f"{label} is empty")
 
 
+def _array_identity(value):
+    array = np.ascontiguousarray(value)
+    identity = {
+        "dtype": str(array.dtype),
+        "shape": list(array.shape),
+        "data_sha256": sha256_bytes(array.tobytes()),
+    }
+    return canonical_object_sha256(identity), identity
+
+
+def _producer_inference_evidence(base, detection, sample, camera_id):
+    evidence = (
+        detection.get("raw_observation", {}).get("inference_evidence")
+        if isinstance(detection.get("raw_observation"), dict) else None
+    )
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema") != "v2x-persisted-inference-evidence/v1"
+        or evidence.get("acceptance_eligible") is not True
+        or evidence.get("reason") is not None
+    ):
+        raise AttachmentError("detection lacks acceptance-eligible producer inference evidence")
+    _exact_keys(
+        evidence,
+        {
+            "schema", "acceptance_eligible", "reason", "manifest_path",
+            "manifest_sha256", "frame_pixel_sha256", "mask_pixel_sha256",
+            "detector_output_sha256",
+        },
+        "producer inference evidence",
+    )
+    descriptor = {
+        "path": evidence.get("manifest_path"),
+        "sha256": evidence.get("manifest_sha256"),
+        "schema": "v2x-persisted-inference-event/v1",
+    }
+    _path, _raw, manifest = load_bound_json(
+        base, descriptor, "producer inference event",
+        "v2x-persisted-inference-event/v1",
+    )
+    _exact_keys(
+        manifest,
+        {
+            "schema", "event_id", "camera_id", "device_id", "session_id",
+            "media_timestamp_utc", "pts_seconds", "frame", "instance_mask",
+            "detector_output", "detector_output_sha256",
+        },
+        "producer inference event",
+    )
+    timing = sample.get("timing") if isinstance(sample, dict) else None
+    try:
+        manifest_pts = float(manifest.get("pts_seconds"))
+        sample_pts = float(timing.get("pts_seconds"))
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise AttachmentError(
+            "producer inference event timing/session linkage is invalid"
+        ) from exc
+    if (
+        manifest.get("event_id") != detection.get("event_id")
+        or manifest.get("camera_id") != camera_id
+        or manifest.get("device_id") != detection.get("device_id")
+        or not isinstance(timing, dict)
+        or manifest.get("session_id") != timing.get("session_id")
+        or manifest.get("media_timestamp_utc") != timing.get("media_timestamp_utc")
+        or isinstance(manifest.get("pts_seconds"), bool)
+        or not math.isfinite(manifest_pts)
+        or not math.isfinite(sample_pts)
+        or abs(manifest_pts - sample_pts) > 1e-9
+    ):
+        raise AttachmentError("producer inference event timing/session linkage is invalid")
+    frame_descriptor = manifest.get("frame")
+    mask_descriptor = manifest.get("instance_mask")
+    _exact_keys(
+        frame_descriptor,
+        {
+            "path", "sha256", "pixel_sha256", "array_identity", "encoding",
+            "resolution", "stddev",
+        },
+        "producer inference frame",
+    )
+    _exact_keys(
+        mask_descriptor,
+        {
+            "path", "sha256", "pixel_sha256", "array_identity", "encoding",
+            "pixel_count", "bbox_fill_ratio", "vehicle_pixel_stddev",
+        },
+        "producer instance mask",
+    )
+    if (
+        not isinstance(frame_descriptor, dict)
+        or not isinstance(mask_descriptor, dict)
+        or sample.get("frame") != {
+            "path": frame_descriptor.get("path"),
+            "sha256": frame_descriptor.get("sha256"),
+        }
+        or sample.get("mask") != {
+            "path": mask_descriptor.get("path"),
+            "sha256": mask_descriptor.get("sha256"),
+        }
+    ):
+        raise AttachmentError("sample substituted producer-bound frame or mask")
+    _frame_path, frame_raw = load_bound_file(
+        base, frame_descriptor, "producer inference frame"
+    )
+    _mask_path, mask_raw = load_bound_file(
+        base, mask_descriptor, "producer instance mask"
+    )
+    frame = cv2.imdecode(np.frombuffer(frame_raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    raw_mask = cv2.imdecode(np.frombuffer(mask_raw, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if frame is None or raw_mask is None:
+        raise AttachmentError("producer frame or instance mask is undecodable")
+    binary_mask = np.asarray(raw_mask > 0, dtype=np.uint8)
+    frame_pixel_sha256, frame_identity = _array_identity(frame)
+    mask_pixel_sha256, mask_identity = _array_identity(binary_mask)
+    _exact_keys(
+        frame_descriptor.get("array_identity"),
+        {"dtype", "shape", "data_sha256"},
+        "producer frame array identity",
+    )
+    _exact_keys(
+        mask_descriptor.get("array_identity"),
+        {"dtype", "shape", "data_sha256"},
+        "producer mask array identity",
+    )
+    vehicle_pixels = frame[binary_mask > 0]
+    bbox = detection.get("bbox")
+    try:
+        x1, y1, x2, y2 = [float(bbox[key]) for key in ("x1", "y1", "x2", "y2")]
+        left = max(0, min(frame.shape[1] - 1, int(math.floor(x1))))
+        top = max(0, min(frame.shape[0] - 1, int(math.floor(y1))))
+        right = max(left + 1, min(frame.shape[1], int(math.ceil(x2))))
+        bottom = max(top + 1, min(frame.shape[0], int(math.ceil(y2))))
+        mask_pixels = int(np.count_nonzero(binary_mask))
+        mask_in_box = int(np.count_nonzero(binary_mask[top:bottom, left:right]))
+        fill_ratio = mask_in_box / float((right - left) * (bottom - top))
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise AttachmentError("producer detection bbox is invalid") from exc
+    try:
+        declared_fill_ratio = float(mask_descriptor.get("bbox_fill_ratio"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AttachmentError(
+            "uniform or substituted producer frame/mask evidence"
+        ) from exc
+    if (
+        frame_descriptor.get("encoding") != "lossless_png_bgr8"
+        or mask_descriptor.get("encoding") != "lossless_png_binary_u8"
+        or frame_descriptor.get("resolution") != [frame.shape[1], frame.shape[0]]
+        or frame_descriptor.get("pixel_sha256") != frame_pixel_sha256
+        or frame_descriptor.get("array_identity") != frame_identity
+        or mask_descriptor.get("pixel_sha256") != mask_pixel_sha256
+        or mask_descriptor.get("array_identity") != mask_identity
+        or evidence.get("frame_pixel_sha256") != frame_pixel_sha256
+        or evidence.get("mask_pixel_sha256") != mask_pixel_sha256
+        or float(np.std(frame.astype(np.float32))) < 2.0
+        or vehicle_pixels.size == 0
+        or float(np.std(vehicle_pixels.astype(np.float32))) < 2.0
+        or mask_pixels < 32
+        or mask_in_box / max(mask_pixels, 1) < 0.90
+        or not 0.05 <= fill_ratio <= 0.95
+        or mask_descriptor.get("pixel_count") != mask_pixels
+        or not math.isfinite(declared_fill_ratio)
+        or abs(declared_fill_ratio - fill_ratio) > 1e-9
+    ):
+        raise AttachmentError("uniform or substituted producer frame/mask evidence")
+    output = manifest.get("detector_output")
+    if not isinstance(output, dict):
+        raise AttachmentError("producer detector output is missing")
+    _exact_keys(
+        output,
+        {
+            "schema", "event_id", "camera_id", "device_id", "frame_number",
+            "track_id", "object_type", "confidence_score", "bbox",
+            "segmentation_output_index", "mask_pixel_sha256",
+            "detector_model_sha256", "detector_config_sha256",
+        },
+        "producer detector output",
+    )
+    segmentation_output_index = output.get("segmentation_output_index")
+    if (
+        not isinstance(segmentation_output_index, int)
+        or isinstance(segmentation_output_index, bool)
+        or segmentation_output_index < 0
+    ):
+        raise AttachmentError("producer detector output is invalid")
+    expected_output = {
+        "schema": "v2x-detector-instance-output/v1",
+        "event_id": detection.get("event_id"),
+        "camera_id": camera_id,
+        "device_id": detection.get("device_id"),
+        "frame_number": sample.get("frame_number"),
+        "track_id": detection.get("track_id"),
+        "object_type": detection.get("object_type"),
+        "confidence_score": detection.get("confidence_score"),
+        "bbox": detection.get("bbox"),
+        "segmentation_output_index": segmentation_output_index,
+        "mask_pixel_sha256": mask_pixel_sha256,
+        "detector_model_sha256": detection.get("raw_observation", {}).get("fingerprints", {}).get("detector_model_sha256"),
+        "detector_config_sha256": detection.get("raw_observation", {}).get("fingerprints", {}).get("detector_config_sha256"),
+    }
+    output_sha256 = canonical_object_sha256(expected_output)
+    if (
+        output != expected_output
+        or manifest.get("detector_output_sha256") != output_sha256
+        or evidence.get("detector_output_sha256") != output_sha256
+    ):
+        raise AttachmentError("producer detector output identity is mismatched")
+    return frame_raw, mask_raw, frame, binary_mask, {
+        "inference_manifest_sha256": evidence.get("manifest_sha256"),
+        "frame_pixel_sha256": frame_pixel_sha256,
+        "mask_pixel_sha256": mask_pixel_sha256,
+        "detector_output_sha256": output_sha256,
+    }
+
+
 def load_detections(path):
     path = Path(path).expanduser().resolve()
     try:
@@ -173,6 +390,11 @@ def _accepted_event_index(artifact, label):
     if not output:
         raise AttachmentError(f"{label} has no accepted event results")
     return output
+
+
+def _exact_keys(value, expected, label):
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise AttachmentError(f"{label} has unexpected or missing fields")
 
 
 def _finite_vector(value, size, label):
@@ -223,6 +445,42 @@ def _parse_utc(value, label):
         return datetime.fromisoformat(value[:-1] + "+00:00").timestamp()
     except ValueError as exc:
         raise AttachmentError(f"{label} is invalid") from exc
+
+
+def _appearance_embedding(frame, mask, bbox, model):
+    if (
+        model.get("algorithm") != "masked-bgr-histogram-l2/v1"
+        or model.get("bins") != [8, 8, 8]
+        or model.get("crop_source") != "producer_instance_mask"
+    ):
+        raise AttachmentError("appearance model algorithm is not allowlisted")
+    try:
+        x1, y1, x2, y2 = [float(bbox[key]) for key in ("x1", "y1", "x2", "y2")]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AttachmentError("appearance crop bbox is invalid") from exc
+    left = max(0, min(frame.shape[1] - 1, int(math.floor(x1))))
+    top = max(0, min(frame.shape[0] - 1, int(math.floor(y1))))
+    right = max(left + 1, min(frame.shape[1], int(math.ceil(x2))))
+    bottom = max(top + 1, min(frame.shape[0], int(math.ceil(y2))))
+    crop = frame[top:bottom, left:right]
+    crop_mask = mask[top:bottom, left:right] > 0
+    pixels = crop[crop_mask]
+    if pixels.shape[0] < 32:
+        raise AttachmentError("appearance crop has insufficient vehicle pixels")
+    histogram, _edges = np.histogramdd(
+        pixels.astype(np.float64),
+        bins=(8, 8, 8),
+        range=((0, 256), (0, 256), (0, 256)),
+    )
+    flattened = histogram.reshape(-1)
+    norm = float(np.linalg.norm(flattened))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise AttachmentError("appearance embedding is degenerate")
+    embedding = flattened / norm
+    normalized = [round(float(value), 12) for value in embedding]
+    return embedding, sha256_bytes(canonical_json_bytes(normalized)), [
+        float(left), float(top), float(right), float(bottom)
+    ]
 
 
 def _camera_context(cameras_path, cameras_raw, cameras_config):
@@ -366,8 +624,20 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
     _reference_path, reference_raw, reference = load_bound_json(
         base, source.get("independent_reference"), "independent reference", REFERENCE_SCHEMA
     )
+    _measurements_path, measurements_raw, measurements = load_bound_json(
+        base,
+        reference.get("source") if isinstance(reference, dict) else None,
+        "independent RTK/survey measurements",
+        REFERENCE_MEASUREMENTS_SCHEMA,
+    )
     _catalog_path, catalog_raw, catalog = load_bound_json(
         base, source.get("blueprint_catalog"), "UE5 blueprint catalog", BLUEPRINT_CATALOG_SCHEMA
+    )
+    _appearance_path, appearance_raw, appearance_model = load_bound_json(
+        base,
+        source.get("appearance_model"),
+        "pinned vehicle appearance model",
+        APPEARANCE_MODEL_SCHEMA,
     )
     static_path, static_raw, _static = load_bound_json(
         base,
@@ -384,22 +654,49 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
     if (
         factor.get("gate_passed") is not True
         or factor.get("acceptance_eligible") is not True
-        or (factor.get("optimizer_contract") or {}).get(
-            "diagnostic_until_independent_truth"
-        ) is not False
+        or factor.get("optimizer_contract") != {
+            "diagnostic_until_independent_truth": False
+        }
     ):
         raise AttachmentError("diagnostic factor-graph output cannot be attached")
     consensus_events = _accepted_event_index(consensus, "reviewed contact consensus")
     factor_events = _accepted_event_index(factor, "factor-graph result")
     identity_events = _accepted_event_index(identity, "trajectory identity result")
     reference_events = _accepted_event_index(reference, "independent reference")
+    for event in consensus_events.values():
+        _exact_keys(
+            event,
+            {"event_id", "accepted", "ambiguity", "camera_id", "frame_sha256", "mask_sha256", "contact"},
+            "reviewed contact event",
+        )
+    for event in factor_events.values():
+        _exact_keys(
+            event,
+            {"event_id", "accepted", "ambiguity", "global_track_id", "trajectory_id", "camera_id", "sample_index", "placement"},
+            "factor-graph event",
+        )
+    for event in identity_events.values():
+        _exact_keys(
+            event,
+            {"event_id", "accepted", "ambiguity", "global_track_id", "trajectory_id", "camera_id", "sample_index", "frame_sha256", "mask_sha256", "crop_bbox", "embedding_sha256"},
+            "identity event",
+        )
+    for event in reference_events.values():
+        _exact_keys(
+            event,
+            {"event_id", "accepted", "ambiguity", "global_track_id", "trajectory_id", "camera_id", "sample_index", "measurement_id"},
+            "independent reference event",
+        )
     reviewer = trajectory.get("reviewer")
     reviewer_ids = consensus.get("reviewer_ids")
     authority_key_id = trajectory.get("authority_key_id")
     try:
-        authority_keys = load_authority_keys(authority_key_file)
+        authority_registry = load_authority_registry(authority_key_file)
     except ReviewedLocalizationError as exc:
         raise AttachmentError(f"review authority rejected: {exc.reason}") from exc
+    authority_keys = {
+        key_id: entry["key"] for key_id, entry in authority_registry.items()
+    }
     authority_key = authority_keys.get(authority_key_id)
     if (
         not isinstance(reviewer, dict)
@@ -414,15 +711,122 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
         or authority_key is None
     ):
         raise AttachmentError("reviewer authority/consensus provenance is incomplete")
-    for label, artifact in (
-        ("reviewed contact consensus", consensus),
-        ("factor-graph result", factor),
-        ("trajectory identity result", identity),
-        ("independent reference", reference),
-        ("UE5 blueprint catalog", catalog),
-    ):
-        if artifact.get("authority_key_id") != authority_key_id:
-            raise AttachmentError(f"{label} is not bound to the review authority")
+    try:
+        trajectory_signer = verify_authenticated_artifact(
+            trajectory, TRAJECTORY_SCHEMA, "reviewed_contract", authority_registry
+        )
+    except ReviewedLocalizationError as exc:
+        raise AttachmentError(
+            f"reviewed trajectory authentication rejected: {exc.reason}"
+        ) from exc
+    if trajectory_signer != authority_key_id:
+        raise AttachmentError("reviewed trajectory signer does not match reviewer")
+    _exact_keys(
+        trajectory,
+        {
+            "schema", "authority_key_id", "acceptance_eligible",
+            "global_track_id", "trajectory_id", "reviewer",
+            "blueprint_dimension_tolerance_m", "source", "samples",
+            "authority",
+        },
+        "reviewed trajectory",
+    )
+    authenticated_artifacts = (
+        (consensus, CONSENSUS_SCHEMA, "contact_consensus", "reviewed contact consensus"),
+        (factor, FACTOR_SCHEMA, "factor_graph", "factor-graph result"),
+        (identity, IDENTITY_SCHEMA, "trajectory_identity", "trajectory identity result"),
+        (reference, REFERENCE_SCHEMA, "independent_reference", "independent reference"),
+        (measurements, REFERENCE_MEASUREMENTS_SCHEMA, "independent_reference", "independent RTK/survey measurements"),
+        (catalog, BLUEPRINT_CATALOG_SCHEMA, "blueprint_catalog", "UE5 blueprint catalog"),
+        (appearance_model, APPEARANCE_MODEL_SCHEMA, "appearance_model", "pinned vehicle appearance model"),
+        (_static, "v2x-static-camera-survey-manifest/v1", "static_calibration", "static calibration manifest"),
+    )
+    artifact_signers = {}
+    for artifact, schema, role, label in authenticated_artifacts:
+        try:
+            artifact_signers[role] = verify_authenticated_artifact(
+                artifact, schema, role, authority_registry
+            )
+        except ReviewedLocalizationError as exc:
+            raise AttachmentError(
+                f"{label} authentication rejected: {exc.reason}"
+            ) from exc
+    if artifact_signers["independent_reference"] == authority_key_id:
+        raise AttachmentError(
+            "independent reference must use a distinct survey authority"
+        )
+    if measurements["authority"]["key_id"] != artifact_signers[
+        "independent_reference"
+    ]:
+        raise AttachmentError(
+            "independent reference and raw measurements have different authorities"
+        )
+    _exact_keys(
+        consensus,
+        {"schema", "acceptance_eligible", "reviewer_ids", "events", "authority"},
+        "reviewed contact consensus",
+    )
+    _exact_keys(
+        factor,
+        {"schema", "acceptance_eligible", "gate_passed", "optimizer_contract", "events", "authority"},
+        "factor-graph result",
+    )
+    _exact_keys(
+        identity,
+        {
+            "schema", "acceptance_eligible", "status", "ambiguity_count",
+            "global_track_id", "trajectory_id", "camera_ids",
+            "appearance_model_sha256", "minimum_appearance_similarity",
+            "events", "pairs", "authority",
+        },
+        "trajectory identity result",
+    )
+    _exact_keys(
+        reference,
+        {"schema", "acceptance_eligible", "source", "events", "authority"},
+        "independent reference",
+    )
+    _exact_keys(
+        measurements,
+        {"schema", "measurements", "authority"},
+        "independent RTK/survey measurements",
+    )
+    _exact_keys(
+        catalog,
+        {"schema", "acceptance_eligible", "families", "authority"},
+        "UE5 blueprint catalog",
+    )
+    _exact_keys(
+        appearance_model,
+        {"schema", "algorithm", "bins", "crop_source", "authority"},
+        "pinned vehicle appearance model",
+    )
+    measurement_rows = measurements.get("measurements")
+    if not isinstance(measurement_rows, list) or not measurement_rows:
+        raise AttachmentError("independent RTK/survey measurements are empty")
+    measurement_index = {}
+    for measurement in measurement_rows:
+        measurement_id = (
+            measurement.get("measurement_id")
+            if isinstance(measurement, dict) else None
+        )
+        if (
+            not isinstance(measurement_id, str)
+            or not measurement_id
+            or measurement_id in measurement_index
+        ):
+            raise AttachmentError("independent measurement IDs are invalid")
+        _exact_keys(
+            measurement,
+            {
+                "measurement_id", "event_id", "camera_id",
+                "media_timestamp_utc", "map_name", "opendrive_sha256",
+                "method", "source_device_id", "capture_run_id",
+                "position_m", "covariance_m2", "uncertainty_m",
+            },
+            "independent RTK/survey measurement",
+        )
+        measurement_index[measurement_id] = measurement
     global_track_id = trajectory.get("global_track_id")
     trajectory_id = trajectory.get("trajectory_id")
     if (
@@ -436,7 +840,7 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
     camera_ids = identity.get("camera_ids")
     if (
         not isinstance(camera_ids, list)
-        or not camera_ids
+        or len(camera_ids) < 2
         or any(not isinstance(item, str) or not item for item in camera_ids)
         or len(camera_ids) != len(set(camera_ids))
     ):
@@ -458,8 +862,13 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
             str(static_path),
             cameras_json_sha256,
             camera_hashes,
+            {
+                camera_id: value.native_resolution
+                for camera_id, value in camera_context.items()
+            },
             map_name,
             opendrive_hash,
+            authority_registry,
         )
     except ReviewedLocalizationError as exc:
         raise AttachmentError(f"static calibration rejected: {exc.reason}") from exc
@@ -474,6 +883,10 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
         cameras=camera_context,
         static_calibration_sha256=static_hash,
         authority_keys=authority_keys,
+        authority_roles={
+            key_id: entry["roles"]
+            for key_id, entry in authority_registry.items()
+        },
     )
 
     samples = trajectory.get("samples")
@@ -514,11 +927,32 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
     ]
     if any(set(sample_events) != denominator for denominator in denominators):
         raise AttachmentError("semantic artifact event denominators do not match samples")
+    referenced_measurement_ids = [
+        reference_events[event_id].get("measurement_id")
+        for event_id in sample_events
+    ]
+    if (
+        any(
+            not isinstance(measurement_id, str) or not measurement_id
+            for measurement_id in referenced_measurement_ids
+        )
+        or len(referenced_measurement_ids)
+        != len(set(referenced_measurement_ids))
+        or set(referenced_measurement_ids) != set(measurement_index)
+    ):
+        raise AttachmentError(
+            "independent measurement denominator does not exactly match samples"
+        )
     pairs = identity.get("pairs")
     if not isinstance(pairs, list):
         raise AttachmentError("identity pair results are missing")
     pair_index = {}
     for pair in pairs:
+        _exact_keys(
+            pair,
+            {"previous_event_id", "event_id", "previous_camera_id", "camera_id", "accepted", "ambiguity", "global_track_id", "trajectory_id", "appearance_similarity", "transit_seconds", "distance_m", "trajectory_covariance_m2"},
+            "identity pair",
+        )
         key = (
             pair.get("previous_event_id"), pair.get("event_id")
         ) if isinstance(pair, dict) else None
@@ -532,10 +966,33 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
     expected_pairs = set(zip(sample_events, sample_events[1:]))
     if set(pair_index) != expected_pairs:
         raise AttachmentError("identity pair evidence is not complete and exact")
+    sample_camera_by_event = {
+        sample["event_id"]: sample["camera_id"] for sample in samples
+    }
+    cross_camera_pairs = []
+    for (previous_event_id, event_id), pair in pair_index.items():
+        previous_camera_id = sample_camera_by_event[previous_event_id]
+        camera_id = sample_camera_by_event[event_id]
+        if (
+            pair.get("previous_camera_id") != previous_camera_id
+            or pair.get("camera_id") != camera_id
+        ):
+            raise AttachmentError("identity pair camera linkage is invalid")
+        if previous_camera_id != camera_id:
+            cross_camera_pairs.append(pair)
+    if not cross_camera_pairs:
+        raise AttachmentError(
+            "reviewed multicamera identity lacks a cross-camera transition"
+        )
+    cross_camera_transition_sha256 = sha256_bytes(canonical_json_bytes(
+        sorted(
+            cross_camera_pairs,
+            key=lambda pair: (pair["previous_event_id"], pair["event_id"]),
+        )
+    ))
     appearance_threshold = identity.get("minimum_appearance_similarity")
     if (
-        not isinstance(identity.get("appearance_model_sha256"), str)
-        or SHA256_RE.fullmatch(identity["appearance_model_sha256"]) is None
+        identity.get("appearance_model_sha256") != sha256_bytes(appearance_raw)
         or not isinstance(appearance_threshold, (int, float))
         or isinstance(appearance_threshold, bool)
         or not math.isfinite(float(appearance_threshold))
@@ -546,19 +1003,25 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
     contracts = {}
     previous_epoch = None
     previous_position = None
-    previous_speed = 0.0
+    previous_speed = None
     previous_event_id = None
+    previous_embedding = None
     for sample in samples:
         event_id = sample.get("event_id")
         detection = by_event.get(event_id)
         camera_id = sample.get("camera_id")
         if camera_id not in camera_ids or camera_id not in camera_context:
             raise AttachmentError("trajectory sample camera is not identity-bound")
-        frame_path, frame_raw = load_bound_file(
-            base, sample.get("frame"), f"{event_id} native frame"
-        )
-        mask_path, mask_raw = load_bound_file(
-            base, sample.get("mask"), f"{event_id} native mask"
+        (
+            frame_raw,
+            mask_raw,
+            _frame_image,
+            _binary_mask,
+            inference_binding,
+        ) = (
+            _producer_inference_evidence(
+                base, detection, sample, camera_id
+            )
         )
         resolution = sample.get("native_resolution")
         verify_bound_image(frame_raw, resolution, f"{event_id} native frame")
@@ -575,6 +1038,12 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
         identity_event = identity_events[event_id]
         reference_event = reference_events[event_id]
         contact = sample.get("contact")
+        embedding, embedding_sha256, crop_bbox = _appearance_embedding(
+            _frame_image,
+            _binary_mask,
+            detection.get("bbox"),
+            appearance_model,
+        )
         if (
             consensus_event.get("camera_id") != camera_id
             or consensus_event.get("frame_sha256") != frame_hash
@@ -597,6 +1066,10 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
             or identity_event.get("trajectory_id") != trajectory_id
             or identity_event.get("camera_id") != camera_id
             or identity_event.get("sample_index") != sample.get("sample_index")
+            or identity_event.get("frame_sha256") != frame_hash
+            or identity_event.get("mask_sha256") != mask_hash
+            or identity_event.get("crop_bbox") != crop_bbox
+            or identity_event.get("embedding_sha256") != embedding_sha256
         ):
             raise AttachmentError("identity event result is not linked to the exact sample")
         if (
@@ -608,18 +1081,38 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
             raise AttachmentError(
                 "independent reference is not linked to the exact sample"
             )
+        measurement_id = reference_event.get("measurement_id")
+        measurement = measurement_index.get(measurement_id)
+        if (
+            not isinstance(measurement, dict)
+            or measurement.get("event_id") != event_id
+            or measurement.get("camera_id") != camera_id
+            or measurement.get("media_timestamp_utc")
+            != sample.get("timing", {}).get("media_timestamp_utc")
+            or measurement.get("map_name") != map_name
+            or measurement.get("opendrive_sha256") != opendrive_hash
+            or measurement.get("method") not in {
+                "independent_rtk_fix",
+                "independent_total_station",
+            }
+            or not isinstance(measurement.get("source_device_id"), str)
+            or not measurement["source_device_id"]
+            or measurement["source_device_id"] == detection.get("device_id")
+            or not isinstance(measurement.get("capture_run_id"), str)
+            or not measurement["capture_run_id"]
+        ):
+            raise AttachmentError(
+                "independent reference lacks an exact authenticated raw measurement"
+            )
         reference_position = _position(
-            reference_event.get("position_m"), f"{event_id} independent reference"
+            measurement.get("position_m"), f"{event_id} independent reference"
         )
         reference_covariance = _matrix_psd(
-            reference_event.get("covariance_m2"), 3, f"{event_id} reference covariance"
+            measurement.get("covariance_m2"), 3, f"{event_id} reference covariance"
         )
-        reference_uncertainty = reference_event.get("uncertainty_m")
+        reference_uncertainty = measurement.get("uncertainty_m")
         if (
-            reference_event.get("source_kind") not in {
-                "independent_rtk", "independent_surveyed_trajectory"
-            }
-            or not isinstance(reference_uncertainty, (int, float))
+            not isinstance(reference_uncertainty, (int, float))
             or isinstance(reference_uncertainty, bool)
             or not 0.0 <= float(reference_uncertainty) <= 0.50
             or math.sqrt(max(0.0, float(np.linalg.eigvalsh(reference_covariance).max())))
@@ -680,12 +1173,16 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
                 for axis in ("x", "y", "z")
             ))
             speed = distance / delta
-            acceleration = (speed - previous_speed) / delta
+            acceleration = (
+                (speed - previous_speed) / delta
+                if previous_speed is not None else None
+            )
             pair = pair_index[(previous_event_id, event_id)]
             pair_covariance = _matrix_psd(
                 pair.get("trajectory_covariance_m2"), 3, "identity trajectory covariance"
             )
             similarity = pair.get("appearance_similarity")
+            recomputed_similarity = float(np.dot(previous_embedding, embedding))
             declared_transit = pair.get("transit_seconds")
             declared_distance = pair.get("distance_m")
             if (
@@ -704,11 +1201,15 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
                     for value in (similarity, declared_transit, declared_distance)
                 )
                 or not 0.0 <= float(similarity) <= 1.0
+                or abs(float(similarity) - recomputed_similarity) > 1e-9
                 or float(declared_transit) <= 0.0
                 or float(declared_distance) < 0.0
                 or float(similarity) < float(appearance_threshold)
                 or speed > MAX_VEHICLE_SPEED_MPS
-                or abs(acceleration) > MAX_VEHICLE_ACCELERATION_MPS2
+                or (
+                    acceleration is not None
+                    and abs(acceleration) > MAX_VEHICLE_ACCELERATION_MPS2
+                )
                 or math.sqrt(max(0.0, float(np.linalg.eigvalsh(pair_covariance).max())))
                 > MAX_LOCALIZATION_UNCERTAINTY_M
                 or abs(float(declared_transit) - delta) > 1e-6
@@ -727,7 +1228,6 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
                 "trajectory_covariance_m2": pair_covariance.tolist(),
                 "pair_evidence_sha256": sha256_bytes(canonical_json_bytes(pair)),
             }
-        del frame_path, mask_path
         raw_observation = detection.get("raw_observation")
         fingerprints = raw_observation.get("fingerprints") if isinstance(raw_observation, dict) else None
         if not isinstance(fingerprints, dict):
@@ -746,6 +1246,7 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
                     "mask_sha256": mask_hash,
                     "native_resolution": resolution,
                     "frame_number": sample.get("frame_number"),
+                    **inference_binding,
                 },
                 "detector": {
                     "model_sha256": fingerprints.get("detector_model_sha256"),
@@ -786,6 +1287,7 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
                 "association_method": "reviewed_multicamera_trajectory",
                 "evidence_sha256": sha256_bytes(identity_raw),
                 "camera_ids": camera_ids,
+                "cross_camera_transition_sha256": cross_camera_transition_sha256,
                 "transition": transition,
             },
             "placement": {
@@ -812,8 +1314,9 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
         contracts[event_id] = contract
         previous_epoch = media_epoch
         previous_position = position
-        previous_speed = transition["speed_mps"] if transition is not None else 0.0
+        previous_speed = transition["speed_mps"] if transition is not None else None
         previous_event_id = event_id
+        previous_embedding = embedding
 
     updated = []
     for row in rows:
@@ -839,7 +1342,9 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
         "authority_key_id": authority_key_id,
         "static_calibration_manifest_sha256": static_hash,
         "independent_reference_sha256": sha256_bytes(reference_raw),
+        "independent_measurements_sha256": sha256_bytes(measurements_raw),
         "blueprint_catalog_sha256": sha256_bytes(catalog_raw),
+        "appearance_model_sha256": sha256_bytes(appearance_raw),
         "output_sha256": sha256_bytes(body),
         "counts": {
             "detections": len(updated),

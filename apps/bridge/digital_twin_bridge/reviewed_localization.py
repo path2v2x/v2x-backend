@@ -18,6 +18,25 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Optional
 
+try:
+    from tools.aggregate_twin_calibration_manifests import (
+        SiteManifestError,
+        aggregate_site_manifests,
+    )
+    from tools.build_twin_calibration_manifest import (
+        validate_intrinsics_artifact,
+        validate_intrinsics_source_images,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct script/package fallback
+    from aggregate_twin_calibration_manifests import (
+        SiteManifestError,
+        aggregate_site_manifests,
+    )
+    from build_twin_calibration_manifest import (
+        validate_intrinsics_artifact,
+        validate_intrinsics_source_images,
+    )
+
 
 SCHEMA = "v2x-reviewed-vehicle-localization/v1"
 TRAJECTORY_SCHEMA = "v2x-reviewed-vehicle-trajectory/v1"
@@ -29,6 +48,16 @@ VEHICLE_FAMILIES = {
 }
 AUTHORITY_SCHEMA = "v2x-review-authority-keys/v1"
 AUTHORITY_SCHEME = "hmac-sha256-v1"
+AUTHORITY_ROLES = frozenset({
+    "reviewed_contract",
+    "contact_consensus",
+    "factor_graph",
+    "trajectory_identity",
+    "independent_reference",
+    "appearance_model",
+    "blueprint_catalog",
+    "static_calibration",
+})
 MAX_LOCALIZATION_UNCERTAINTY_M = 2.0
 MAX_INDEPENDENT_REFERENCE_ERROR_M = 2.0
 MAX_VEHICLE_SPEED_MPS = 45.0
@@ -63,6 +92,7 @@ class ReviewedPlacementContext:
     cameras: Mapping[str, CameraPlacementContext]
     static_calibration_sha256: str
     authority_keys: Mapping[str, bytes]
+    authority_roles: Mapping[str, frozenset[str]]
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -130,6 +160,19 @@ def seal_contract(value: Mapping[str, Any], key_id: str, key: bytes) -> dict:
     }
     sealed["authority"]["signature"] = authority_signature(sealed, key)
     sealed["contract_sha256"] = contract_sha256(sealed)
+    return sealed
+
+
+def seal_authenticated_artifact(
+    value: Mapping[str, Any], key_id: str, key: bytes
+) -> dict:
+    """Attach the same keyed authority envelope to an upstream artifact."""
+    sealed = dict(value)
+    sealed["authority"] = {
+        "scheme": AUTHORITY_SCHEME,
+        "key_id": _text(key_id, "authority_key_id_missing"),
+    }
+    sealed["authority"]["signature"] = authority_signature(sealed, key)
     return sealed
 
 
@@ -342,6 +385,22 @@ def validate_measured_intrinsics(
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ReviewedLocalizationError("active_intrinsics_metrics_invalid") from exc
     source_hashes = calibration.get("source_images_sha256")
+    source_image_values = calibration.get("source_image_paths")
+    if not isinstance(source_image_values, list):
+        raise ReviewedLocalizationError("active_intrinsics_sources_missing")
+    source_image_paths = []
+    for path_value in source_image_values:
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ReviewedLocalizationError("active_intrinsics_sources_missing")
+        source_path = Path(path_value).expanduser()
+        if not source_path.is_absolute():
+            source_path = base / source_path
+        try:
+            source_image_paths.append(source_path.resolve(strict=True))
+        except OSError as exc:
+            raise ReviewedLocalizationError(
+                "active_intrinsics_source_unavailable"
+            ) from exc
     report_items = (
         (accepted if isinstance(accepted, list) else [])
         + (holdouts if isinstance(holdouts, list) else [])
@@ -368,6 +427,7 @@ def validate_measured_intrinsics(
         or not isinstance(holdouts, list) or len(holdouts) < 2
         or not isinstance(source_hashes, list)
         or len(source_hashes) < 12
+        or len(source_image_paths) != len(source_hashes)
         or len(source_hashes) != len(source_hash_set)
         or any(
             not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
@@ -401,10 +461,19 @@ def validate_measured_intrinsics(
         ]
     ):
         raise ReviewedLocalizationError("active_intrinsics_gate_failed")
+    try:
+        validate_intrinsics_artifact(camera, artifact_raw)
+        verified_source_hashes = validate_intrinsics_source_images(
+            camera, source_image_paths
+        )
+    except (OSError, ValueError) as exc:
+        raise ReviewedLocalizationError("active_intrinsics_gate_failed") from exc
+    if verified_source_hashes != sorted(source_hash_set):
+        raise ReviewedLocalizationError("active_intrinsics_gate_failed")
     return sha256_bytes(artifact_raw), sha256_bytes(report_raw)
 
 
-def load_authority_keys(path_value: str) -> Mapping[str, bytes]:
+def load_authority_registry(path_value: str) -> Mapping[str, dict]:
     try:
         path = Path(path_value).expanduser().resolve(strict=True)
         value = json.loads(path.read_bytes())
@@ -418,26 +487,250 @@ def load_authority_keys(path_value: str) -> Mapping[str, bytes]:
         or not keys
     ):
         raise ReviewedLocalizationError("authority_key_file_invalid")
-    output = {}
-    for key_id, encoded in keys.items():
-        if not isinstance(key_id, str) or not key_id or not isinstance(encoded, str):
+    output: dict[str, dict] = {}
+    for key_id, entry in keys.items():
+        if (
+            not isinstance(key_id, str)
+            or not key_id
+            or not isinstance(entry, dict)
+            or set(entry) != {"key_hex", "roles"}
+            or not isinstance(entry.get("key_hex"), str)
+            or not isinstance(entry.get("roles"), list)
+            or not entry["roles"]
+            or any(
+                not isinstance(role, str) or role not in AUTHORITY_ROLES
+                for role in entry["roles"]
+            )
+            or len(entry["roles"]) != len(set(entry["roles"]))
+        ):
             raise ReviewedLocalizationError("authority_key_file_invalid")
         try:
-            key = bytes.fromhex(encoded)
+            key = bytes.fromhex(entry["key_hex"])
         except ValueError as exc:
             raise ReviewedLocalizationError("authority_key_file_invalid") from exc
         if len(key) < 32:
             raise ReviewedLocalizationError("authority_key_file_invalid")
-        output[key_id] = key
+        output[key_id] = {
+            "key": key,
+            "roles": frozenset(entry["roles"]),
+        }
     return output
+
+
+def load_authority_keys(path_value: str) -> Mapping[str, bytes]:
+    return {
+        key_id: entry["key"]
+        for key_id, entry in load_authority_registry(path_value).items()
+    }
+
+
+def verify_authenticated_artifact(
+    value: Mapping[str, Any],
+    expected_schema: str,
+    expected_role: str,
+    registry: Mapping[str, dict],
+) -> str:
+    if not isinstance(value, dict) or value.get("schema") != expected_schema:
+        raise ReviewedLocalizationError("artifact_schema_not_allowlisted")
+    authority = _object(value.get("authority"), "artifact_authority_missing")
+    _exact_keys(
+        authority,
+        {"scheme", "key_id", "signature"},
+        "artifact_authority_fields_invalid",
+    )
+    if authority.get("scheme") != AUTHORITY_SCHEME:
+        raise ReviewedLocalizationError("artifact_authority_scheme_invalid")
+    key_id = _text(authority.get("key_id"), "artifact_authority_key_missing")
+    entry = registry.get(key_id)
+    signature = _sha(
+        authority.get("signature"), "artifact_authority_signature_invalid"
+    )
+    if (
+        entry is None
+        or expected_role not in entry["roles"]
+        or not hmac.compare_digest(
+            signature, authority_signature(value, entry["key"])
+        )
+    ):
+        raise ReviewedLocalizationError("artifact_authority_mismatch")
+    return key_id
+
+
+def _artifact_descriptor(
+    value: Any, expected_schema: str, reason: str
+) -> tuple[str, str]:
+    descriptor = _object(value, reason)
+    _exact_keys(descriptor, {"path", "sha256", "schema"}, reason)
+    if descriptor.get("schema") != expected_schema:
+        raise ReviewedLocalizationError(reason)
+    return (
+        _text(descriptor.get("path"), reason),
+        _sha(descriptor.get("sha256"), reason),
+    )
+
+
+def _pixel(value: Any, width: int, height: int, reason: str) -> list[float]:
+    pixel = _vector(value, 2, reason)
+    if not (0.0 <= pixel[0] < width and 0.0 <= pixel[1] < height):
+        raise ReviewedLocalizationError(reason)
+    return pixel
+
+
+def _heldout_reprojection_metrics(
+    evidence: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    camera_id: str,
+    camera_hash: str,
+    manifest_hash: str,
+) -> None:
+    _exact_keys(
+        evidence,
+        {
+            "schema", "camera_id", "camera_config_sha256",
+            "camera_manifest_sha256", "native_resolution", "points",
+            "roads", "authority",
+        },
+        "static_reprojection_fields_invalid",
+    )
+    width = manifest.get("width")
+    height = manifest.get("height")
+    if (
+        evidence.get("schema") != "v2x-camera-heldout-reprojection/v1"
+        or evidence.get("camera_id") != camera_id
+        or evidence.get("camera_config_sha256") != camera_hash
+        or evidence.get("camera_manifest_sha256") != manifest_hash
+        or not isinstance(width, int)
+        or isinstance(width, bool)
+        or width <= 0
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or height <= 0
+        or evidence.get("native_resolution") != [width, height]
+    ):
+        raise ReviewedLocalizationError("static_reprojection_binding_invalid")
+    features = manifest.get("features")
+    if not isinstance(features, list):
+        raise ReviewedLocalizationError("static_reprojection_manifest_invalid")
+    holdout_points = {
+        item.get("id"): item
+        for item in features
+        if isinstance(item, dict)
+        and item.get("split") == "holdout"
+        and item.get("type") == "point"
+    }
+    holdout_roads = {
+        item.get("id"): item
+        for item in features
+        if isinstance(item, dict)
+        and item.get("split") == "holdout"
+        and item.get("type") == "polyline"
+    }
+    points = evidence.get("points")
+    roads = evidence.get("roads")
+    if (
+        len(holdout_points) < 4
+        or len(holdout_roads) < 2
+        or not isinstance(points, list)
+        or not isinstance(roads, list)
+    ):
+        raise ReviewedLocalizationError("static_reprojection_denominator_invalid")
+    point_residuals: list[float] = []
+    seen_points = set()
+    for item in points:
+        _exact_keys(
+            _object(item, "static_reprojection_point_invalid"),
+            {"feature_id", "observed_pixel", "predicted_pixel"},
+            "static_reprojection_point_invalid",
+        )
+        feature_id = _text(
+            item.get("feature_id"), "static_reprojection_point_invalid"
+        )
+        feature = holdout_points.get(feature_id)
+        if feature is None or feature_id in seen_points:
+            raise ReviewedLocalizationError("static_reprojection_point_invalid")
+        seen_points.add(feature_id)
+        observed = _pixel(
+            item.get("observed_pixel"), width, height,
+            "static_reprojection_point_invalid",
+        )
+        predicted = _pixel(
+            item.get("predicted_pixel"), width, height,
+            "static_reprojection_point_invalid",
+        )
+        if observed != [float(value) for value in feature.get("image", [])]:
+            raise ReviewedLocalizationError(
+                "static_reprojection_observation_substituted"
+            )
+        point_residuals.append(math.dist(observed, predicted))
+    road_residuals: list[float] = []
+    seen_roads = set()
+    for item in roads:
+        _exact_keys(
+            _object(item, "static_reprojection_road_invalid"),
+            {"feature_id", "observed_polyline", "predicted_polyline"},
+            "static_reprojection_road_invalid",
+        )
+        feature_id = _text(
+            item.get("feature_id"), "static_reprojection_road_invalid"
+        )
+        feature = holdout_roads.get(feature_id)
+        observed_values = item.get("observed_polyline")
+        predicted_values = item.get("predicted_polyline")
+        feature_values = feature.get("image_polyline") if feature else None
+        if (
+            feature is None
+            or feature_id in seen_roads
+            or not isinstance(observed_values, list)
+            or not isinstance(predicted_values, list)
+            or len(observed_values) < 2
+            or len(observed_values) != len(predicted_values)
+            or observed_values != feature_values
+        ):
+            raise ReviewedLocalizationError("static_reprojection_road_invalid")
+        seen_roads.add(feature_id)
+        for observed_value, predicted_value in zip(
+            observed_values, predicted_values
+        ):
+            observed = _pixel(
+                observed_value, width, height,
+                "static_reprojection_road_invalid",
+            )
+            predicted = _pixel(
+                predicted_value, width, height,
+                "static_reprojection_road_invalid",
+            )
+            road_residuals.append(math.dist(observed, predicted))
+    if seen_points != set(holdout_points) or seen_roads != set(holdout_roads):
+        raise ReviewedLocalizationError("static_reprojection_denominator_invalid")
+    point_rmse = math.sqrt(
+        sum(value * value for value in point_residuals) / len(point_residuals)
+    )
+    ordered = sorted(point_residuals)
+    point_p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+    point_max = max(point_residuals)
+    road_rmse = math.sqrt(
+        sum(value * value for value in road_residuals) / len(road_residuals)
+    )
+    road_max = max(road_residuals)
+    scale = width / 1280.0
+    if (
+        point_rmse > 10.0 * scale
+        or point_p95 > 16.0 * scale
+        or point_max > 24.0 * scale
+        or road_rmse > 6.0 * scale
+        or road_max > 12.0 * scale
+    ):
+        raise ReviewedLocalizationError("static_reprojection_threshold_failed")
 
 
 def validate_static_calibration(
     path_value: str,
     cameras_json_sha256: str,
     camera_hashes: Mapping[str, str],
+    camera_resolutions: Mapping[str, tuple[int, int]],
     map_name: str,
     opendrive_sha256: str,
+    authority_registry: Mapping[str, dict],
 ) -> str:
     path = Path(path_value).expanduser()
     try:
@@ -446,43 +739,126 @@ def validate_static_calibration(
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise ReviewedLocalizationError("static_calibration_unavailable") from exc
-    gate = value.get("heldout_gate") if isinstance(value, dict) else None
-    metrics = gate.get("cameras") if isinstance(gate, dict) else None
+    if not isinstance(value, dict):
+        raise ReviewedLocalizationError("static_calibration_gate_failed")
+    try:
+        verify_authenticated_artifact(
+            value,
+            "v2x-static-camera-survey-manifest/v1",
+            "static_calibration",
+            authority_registry,
+        )
+    except ReviewedLocalizationError as exc:
+        raise ReviewedLocalizationError("static_calibration_gate_failed") from exc
+    _exact_keys(
+        value,
+        {
+            "schema", "source_cameras_json_sha256", "map",
+            "site_aggregation", "heldout_reprojection", "authority",
+        },
+        "static_calibration_gate_failed",
+    )
+    aggregation_path_value, aggregation_hash = _artifact_descriptor(
+        value.get("site_aggregation"),
+        "v2x-site-calibration-aggregation/v1",
+        "static_calibration_aggregation_invalid",
+    )
+    aggregation_raw, aggregation = _read_hashed_json(
+        aggregation_path_value,
+        aggregation_hash,
+        path.parent,
+        "static_calibration_aggregation",
+    )
+    manifest_index = aggregation.get("manifests")
+    registry_descriptor = aggregation.get("site_landmark_registry")
+    reprojection = value.get("heldout_reprojection")
     if (
-        not isinstance(value, dict)
-        or value.get("schema") != "v2x-static-camera-survey-manifest/v1"
-        or value.get("source_cameras_json_sha256") != cameras_json_sha256
+        value.get("source_cameras_json_sha256") != cameras_json_sha256
         or value.get("map") != {
             "name": map_name,
             "opendrive_sha256": opendrive_sha256,
         }
-        or not isinstance(gate, dict)
-        or gate.get("passed") is not True
-        or gate.get("reference_resolution") != [1280, 960]
-        or not isinstance(metrics, dict)
-        or set(metrics) != set(camera_hashes)
+        or set(camera_hashes) != {"ch1", "ch2", "ch3", "ch4"}
+        or set(camera_resolutions) != set(camera_hashes)
+        or not isinstance(manifest_index, dict)
+        or set(manifest_index) != set(camera_hashes)
+        or not isinstance(registry_descriptor, dict)
+        or registry_descriptor.get("cameras_file_sha256")
+        != cameras_json_sha256
+        or not isinstance(reprojection, dict)
+        or set(reprojection) != set(camera_hashes)
+    ):
+        raise ReviewedLocalizationError("static_calibration_gate_failed")
+    registry_path_value = registry_descriptor.get("path")
+    manifest_paths = []
+    for camera_id in sorted(camera_hashes):
+        manifest_item = manifest_index[camera_id]
+        if not isinstance(manifest_item, dict):
+            raise ReviewedLocalizationError("static_calibration_gate_failed")
+        manifest_paths.append(manifest_item.get("path"))
+    try:
+        recomputed = aggregate_site_manifests(
+            registry_path_value, manifest_paths
+        )
+    except (OSError, SiteManifestError, ValueError) as exc:
+        raise ReviewedLocalizationError(
+            "static_calibration_raw_replay_failed"
+        ) from exc
+    if recomputed != aggregation:
+        raise ReviewedLocalizationError("static_calibration_stale_summary")
+    aggregate_map = aggregation.get("map_identity")
+    if (
+        not isinstance(aggregate_map, dict)
+        or aggregate_map.get("ue5_map") != map_name
+        or aggregate_map.get("ue5_map_opendrive_sha256") != opendrive_sha256
     ):
         raise ReviewedLocalizationError("static_calibration_gate_failed")
     for camera_id, expected_hash in camera_hashes.items():
-        item = metrics.get(camera_id)
+        manifest_item = manifest_index[camera_id]
+        manifest_raw, manifest = _read_hashed_json(
+            manifest_item.get("path"),
+            manifest_item.get("sha256"),
+            path.parent,
+            "static_camera_manifest",
+        )
+        evidence_path_value, evidence_hash = _artifact_descriptor(
+            reprojection[camera_id],
+            "v2x-camera-heldout-reprojection/v1",
+            "static_reprojection_descriptor_invalid",
+        )
+        _evidence_raw, evidence = _read_hashed_json(
+            evidence_path_value,
+            evidence_hash,
+            path.parent,
+            "static_reprojection_evidence",
+        )
         try:
-            numbers = [
-                float(item[key])
-                for key in (
-                    "landmark_rmse_px", "landmark_p95_px", "landmark_max_px",
-                    "road_rmse_px", "road_max_px",
-                )
-            ]
-        except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise ReviewedLocalizationError("static_calibration_gate_failed") from exc
+            verify_authenticated_artifact(
+                evidence,
+                "v2x-camera-heldout-reprojection/v1",
+                "static_calibration",
+                authority_registry,
+            )
+        except ReviewedLocalizationError as exc:
+            raise ReviewedLocalizationError(
+                "static_reprojection_authentication_failed"
+            ) from exc
         if (
-            item.get("camera_config_sha256") != expected_hash
-            or int(item.get("landmark_count", 0)) < 4
-            or not all(math.isfinite(number) for number in numbers)
-            or numbers[0] > 10.0 or numbers[1] > 16.0 or numbers[2] > 24.0
-            or numbers[3] > 6.0 or numbers[4] > 12.0
+            manifest.get("camera_config_sha256") != expected_hash
+            or manifest.get("cameras_file_sha256") != cameras_json_sha256
+            or manifest.get("ue5_map") != map_name
+            or manifest.get("ue5_map_opendrive_sha256") != opendrive_sha256
+            or [manifest.get("width"), manifest.get("height")]
+            != list(camera_resolutions[camera_id])
         ):
             raise ReviewedLocalizationError("static_calibration_gate_failed")
+        _heldout_reprojection_metrics(
+            evidence,
+            manifest,
+            camera_id,
+            expected_hash,
+            sha256_bytes(manifest_raw),
+        )
     return sha256_bytes(raw)
 
 
@@ -535,12 +911,18 @@ def build_runtime_context(
     cameras_hash = sha256_bytes(cameras_raw)
     opendrive_hash = sha256_bytes(opendrive.encode("utf-8"))
     map_name = _text(getattr(carla_map, "name", None), "active_map_name_invalid")
+    authority_registry = load_authority_registry(authority_key_file)
     static_hash = validate_static_calibration(
         static_calibration_path,
         cameras_hash,
         camera_hashes,
+        {
+            camera_id: placement.native_resolution
+            for camera_id, placement in indexed.items()
+        },
         map_name,
         opendrive_hash,
+        authority_registry,
     )
     return ReviewedPlacementContext(
         map_name=map_name,
@@ -548,7 +930,14 @@ def build_runtime_context(
         cameras_json_sha256=cameras_hash,
         cameras=indexed,
         static_calibration_sha256=static_hash,
-        authority_keys=load_authority_keys(authority_key_file),
+        authority_keys={
+            key_id: entry["key"]
+            for key_id, entry in authority_registry.items()
+        },
+        authority_roles={
+            key_id: entry["roles"]
+            for key_id, entry in authority_registry.items()
+        },
     )
 
 
@@ -585,8 +974,14 @@ def validate_contract(
     supplied_signature = _sha(
         authority.get("signature"), "authority_signature_invalid"
     )
-    if authority_key is None or not hmac.compare_digest(
+    if (
+        authority_key is None
+        or "reviewed_contract" not in context.authority_roles.get(
+            authority_key_id, frozenset()
+        )
+        or not hmac.compare_digest(
         supplied_signature, authority_signature(value, authority_key)
+        )
     ):
         raise ReviewedLocalizationError("authority_signature_mismatch")
 
@@ -613,11 +1008,50 @@ def validate_contract(
     source = _object(value.get("source"), "contract_source_missing")
     _exact_keys(source, {"frame", "detector", "camera", "map"}, "source_fields_invalid")
     frame = _object(source.get("frame"), "native_frame_binding_missing")
-    _exact_keys(frame, {"source_kind", "sha256", "mask_sha256", "native_resolution", "frame_number"}, "native_frame_fields_invalid")
+    _exact_keys(
+        frame,
+        {
+            "source_kind", "sha256", "mask_sha256", "native_resolution",
+            "frame_number", "inference_manifest_sha256",
+            "frame_pixel_sha256", "mask_pixel_sha256",
+            "detector_output_sha256",
+        },
+        "native_frame_fields_invalid",
+    )
     if frame.get("source_kind") != "persisted_native_frame_and_instance_mask":
         raise ReviewedLocalizationError("native_frame_source_invalid")
     frame_sha256 = _sha(frame.get("sha256"), "native_frame_hash_invalid")
     mask_sha256 = _sha(frame.get("mask_sha256"), "native_mask_hash_invalid")
+    inference_manifest_sha256 = _sha(
+        frame.get("inference_manifest_sha256"),
+        "inference_manifest_hash_invalid",
+    )
+    frame_pixel_sha256 = _sha(
+        frame.get("frame_pixel_sha256"), "native_frame_pixel_hash_invalid"
+    )
+    mask_pixel_sha256 = _sha(
+        frame.get("mask_pixel_sha256"), "native_mask_pixel_hash_invalid"
+    )
+    detector_output_sha256 = _sha(
+        frame.get("detector_output_sha256"), "detector_output_hash_invalid"
+    )
+    emitted_inference = _nested(
+        detection, "raw_observation", "inference_evidence"
+    )
+    if (
+        not isinstance(emitted_inference, dict)
+        or emitted_inference.get("schema")
+        != "v2x-persisted-inference-evidence/v1"
+        or emitted_inference.get("acceptance_eligible") is not True
+        or emitted_inference.get("reason") is not None
+        or inference_manifest_sha256
+        != emitted_inference.get("manifest_sha256")
+        or frame_pixel_sha256 != emitted_inference.get("frame_pixel_sha256")
+        or mask_pixel_sha256 != emitted_inference.get("mask_pixel_sha256")
+        or detector_output_sha256
+        != emitted_inference.get("detector_output_sha256")
+    ):
+        raise ReviewedLocalizationError("producer_inference_binding_mismatch")
     resolution = frame.get("native_resolution")
     if (
         not isinstance(resolution, list)
@@ -826,7 +1260,7 @@ def validate_contract(
         raise ReviewedLocalizationError("independent_reference_not_accepted")
 
     identity = _object(value.get("identity"), "identity_provenance_missing")
-    _exact_keys(identity, {"status", "global_track_id", "trajectory_id", "association_method", "evidence_sha256", "camera_ids", "transition"}, "identity_fields_invalid")
+    _exact_keys(identity, {"status", "global_track_id", "trajectory_id", "association_method", "evidence_sha256", "camera_ids", "cross_camera_transition_sha256", "transition"}, "identity_fields_invalid")
     if identity.get("status") != "unambiguous":
         raise ReviewedLocalizationError("identity_ambiguous")
     if identity.get("global_track_id") != global_track_id:
@@ -838,11 +1272,16 @@ def validate_contract(
     identity_evidence_sha256 = _sha(
         identity.get("evidence_sha256"), "identity_evidence_hash_invalid"
     )
+    cross_camera_transition_sha256 = _sha(
+        identity.get("cross_camera_transition_sha256"),
+        "identity_cross_camera_transition_hash_invalid",
+    )
     camera_ids = identity.get("camera_ids")
     if (
         not isinstance(camera_ids, list)
         or any(not isinstance(item, str) or not item for item in camera_ids)
         or camera_id not in camera_ids
+        or len(camera_ids) < 2
         or len(camera_ids) != len(set(camera_ids))
         or any(item not in context.cameras for item in camera_ids)
     ):
@@ -875,10 +1314,13 @@ def validate_contract(
             key: transition.get(key)
             for key in (
                 "appearance_similarity", "transit_seconds", "distance_m",
-                "speed_mps", "acceleration_mps2",
+                "speed_mps",
             )
         }
         if any(not _finite(value) for value in numeric.values()):
+            raise ReviewedLocalizationError("identity_transition_nonfinite")
+        acceleration_mps2 = transition.get("acceleration_mps2")
+        if acceleration_mps2 is not None and not _finite(acceleration_mps2):
             raise ReviewedLocalizationError("identity_transition_nonfinite")
         if (
             transition.get("accepted") is not True
@@ -887,7 +1329,11 @@ def validate_contract(
             or not 0.0 < float(numeric["transit_seconds"]) <= MAX_TRANSIT_SECONDS
             or float(numeric["distance_m"]) < 0.0
             or not 0.0 <= float(numeric["speed_mps"]) <= MAX_VEHICLE_SPEED_MPS
-            or abs(float(numeric["acceleration_mps2"])) > MAX_VEHICLE_ACCELERATION_MPS2
+            or (
+                acceleration_mps2 is not None
+                and abs(float(acceleration_mps2))
+                > MAX_VEHICLE_ACCELERATION_MPS2
+            )
         ):
             raise ReviewedLocalizationError("identity_transition_gate_failed")
         trajectory_covariance_m2 = _matrix(
@@ -905,7 +1351,10 @@ def validate_contract(
             "transit_seconds": float(numeric["transit_seconds"]),
             "distance_m": float(numeric["distance_m"]),
             "speed_mps": float(numeric["speed_mps"]),
-            "acceleration_mps2": float(numeric["acceleration_mps2"]),
+            "acceleration_mps2": (
+                float(acceleration_mps2)
+                if acceleration_mps2 is not None else None
+            ),
             "trajectory_covariance_m2": trajectory_covariance_m2,
             "pair_evidence_sha256": pair_evidence_sha256,
         }
@@ -1016,6 +1465,10 @@ def validate_contract(
         "pts_seconds": float(pts_seconds),
         "frame_sha256": frame_sha256,
         "mask_sha256": mask_sha256,
+        "inference_manifest_sha256": inference_manifest_sha256,
+        "frame_pixel_sha256": frame_pixel_sha256,
+        "mask_pixel_sha256": mask_pixel_sha256,
+        "detector_output_sha256": detector_output_sha256,
         "detector_model_sha256": detector_model_sha256,
         "detector_config_sha256": detector_config_sha256,
         "cameras_json_sha256": cameras_json_sha256,
@@ -1032,6 +1485,7 @@ def validate_contract(
         "independent_reference_sha256": independent_reference_sha256,
         "identity_evidence_sha256": identity_evidence_sha256,
         "identity_camera_ids": list(camera_ids),
+        "cross_camera_transition_sha256": cross_camera_transition_sha256,
         "transition": normalized_transition,
         "position_m": {axis: float(position[axis]) for axis in ("x", "y", "z")},
         "covariance_m2": covariance_m2,

@@ -102,6 +102,7 @@ class TwinTrack:
         "vehicle_dimensions_m",
         "reviewed_speed_mps", "cleanup_failure", "actual_dimensions_m",
         "blueprint_catalog_sha256", "blueprint_pool_sha256",
+        "quarantined_reason",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -140,6 +141,7 @@ class TwinTrack:
         self.actual_dimensions_m = None
         self.blueprint_catalog_sha256 = None
         self.blueprint_pool_sha256 = None
+        self.quarantined_reason = None
 
 
 class TwinSync:
@@ -407,10 +409,11 @@ class TwinSync:
         track.blueprint_pool_sha256 = self._blueprint_pool_sha256[
             reviewed["blueprint_family"]
         ]
+        track.quarantined_reason = None
         track.reviewed_speed_mps = (
             reviewed["transition"]["speed_mps"]
             if reviewed["transition"] is not None
-            else 0.0
+            else None
         )
         track.current = location
         track.target = location
@@ -426,6 +429,11 @@ class TwinSync:
     def _strict_sequence_is_valid(
         self, track: TwinTrack, reviewed: dict, object_type: str
     ) -> Optional[str]:
+        if (
+            track.reviewed_localization is None
+            and reviewed["sample_index"] != 0
+        ):
+            return "trajectory_must_start_at_zero"
         if track.object_type != object_type:
             return "trajectory_object_type_changed"
         if track.trajectory_id is not None and track.trajectory_id != reviewed["trajectory_id"]:
@@ -452,18 +460,39 @@ class TwinSync:
                 for axis in ("x", "y", "z")
             ))
             speed_mps = distance_m / delta_seconds
-            previous_speed = track.reviewed_speed_mps or 0.0
-            acceleration_mps2 = (speed_mps - previous_speed) / delta_seconds
+            previous_speed = track.reviewed_speed_mps
+            acceleration_mps2 = (
+                (speed_mps - previous_speed) / delta_seconds
+                if previous_speed is not None
+                else None
+            )
             if (
                 abs(transition["transit_seconds"] - delta_seconds) > 1e-6
                 or abs(transition["distance_m"] - distance_m) > 1e-6
                 or abs(transition["speed_mps"] - speed_mps) > 1e-6
-                or abs(transition["acceleration_mps2"] - acceleration_mps2) > 1e-6
+                or (
+                    acceleration_mps2 is None
+                    and transition["acceleration_mps2"] is not None
+                )
+                or (
+                    acceleration_mps2 is not None
+                    and (
+                        transition["acceleration_mps2"] is None
+                        or abs(
+                            transition["acceleration_mps2"]
+                            - acceleration_mps2
+                        ) > 1e-6
+                    )
+                )
             ):
                 return "trajectory_transition_metrics_mismatch"
             if (
                 speed_mps > MAX_VEHICLE_SPEED_MPS
-                or abs(acceleration_mps2) > MAX_VEHICLE_ACCELERATION_MPS2
+                or (
+                    acceleration_mps2 is not None
+                    and abs(acceleration_mps2)
+                    > MAX_VEHICLE_ACCELERATION_MPS2
+                )
             ):
                 return "trajectory_dynamics_exceeded"
         return None
@@ -485,11 +514,22 @@ class TwinSync:
 
     @staticmethod
     def _transform_matches(transform, intended, tolerance: float = 1e-6) -> bool:
+        yaw_error = abs(
+            (
+                float(transform.rotation.yaw)
+                - float(intended.rotation.yaw)
+                + 180.0
+            )
+            % 360.0
+            - 180.0
+        )
         return (
             abs(float(transform.location.x) - float(intended.location.x)) <= tolerance
             and abs(float(transform.location.y) - float(intended.location.y)) <= tolerance
             and abs(float(transform.location.z) - float(intended.location.z)) <= tolerance
-            and abs(float(transform.rotation.yaw) - float(intended.rotation.yaw)) <= tolerance
+            and yaw_error <= tolerance
+            and abs(float(transform.rotation.pitch) - float(intended.rotation.pitch)) <= tolerance
+            and abs(float(transform.rotation.roll) - float(intended.rotation.roll)) <= tolerance
         )
 
     def _set_transform_transactionally(self, actor, intended) -> Optional[str]:
@@ -537,6 +577,11 @@ class TwinSync:
         track.actor_id = None
         track.cleanup_failure = None
         return True
+
+    def _quarantine_actor(self, track: TwinTrack, actor, reason: str) -> None:
+        """Remove an actor whose exact strict pose can no longer be proved."""
+        track.quarantined_reason = reason
+        self._destroy_owned_actor(track, actor, reason)
 
     def _commit_detection_metadata(
         self,
@@ -661,7 +706,10 @@ class TwinSync:
                 reviewed is not None
                 and track is not None
                 and track.actor_id is not None
-                and track.cleanup_failure is not None
+                and (
+                    track.cleanup_failure is not None
+                    or track.quarantined_reason is not None
+                )
             ):
                 self._reject_strict(det, "strict_cleanup_pending")
                 continue
@@ -766,7 +814,7 @@ class TwinSync:
                             self._reject_strict(
                                 det, "active_blueprint_dimensions_mismatch"
                             )
-                            self._destroy_owned_actor(
+                            self._quarantine_actor(
                                 track, actor, "blueprint_dimensions_mismatch"
                             )
                             actor = None
@@ -834,6 +882,9 @@ class TwinSync:
                         self._reject_strict(
                             det, "active_blueprint_dimensions_mismatch"
                         )
+                        self._quarantine_actor(
+                            track, actor, "active_blueprint_dimensions_mismatch"
+                        )
                         continue
                     intended_transform = carla.Transform(
                         location,
@@ -844,6 +895,10 @@ class TwinSync:
                     )
                     if transform_error is not None:
                         self._reject_strict(det, transform_error)
+                        if transform_error == "strict_transform_rollback_failed":
+                            self._quarantine_actor(
+                                track, actor, "strict_transform_rollback_failed"
+                            )
                         logger.warning(
                             "Strict twin transform transaction failed for %s: %s",
                             object_id,
@@ -1026,6 +1081,55 @@ class TwinSync:
         for track in self._tracks.values():
             if track.actor_id is None or track.target is None:
                 continue
+            if self._reviewed_placement == "strict":
+                actor = None
+                try:
+                    actor = self._world.get_actor(track.actor_id)
+                    if actor is None:
+                        track.actor_id = None
+                        track.quarantined_reason = "strict_actor_vanished"
+                        continue
+                    reviewed = track.reviewed_localization
+                    if reviewed is None:
+                        raise RuntimeError("strict track lacks accepted review")
+                    intended = carla.Transform(
+                        carla.Location(**reviewed["position_m"]),
+                        carla.Rotation(yaw=reviewed["heading_deg"]),
+                    )
+                    actual_dimensions = self._actor_dimensions_m(actor)
+                    expected_dimensions = reviewed["blueprint"][
+                        "expected_dimensions_m"
+                    ]
+                    dimension_tolerance = reviewed["blueprint"][
+                        "dimension_tolerance_m"
+                    ]
+                    if (
+                        not self._transform_matches(
+                            actor.get_transform(), intended
+                        )
+                        or actual_dimensions is None
+                        or any(
+                            abs(actual_dimensions[key] - expected_dimensions[key])
+                            > dimension_tolerance
+                            for key in ("length", "width", "height")
+                        )
+                    ):
+                        raise RuntimeError("strict actor integrity mismatch")
+                except Exception:
+                    self._strict_rejections["strict_tick_integrity_mismatch"] += 1
+                    track.quarantined_reason = "strict_tick_integrity_mismatch"
+                    if actor is not None:
+                        self._quarantine_actor(
+                            track, actor, "strict_tick_integrity_mismatch"
+                        )
+                    logger.error(
+                        "Strict twin tick quarantined %s after integrity mismatch",
+                        track.object_id,
+                        exc_info=True,
+                    )
+                # Strict actors are placed atomically by _apply. A tick must
+                # verify that exact full pose, never issue an unchecked no-op.
+                continue
             if track.current is None:
                 track.current = track.target
             t = 1.0
@@ -1064,7 +1168,7 @@ class TwinSync:
                 actor = self._world.get_actor(track.actor_id)
                 if actor is not None:
                     resolved_actor_id = int(actor.id)
-                    actor_present = True
+                    actor_present = track.quarantined_reason is None
                     actor_type = getattr(actor, "type_id", None)
                     transform = actor.get_transform()
                     transform_payload = {
@@ -1123,7 +1227,7 @@ class TwinSync:
             # resolving the actor and its transform from the live UE5 world.
             # Keep the track's last ID separately for diagnostics.
             "tracked_actor_id": tracked_actor_id,
-            "actor_id": resolved_actor_id,
+            "actor_id": resolved_actor_id if actor_present else None,
             "actor_present": actor_present and transform_payload is not None,
             "actor_type": actor_type,
             "carla_transform": transform_payload,
@@ -1172,6 +1276,8 @@ class TwinSync:
                     if reviewed else None
                 ),
                 "cleanup_failure": track.cleanup_failure,
+                "actor_quarantined": track.quarantined_reason is not None,
+                "quarantined_reason": track.quarantined_reason,
                 "placement_provenance": (
                     {
                         key: reviewed[key]

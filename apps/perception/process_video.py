@@ -317,6 +317,13 @@ def assess_media_clock(
         "source": "hls_ext_x_program_date_time",
         "schema_version": 1,
     }
+    session_id = raw_clock.get("session_id")
+    if not isinstance(session_id, str) or re.fullmatch(
+        r"[A-Za-z0-9._:-]{1,256}", session_id
+    ) is None:
+        result["status"] = "invalid_session_provenance"
+        return result
+    safe_clock["session_id"] = session_id
     anchor_timestamp = raw_clock.get("anchor_program_date_time_utc")
     if isinstance(anchor_timestamp, str):
         try:
@@ -588,6 +595,19 @@ def canonical_object_sha256(value):
     return hashlib.sha256(payload).hexdigest()
 
 
+def canonical_json_bytes(value):
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def detector_config_fingerprint(model_sha256, confidence):
     """Fingerprint the exact source-controlled detector/tracker invocation."""
     return canonical_object_sha256({
@@ -599,6 +619,215 @@ def detector_config_fingerprint(model_sha256, confidence):
         "allowed_classes": ["car", "person", "truck"],
         "ground_contact_method": "bbox_bottom_center_diagnostic",
     })
+
+
+def _ndarray_sha256(value):
+    array = np.ascontiguousarray(value)
+    identity = {
+        "dtype": str(array.dtype),
+        "shape": list(array.shape),
+        "data_sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+    }
+    return canonical_object_sha256(identity), identity
+
+
+def _write_immutable(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        temporary.write_bytes(payload)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise ValueError(f"immutable evidence collision at {path}")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def persist_vehicle_inference_evidence(record, frame, evidence_root):
+    """Persist the exact inference pixels and model instance mask for review.
+
+    A detection model without native instance segmentation remains usable for
+    baseline diagnostics, but can never produce acceptance evidence.
+    """
+    raw_observation = record.setdefault("raw_observation", {})
+    evidence = {
+        "schema": "v2x-persisted-inference-evidence/v1",
+        "acceptance_eligible": False,
+        "reason": "incomplete_exact_inference_evidence",
+    }
+    raw_observation["inference_evidence"] = evidence
+    mask = record.pop("_review_instance_mask", None)
+    output_index = record.pop("_segmentation_output_index", None)
+    if record.get("object_type") not in {"car", "truck", "bus"}:
+        evidence["reason"] = "not_vehicle"
+        return evidence
+    clock = record.get("media_clock")
+    fingerprints = raw_observation.get("fingerprints")
+    session_id = clock.get("session_id") if isinstance(clock, dict) else None
+    device_id = record.get("device_id")
+    event_id = record.get("event_id")
+    frame_number = (
+        record.get("camera_data", {})
+        .get("bifocal_metadata", {})
+        .get("frame")
+    )
+    if (
+        record.get("media_time_trusted") is not True
+        or record.get("media_clock_status") != "matched"
+        or not isinstance(clock, dict)
+        or clock.get("evidence_method") != "exact_same_session_pts"
+        or not isinstance(clock.get("source_pts"), int)
+        or not isinstance(clock.get("source_time_base_numerator"), int)
+        or not isinstance(clock.get("source_time_base_denominator"), int)
+        or clock.get("source_pts") < 0
+        or clock.get("source_time_base_numerator") <= 0
+        or clock.get("source_time_base_denominator") <= 0
+        or not isinstance(session_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id) is None
+        or not isinstance(event_id, str)
+        or not event_id
+        or not isinstance(device_id, str)
+        or not device_id
+        or not isinstance(frame_number, int)
+        or isinstance(frame_number, bool)
+        or frame_number < 0
+        or not isinstance(fingerprints, dict)
+        or any(
+            not isinstance(fingerprints.get(key), str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprints[key]) is None
+            for key in ("detector_model_sha256", "detector_config_sha256")
+        )
+        or not isinstance(mask, np.ndarray)
+        or not isinstance(output_index, int)
+        or isinstance(output_index, bool)
+        or output_index < 0
+    ):
+        return evidence
+    if (
+        not isinstance(frame, np.ndarray)
+        or frame.dtype != np.uint8
+        or frame.ndim != 3
+        or frame.shape[2] != 3
+        or mask.shape != frame.shape[:2]
+    ):
+        evidence["reason"] = "inference_frame_or_mask_shape_invalid"
+        return evidence
+    bbox = record.get("bbox") or (
+        record.get("camera_data", {})
+        .get("bifocal_metadata", {})
+        .get("bbox")
+    )
+    try:
+        x1, y1, x2, y2 = [float(bbox[key]) for key in ("x1", "y1", "x2", "y2")]
+    except (KeyError, TypeError, ValueError):
+        evidence["reason"] = "detector_bbox_invalid"
+        return evidence
+    height, width = frame.shape[:2]
+    left = max(0, min(width - 1, int(math.floor(x1))))
+    top = max(0, min(height - 1, int(math.floor(y1))))
+    right = max(left + 1, min(width, int(math.ceil(x2))))
+    bottom = max(top + 1, min(height, int(math.ceil(y2))))
+    binary_mask = np.asarray(mask > 0, dtype=np.uint8)
+    pixel_count = int(np.count_nonzero(binary_mask))
+    box_area = float((right - left) * (bottom - top))
+    mask_in_box = int(np.count_nonzero(binary_mask[top:bottom, left:right]))
+    fill_ratio = mask_in_box / box_area
+    frame_stddev = float(np.std(frame.astype(np.float32)))
+    vehicle_pixels = frame[binary_mask > 0]
+    vehicle_stddev = (
+        float(np.std(vehicle_pixels.astype(np.float32)))
+        if vehicle_pixels.size else 0.0
+    )
+    if (
+        pixel_count < 32
+        or mask_in_box / max(pixel_count, 1) < 0.90
+        or not 0.05 <= fill_ratio <= 0.95
+        or frame_stddev < 2.0
+        or vehicle_stddev < 2.0
+    ):
+        evidence["reason"] = "uniform_or_nonvehicle_segmentation_substitute"
+        return evidence
+    frame_ok, frame_png = cv2.imencode(".png", frame)
+    mask_ok, mask_png = cv2.imencode(".png", binary_mask * 255)
+    if not frame_ok or not mask_ok:
+        evidence["reason"] = "lossless_evidence_encoding_failed"
+        return evidence
+    frame_bytes, mask_bytes = frame_png.tobytes(), mask_png.tobytes()
+    frame_pixel_sha256, frame_array_identity = _ndarray_sha256(frame)
+    mask_pixel_sha256, mask_array_identity = _ndarray_sha256(binary_mask)
+    detector_output = {
+        "schema": "v2x-detector-instance-output/v1",
+        "event_id": event_id,
+        "camera_id": device_id.rsplit("-", 1)[-1],
+        "device_id": device_id,
+        "frame_number": frame_number,
+        "track_id": record.get("track_id"),
+        "object_type": record.get("object_type"),
+        "confidence_score": record.get("confidence_score"),
+        "bbox": bbox,
+        "segmentation_output_index": output_index,
+        "mask_pixel_sha256": mask_pixel_sha256,
+        "detector_model_sha256": fingerprints["detector_model_sha256"],
+        "detector_config_sha256": fingerprints["detector_config_sha256"],
+    }
+    detector_output_sha256 = canonical_object_sha256(detector_output)
+    pts_seconds = (
+        clock["source_pts"]
+        * clock["source_time_base_numerator"]
+        / clock["source_time_base_denominator"]
+    )
+    root = Path(evidence_root).expanduser().resolve()
+    event_path_key = hashlib.sha256(event_id.encode("utf-8")).hexdigest()
+    frame_path = root / "frames" / f"{frame_pixel_sha256}.png"
+    mask_path = root / "masks" / f"{event_path_key}.png"
+    manifest_path = root / "events" / f"{event_path_key}.json"
+    _write_immutable(frame_path, frame_bytes)
+    _write_immutable(mask_path, mask_bytes)
+    manifest = {
+        "schema": "v2x-persisted-inference-event/v1",
+        "event_id": record.get("event_id"),
+        "camera_id": detector_output["camera_id"],
+        "device_id": record.get("device_id"),
+        "session_id": session_id,
+        "media_timestamp_utc": record.get("media_timestamp_utc"),
+        "pts_seconds": pts_seconds,
+        "frame": {
+            "path": str(frame_path),
+            "sha256": hashlib.sha256(frame_bytes).hexdigest(),
+            "pixel_sha256": frame_pixel_sha256,
+            "array_identity": frame_array_identity,
+            "encoding": "lossless_png_bgr8",
+            "resolution": [width, height],
+            "stddev": frame_stddev,
+        },
+        "instance_mask": {
+            "path": str(mask_path),
+            "sha256": hashlib.sha256(mask_bytes).hexdigest(),
+            "pixel_sha256": mask_pixel_sha256,
+            "array_identity": mask_array_identity,
+            "encoding": "lossless_png_binary_u8",
+            "pixel_count": pixel_count,
+            "bbox_fill_ratio": fill_ratio,
+            "vehicle_pixel_stddev": vehicle_stddev,
+        },
+        "detector_output": detector_output,
+        "detector_output_sha256": detector_output_sha256,
+    }
+    manifest_bytes = canonical_json_bytes(manifest)
+    _write_immutable(manifest_path, manifest_bytes)
+    evidence.update({
+        "acceptance_eligible": True,
+        "reason": None,
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "frame_pixel_sha256": frame_pixel_sha256,
+        "mask_pixel_sha256": mask_pixel_sha256,
+        "detector_output_sha256": detector_output_sha256,
+    })
+    return evidence
 
 
 def camera_config_fingerprints(config, path=None):
@@ -2494,7 +2723,17 @@ class MultiCameraPipeline:
                         frames_to_process[i] = snapshot["frame"]
                         source_epochs[i] = snapshot["source_epoch"]
                         source_monotonic[i] = snapshot["source_monotonic"]
-                        frame_media_clocks[i] = snapshot.get("media_clock")
+                        frame_media_clock = snapshot.get("media_clock")
+                        if isinstance(frame_media_clock, dict):
+                            frame_media_clock = dict(frame_media_clock)
+                            raw_clock = frame_media_clock.get("media_clock")
+                            if isinstance(raw_clock, dict):
+                                raw_clock = dict(raw_clock)
+                                raw_clock["session_id"] = (
+                                    f"{self.perception_run_id}:{camera_ids[i]}"
+                                )
+                                frame_media_clock["media_clock"] = raw_clock
+                        frame_media_clocks[i] = frame_media_clock
 
                     if not any(frame is not None for frame in frames_to_process):
                         time.sleep(0.02)
@@ -2588,6 +2827,31 @@ class MultiCameraPipeline:
                             media_clock_min_latency_ms,
                             media_clock_max_latency_ms,
                         )
+                    evidence_root = getattr(
+                        detector,
+                        "review_evidence_dir",
+                        Path("~/.local/share/v2x-perception/review-evidence")
+                        .expanduser(),
+                    )
+                    for record in det_3d:
+                        try:
+                            persist_vehicle_inference_evidence(
+                                record, frame, evidence_root
+                            )
+                        except (OSError, TypeError, ValueError) as exc:
+                            record.pop("_review_instance_mask", None)
+                            record.pop("_segmentation_output_index", None)
+                            record.setdefault("raw_observation", {})[
+                                "inference_evidence"
+                            ] = {
+                                "schema": "v2x-persisted-inference-evidence/v1",
+                                "acceptance_eligible": False,
+                                "reason": "evidence_persistence_failed",
+                            }
+                            print(
+                                "Review evidence persistence failed for "
+                                f"{record.get('event_id')}: {type(exc).__name__}"
+                            )
                     return i, frame, frame_utc_str, det_3d
 
                 inference_results = [
@@ -2792,6 +3056,7 @@ class VideoObjectDetector:
                  image_height=None, cameras_json_sha256=None,
                  camera_config_sha256=None, detector_model_sha256=None,
                  detector_config_sha256=None,
+                 review_evidence_dir=None,
                  map_georeference=None):
 
         """
@@ -2827,6 +3092,13 @@ class VideoObjectDetector:
         self.camera_config_sha256 = camera_config_sha256
         self.detector_model_sha256 = detector_model_sha256
         self.detector_config_sha256 = detector_config_sha256
+        self.review_evidence_dir = Path(
+            review_evidence_dir
+            or os.getenv(
+                "V2X_REVIEW_EVIDENCE_DIR",
+                "~/.local/share/v2x-perception/review-evidence",
+            )
+        ).expanduser()
         self.map_georeference = map_georeference
 
         self.pitch_deg = pitch_deg
@@ -2880,8 +3152,17 @@ class VideoObjectDetector:
         if result.boxes.id is not None:
             # Get IDs as an array of integers
             track_ids = result.boxes.id.int().cpu().tolist()
+            mask_data = (
+                result.masks.data
+                if getattr(result, "masks", None) is not None
+                and getattr(result.masks, "data", None) is not None
+                else None
+            )
+            original_shape = getattr(result, "orig_shape", None)
 
-            for box, track_id in zip(result.boxes, track_ids):
+            for output_index, (box, track_id) in enumerate(
+                zip(result.boxes, track_ids)
+            ):
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 conf = float(box.conf[0])
                 cls = int(box.cls[0])
@@ -2891,13 +3172,28 @@ class VideoObjectDetector:
                 if class_name not in allowed_classes:
                     continue
 
+                instance_mask = None
+                if (
+                    mask_data is not None
+                    and output_index < len(mask_data)
+                    and isinstance(original_shape, (tuple, list))
+                    and len(original_shape) == 2
+                ):
+                    instance_mask = mask_data[output_index].detach().cpu().numpy()
+                    instance_mask = cv2.resize(
+                        instance_mask.astype(np.float32),
+                        (int(original_shape[1]), int(original_shape[0])),
+                        interpolation=cv2.INTER_NEAREST,
+                    ) > 0.5
                 detections.append({
                     'frame': frame_num,
                     'track_id': track_id,
                     'class_name': class_name,
                     'confidence': conf,
                     'bbox': {'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2)},
-                    'center': {'x': float((x1 + x2) / 2), 'y': float((y1 + y2) / 2)}
+                    'center': {'x': float((x1 + x2) / 2), 'y': float((y1 + y2) / 2)},
+                    '_instance_mask': instance_mask,
+                    '_segmentation_output_index': output_index,
                 })
         return detections
 
@@ -3131,6 +3427,10 @@ class VideoObjectDetector:
                     "reason": "ground_contact_not_reviewed",
                 },
             }
+            record["_review_instance_mask"] = det.get("_instance_mask")
+            record["_segmentation_output_index"] = det.get(
+                "_segmentation_output_index"
+            )
             records.append(record)
         return records
 

@@ -4,10 +4,18 @@ Status: source-only design and tests. This work does **not** establish that the
 static camera calibration gate has passed and must not be deployed without the
 separate controlled live gate.
 
-Fable review status (2026-07-13): attempted with `--model fable --effort high`
-and read-only tools, but Claude CLI exited 1 because its OAuth session was expired
-and could not be refreshed. No model review was available to incorporate; this is
-an external review blocker, not evidence that the plan was approved.
+Fable review status (2026-07-13): the earlier OAuth-blocked attempts were retried
+after re-authentication. A high-effort, read-only Fable review completed and its
+governance, canonicalization, clock, numeric-boundary, monitoring, and schema
+evolution findings were incorporated. The final high-effort re-review completed
+successfully and reported no remaining substantive blocker.
+
+Fable implementation review status (2026-07-13): a separate high-effort,
+read-only review inspected the producer, attachment tool, runtime validator,
+UE5 synchronization, schemas, fixtures, and adversarial tests. It reported no
+substantive blocker in the required risk classes. Its non-blocking sample-zero,
+yaw-normalization, and short-array observations were tightened before the final
+test run.
 
 Independent implementation review status: changes required after commit
 `e986ab6`. The remediation must add authority verification, semantic evidence
@@ -16,22 +24,23 @@ eigenvalue-correct covariance bounds, transaction-safe actor updates/cleanup,
 strict-live freshness, and exact blueprint/geometry binding. The prior commit is
 not an acceptance candidate.
 
-Fable remediation review status: retried after the independent findings, but the
-same Claude CLI OAuth refresh failure returned exit 1. No Fable remediation
-review was available; the independent findings below are therefore the governing
-review record.
-
-Remediation verification (2026-07-13): the isolated source worktree passes 498
-bridge tests and 499 perception tests, including the new authority-forgery,
-semantic-linkage, correlated-covariance, dynamics, freshness/replay, blueprint
-geometry, transform rollback, and cleanup-ownership adversarial cases. Both JSON
-schemas pass Draft 2020-12 metaschema validation. This is source evidence only;
-it is not a live calibration, holdout, UE5, or deployment acceptance result.
+Current remediation verification (2026-07-13): the isolated source worktree
+passes 505 bridge tests and 501 perception tests with warnings treated as errors.
+The implementation now binds a producer-persisted lossless inference frame,
+native detector instance mask, exact detector output and same-session PTS;
+authenticates every upstream semantic artifact by allowlisted role; replays the
+retained four-camera calibration manifests, images, annotations, intrinsics
+sources, depth buffers, survey registry and exact held-out denominators; and
+quarantines any UE5 actor whose full pose/dimensions or rollback cannot be proved.
+Both JSON schemas parse and the complete suites exercise the new contracts. This
+is source evidence only; it does not claim that a real site calibration or live
+same-car UE5 replay has passed.
 
 ## Safety and migration boundary
 
-- Keep `DTB_TWIN_REVIEWED_PLACEMENT=off` as the default. Off mode preserves the
-  existing GPS-derived placement behavior byte-for-byte.
+- Keep `DTB_TWIN_REVIEWED_PLACEMENT=off` as the default. Off mode remains covered
+  by the complete pre-existing bridge regression suite; this plan does not claim
+  a byte-for-byte golden comparison that has not been performed.
 - Strict mode accepts only a versioned, self-hashed reviewed localization sample
   whose event, identity, exact native frame, mask, detector, camera config,
   intrinsics, map, timing, consensus, reviewer, covariance, and trajectory
@@ -40,6 +49,20 @@ it is not a live calibration, holdout, UE5, or deployment acceptance result.
   bbox-bottom-centre diagnostics, a lane-snapped position, or an earlier identity.
 - No service, AWS, UE worker, future holdout, or production checkout mutation is
   part of this change.
+- The exact authority registry selected by `DTB_TWIN_REVIEW_AUTHORITY_KEYS` is the
+  local trust anchor. It must be root/operator controlled and changed atomically.
+  Removing a key or removing its role revokes every previously signed artifact
+  at the next load/restart; no grandfathering or dual acceptance is implicit.
+  Rotation requires overlapping active key IDs only during an explicitly reviewed
+  re-signing window, followed by removal of the old key and a strict rejection
+  audit. A later schema version must use a new schema ID and explicit migration;
+  v1 never accepts added fields or silently upgrades old signatures.
+- Strict-live freshness compares signed/trusted media time with the Path host's
+  UTC wall clock (`time.time`). Deployment must prove NTP synchronization before
+  enabling strict mode; a stale/future signed sample still fails closed.
+- Held-out residual recomputation uses Python scalar IEEE-754 binary64 `math`
+  operations and a fixed nearest-rank P95, with no NumPy/BLAS dependency. Exact
+  boundary and just-over-boundary tests prevent platform-tuned epsilon changes.
 
 ## Implementation phases
 
@@ -78,6 +101,21 @@ it is not a live calibration, holdout, UE5, or deployment acceptance result.
    and cleanup transactional; gate strict live freshness separately from replay;
    and bind the selected blueprint catalog/pool/item plus measured actor dimensions
    to reviewed geometry and independent placement-error evidence.
+8. Close the second independent-review findings: accept only inference-time
+   producer evidence with a native instance segmentation output; recompute the
+   pinned appearance embedding from those exact pixels; require separately signed
+   raw RTK/total-station measurements from a non-camera authority; recompute the
+   four-camera static gate from every retained raw artifact and exact holdout
+   point/road residual; require at least one genuine cross-camera transition;
+   leave acceleration unknown until three positions or a signed prior velocity
+   exist; and destroy/quarantine actors after rollback, tick-readback, full-pose,
+   or dimension failure.
+9. Close the Fable governance/verifiability findings: test canonical key ordering,
+   intentional numeric and Unicode byte distinctions, and authority-algorithm
+   confusion; test exact and just-over residual boundaries; document the authority
+   registry lifecycle, Path-host clock authority, deterministic numeric method,
+   rejection/quarantine monitoring, explicit re-signing, and v2 migration rule;
+   then require a successful final Fable re-review before source acceptance.
 
 ## Exit criteria
 
@@ -89,9 +127,35 @@ it is not a live calibration, holdout, UE5, or deployment acceptance result.
   and blueprint across fresh `TwinSync` instances; different/ambiguous identities
   cannot alias silently.
 - A multi-camera trajectory keeps one global track and actor while timestamps and
-  sample order advance monotonically; replay/session cleanup remains unchanged.
+  sample order advance monotonically; at least two cameras and one bound
+  cross-camera transition are mandatory. Two positions establish speed but not
+  acceleration; the third position establishes the first acceleration sample.
 - Offline tooling round-trips a valid reviewed trajectory and detects any mutation
-  of detections, frame, mask, consensus, factor-graph, config, intrinsics, or map
-  bindings.
+  of detections, producer inference manifest/frame/native instance mask/detector
+  output, consensus, factor-graph, appearance, raw independent measurement,
+  config, intrinsics source image, retained calibration input, or map binding.
+- Static calibration cannot pass from a `passed: true` summary. Exactly ch1-ch4
+  must replay through the approved aggregation validator, preserve every train
+  and holdout denominator, and independently recompute held-out point RMSE/P95/max
+  <=10/16/24 px and road RMSE/max <=6/12 px at 1280-wide scale.
+- A strict UE5 update commits metadata only after exact full XYZ/yaw/pitch/roll and
+  blueprint-dimension readback. Failed rollback or later tick drift makes the
+  actor absent, quarantined and cleanup-owned; it is never reported as present.
+- Full bridge and perception suites pass in their intended Python environments
+  with `-W error`; JSON schemas parse; `git diff --check` is clean.
+- Canonical JSON sorts object keys but deliberately does not equate integer/float
+  spellings or Unicode normalization forms. Exact retained bytes and schema tags
+  are security semantics; alternate HMAC/hash algorithm tags are rejected even
+  when the same key material is used.
+- Deployment/runbook work must alert on sustained strict-rejection rate and any
+  nonzero quarantine/cleanup-failure count. Legitimate camera/map/model changes
+  require a coordinated artifact regeneration/review/re-signing runbook; stale
+  hashes never receive an availability fallback. Unbounded quarantine growth is
+  an incident and closes deployment. Clock synchronization health must remain
+  monitored after enablement; loss of NTP synchronization closes strict mode.
+- The recorded 505 bridge and 501 perception totals are independently re-run from
+  separate commands in their pinned environments.
+- Fable high-effort read-only plan re-review completed successfully after the
+  findings above with no remaining substantive blocker.
 - No runtime/deployment files outside this worktree are changed, and no statement
   claims static calibration acceptance.

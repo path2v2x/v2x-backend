@@ -24,18 +24,22 @@
         "frame": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["source_kind", "sha256", "mask_sha256", "native_resolution", "frame_number"],
+          "required": ["source_kind", "sha256", "mask_sha256", "native_resolution", "frame_number", "inference_manifest_sha256", "frame_pixel_sha256", "mask_pixel_sha256", "detector_output_sha256"],
           "properties": {
             "source_kind": {"const": "persisted_native_frame_and_instance_mask"},
             "sha256": {"$ref": "#/$defs/sha256"},
             "mask_sha256": {"$ref": "#/$defs/sha256"},
             "native_resolution": {
-              "type": "array", "prefixItems": [
+              "type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [
                 {"type": "integer", "minimum": 1},
                 {"type": "integer", "minimum": 1}
               ], "items": false
             },
-            "frame_number": {"type": "integer", "minimum": 0}
+            "frame_number": {"type": "integer", "minimum": 0},
+            "inference_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "frame_pixel_sha256": {"$ref": "#/$defs/sha256"},
+            "mask_pixel_sha256": {"$ref": "#/$defs/sha256"},
+            "detector_output_sha256": {"$ref": "#/$defs/sha256"}
           }
         },
         "detector": {
@@ -132,14 +136,15 @@
     },
     "identity": {
       "type": "object", "additionalProperties": false,
-      "required": ["status", "global_track_id", "trajectory_id", "association_method", "evidence_sha256", "camera_ids", "transition"],
+      "required": ["status", "global_track_id", "trajectory_id", "association_method", "evidence_sha256", "camera_ids", "cross_camera_transition_sha256", "transition"],
       "properties": {
         "status": {"const": "unambiguous"},
         "global_track_id": {"type": "string", "minLength": 1},
         "trajectory_id": {"type": "string", "minLength": 1},
         "association_method": {"const": "reviewed_multicamera_trajectory"},
         "evidence_sha256": {"$ref": "#/$defs/sha256"},
-        "camera_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "camera_ids": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "cross_camera_transition_sha256": {"$ref": "#/$defs/sha256"},
         "transition": {
           "oneOf": [
             {"type": "null"},
@@ -154,7 +159,7 @@
                 "transit_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
                 "distance_m": {"type": "number", "minimum": 0},
                 "speed_mps": {"type": "number", "minimum": 0, "maximum": 45},
-                "acceleration_mps2": {"type": "number", "minimum": -8, "maximum": 8},
+                "acceleration_mps2": {"type": ["number", "null"], "minimum": -8, "maximum": 8},
                 "trajectory_covariance_m2": {"$ref": "#/$defs/matrix3"},
                 "pair_evidence_sha256": {"$ref": "#/$defs/sha256"}
               }
@@ -235,7 +240,7 @@
         "height": {"type": "number", "minimum": 0.1, "maximum": 6}
       }
     },
-    "point2": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false},
+    "point2": {"type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false},
     "matrix2": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}},
     "matrix3": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}}
   }

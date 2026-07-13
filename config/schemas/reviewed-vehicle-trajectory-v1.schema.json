@@ -4,7 +4,7 @@
   "title": "Reviewed vehicle trajectory attachment input",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "authority_key_id", "acceptance_eligible", "global_track_id", "trajectory_id", "reviewer", "blueprint_dimension_tolerance_m", "source", "samples"],
+  "required": ["schema", "authority_key_id", "acceptance_eligible", "global_track_id", "trajectory_id", "reviewer", "blueprint_dimension_tolerance_m", "source", "samples", "authority"],
   "properties": {
     "schema": {"const": "v2x-reviewed-vehicle-trajectory/v1"},
     "authority_key_id": {"type": "string", "minLength": 1},
@@ -19,7 +19,7 @@
     },
     "source": {
       "type": "object", "additionalProperties": false,
-      "required": ["detections_ndjson_sha256", "consensus", "factor_graph", "identity", "independent_reference", "blueprint_catalog", "static_calibration", "cameras_json", "opendrive"],
+      "required": ["detections_ndjson_sha256", "consensus", "factor_graph", "identity", "independent_reference", "blueprint_catalog", "appearance_model", "static_calibration", "cameras_json", "opendrive"],
       "properties": {
         "detections_ndjson_sha256": {"$ref": "#/$defs/sha256"},
         "consensus": {"$ref": "#/$defs/consensusArtifact"},
@@ -27,6 +27,7 @@
         "identity": {"$ref": "#/$defs/identityArtifact"},
         "independent_reference": {"$ref": "#/$defs/referenceArtifact"},
         "blueprint_catalog": {"$ref": "#/$defs/blueprintArtifact"},
+        "appearance_model": {"$ref": "#/$defs/appearanceArtifact"},
         "static_calibration": {"$ref": "#/$defs/staticArtifact"},
         "cameras_json": {"$ref": "#/$defs/fileArtifact"},
         "opendrive": {
@@ -51,14 +52,15 @@
           "sample_index": {"type": "integer", "minimum": 0},
           "frame": {"$ref": "#/$defs/fileArtifact"},
           "mask": {"$ref": "#/$defs/fileArtifact"},
-          "native_resolution": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}], "items": false},
+          "native_resolution": {"type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}], "items": false},
           "frame_number": {"type": "integer", "minimum": 0},
           "contact": {"$ref": "#/$defs/contact"},
           "timing": {"$ref": "#/$defs/timing"},
           "placement": {"$ref": "#/$defs/placement"}
         }
       }
-    }
+    },
+    "authority": {"$ref": "#/$defs/authority"}
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -91,10 +93,22 @@
     "blueprintArtifact": {
       "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-reviewed-ue5-blueprint-catalog/v1"}}}]
     },
+    "appearanceArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-pinned-vehicle-appearance-model/v1"}}}]
+    },
     "staticArtifact": {
       "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-static-camera-survey-manifest/v1"}}}]
     },
-    "point2": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false},
+    "authority": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scheme", "key_id", "signature"],
+      "properties": {
+        "scheme": {"const": "hmac-sha256-v1"},
+        "key_id": {"type": "string", "minLength": 1},
+        "signature": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "point2": {"type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false},
     "contact": {
       "type": "object", "additionalProperties": false,
       "required": ["method", "left_ground_pixel", "right_ground_pixel", "footprint_midpoint_pixel", "covariance_px2"],

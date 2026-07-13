@@ -4,7 +4,10 @@ import hashlib
 import json
 import math
 from datetime import datetime, timezone
+from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from digital_twin_bridge import twin_sync as twin_sync_module
@@ -12,6 +15,8 @@ from digital_twin_bridge.reviewed_localization import (
     CameraPlacementContext,
     ReviewedLocalizationError,
     ReviewedPlacementContext,
+    _heldout_reprojection_metrics,
+    authority_signature,
     build_runtime_context,
     canonical_json_bytes,
     contract_sha256,
@@ -21,6 +26,7 @@ from digital_twin_bridge.reviewed_localization import (
 )
 from digital_twin_bridge.twin_sync import TwinSync
 from tests.conftest import MockBlueprint
+from tests.reviewed_calibration_fixture import build_reviewed_static_calibration
 
 
 HASHES = {letter: letter * 64 for letter in "abcdef1234567890"}
@@ -57,6 +63,7 @@ def context():
         },
         static_calibration_sha256=HASHES["0"],
         authority_keys={AUTHORITY_KEY_ID: AUTHORITY_KEY},
+        authority_roles={AUTHORITY_KEY_ID: frozenset({"reviewed_contract"})},
     )
 
 
@@ -87,6 +94,15 @@ def detection(camera_id="ch1", sample_index=0, seconds=0, position=None):
         "camera_data": {"bifocal_metadata": {"frame": 5 + sample_index}},
         "raw_observation": {
             "native_resolution": [1280, 960],
+            "inference_evidence": {
+                "schema": "v2x-persisted-inference-evidence/v1",
+                "acceptance_eligible": True,
+                "reason": None,
+                "manifest_sha256": HASHES["a"],
+                "frame_pixel_sha256": HASHES["b"],
+                "mask_pixel_sha256": HASHES["c"],
+                "detector_output_sha256": HASHES["d"],
+            },
             "fingerprints": {
                 "cameras_json_sha256": HASHES["b"],
                 "camera_config_sha256": camera.camera_config_sha256,
@@ -113,6 +129,10 @@ def detection(camera_id="ch1", sample_index=0, seconds=0, position=None):
                 "mask_sha256": HASHES["4"],
                 "native_resolution": [1280, 960],
                 "frame_number": 5 + sample_index,
+                "inference_manifest_sha256": HASHES["a"],
+                "frame_pixel_sha256": HASHES["b"],
+                "mask_pixel_sha256": HASHES["c"],
+                "detector_output_sha256": HASHES["d"],
             },
             "detector": {
                 "model_sha256": HASHES["e"],
@@ -166,6 +186,7 @@ def detection(camera_id="ch1", sample_index=0, seconds=0, position=None):
             "association_method": "reviewed_multicamera_trajectory",
             "evidence_sha256": HASHES["7"],
             "camera_ids": ["ch1", "ch2"],
+            "cross_camera_transition_sha256": HASHES["6"],
             "transition": (
                 None
                 if sample_index == 0
@@ -185,11 +206,7 @@ def detection(camera_id="ch1", sample_index=0, seconds=0, position=None):
                         + (position["y"] - 20.0) ** 2
                         + (position["z"] - 1.25) ** 2
                     ) / float(seconds),
-                    "acceleration_mps2": math.sqrt(
-                        (position["x"] - 10.0) ** 2
-                        + (position["y"] - 20.0) ** 2
-                        + (position["z"] - 1.25) ** 2
-                    ) / (float(seconds) ** 2),
+                    "acceleration_mps2": None,
                     "trajectory_covariance_m2": [
                         [0.3, 0.0, 0.0],
                         [0.0, 0.3, 0.0],
@@ -264,10 +281,112 @@ def test_valid_contract_uses_reviewed_footprint_midpoint_not_bbox_center():
     assert reviewed["position_m"] == {"x": 10.0, "y": 20.0, "z": 1.25}
 
 
+def test_canonical_json_and_authority_algorithm_are_unambiguous():
+    assert canonical_json_bytes({"b": 2, "a": "é"}) == canonical_json_bytes(
+        {"a": "é", "b": 2}
+    )
+    assert canonical_json_bytes({"value": 1}) != canonical_json_bytes(
+        {"value": 1.0}
+    )
+    assert canonical_json_bytes({"value": "é"}) != canonical_json_bytes(
+        {"value": "e\u0301"}
+    )
+
+    value = detection()
+    contract = value["reviewed_localization"]
+    contract["authority"]["scheme"] = "hmac-sha512-v1"
+    contract["authority"]["signature"] = authority_signature(
+        contract, AUTHORITY_KEY
+    )
+    contract["contract_sha256"] = contract_sha256(contract)
+    with pytest.raises(ReviewedLocalizationError, match="authority_scheme_invalid"):
+        validate_contract(contract, value, context())
+
+
+def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
+    camera_hash = HASHES["c"]
+    manifest_hash = HASHES["d"]
+    point_features = [
+        {
+            "id": f"point-{index}", "type": "point", "split": "holdout",
+            "image": [100.0 + index, 100.0],
+        }
+        for index in range(20)
+    ]
+    road_features = [
+        {
+            "id": f"road-{index}", "type": "polyline", "split": "holdout",
+            "image_polyline": [[100.0, 200.0 + index], [200.0, 200.0 + index]],
+        }
+        for index in range(2)
+    ]
+    manifest = {
+        "width": 1280,
+        "height": 960,
+        "features": point_features + road_features,
+    }
+    evidence = {
+        "schema": "v2x-camera-heldout-reprojection/v1",
+        "camera_id": "ch1",
+        "camera_config_sha256": camera_hash,
+        "camera_manifest_sha256": manifest_hash,
+        "native_resolution": [1280, 960],
+        "points": [
+            {
+                "feature_id": feature["id"],
+                "observed_pixel": feature["image"],
+                "predicted_pixel": [
+                    feature["image"][0] + (24.0 if index == 19 else 0.0),
+                    feature["image"][1],
+                ],
+            }
+            for index, feature in enumerate(point_features)
+        ],
+        "roads": [
+            {
+                "feature_id": feature["id"],
+                "observed_polyline": feature["image_polyline"],
+                "predicted_polyline": [
+                    [feature["image_polyline"][0][0]
+                     + (12.0 if index == 1 else 0.0),
+                     feature["image_polyline"][0][1]],
+                    feature["image_polyline"][1],
+                ],
+            }
+            for index, feature in enumerate(road_features)
+        ],
+        "authority": {
+            "scheme": "hmac-sha256-v1",
+            "key_id": AUTHORITY_KEY_ID,
+            "signature": HASHES["e"],
+        },
+    }
+    _heldout_reprojection_metrics(
+        evidence, manifest, "ch1", camera_hash, manifest_hash
+    )
+
+    evidence["points"][-1]["predicted_pixel"][0] += 1e-9
+    with pytest.raises(
+        ReviewedLocalizationError, match="static_reprojection_threshold_failed"
+    ):
+        _heldout_reprojection_metrics(
+            evidence, manifest, "ch1", camera_hash, manifest_hash
+        )
+
+
 def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_world):
-    hashes = [f"{index:064x}" for index in range(1, 13)]
     matrix = [[1000.0, 0, 640.0], [0, 1000.0, 480.0], [0, 0, 1]]
     distortion = {key: 0.0 for key in ("k1", "k2", "p1", "p2", "k3")}
+    source_paths = []
+    hashes = []
+    for index in range(12):
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        image[:, :, 0] = index * 17
+        image[index % 24:index % 24 + 8, :, 1] = 255
+        source_path = tmp_path / f"intrinsics-source-{index}.png"
+        assert cv2.imwrite(str(source_path), image)
+        source_paths.append(str(source_path))
+        hashes.append(hashlib.sha256(source_path.read_bytes()).hexdigest())
     normalized = {
         "method": "checkerboard",
         "image_count": 12,
@@ -282,68 +401,84 @@ def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_w
     report = tmp_path / "intrinsics-report.json"
     report.write_text(json.dumps({
         "schema": "v2x-checkerboard-calibration-report/v1",
-        "accepted": [{"sha256": value} for value in hashes[:10]],
-        "holdouts": [{"sha256": value} for value in hashes[10:]],
+        "accepted": [
+            {"path": source_paths[index], "sha256": value,
+             "rmse_px": 0.4, "max_error_px": 0.8}
+            for index, value in enumerate(hashes[:10])
+        ],
+        "holdouts": [
+            {"path": source_paths[index + 10], "sha256": value,
+             "rmse_px": 0.5, "max_error_px": 1.0}
+            for index, value in enumerate(hashes[10:])
+        ],
         "holdout_metrics": {"rmse_px": 0.6, "max_error_px": 1.2},
     }) + "\n")
     cameras = tmp_path / "cameras.json"
-    camera = {
-        "id": "ch1",
-        "intrinsics": {
-            "width": 1280, "height": 960,
-            "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
-        },
-        "intrinsics_calibration": {
-            **normalized,
-            "artifact_path": str(intrinsics),
-            "artifact_sha256": hashlib.sha256(intrinsics.read_bytes()).hexdigest(),
-            "report_path": str(report),
-            "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
-        },
-    }
-    cameras.write_text(json.dumps({"cameras": [camera]}) + "\n")
-    mock_world.get_map().to_opendrive = lambda: "<OpenDRIVE/>"
-    opendrive_hash = hashlib.sha256(b"<OpenDRIVE/>").hexdigest()
-    camera_hash = hashlib.sha256(
-        json.dumps(camera, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    static = tmp_path / "static.json"
-    static.write_text(json.dumps({
-        "schema": "v2x-static-camera-survey-manifest/v1",
-        "source_cameras_json_sha256": hashlib.sha256(cameras.read_bytes()).hexdigest(),
-        "map": {"name": "TestMap", "opendrive_sha256": opendrive_hash},
-        "heldout_gate": {
-            "passed": True,
-            "reference_resolution": [1280, 960],
-            "cameras": {
-                "ch1": {
-                    "camera_config_sha256": camera_hash,
-                    "landmark_count": 4,
-                    "landmark_rmse_px": 5.0,
-                    "landmark_p95_px": 8.0,
-                    "landmark_max_px": 10.0,
-                    "road_rmse_px": 4.0,
-                    "road_max_px": 8.0,
-                }
+    camera_values = []
+    for camera_id in ("ch1", "ch2", "ch3", "ch4"):
+        camera_values.append({
+            "id": camera_id,
+            "intrinsics": {
+                "width": 1280, "height": 960,
+                "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
             },
-        },
-    }) + "\n")
+            "intrinsics_calibration": {
+                **normalized,
+                "artifact_path": str(intrinsics),
+                "artifact_sha256": hashlib.sha256(intrinsics.read_bytes()).hexdigest(),
+                "report_path": str(report),
+                "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+                "source_image_paths": source_paths,
+            },
+        })
+    cameras.write_text(json.dumps({"cameras": camera_values}) + "\n")
+    mock_world.get_map().to_opendrive = lambda: "<OpenDRIVE/>"
+    mock_world.get_map().name = (
+        "Carla/Maps/Richmond_Field_Station_Richmond_CA"
+    )
+    opendrive_hash = hashlib.sha256(b"<OpenDRIVE/>").hexdigest()
     authority = tmp_path / "authority.json"
     authority.write_text(json.dumps({
         "schema": "v2x-review-authority-keys/v1",
-        "keys": {AUTHORITY_KEY_ID: AUTHORITY_KEY.hex()},
+        "keys": {AUTHORITY_KEY_ID: {
+            "key_hex": AUTHORITY_KEY.hex(),
+            "roles": ["reviewed_contract", "static_calibration"],
+        }},
     }) + "\n")
+    static = build_reviewed_static_calibration(
+        tmp_path / "static-evidence",
+        cameras,
+        camera_values,
+        mock_world.get_map().name,
+        opendrive_hash,
+        AUTHORITY_KEY_ID,
+        AUTHORITY_KEY,
+    )
 
     runtime = build_runtime_context(
         mock_world.get_map(), str(cameras), str(static), str(authority)
     )
 
-    assert runtime.map_name == "TestMap"
+    assert runtime.map_name == mock_world.get_map().name
     assert runtime.opendrive_sha256 == opendrive_hash
     assert runtime.cameras_json_sha256 == hashlib.sha256(cameras.read_bytes()).hexdigest()
 
     assert runtime.static_calibration_sha256 == hashlib.sha256(static.read_bytes()).hexdigest()
     assert runtime.authority_keys[AUTHORITY_KEY_ID] == AUTHORITY_KEY
+
+    static_value = json.loads(static.read_text())
+    aggregation = json.loads(
+        Path(static_value["site_aggregation"]["path"]).read_text()
+    )
+    ch1_manifest = json.loads(
+        Path(aggregation["manifests"]["ch1"]["path"]).read_text()
+    )
+    retained_real = Path(ch1_manifest["source_artifacts"]["real_frame"]["path"])
+    retained_real.write_bytes(retained_real.read_bytes() + b"stale")
+    with pytest.raises(ReviewedLocalizationError, match="raw_replay_failed"):
+        build_runtime_context(
+            mock_world.get_map(), str(cameras), str(static), str(authority)
+        )
 
     intrinsics.write_text("tampered\n")
     with pytest.raises(ReviewedLocalizationError, match="artifact_(unavailable|mismatch)"):
@@ -433,6 +568,14 @@ def test_timestamp_and_session_spoof_are_rejected():
         validate_contract(value["reviewed_localization"], value, context())
 
 
+def test_contract_rejects_nominal_multicamera_identity_with_one_camera():
+    value = detection()
+    value["reviewed_localization"]["identity"]["camera_ids"] = ["ch1"]
+    reseal(value)
+    with pytest.raises(ReviewedLocalizationError, match="identity_camera_set_invalid"):
+        validate_contract(value["reviewed_localization"], value, context())
+
+
 def test_strict_mode_uses_exact_world_actor_center_without_lane_or_gps(
     mock_world, monkeypatch
 ):
@@ -504,9 +647,78 @@ def test_multicamera_trajectory_keeps_one_actor_and_exact_latest_sample(mock_wor
     assert status["reviewed_contract_sha256"] == second["reviewed_localization"]["contract_sha256"]
 
 
+def test_acceleration_requires_three_positions_not_assumed_zero_initial_speed(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+    first = detection(camera_id="ch1", sample_index=0, seconds=0)
+    second = detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )
+    assert second["reviewed_localization"]["identity"]["transition"][
+        "acceleration_mps2"
+    ] is None
+    third = detection(
+        camera_id="ch1", sample_index=2, seconds=2,
+        position={"x": 12.0, "y": 20.0, "z": 1.25},
+    )
+    third["reviewed_localization"]["identity"]["transition"].update({
+        "previous_event_id": "event-1",
+        "transit_seconds": 1.0,
+        "distance_m": 1.0,
+        "speed_mps": 1.0,
+        "acceleration_mps2": 0.0,
+    })
+    reseal(third)
+    sync._apply([first])
+    sync._apply([second])
+    sync._apply([third])
+    assert sync.status()["objects"][0]["trajectory_sample_index"] == 2
+
+    rejected = strict_sync(mock_world)
+    rejected._apply([first])
+    rejected._apply([second])
+    bad_third = detection(
+        camera_id="ch1", sample_index=2, seconds=2,
+        position={"x": 12.0, "y": 20.0, "z": 1.25},
+    )
+    bad_third["reviewed_localization"]["identity"]["transition"].update({
+        "previous_event_id": "event-1",
+        "transit_seconds": 1.0,
+        "distance_m": 1.0,
+        "speed_mps": 1.0,
+        "acceleration_mps2": None,
+    })
+    reseal(bad_third)
+    rejected._apply([bad_third])
+    assert rejected.status()["strict_rejections"][
+        "trajectory_transition_metrics_mismatch"
+    ] == 1
+
+
 def test_trajectory_must_start_at_zero(mock_world):
     sync = strict_sync(mock_world)
     sync._apply([detection(sample_index=1, seconds=1)])
+    assert sync.actor_ids() == set()
+    assert sync.status()["strict_rejections"]["trajectory_must_start_at_zero"] == 1
+
+
+def test_spawn_collision_cannot_create_an_unanchored_sample_one_track(mock_world):
+    sync = strict_sync(mock_world)
+    original_spawn = mock_world.try_spawn_actor
+    mock_world.try_spawn_actor = lambda *_args, **_kwargs: None
+    sync._apply([detection(sample_index=0, seconds=0)])
+    assert sync.actor_ids() == set()
+    mock_world.try_spawn_actor = original_spawn
+
+    sync._apply([
+        detection(
+            camera_id="ch2", sample_index=1, seconds=1,
+            position={"x": 11.0, "y": 20.0, "z": 1.25},
+        )
+    ])
+
     assert sync.actor_ids() == set()
     assert sync.status()["strict_rejections"]["trajectory_must_start_at_zero"] == 1
 
@@ -576,6 +788,11 @@ def test_failed_exact_actor_transform_keeps_last_accepted_provenance(mock_world)
     assert status["event_id"] == first["event_id"]
     assert status["reviewed_contract_sha256"] == first["reviewed_localization"]["contract_sha256"]
     assert status["reviewed_world_location"] == {"x": 10.0, "y": 20.0, "z": 1.25}
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert status["quarantined_reason"] == "strict_transform_rollback_failed"
+    assert actor.is_destroyed
+    assert sync.actor_ids() == set()
     assert sync.status()["strict_rejections"]["strict_transform_rollback_failed"] == 1
 
 
@@ -604,6 +821,42 @@ def test_exact_transform_failure_rolls_back_before_metadata_commit(mock_world):
     assert status["event_id"] == first["event_id"]
     assert status["trajectory_sample_index"] == 0
     assert sync.status()["strict_rejections"]["strict_exact_transform_failed"] == 1
+
+
+def test_strict_tick_quarantines_silent_pose_drift_instead_of_reapplying(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+    actor._transform.location.x += 0.5
+    actor._transform.rotation.pitch = 1.0
+
+    sync.tick()
+
+    status = sync.status()["objects"][0]
+    assert actor.is_destroyed
+    assert sync.actor_ids() == set()
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert status["quarantined_reason"] == "strict_tick_integrity_mismatch"
+    assert sync.status()["strict_rejections"]["strict_tick_integrity_mismatch"] == 1
+
+
+def test_strict_tick_accepts_only_modulo_equivalent_yaw_normalization(mock_world):
+    sync = strict_sync(mock_world)
+    value = detection()
+    value["reviewed_localization"]["placement"]["heading_deg"] = 190.0
+    reseal(value)
+    sync._apply([value])
+    actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+    actor._transform.rotation.yaw = -170.0
+
+    sync.tick()
+
+    assert sync.actor_ids() == {actor.id}
+    assert actor.is_destroyed is False
+    assert sync.status()["objects"][0]["actor_quarantined"] is False
 
 
 def test_live_freshness_gate_is_not_applied_to_replay(mock_world):
