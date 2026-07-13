@@ -1,10 +1,12 @@
 from ultralytics import YOLO
 from concurrent.futures import TimeoutError as FutureTimeoutError
 import cv2
+from itertools import chain
 import math
 import os
 import re
 import signal
+import sys
 import threading
 from pathlib import Path
 import numpy as np
@@ -53,6 +55,163 @@ _OUTER_SHUTDOWN_RESERVE_SECONDS = (
     + _PERCEPTION_HTTP_SHUTDOWN_BOUND_SECONDS
     + _OUTER_SHUTDOWN_MARGIN_SECONDS
 )
+_BOUNDED_DIAGNOSTIC_THREAD_LIMIT = 16
+_BOUNDED_DIAGNOSTIC_CANDIDATE_LIMIT = 64
+_BOUNDED_DIAGNOSTIC_FRAME_LIMIT = 12
+_BOUNDED_DIAGNOSTIC_STACK_BYTES = 6144
+_SHUTDOWN_FAILURE_CAUSES = (
+    "reader_timeout",
+    "terminal_cleanup_timeout",
+)
+_SAFE_STACK_FILE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_SAFE_STACK_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _safe_stack_symbol(value, pattern):
+    value = str(value)
+    return value if pattern.fullmatch(value) else "other"
+
+
+def _diagnostic_thread_category(thread, frame):
+    if thread is threading.current_thread():
+        return "reporter"
+    if thread is threading.main_thread():
+        return "main"
+    if thread.name.startswith("v2x-inference-"):
+        return "inference"
+    cursor = frame
+    inspected_frames = 0
+    while (
+        cursor is not None
+        and inspected_frames < _BOUNDED_DIAGNOSTIC_FRAME_LIMIT
+    ):
+        filename = os.path.basename(cursor.f_code.co_filename)
+        if filename == "live_capture.py":
+            return "capture"
+        if filename == "ffmpeg_capture.py":
+            return "decoder"
+        if filename in {"socketserver.py", "server.py"}:
+            return "http"
+        cursor = cursor.f_back
+        inspected_frames += 1
+    return "other"
+
+
+def _bounded_python_stack_snapshot():
+    """Return capped stack metadata without paths, IDs, source, or locals."""
+    current = threading.current_thread()
+    main = threading.main_thread()
+    enumerated = threading.enumerate()
+    candidates = []
+    seen_idents = set()
+    for thread in chain((current, main), reversed(enumerated)):
+        if thread.ident in seen_idents:
+            continue
+        seen_idents.add(thread.ident)
+        candidates.append(thread)
+        if len(candidates) >= _BOUNDED_DIAGNOSTIC_CANDIDATE_LIMIT:
+            break
+    frames_by_ident = sys._current_frames()
+    categorized = []
+    for candidate_index, thread in enumerate(candidates):
+        frame = frames_by_ident.get(thread.ident)
+        frames = []
+        cursor = frame
+        while cursor is not None and len(frames) < _BOUNDED_DIAGNOSTIC_FRAME_LIMIT:
+            frames.append({
+                "file": _safe_stack_symbol(
+                    os.path.basename(cursor.f_code.co_filename),
+                    _SAFE_STACK_FILE,
+                ),
+                "line": max(0, int(cursor.f_lineno)),
+                "function": _safe_stack_symbol(
+                    cursor.f_code.co_name, _SAFE_STACK_FUNCTION
+                ),
+            })
+            cursor = cursor.f_back
+        category = _diagnostic_thread_category(thread, frame)
+        categorized.append((
+            {
+                "capture": 0,
+                "decoder": 0,
+                "inference": 1,
+                "reporter": 2,
+                "main": 2,
+                "http": 3,
+                "other": 4,
+            }[category],
+            candidate_index,
+            {"category": category, "frames": frames},
+        ))
+    categorized.sort(key=lambda item: (item[0], item[1]))
+    threads = [
+        item[2]
+        for item in categorized[:_BOUNDED_DIAGNOSTIC_THREAD_LIMIT]
+    ]
+    snapshot = {
+        "observed_thread_count": len(enumerated),
+        "candidate_thread_count": len(candidates),
+        "reported_thread_count": len(threads),
+        "truncated": (
+            len(enumerated) > len(candidates)
+            or len(candidates) > len(threads)
+        ),
+        "threads": threads,
+    }
+    while (
+        len(json.dumps(snapshot, separators=(",", ":")).encode("utf-8"))
+        > _BOUNDED_DIAGNOSTIC_STACK_BYTES
+    ):
+        frame_owner = next(
+            (entry for entry in reversed(threads) if entry["frames"]), None
+        )
+        if frame_owner is not None:
+            frame_owner["frames"].pop()
+        elif threads:
+            threads.pop()
+            snapshot["reported_thread_count"] = len(threads)
+        else:
+            break
+        snapshot["truncated"] = True
+    return snapshot
+
+
+def _emit_bounded_shutdown_diagnostics(
+    failure_causes, live_reader_alive_count
+):
+    """Emit bounded, secret-free state after cooperative shutdown fails."""
+    requested_causes = set(failure_causes)
+    causes = [
+        cause for cause in _SHUTDOWN_FAILURE_CAUSES
+        if cause in requested_causes
+    ]
+    try:
+        alive_count = max(0, min(int(live_reader_alive_count), 64))
+    except (TypeError, ValueError, OverflowError):
+        alive_count = 0
+    try:
+        python_stacks = _bounded_python_stack_snapshot()
+    except Exception:
+        python_stacks = {
+            "observed_thread_count": 0,
+            "candidate_thread_count": 0,
+            "reported_thread_count": 0,
+            "truncated": True,
+            "threads": [],
+            "snapshot": "unavailable",
+        }
+    payload = {
+        "event": "perception_bounded_shutdown_failure",
+        "failure_causes": causes,
+        "live_reader_alive_count": alive_count,
+        "decoder_topology": capture_preparation_topology(),
+        "python_stacks": python_stacks,
+    }
+    print(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _live_pipeline_shutdown_timeout_seconds(
@@ -1781,6 +1940,8 @@ class MultiCameraPipeline:
 
         finally:
             shutdown_error = None
+            shutdown_failure_causes = []
+            live_reader_alive_count = 0
             # One deadline covers reader cancellation, decoder teardown, and
             # tracked helper cleanup.  It remains well inside systemd's
             # TimeoutStopSec so the service can fail visibly instead of being
@@ -1797,13 +1958,18 @@ class MultiCameraPipeline:
             inference_executor.shutdown(wait=False, cancel_futures=True)
             for reader in live_readers:
                 reader.join(max(0.0, stop_deadline - time.monotonic()))
-            if any(reader.is_alive() for reader in live_readers):
+            live_reader_alive_count = sum(
+                int(reader.is_alive()) for reader in live_readers
+            )
+            if live_reader_alive_count:
+                shutdown_failure_causes.append("reader_timeout")
                 shutdown_error = RuntimeError(
                     "live reader shutdown exceeded its bounded deadline"
                 )
             if not wait_for_terminal_cleanups(
                 max(0.0, stop_deadline - time.monotonic())
             ):
+                shutdown_failure_causes.append("terminal_cleanup_timeout")
                 shutdown_error = RuntimeError(
                     "terminal decoder cleanup exceeded its bounded deadline"
                 )
@@ -1822,6 +1988,9 @@ class MultiCameraPipeline:
                     cap.release()
             cv2.destroyAllWindows()
             if shutdown_error is not None:
+                _emit_bounded_shutdown_diagnostics(
+                    shutdown_failure_causes, live_reader_alive_count
+                )
                 raise shutdown_error
             print(f"Multi-Stream complete. Processed {frame_count} frames, found {len(self.all_clean_detections)} total unique objects.")
 

@@ -1,5 +1,6 @@
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
 import select
@@ -18,6 +19,15 @@ from live_capture import (  # noqa: E402
     _AsyncMediaClockResolution,
     _begin_terminal_recovery,
     _cancel_proactive_preparations,
+    _DIAGNOSTIC_CLEANUP_LIMIT,
+    _DIAGNOSTIC_PREPARATION_LIMIT,
+    _promote_reader_owned_cleanup,
+    _PROACTIVE_PREPARATIONS,
+    _PROACTIVE_PREPARATIONS_LOCK,
+    _start_reader_owned_cleanup,
+    _start_terminal_cleanup,
+    _TERMINAL_CLEANUPS,
+    _TERMINAL_CLEANUPS_LOCK,
     capture_preparation_topology,
 )
 from decoder_admission import AUXILIARY_DECODER_ADMISSION  # noqa: E402
@@ -207,6 +217,238 @@ class LiveStreamReaderTests(unittest.TestCase):
                 return True
             time.sleep(0.01)
         return bool(predicate())
+
+    def test_topology_sanitizes_unknown_state_and_never_blocks_on_locks(self):
+        source_entered = threading.Event()
+        release_source = threading.Event()
+        secret = "https://camera.invalid/live?token=top-secret"
+
+        def blocked_source():
+            source_entered.set()
+            release_source.wait(1.0)
+            raise RuntimeError(secret)
+
+        preparation = _AsyncCapturePreparation(
+            source_factory=blocked_source,
+            clock_source_factory=None,
+            capture_factory=lambda _source: None,
+            media_clock_factory=None,
+            media_clock_validator=None,
+            capture_position_milliseconds=lambda _cap: 0.0,
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=time.monotonic,
+            reserve_decoder_slot=True,
+        )
+        try:
+            self.assertTrue(source_entered.wait(1.0))
+            preparation._set_stage(secret)
+            topology = capture_preparation_topology()
+            self.assertEqual(topology["proactive_preparation_snapshot"], "ok")
+            self.assertEqual(
+                topology["proactive_preparation_states"]["stage_counts"],
+                {"other": 1},
+            )
+            encoded = json.dumps(topology, sort_keys=True)
+            self.assertNotIn("top-secret", encoded)
+            self.assertNotIn(str(id(preparation)), encoded)
+
+            with preparation._stage_lock:
+                started = time.monotonic()
+                busy = capture_preparation_topology()
+                self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(
+                busy["proactive_preparation_states"]["stage_counts"],
+                {"lock_busy": 1},
+            )
+
+            with preparation._result_lock:
+                busy = capture_preparation_topology()
+            self.assertEqual(
+                busy["proactive_preparation_states"][
+                    "claimed_lock_busy_count"
+                ],
+                1,
+            )
+
+            with _PROACTIVE_PREPARATIONS_LOCK:
+                started = time.monotonic()
+                busy = capture_preparation_topology()
+                self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(busy["proactive_preparation_snapshot"], "lock_busy")
+            self.assertEqual(busy["proactive_preparations"], -1)
+
+            with _TERMINAL_CLEANUPS_LOCK:
+                started = time.monotonic()
+                busy = capture_preparation_topology()
+                self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(busy["terminal_cleanup_snapshot"], "lock_busy")
+            self.assertEqual(busy["terminal_cleanups"], -1)
+            self.assertEqual(busy["terminal_cleanup_sampled_count"], 0)
+        finally:
+            preparation.discard()
+            release_source.set()
+            preparation.join(1.0)
+        self.assertTrue(preparation.wait_quiesced(1.0))
+
+    def test_topology_state_sampling_has_fixed_cardinality(self):
+        class FakePreparation:
+            def diagnostic_state(self):
+                return {
+                    "stage": "source",
+                    "claimed": False,
+                    "done": False,
+                    "discarded": False,
+                    "quiesced": False,
+                }
+
+        preparations = {
+            FakePreparation()
+            for _ in range(_DIAGNOSTIC_PREPARATION_LIMIT + 5)
+        }
+        with _PROACTIVE_PREPARATIONS_LOCK:
+            _PROACTIVE_PREPARATIONS.update(preparations)
+        try:
+            topology = capture_preparation_topology()
+            states = topology["proactive_preparation_states"]
+            self.assertEqual(
+                topology["proactive_preparation_snapshot"], "truncated"
+            )
+            self.assertEqual(
+                states["sampled_count"], _DIAGNOSTIC_PREPARATION_LIMIT
+            )
+            self.assertEqual(
+                sum(states["stage_counts"].values()),
+                _DIAGNOSTIC_PREPARATION_LIMIT,
+            )
+        finally:
+            with _PROACTIVE_PREPARATIONS_LOCK:
+                _PROACTIVE_PREPARATIONS.difference_update(preparations)
+
+        class FakeCleanup:
+            def diagnostic_kind(self):
+                return "candidate"
+
+            def age_seconds(self, _now):
+                return 1.0
+
+        cleanup_entries = {
+            ("test-cardinality", index): FakeCleanup()
+            for index in range(_DIAGNOSTIC_CLEANUP_LIMIT + 5)
+        }
+        with _TERMINAL_CLEANUPS_LOCK:
+            _TERMINAL_CLEANUPS.update(cleanup_entries)
+        try:
+            topology = capture_preparation_topology()
+            self.assertEqual(
+                topology["terminal_cleanup_snapshot"], "truncated"
+            )
+            self.assertEqual(
+                topology["terminal_cleanup_sampled_count"],
+                _DIAGNOSTIC_CLEANUP_LIMIT,
+            )
+            self.assertEqual(
+                sum(
+                    state["count"]
+                    for state in topology["terminal_cleanup_states"].values()
+                ),
+                _DIAGNOSTIC_CLEANUP_LIMIT,
+            )
+        finally:
+            with _TERMINAL_CLEANUPS_LOCK:
+                for key in cleanup_entries:
+                    _TERMINAL_CLEANUPS.pop(key, None)
+
+    def test_topology_counts_ready_and_claimed_preparation_without_ids(self):
+        source = "https://camera.invalid/live?token=claim-secret"
+        capture = PositionedScriptedCapture(["frame"], [0.0])
+        preparation = _AsyncCapturePreparation(
+            source_factory=lambda: source,
+            clock_source_factory=None,
+            capture_factory=lambda _source: capture,
+            media_clock_factory=None,
+            media_clock_validator=None,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=time.monotonic,
+            reserve_decoder_slot=True,
+        )
+        result = None
+        try:
+            self.assertTrue(self.wait_until(lambda: preparation.poll()[0]))
+            ready = capture_preparation_topology()
+            ready_states = ready["proactive_preparation_states"]
+            self.assertEqual(ready_states["stage_counts"], {"first_frame": 1})
+            self.assertEqual(ready_states["done_count"], 1)
+            self.assertEqual(ready_states["claimed_count"], 0)
+            self.assertEqual(ready_states["claimed_lock_busy_count"], 0)
+
+            result = preparation.take()
+            claimed = capture_preparation_topology()
+            self.assertEqual(
+                claimed["proactive_preparation_states"]["claimed_count"], 1
+            )
+            encoded = json.dumps(claimed, sort_keys=True)
+            self.assertNotIn("claim-secret", encoded)
+            self.assertNotIn(str(id(preparation)), encoded)
+        finally:
+            preparation.adopt()
+            if result is not None:
+                result[0].release()
+
+    def test_terminal_cleanup_kind_age_and_identifier_are_bounded(self):
+        entered = threading.Event()
+        release = threading.Event()
+        secret_key = ("https://cleanup.invalid?token=secret", 987654321)
+
+        def blocked_cleanup():
+            entered.set()
+            release.wait(1.0)
+
+        cleanup = _start_terminal_cleanup(secret_key, blocked_cleanup)
+        try:
+            self.assertTrue(entered.wait(1.0))
+            cleanup._started_monotonic -= 2.0
+            topology = capture_preparation_topology()
+            state = topology["terminal_cleanup_states"]["other"]
+            self.assertEqual(state["count"], 1)
+            self.assertGreaterEqual(state["oldest_age_seconds"], 2.0)
+            encoded = json.dumps(topology, sort_keys=True)
+            self.assertNotIn("cleanup.invalid", encoded)
+            self.assertNotIn("987654321", encoded)
+        finally:
+            release.set()
+            self.assertTrue(cleanup.wait(1.0))
+
+    def test_promoted_reader_cleanup_preserves_original_age(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_cleanup():
+            entered.set()
+            release.wait(1.0)
+
+        owned = _start_reader_owned_cleanup(
+            ("owned", 123456789), blocked_cleanup
+        )
+        promoted = None
+        try:
+            self.assertTrue(entered.wait(1.0))
+            owned._started_monotonic -= 2.0
+            promoted = _promote_reader_owned_cleanup(owned)
+            state = capture_preparation_topology()[
+                "terminal_cleanup_states"
+            ]["reader-owned"]
+            self.assertEqual(state["count"], 1)
+            self.assertGreaterEqual(state["oldest_age_seconds"], 2.0)
+        finally:
+            release.set()
+            self.assertTrue(owned.wait(1.0))
+            if promoted is not None:
+                self.assertTrue(promoted.wait(1.0))
 
     def test_preparation_prefers_same_session_pts_without_clock_session(self):
         capture = TransportClockCapture(["static-frame"], [2204.0])

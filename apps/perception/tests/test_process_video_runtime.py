@@ -1,5 +1,7 @@
 import sys
 import copy
+import io
+import json
 import os
 from pathlib import Path
 import threading
@@ -15,9 +17,13 @@ sys.path.insert(0, str(PERCEPTION_DIR))
 
 from live_capture import bounded_frame_identity  # noqa: E402
 from process_video import (  # noqa: E402
+    _BOUNDED_DIAGNOSTIC_FRAME_LIMIT,
+    _BOUNDED_DIAGNOSTIC_STACK_BYTES,
+    _BOUNDED_DIAGNOSTIC_THREAD_LIMIT,
     _COOPERATIVE_SHUTDOWN_CEILING_SECONDS,
     _COOPERATIVE_SHUTDOWN_MARGIN_SECONDS,
     _OUTER_SHUTDOWN_RESERVE_SECONDS,
+    _emit_bounded_shutdown_diagnostics,
     _live_pipeline_shutdown_timeout_seconds,
     FrameBroadcaster,
     MultiCameraPipeline,
@@ -73,7 +79,20 @@ class FrameBroadcasterTests(unittest.TestCase):
             "urgent_windows": 0,
             "proactive_preparations": 0,
             "terminal_recoveries": 0,
+            "proactive_preparation_snapshot": "ok",
+            "proactive_preparation_states": {
+                "sampled_count": 0,
+                "stage_counts": {},
+                "claimed_count": 0,
+                "claimed_lock_busy_count": 0,
+                "done_count": 0,
+                "discarded_count": 0,
+                "quiesced_count": 0,
+            },
             "terminal_cleanups": 0,
+            "terminal_cleanup_snapshot": "ok",
+            "terminal_cleanup_sampled_count": 0,
+            "terminal_cleanup_states": {},
             "terminal_cleanup_failures": 0,
         })
 
@@ -832,6 +851,103 @@ class LivePipelineTimestampTests(unittest.TestCase):
         )
         self.assertLess(timeout, _COOPERATIVE_SHUTDOWN_CEILING_SECONDS)
 
+    def test_bounded_shutdown_diagnostics_are_capped_and_secret_free(self):
+        release_workers = threading.Event()
+        workers_ready = threading.Barrier(
+            _BOUNDED_DIAGNOSTIC_THREAD_LIMIT + 6
+        )
+        secret = "signed-token-local-value-must-not-appear"
+
+        def blocked_worker():
+            local_secret = secret
+            workers_ready.wait(timeout=2.0)
+            release_workers.wait(2.0)
+            self.assertTrue(local_secret)
+
+        workers = [
+            threading.Thread(target=blocked_worker, name=secret, daemon=True)
+            for _ in range(_BOUNDED_DIAGNOSTIC_THREAD_LIMIT + 4)
+        ]
+        capture_namespace = {
+            "workers_ready": workers_ready,
+            "release_workers": release_workers,
+        }
+        exec(compile(
+            "def capture_worker():\n"
+            "    workers_ready.wait(timeout=2.0)\n"
+            "    release_workers.wait(2.0)\n",
+            f"/{secret}/live_capture.py",
+            "exec",
+        ), capture_namespace)
+        relevant_worker = threading.Thread(
+            target=capture_namespace["capture_worker"],
+            name=secret,
+            daemon=True,
+        )
+        for worker in workers:
+            worker.start()
+        relevant_worker.start()
+        workers_ready.wait(timeout=2.0)
+        stream = io.StringIO()
+        topology = {
+            "proactive_preparations": 0,
+            "terminal_cleanups": 0,
+        }
+        try:
+            with patch(
+                "process_video.capture_preparation_topology",
+                return_value=topology,
+            ), patch("process_video.sys.stderr", stream):
+                _emit_bounded_shutdown_diagnostics(
+                    [
+                        "terminal_cleanup_timeout",
+                        "https://invalid?token=diagnostic-secret",
+                        "reader_timeout",
+                    ],
+                    999,
+                )
+        finally:
+            release_workers.set()
+            for worker in [*workers, relevant_worker]:
+                worker.join(1.0)
+
+        encoded = stream.getvalue()
+        payload = json.loads(encoded)
+        self.assertEqual(
+            payload["failure_causes"],
+            ["reader_timeout", "terminal_cleanup_timeout"],
+        )
+        self.assertEqual(payload["live_reader_alive_count"], 64)
+        self.assertNotIn(secret, encoded)
+        self.assertNotIn("diagnostic-secret", encoded)
+        self.assertNotIn("0x", encoded)
+        stacks = payload["python_stacks"]
+        self.assertLessEqual(
+            stacks["reported_thread_count"],
+            _BOUNDED_DIAGNOSTIC_THREAD_LIMIT,
+        )
+        self.assertTrue(stacks["truncated"])
+        self.assertLessEqual(
+            len(json.dumps(stacks, separators=(",", ":")).encode("utf-8")),
+            _BOUNDED_DIAGNOSTIC_STACK_BYTES,
+        )
+        allowed_categories = {
+            "reporter", "main", "inference", "capture", "decoder",
+            "http", "other",
+        }
+        self.assertIn(
+            "capture",
+            [thread["category"] for thread in stacks["threads"]],
+        )
+        for thread in stacks["threads"]:
+            self.assertIn(thread["category"], allowed_categories)
+            self.assertLessEqual(
+                len(thread["frames"]), _BOUNDED_DIAGNOSTIC_FRAME_LIMIT
+            )
+            for frame in thread["frames"]:
+                self.assertNotIn("/", frame["file"])
+                self.assertNotIn("\\", frame["file"])
+
     def test_nvdec_shutdown_budget_covers_concurrent_claimed_cleanup(self):
         timeout = _live_pipeline_shutdown_timeout_seconds(
             "ffmpeg_nvdec", 10_000, 10_000
@@ -1022,14 +1138,21 @@ class LivePipelineTimestampTests(unittest.TestCase):
         shutdown.set()
 
         started = time.monotonic()
-        with patch("process_video.LiveStreamReader", StubbornReader), patch.dict(
+        with patch("process_video.LiveStreamReader", StubbornReader), patch(
+            "process_video.wait_for_terminal_cleanups", return_value=False
+        ), patch(
+            "process_video._emit_bounded_shutdown_diagnostics"
+        ) as emit_diagnostics, patch.dict(
             os.environ,
             {
                 "V2X_PERCEPTION_OPEN_TIMEOUT_MS": "1",
                 "V2X_PERCEPTION_READ_TIMEOUT_MS": "1",
             },
         ):
-            with self.assertRaisesRegex(RuntimeError, "bounded deadline"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "terminal decoder cleanup exceeded its bounded deadline",
+            ):
                 pipeline.process_streams(
                     ["v2x-backend-cam-ch1"],
                     show_live=False,
@@ -1041,6 +1164,9 @@ class LivePipelineTimestampTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertTrue(StubbornReader.instances[0].stop_requested)
         self.assertIsNotNone(StubbornReader.instances[0].shutdown_deadline)
+        emit_diagnostics.assert_called_once_with(
+            ["reader_timeout", "terminal_cleanup_timeout"], 1
+        )
 
     def test_active_inference_observes_shutdown_inside_wall_bound(self):
         inference_entered = threading.Event()

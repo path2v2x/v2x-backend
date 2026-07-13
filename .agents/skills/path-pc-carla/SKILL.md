@@ -9,15 +9,57 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 15:25 UTC; verify rather than assume. These items
+Observed through 2026-07-13 16:00 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
-- Canonical `origin/main` is now PR 49 merge
-  `3849cfe3e93f2781d280315e003c958a6b714ef5`. PR 49 is not deployed. Live
+- Canonical `origin/main` is now PR 50 merge
+  `6da5f01af8c6e15927c7063797f5890e05df3b3d`. PR 50 is not deployed. Live
   production remains the exact, detached, clean PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
-  environment and timers restored. Do not describe PR 42-48 or the eager-
+  environment and timers restored. Do not describe PR 42-50 or the eager-
   cleanup follow-ups below as production.
+- PR 50's first complete five-child stop canary is rejected. Evidence is at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T153621Z-pr50-claimed-handover-shutdown-canary/`
+  and the verified rollback is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T153621Z-pr50-claimed-handover-shutdown/`.
+  PR 50 reached exact four-camera readiness in six seconds and the first
+  qualifying 0.2-second helper sample captured `in_use=1`,
+  `proactive_preparations=1`, five FFmpeg children, zero cleanup failures, and
+  every camera fresh, inference-fresh, trusted, and `exact_same_session_pts`.
+  Stop at 15:36:42.916 UTC emitted two immediate partial rawvideo buffer
+  warnings, then raised `terminal decoder cleanup exceeded its bounded
+  deadline` 32.293 seconds later, exactly at the 32.2-second pipeline boundary;
+  systemd recorded `Result=exit-code` without SIGKILL. Exact PR 35 was restored
+  and healthy by 15:37:28 UTC. CARLA, Drive, web, sessions, actors, tracks, and
+  all intended timers remained safe. Do not redeploy PR 50 unchanged.
+- PR 50's pre-stop topology cannot distinguish an unclaimed helper in
+  `capture_open`/`first_frame`/clock cleanup from a claimed handover, and the
+  generic timeout cannot distinguish a live reader from a process-wide pending
+  cleanup. The strongest current inference is an unclaimed helper: the first
+  observed registered helper already had the new fifth child, and a complete
+  open/trusted-frame/take/handover inside that same sub-0.2-second transition is
+  unlikely. The partial-buffer warnings prove writer cancellation, not native
+  OpenCV/mediator/preparation-thread quiescence. Do not increase the deadline
+  again without stage/cleanup/stack evidence.
+- Current source-only branch `codex/v2x-shutdown-diagnostics` adds bounded,
+  secret-free proof only; it does not change teardown ownership or deadlines.
+  Health and failure evidence include allowlisted preparation stage counts,
+  claimed/done/discarded/quiesced counts, fixed cleanup-kind counts and oldest
+  ages, exact total/sampled counts, and truthful `truncated`/`lock_busy` states.
+  A bounded failure preserves both `reader_timeout` and
+  `terminal_cleanup_timeout`, reports the live-reader count, and emits at most
+  16 sanitized Python stacks from at most 64 current/main/newest candidates,
+  12 frames each, and 6,144 bytes total. It never emits thread/object IDs,
+  addresses, names, locals, source text, full paths, URLs, or cleanup keys.
+  Diagnostic locks time out in 10 ms, claimed lock contention remains unknown
+  rather than false, promoted reader cleanup keeps its original age, and
+  capture/decoder stacks are prioritized. All 105 focused and 243 full
+  perception tests pass with warnings as errors; compilation/diff checks pass;
+  independent source review is clear. This branch is not merged or deployed.
+  Require canonical merge and one diagnostic five-child canary with exact
+  rollback; use its stage, cleanup, dual-cause, stack, and child-reap evidence
+  to select the next source fix. Fable still fails authentication before file
+  access; never claim a Fable pass.
 - PR 49's first complete five-child stop canary is rejected. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T145940Z-pr49-eager-proactive-cancel-canary/`
   and the verified rollback is
@@ -37,7 +79,7 @@ override every older PR 32/candidate statement below.
   and replacement captures. PR 49 budgeted only OpenCV open plus read plus one
   second and omitted explicit FFmpeg TERM/KILL, PTS-sidecar, mediator, watcher,
   HTTP-server, and fragment-executor shutdown reserves.
-- The current source-only follow-up releases the old and claimed replacement
+- PR 50 releases the old and claimed replacement
   captures concurrently only when shutdown intersects proactive handover.
   Normal handover remains topology-silent and retains the replacement decoder
   lease until the old capture is dead. Shutdown promotes the already-running
@@ -52,11 +94,8 @@ override every older PR 32/candidate statement below.
   visibility beyond the reader deadline, zero final topology, and two reaped
   child PIDs; it passed 20/20. All 237 perception tests pass with warnings as
   errors, compilation/diff checks are clean, and independent source review has
-  no remaining blocker. This follow-up is not merged or deployed. Require a
-  canonical commit/merge and repeat the unchanged five-child stop,
-  exact restart, forced-reader recovery, 700-frame soak, fingerprint, rollback,
-  and zero-session gates before promotion. Fable still fails authentication
-  before file access; never claim a Fable pass.
+  no remaining source blocker. PR 50 is merged but rejected by the newer live
+  evidence above and remains undeployed.
 - PR 48 merged the source-clear bounded cleanup described below. Its first
   upload-disabled window at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T143815Z-pr48-bounded-cleanup-canary/`

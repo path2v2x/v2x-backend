@@ -9,6 +9,7 @@ sequence number so consumers never mistake a cached frame for new input.
 from collections import deque
 import hashlib
 import inspect
+from itertools import islice
 import math
 import threading
 import time
@@ -27,6 +28,30 @@ _TERMINAL_RECOVERIES = 0
 _TERMINAL_CLEANUPS = {}
 _TERMINAL_CLEANUPS_LOCK = threading.Lock()
 _TERMINAL_CLEANUP_FAILURES = 0
+_PROACTIVE_PREPARATION_STAGE_NAMES = frozenset({
+    "capture_open",
+    "capture_position",
+    "clock_resolution",
+    "clock_source",
+    "clock_validation",
+    "decoder_slot",
+    "failed",
+    "first_frame",
+    "preparation_slot",
+    "ready",
+    "recent_exact_anchor",
+    "source",
+    "transport_clock_validation",
+})
+_TERMINAL_CLEANUP_KIND_NAMES = frozenset({
+    "candidate",
+    "capture",
+    "claimed",
+    "reader-owned",
+})
+_DIAGNOSTIC_LOCK_TIMEOUT_SECONDS = 0.01
+_DIAGNOSTIC_PREPARATION_LIMIT = 16
+_DIAGNOSTIC_CLEANUP_LIMIT = 32
 _TRANSPORT_DIAGNOSTICS = {
     "starting",
     "matched",
@@ -65,8 +90,13 @@ _TRANSPORT_DIAGNOSTICS = {
 class _AsyncTerminalCleanup:
     """Run potentially blocking decoder teardown outside the failover clock."""
 
-    def __init__(self, key, action):
+    def __init__(self, key, action, started_monotonic=None):
         self.key = key
+        self._started_monotonic = (
+            time.monotonic()
+            if started_monotonic is None
+            else float(started_monotonic)
+        )
         self._action = action
         self._done = threading.Event()
         self._succeeded = False
@@ -101,12 +131,26 @@ class _AsyncTerminalCleanup:
     def succeeded(self):
         return self._done.is_set() and self._succeeded
 
+    def diagnostic_kind(self):
+        kind = self.key[0] if isinstance(self.key, tuple) and self.key else None
+        return kind if kind in _TERMINAL_CLEANUP_KIND_NAMES else "other"
 
-def _start_terminal_cleanup(key, action):
+    def age_seconds(self, now_monotonic=None):
+        now = (
+            time.monotonic()
+            if now_monotonic is None
+            else float(now_monotonic)
+        )
+        return max(0.0, now - self._started_monotonic)
+
+
+def _start_terminal_cleanup(key, action, started_monotonic=None):
     with _TERMINAL_CLEANUPS_LOCK:
         cleanup = _TERMINAL_CLEANUPS.get(key)
         if cleanup is None:
-            cleanup = _AsyncTerminalCleanup(key, action)
+            cleanup = _AsyncTerminalCleanup(
+                key, action, started_monotonic=started_monotonic
+            )
             _TERMINAL_CLEANUPS[key] = cleanup
             cleanup.start()
         return cleanup
@@ -128,7 +172,9 @@ def _promote_reader_owned_cleanup(cleanup):
         # would count one failed release twice.
 
     return _start_terminal_cleanup(
-        ("reader-owned", id(cleanup)), wait_for_owned_cleanup
+        ("reader-owned", id(cleanup)),
+        wait_for_owned_cleanup,
+        started_monotonic=cleanup._started_monotonic,
     )
 
 
@@ -195,14 +241,105 @@ def _unregister_proactive_preparation(preparation):
 
 def capture_preparation_topology():
     """Return secret-free process-wide preparation counts for health evidence."""
-    with _PROACTIVE_PREPARATIONS_LOCK:
-        topology = {
-            "proactive_preparations": len(_PROACTIVE_PREPARATIONS),
-            "terminal_recoveries": _TERMINAL_RECOVERIES,
+    if _PROACTIVE_PREPARATIONS_LOCK.acquire(
+        timeout=_DIAGNOSTIC_LOCK_TIMEOUT_SECONDS
+    ):
+        try:
+            proactive_count = len(_PROACTIVE_PREPARATIONS)
+            preparations = tuple(islice(
+                _PROACTIVE_PREPARATIONS, _DIAGNOSTIC_PREPARATION_LIMIT
+            ))
+            terminal_recoveries = _TERMINAL_RECOVERIES
+            proactive_snapshot = (
+                "ok" if proactive_count == len(preparations) else "truncated"
+            )
+        finally:
+            _PROACTIVE_PREPARATIONS_LOCK.release()
+        preparation_states = tuple(
+            preparation.diagnostic_state() for preparation in preparations
+        )
+        stage_counts = {}
+        for state in preparation_states:
+            stage = state["stage"]
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    else:
+        proactive_count = -1
+        terminal_recoveries = -1
+        proactive_snapshot = "lock_busy"
+        preparation_states = ()
+        stage_counts = {"lock_busy": 1}
+    topology = {
+        "proactive_preparations": proactive_count,
+        "terminal_recoveries": terminal_recoveries,
+        "proactive_preparation_snapshot": proactive_snapshot,
+        "proactive_preparation_states": {
+            "sampled_count": len(preparation_states),
+            "stage_counts": dict(sorted(stage_counts.items())),
+            "claimed_count": sum(
+                int(state["claimed"] is True)
+                for state in preparation_states
+            ),
+            "claimed_lock_busy_count": sum(
+                int(state["claimed"] is None)
+                for state in preparation_states
+            ),
+            "done_count": sum(
+                int(state["done"]) for state in preparation_states
+            ),
+            "discarded_count": sum(
+                int(state["discarded"]) for state in preparation_states
+            ),
+            "quiesced_count": sum(
+                int(state["quiesced"]) for state in preparation_states
+            ),
+        },
+    }
+    if _TERMINAL_CLEANUPS_LOCK.acquire(
+        timeout=_DIAGNOSTIC_LOCK_TIMEOUT_SECONDS
+    ):
+        try:
+            terminal_cleanup_count = len(_TERMINAL_CLEANUPS)
+            cleanups = tuple(islice(
+                _TERMINAL_CLEANUPS.values(), _DIAGNOSTIC_CLEANUP_LIMIT
+            ))
+            cleanup_failures = _TERMINAL_CLEANUP_FAILURES
+            cleanup_snapshot = (
+                "ok"
+                if terminal_cleanup_count == len(cleanups)
+                else "truncated"
+            )
+        finally:
+            _TERMINAL_CLEANUPS_LOCK.release()
+        now = time.monotonic()
+        cleanup_states = {}
+        for cleanup in cleanups:
+            kind = cleanup.diagnostic_kind()
+            state = cleanup_states.setdefault(
+                kind, {"count": 0, "oldest_age_seconds": 0.0}
+            )
+            state["count"] += 1
+            state["oldest_age_seconds"] = max(
+                state["oldest_age_seconds"], cleanup.age_seconds(now)
+            )
+        for state in cleanup_states.values():
+            state["oldest_age_seconds"] = round(
+                state["oldest_age_seconds"], 3
+            )
+    else:
+        terminal_cleanup_count = -1
+        cleanups = ()
+        cleanup_failures = _TERMINAL_CLEANUP_FAILURES
+        cleanup_snapshot = "lock_busy"
+        cleanup_states = {
+            "lock_busy": {"count": 1, "oldest_age_seconds": 0.0}
         }
-    with _TERMINAL_CLEANUPS_LOCK:
-        topology["terminal_cleanups"] = len(_TERMINAL_CLEANUPS)
-        topology["terminal_cleanup_failures"] = _TERMINAL_CLEANUP_FAILURES
+    topology["terminal_cleanups"] = terminal_cleanup_count
+    topology["terminal_cleanup_snapshot"] = cleanup_snapshot
+    topology["terminal_cleanup_sampled_count"] = len(cleanups)
+    topology["terminal_cleanup_states"] = dict(
+        sorted(cleanup_states.items())
+    )
+    topology["terminal_cleanup_failures"] = cleanup_failures
     return topology
 
 
@@ -474,6 +611,32 @@ class _AsyncCapturePreparation:
     def stage(self):
         with self._stage_lock:
             return self._stage
+
+    def diagnostic_state(self):
+        """Return bounded, secret-free state used only for aggregate counts."""
+        if self._stage_lock.acquire(timeout=_DIAGNOSTIC_LOCK_TIMEOUT_SECONDS):
+            try:
+                stage = self._stage
+            finally:
+                self._stage_lock.release()
+        else:
+            stage = "lock_busy"
+        if stage not in _PROACTIVE_PREPARATION_STAGE_NAMES:
+            stage = "lock_busy" if stage == "lock_busy" else "other"
+        if self._result_lock.acquire(timeout=_DIAGNOSTIC_LOCK_TIMEOUT_SECONDS):
+            try:
+                claimed = self._claimed
+            finally:
+                self._result_lock.release()
+        else:
+            claimed = None
+        return {
+            "stage": stage,
+            "claimed": None if claimed is None else bool(claimed),
+            "done": self._done.is_set(),
+            "discarded": self._discarded.is_set(),
+            "quiesced": self._quiesced.is_set(),
+        }
 
     def evidence(self):
         return self._success_evidence
