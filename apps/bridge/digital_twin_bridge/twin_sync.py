@@ -13,6 +13,7 @@ Disable entirely with DTB_TWIN_SYNC=off.
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import time
@@ -29,6 +30,23 @@ VEHICLE_TYPES = {"car", "truck", "bus"}
 # Never mirror detections into blueprints with gameplay side effects
 # (the firetruck triggers EVA pull-over alerts on drive sessions).
 BLUEPRINT_BLOCKLIST = ("firetruck", "ambulance", "police")
+
+# Spawn coordinates are only a bounded allocation bootstrap.  Successful
+# actors are moved to the exact detection-derived transform before they are
+# tracked, so none of these offsets may leak into placement evidence.  Keep
+# this sequence fixed across polls and releases: retry drift would make a
+# blocked track's eventual spawn depend on how long it had been observed.
+SPAWN_BOOTSTRAP_MAX_OFFSET_M = 2.0
+SPAWN_BOOTSTRAP_OFFSETS = (
+    (0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.75),
+    (0.0, 0.0, 1.5),
+    (0.0, 0.0, 2.0),
+    (1.25, 0.0, 0.75),
+    (-1.25, 0.0, 0.75),
+    (0.0, 1.25, 0.75),
+    (0.0, -1.25, 0.75),
+)
 
 
 def _parse_utc_epoch(value) -> Optional[float]:
@@ -181,8 +199,10 @@ class TwinSync:
             pool = self._vehicle_blueprints
         if not pool:
             return None
-        # Stable per-track pick so a track keeps its car across updates.
-        bp = pool[hash(track.object_id) % len(pool)]
+        # Python's hash() is randomized per process.  A stable digest keeps a
+        # physical track on the same UE5 blueprint across retries/restarts.
+        digest = hashlib.sha256(track.object_id.encode("utf-8")).digest()
+        bp = pool[int.from_bytes(digest[:8], "big") % len(pool)]
         try:
             bp.set_attribute("role_name", "twin_object")
         except (IndexError, RuntimeError):
@@ -305,19 +325,59 @@ class TwinSync:
                 bp = self._blueprint_for(track)
                 if bp is None:
                     continue
-                transform = carla.Transform(location, carla.Rotation(yaw=track.yaw))
-                actor = self._world.try_spawn_actor(bp, transform)
+                intended_transform = carla.Transform(
+                    location,
+                    carla.Rotation(yaw=track.yaw),
+                )
+                actor = None
+                for dx, dy, dz in SPAWN_BOOTSTRAP_OFFSETS:
+                    candidate_transform = carla.Transform(
+                        carla.Location(
+                            x=location.x + dx,
+                            y=location.y + dy,
+                            z=location.z + dz,
+                        ),
+                        carla.Rotation(yaw=track.yaw),
+                    )
+                    actor = self._world.try_spawn_actor(bp, candidate_transform)
+                    if actor is None:
+                        continue
+                    try:
+                        actor.set_simulate_physics(False)
+                        actor.set_transform(intended_transform)
+                    except Exception:
+                        logger.warning(
+                            "Twin spawn setup failed for %s (%s); "
+                            "destroying provisional actor",
+                            object_id,
+                            bp.id,
+                            exc_info=True,
+                        )
+                        try:
+                            actor.destroy()
+                        except Exception:
+                            logger.error(
+                                "Twin provisional actor cleanup failed for %s",
+                                object_id,
+                                exc_info=True,
+                            )
+                        actor = None
+                        continue
+                    break
                 if actor is None:
-                    # Spawn collision; lift a little more and retry next poll.
                     logger.info(
-                        "Twin spawn blocked for %s (%s) at (%.1f, %.1f, %.1f); retrying",
-                        object_id, bp.id, location.x, location.y, location.z,
+                        "Twin spawn blocked for %s (%s) at "
+                        "(%.1f, %.1f, %.1f) after %d bounded candidates "
+                        "within %.1fm; retrying next poll",
+                        object_id,
+                        bp.id,
+                        location.x,
+                        location.y,
+                        location.z,
+                        len(SPAWN_BOOTSTRAP_OFFSETS),
+                        SPAWN_BOOTSTRAP_MAX_OFFSET_M,
                     )
                     continue
-                try:
-                    actor.set_simulate_physics(False)
-                except Exception:
-                    pass
                 track.actor_id = actor.id
                 track.current = location
                 track.target = location

@@ -1,5 +1,6 @@
 """Tests for TwinSync: detections -> CARLA actor lifecycle."""
 
+import hashlib
 import threading
 import time
 
@@ -8,7 +9,7 @@ import pytest
 from digital_twin_bridge import twin_sync as twin_sync_module
 from digital_twin_bridge.twin_sync import TwinSync
 
-from tests.conftest import MockBlueprint, MockLocation
+from tests.conftest import MockBlueprint, MockLocation, MockTransform
 
 
 def make_detection(object_id="global_car_1", object_type="car", lat=37.9155, lon=-122.3348):
@@ -152,6 +153,164 @@ class TestSpawn:
             sync._apply([make_detection(object_id=f"global_car_{i}")])
         for actor_id in sync.actor_ids():
             assert "firetruck" not in mock_world.get_actor(actor_id).type_id
+
+    def test_first_spawn_candidate_and_final_transform_are_exact(
+        self, sync, mock_world, monkeypatch
+    ):
+        attempts = []
+        original_spawn = mock_world.try_spawn_actor
+
+        def recording_spawn(blueprint, transform, *args, **kwargs):
+            attempts.append(transform)
+            return original_spawn(blueprint, transform, *args, **kwargs)
+
+        monkeypatch.setattr(mock_world, "try_spawn_actor", recording_spawn)
+
+        sync._apply([make_detection()])
+
+        assert len(attempts) == 1
+        track = sync._tracks["global_car_1"]
+        actor = mock_world.get_actor(track.actor_id)
+        assert attempts[0] == MockTransform(track.current, attempts[0].rotation)
+        assert actor.physics_enabled is False
+        assert actor.get_transform() == MockTransform(track.current, attempts[0].rotation)
+
+    def test_blocked_exact_candidate_uses_nearby_bootstrap_then_exact_transform(
+        self, sync, mock_world, monkeypatch
+    ):
+        attempts = []
+        original_spawn = mock_world.try_spawn_actor
+
+        def block_exact_once(blueprint, transform, *args, **kwargs):
+            attempts.append(transform)
+            if len(attempts) == 1:
+                return None
+            return original_spawn(blueprint, transform, *args, **kwargs)
+
+        monkeypatch.setattr(mock_world, "try_spawn_actor", block_exact_once)
+
+        sync._apply([make_detection()])
+
+        assert len(attempts) == 2
+        track = sync._tracks["global_car_1"]
+        actor = mock_world.get_actor(track.actor_id)
+        intended = MockTransform(track.current, attempts[0].rotation)
+        assert attempts[0] == intended
+        assert attempts[1].location != intended.location
+        assert attempts[1].location.distance(intended.location) <= (
+            twin_sync_module.SPAWN_BOOTSTRAP_MAX_OFFSET_M
+        )
+        assert actor.physics_enabled is False
+        assert actor.get_transform() == intended
+        assert track.current == intended.location
+        assert track.target == intended.location
+
+    def test_all_bootstrap_candidates_blocked_is_bounded_and_has_no_actor(
+        self, sync, mock_world, monkeypatch
+    ):
+        attempts = []
+
+        def always_block(_blueprint, transform, *_args, **_kwargs):
+            attempts.append(transform)
+            return None
+
+        monkeypatch.setattr(mock_world, "try_spawn_actor", always_block)
+
+        sync._apply([make_detection()])
+
+        assert len(attempts) == len(twin_sync_module.SPAWN_BOOTSTRAP_OFFSETS)
+        assert all(
+            attempt.location.distance(attempts[0].location)
+            <= twin_sync_module.SPAWN_BOOTSTRAP_MAX_OFFSET_M
+            for attempt in attempts
+        )
+        assert sync.actor_ids() == set()
+        assert mock_world.spawned_actors == []
+        assert sync._tracks["global_car_1"].actor_id is None
+
+    def test_setup_failure_destroys_provisional_actors_and_tracks_none(
+        self, sync, mock_world, monkeypatch
+    ):
+        provisional_actors = []
+        original_spawn = mock_world.try_spawn_actor
+
+        def spawn_with_failed_exact_transform(blueprint, transform, *args, **kwargs):
+            actor = original_spawn(blueprint, transform, *args, **kwargs)
+            provisional_actors.append(actor)
+
+            def fail_exact_transform(_transform):
+                raise RuntimeError("set_transform failed")
+
+            actor.set_transform = fail_exact_transform
+            return actor
+
+        monkeypatch.setattr(
+            mock_world,
+            "try_spawn_actor",
+            spawn_with_failed_exact_transform,
+        )
+
+        sync._apply([make_detection()])
+
+        assert len(provisional_actors) == len(
+            twin_sync_module.SPAWN_BOOTSTRAP_OFFSETS
+        )
+        assert all(actor.physics_enabled is False for actor in provisional_actors)
+        assert all(actor.is_destroyed for actor in provisional_actors)
+        assert sync.actor_ids() == set()
+        assert sync._tracks["global_car_1"].actor_id is None
+
+    def test_retry_reuses_candidate_order_and_never_duplicates_actor(
+        self, sync, mock_world, monkeypatch
+    ):
+        attempts = []
+        first_poll_attempts = len(twin_sync_module.SPAWN_BOOTSTRAP_OFFSETS)
+        original_spawn = mock_world.try_spawn_actor
+
+        def block_first_poll(blueprint, transform, *args, **kwargs):
+            attempts.append((blueprint.id, transform))
+            if len(attempts) <= first_poll_attempts:
+                return None
+            if len(attempts) == first_poll_attempts + 1:
+                return None
+            return original_spawn(blueprint, transform, *args, **kwargs)
+
+        monkeypatch.setattr(mock_world, "try_spawn_actor", block_first_poll)
+
+        sync._apply([make_detection()])
+        assert sync.actor_ids() == set()
+        sync._apply([make_detection()])
+        actor_ids = sync.actor_ids()
+        assert len(actor_ids) == 1
+        attempts_after_spawn = len(attempts)
+        sync._apply([make_detection(lat=37.9156)])
+
+        assert sync.actor_ids() == actor_ids
+        assert len(mock_world.spawned_actors) == 1
+        assert len(attempts) == attempts_after_spawn
+        first_order = [
+            attempt.location for _blueprint, attempt in attempts[:first_poll_attempts]
+        ]
+        retry_order = [
+            attempt.location
+            for _blueprint, attempt in attempts[
+                first_poll_attempts:first_poll_attempts + 2
+            ]
+        ]
+        assert retry_order == first_order[:2]
+        assert len({blueprint for blueprint, _attempt in attempts}) == 1
+
+    def test_blueprint_selection_uses_stable_object_digest(self, sync):
+        sync._load_blueprints()
+        track = twin_sync_module.TwinTrack("global_car_digest", "car")
+        digest = hashlib.sha256(track.object_id.encode("utf-8")).digest()
+        expected_index = int.from_bytes(digest[:8], "big") % len(
+            sync._vehicle_blueprints
+        )
+
+        assert sync._blueprint_for(track).id == (
+            sync._vehicle_blueprints[expected_index].id
+        )
 
 
 class TestLifecycle:
