@@ -9,6 +9,25 @@ and read-only tools, but Claude CLI exited 1 because its OAuth session was expir
 and could not be refreshed. No model review was available to incorporate; this is
 an external review blocker, not evidence that the plan was approved.
 
+Independent implementation review status: changes required after commit
+`e986ab6`. The remediation must add authority verification, semantic evidence
+linkage, measured optical/static gates, trajectory dynamics and appearance gates,
+eigenvalue-correct covariance bounds, transaction-safe actor updates/cleanup,
+strict-live freshness, and exact blueprint/geometry binding. The prior commit is
+not an acceptance candidate.
+
+Fable remediation review status: retried after the independent findings, but the
+same Claude CLI OAuth refresh failure returned exit 1. No Fable remediation
+review was available; the independent findings below are therefore the governing
+review record.
+
+Remediation verification (2026-07-13): the isolated source worktree passes 498
+bridge tests and 499 perception tests, including the new authority-forgery,
+semantic-linkage, correlated-covariance, dynamics, freshness/replay, blueprint
+geometry, transform rollback, and cleanup-ownership adversarial cases. Both JSON
+schemas pass Draft 2020-12 metaschema validation. This is source evidence only;
+it is not a live calibration, holdout, UE5, or deployment acceptance result.
+
 ## Safety and migration boundary
 
 - Keep `DTB_TWIN_REVIEWED_PLACEMENT=off` as the default. Off mode preserves the
@@ -51,6 +70,14 @@ an external review blocker, not evidence that the plan was approved.
    inspect the source-only diff, and commit the clean isolated branch. Any missing
    surveyed static truth or accepted trajectory artifact remains an explicit
    deployment blocker, never a test threshold adjustment.
+7. Remediate independent-review findings without relaxing gates: verify an
+   allowlisted keyed reviewer authority; semantically bind every accepted event,
+   contact, mask, factor-graph placement, identity pair, appearance result,
+   measured intrinsics, and passing static holdout result; enforce strict
+   trajectory time/dynamics/covariance/transit constraints; make UE5 actor updates
+   and cleanup transactional; gate strict live freshness separately from replay;
+   and bind the selected blueprint catalog/pool/item plus measured actor dimensions
+   to reviewed geometry and independent placement-error evidence.
 
 ## Exit criteria
 

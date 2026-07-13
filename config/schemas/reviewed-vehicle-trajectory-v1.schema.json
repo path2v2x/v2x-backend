@@ -4,12 +4,14 @@
   "title": "Reviewed vehicle trajectory attachment input",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "acceptance_eligible", "global_track_id", "trajectory_id", "reviewer", "source", "samples"],
+  "required": ["schema", "authority_key_id", "acceptance_eligible", "global_track_id", "trajectory_id", "reviewer", "blueprint_dimension_tolerance_m", "source", "samples"],
   "properties": {
     "schema": {"const": "v2x-reviewed-vehicle-trajectory/v1"},
+    "authority_key_id": {"type": "string", "minLength": 1},
     "acceptance_eligible": {"const": true},
     "global_track_id": {"type": "string", "minLength": 1},
     "trajectory_id": {"type": "string", "minLength": 1},
+    "blueprint_dimension_tolerance_m": {"type": "number", "minimum": 0, "maximum": 0.25},
     "reviewer": {
       "type": "object", "additionalProperties": false,
       "required": ["kind", "id"],
@@ -17,12 +19,15 @@
     },
     "source": {
       "type": "object", "additionalProperties": false,
-      "required": ["detections_ndjson_sha256", "consensus", "factor_graph", "identity", "cameras_json", "opendrive"],
+      "required": ["detections_ndjson_sha256", "consensus", "factor_graph", "identity", "independent_reference", "blueprint_catalog", "static_calibration", "cameras_json", "opendrive"],
       "properties": {
         "detections_ndjson_sha256": {"$ref": "#/$defs/sha256"},
-        "consensus": {"$ref": "#/$defs/jsonArtifact"},
-        "factor_graph": {"$ref": "#/$defs/jsonArtifact"},
-        "identity": {"$ref": "#/$defs/jsonArtifact"},
+        "consensus": {"$ref": "#/$defs/consensusArtifact"},
+        "factor_graph": {"$ref": "#/$defs/factorArtifact"},
+        "identity": {"$ref": "#/$defs/identityArtifact"},
+        "independent_reference": {"$ref": "#/$defs/referenceArtifact"},
+        "blueprint_catalog": {"$ref": "#/$defs/blueprintArtifact"},
+        "static_calibration": {"$ref": "#/$defs/staticArtifact"},
         "cameras_json": {"$ref": "#/$defs/fileArtifact"},
         "opendrive": {
           "type": "object", "additionalProperties": false,
@@ -70,6 +75,24 @@
         "sha256": {"$ref": "#/$defs/sha256"},
         "schema": {"type": "string", "minLength": 1}
       }
+    },
+    "consensusArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-reviewed-footprint-consensus/v1"}}}]
+    },
+    "factorArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-reviewed-detection-factor-graph/v1"}}}]
+    },
+    "identityArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-reviewed-trajectory-identity/v1"}}}]
+    },
+    "referenceArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-independent-vehicle-reference/v1"}}}]
+    },
+    "blueprintArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-reviewed-ue5-blueprint-catalog/v1"}}}]
+    },
+    "staticArtifact": {
+      "allOf": [{"$ref": "#/$defs/jsonArtifact"}, {"properties": {"schema": {"const": "v2x-static-camera-survey-manifest/v1"}}}]
     },
     "point2": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false},
     "contact": {

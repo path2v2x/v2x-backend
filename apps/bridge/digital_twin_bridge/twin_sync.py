@@ -25,9 +25,13 @@ import requests
 from digital_twin_bridge.detection_pages import fetch_all_detection_pages
 from digital_twin_bridge.geo_utils import gps_to_carla
 from digital_twin_bridge.reviewed_localization import (
+    MAX_VEHICLE_ACCELERATION_MPS2,
+    MAX_VEHICLE_SPEED_MPS,
     ReviewedLocalizationError,
     ReviewedPlacementContext,
     build_runtime_context,
+    canonical_json_bytes,
+    sha256_bytes,
     validate_contract,
 )
 
@@ -96,6 +100,8 @@ class TwinTrack:
         "reviewed_localization", "trajectory_id", "sample_index",
         "reviewed_media_epoch", "blueprint_family", "placement_key_sha256",
         "vehicle_dimensions_m",
+        "reviewed_speed_mps", "cleanup_failure", "actual_dimensions_m",
+        "blueprint_catalog_sha256", "blueprint_pool_sha256",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -129,6 +135,11 @@ class TwinTrack:
         self.blueprint_family = None
         self.placement_key_sha256 = None
         self.vehicle_dimensions_m = None
+        self.reviewed_speed_mps = None
+        self.cleanup_failure = None
+        self.actual_dimensions_m = None
+        self.blueprint_catalog_sha256 = None
+        self.blueprint_pool_sha256 = None
 
 
 class TwinSync:
@@ -152,6 +163,8 @@ class TwinSync:
         reviewed_placement: str = "off",
         reviewed_context: Optional[ReviewedPlacementContext] = None,
         cameras_json_path: str = "",
+        static_calibration_path: str = "",
+        authority_key_file: str = "",
     ) -> None:
         self._world = world
         self._map = carla_map
@@ -171,7 +184,10 @@ class TwinSync:
         self._reviewed_placement = placement_mode
         if placement_mode == "strict":
             self._reviewed_context = reviewed_context or build_runtime_context(
-                carla_map, cameras_json_path
+                carla_map,
+                cameras_json_path,
+                static_calibration_path,
+                authority_key_file,
             )
         else:
             self._reviewed_context = None
@@ -182,6 +198,8 @@ class TwinSync:
         self._truck_blueprints: List[object] = []
         self._walker_blueprints: List[object] = []
         self._blueprints_loaded = False
+        self._blueprint_catalog_sha256 = None
+        self._blueprint_pool_sha256 = {}
         self._stopped = False
         self._poll_failures = 0
         self._mode = "live"
@@ -222,16 +240,35 @@ class TwinSync:
             self._truck_blueprints = list(self._vehicle_blueprints)
 
         self._walker_blueprints = sorted(bp_lib.filter("walker.pedestrian.*"), key=lambda b: b.id)
+        family_ids = {
+            "passenger_car": [bp.id for bp in self._vehicle_blueprints],
+            "truck": [bp.id for bp in self._truck_blueprints],
+            "bus": [bp.id for bp in self._truck_blueprints],
+        }
+        self._blueprint_catalog_sha256 = sha256_bytes(
+            canonical_json_bytes(family_ids)
+        )
+        self._blueprint_pool_sha256 = {
+            family: sha256_bytes(canonical_json_bytes(ids))
+            for family, ids in family_ids.items()
+        }
         self._blueprints_loaded = True
         logger.info(
             "Twin sync blueprints: %d vehicles, %d trucks, %d walkers",
             len(self._vehicle_blueprints), len(self._truck_blueprints), len(self._walker_blueprints),
         )
 
-    def _blueprint_for(self, track: TwinTrack):
+    def _blueprint_for(self, track: TwinTrack, reviewed: Optional[dict] = None):
+        strict_reviewed = reviewed if self._reviewed_placement == "strict" else None
+        reviewed_family = (
+            strict_reviewed["blueprint_family"] if strict_reviewed is not None else None
+        )
         if track.object_type == "person":
             pool = self._walker_blueprints
-        elif track.blueprint_family in {"truck", "bus"} or track.object_type in {"truck", "bus"}:
+        elif reviewed_family in {"truck", "bus"} or (
+            reviewed_family is None
+            and (track.blueprint_family in {"truck", "bus"} or track.object_type in {"truck", "bus"})
+        ):
             pool = self._truck_blueprints
         else:
             pool = self._vehicle_blueprints
@@ -241,11 +278,25 @@ class TwinSync:
         # Python's hash() is randomized per process.  A stable digest keeps a
         # replayed physical track on the same UE5 blueprint across bounded
         # retries and service restarts, making visual evidence reproducible.
-        if track.placement_key_sha256 is not None:
+        if strict_reviewed is not None:
+            digest = bytes.fromhex(strict_reviewed["placement_key_sha256"])
+        elif track.placement_key_sha256 is not None:
             digest = bytes.fromhex(track.placement_key_sha256)
         else:
             digest = hashlib.sha256(track.object_id.encode("utf-8")).digest()
         bp = pool[int.from_bytes(digest[:8], "big") % len(pool)]
+        if self._reviewed_placement == "strict":
+            reviewed = reviewed or track.reviewed_localization
+            if reviewed is None:
+                return None
+            binding = reviewed["blueprint"]
+            family = reviewed["blueprint_family"]
+            if (
+                binding["catalog_sha256"] != self._blueprint_catalog_sha256
+                or binding["pool_sha256"] != self._blueprint_pool_sha256.get(family)
+                or binding["selected_blueprint_id"] != bp.id
+            ):
+                raise ReviewedLocalizationError("active_blueprint_binding_mismatch")
         try:
             bp.set_attribute("role_name", "twin_object")
         except (IndexError, RuntimeError):
@@ -333,13 +384,16 @@ class TwinSync:
         )
 
     def _commit_reviewed_track(
-        self, track: TwinTrack, reviewed: dict, location
+        self, track: TwinTrack, reviewed: dict, location, actual_dimensions: dict
     ) -> None:
-        position = reviewed["position_m"]
-        track.raw_carla_location = dict(position)
+        # Never reuse the reviewed target as its own "raw" or independent
+        # reference. Those circular diagnostics previously produced a fake zero.
+        track.raw_carla_location = None
         track.lane_snap_distance_m = None
-        track.raw_to_target_planar_m = 0.0
-        track.placement_planar_error_m = 0.0
+        track.raw_to_target_planar_m = None
+        track.placement_planar_error_m = reviewed[
+            "independent_reference_error_m"
+        ]
         track.yaw = reviewed["heading_deg"]
         track.reviewed_localization = reviewed
         track.trajectory_id = reviewed["trajectory_id"]
@@ -348,6 +402,16 @@ class TwinSync:
         track.blueprint_family = reviewed["blueprint_family"]
         track.placement_key_sha256 = reviewed["placement_key_sha256"]
         track.vehicle_dimensions_m = reviewed["dimensions_m"]
+        track.actual_dimensions_m = dict(actual_dimensions)
+        track.blueprint_catalog_sha256 = self._blueprint_catalog_sha256
+        track.blueprint_pool_sha256 = self._blueprint_pool_sha256[
+            reviewed["blueprint_family"]
+        ]
+        track.reviewed_speed_mps = (
+            reviewed["transition"]["speed_mps"]
+            if reviewed["transition"] is not None
+            else 0.0
+        )
         track.current = location
         track.target = location
 
@@ -366,14 +430,113 @@ class TwinSync:
             return "trajectory_object_type_changed"
         if track.trajectory_id is not None and track.trajectory_id != reviewed["trajectory_id"]:
             return "trajectory_identity_changed"
-        if track.sample_index is not None and reviewed["sample_index"] <= track.sample_index:
-            return "trajectory_sample_not_monotonic"
+        if (
+            track.sample_index is not None
+            and reviewed["sample_index"] != track.sample_index + 1
+        ):
+            return "trajectory_sample_not_contiguous"
         if (
             track.reviewed_media_epoch is not None
-            and reviewed["media_epoch"] < track.reviewed_media_epoch
+            and reviewed["media_epoch"] <= track.reviewed_media_epoch
         ):
-            return "trajectory_timestamp_regressed"
+            return "trajectory_timestamp_not_strictly_increasing"
+        if track.reviewed_localization is not None:
+            transition = reviewed.get("transition")
+            if transition is None or transition["previous_event_id"] != track.event_id:
+                return "trajectory_pair_evidence_mismatch"
+            delta_seconds = reviewed["media_epoch"] - track.reviewed_media_epoch
+            previous = track.reviewed_localization["position_m"]
+            current = reviewed["position_m"]
+            distance_m = math.sqrt(sum(
+                (current[axis] - previous[axis]) ** 2
+                for axis in ("x", "y", "z")
+            ))
+            speed_mps = distance_m / delta_seconds
+            previous_speed = track.reviewed_speed_mps or 0.0
+            acceleration_mps2 = (speed_mps - previous_speed) / delta_seconds
+            if (
+                abs(transition["transit_seconds"] - delta_seconds) > 1e-6
+                or abs(transition["distance_m"] - distance_m) > 1e-6
+                or abs(transition["speed_mps"] - speed_mps) > 1e-6
+                or abs(transition["acceleration_mps2"] - acceleration_mps2) > 1e-6
+            ):
+                return "trajectory_transition_metrics_mismatch"
+            if (
+                speed_mps > MAX_VEHICLE_SPEED_MPS
+                or abs(acceleration_mps2) > MAX_VEHICLE_ACCELERATION_MPS2
+            ):
+                return "trajectory_dynamics_exceeded"
         return None
+
+    @staticmethod
+    def _actor_dimensions_m(actor) -> Optional[dict]:
+        try:
+            extent = actor.bounding_box.extent
+            dimensions = {
+                "length": 2.0 * float(extent.x),
+                "width": 2.0 * float(extent.y),
+                "height": 2.0 * float(extent.z),
+            }
+        except Exception:
+            return None
+        if not all(math.isfinite(value) and value > 0.0 for value in dimensions.values()):
+            return None
+        return dimensions
+
+    @staticmethod
+    def _transform_matches(transform, intended, tolerance: float = 1e-6) -> bool:
+        return (
+            abs(float(transform.location.x) - float(intended.location.x)) <= tolerance
+            and abs(float(transform.location.y) - float(intended.location.y)) <= tolerance
+            and abs(float(transform.location.z) - float(intended.location.z)) <= tolerance
+            and abs(float(transform.rotation.yaw) - float(intended.rotation.yaw)) <= tolerance
+        )
+
+    def _set_transform_transactionally(self, actor, intended) -> Optional[str]:
+        try:
+            previous = actor.get_transform()
+        except Exception:
+            return "strict_previous_transform_unavailable"
+        try:
+            actor.set_transform(intended)
+            if not self._transform_matches(actor.get_transform(), intended):
+                raise RuntimeError("exact transform verification failed")
+            return None
+        except Exception:
+            try:
+                actor.set_transform(previous)
+                if not self._transform_matches(actor.get_transform(), previous):
+                    raise RuntimeError("rollback verification failed")
+            except Exception:
+                return "strict_transform_rollback_failed"
+            return "strict_exact_transform_failed"
+
+    def _destroy_owned_actor(
+        self, track: TwinTrack, actor, failure_reason: str
+    ) -> bool:
+        track.actor_id = int(actor.id)
+        try:
+            destroyed = actor.destroy()
+        except Exception:
+            track.cleanup_failure = f"{failure_reason}:destroy_exception"
+            logger.error(
+                "Twin actor cleanup raised for %s actor=%s",
+                track.object_id,
+                actor.id,
+                exc_info=True,
+            )
+            return False
+        if destroyed is not True:
+            track.cleanup_failure = f"{failure_reason}:destroy_false"
+            logger.error(
+                "Twin actor cleanup returned false for %s actor=%s",
+                track.object_id,
+                actor.id,
+            )
+            return False
+        track.actor_id = None
+        track.cleanup_failure = None
+        return True
 
     def _commit_detection_metadata(
         self,
@@ -473,6 +636,14 @@ class TwinSync:
                 except ReviewedLocalizationError as exc:
                     self._reject_strict(det, exc.reason)
                     continue
+                if not use_detection_ts:
+                    detection_age = now - reviewed["media_epoch"]
+                    if detection_age > self._detection_max_age:
+                        self._reject_strict(det, "strict_live_detection_stale")
+                        continue
+                    if detection_age < -self._detection_future_tolerance:
+                        self._reject_strict(det, "strict_live_detection_future")
+                        continue
                 object_id = reviewed["global_track_id"]
                 if object_type not in VEHICLE_TYPES:
                     self._reject_strict(det, "strict_mode_vehicle_only")
@@ -486,6 +657,17 @@ class TwinSync:
                 continue
 
             track = self._tracks.get(object_id)
+            if (
+                reviewed is not None
+                and track is not None
+                and track.actor_id is not None
+                and track.cleanup_failure is not None
+            ):
+                self._reject_strict(det, "strict_cleanup_pending")
+                continue
+            if reviewed is not None and track is None and reviewed["sample_index"] != 0:
+                self._reject_strict(det, "trajectory_must_start_at_zero")
+                continue
             if reviewed is not None and track is not None:
                 sequence_error = self._strict_sequence_is_valid(
                     track, reviewed, object_type
@@ -496,17 +678,22 @@ class TwinSync:
             if track is None:
                 track = TwinTrack(object_id, object_type)
                 self._tracks[object_id] = track
+            reviewed_bp = None
+            if reviewed is not None:
+                try:
+                    reviewed_bp = self._blueprint_for(track, reviewed)
+                except ReviewedLocalizationError as exc:
+                    self._reject_strict(det, exc.reason)
+                    continue
+                if reviewed_bp is None:
+                    self._reject_strict(det, "active_blueprint_pool_empty")
+                    continue
             gps = det.get("gps_location") or {}
             lat, lon = gps.get("latitude"), gps.get("longitude")
             if reviewed is None:
                 self._commit_detection_metadata(track, det, now, use_detection_ts)
 
             if reviewed is not None:
-                # The family/key are needed for deterministic blueprint choice
-                # before a first spawn.  The reviewed sample itself is committed
-                # only after the exact transform succeeds.
-                track.blueprint_family = reviewed["blueprint_family"]
-                track.placement_key_sha256 = reviewed["placement_key_sha256"]
                 location = self._reviewed_location_for(reviewed)
             else:
                 location = self._location_for(track, float(lat), float(lon))
@@ -514,7 +701,7 @@ class TwinSync:
                 continue
 
             if track.actor_id is None:
-                bp = self._blueprint_for(track)
+                bp = reviewed_bp if reviewed is not None else self._blueprint_for(track)
                 if bp is None:
                     continue
                 intended_transform = carla.Transform(
@@ -541,6 +728,10 @@ class TwinSync:
                     try:
                         actor.set_simulate_physics(False)
                         actor.set_transform(intended_transform)
+                        if not self._transform_matches(
+                            actor.get_transform(), intended_transform
+                        ):
+                            raise RuntimeError("spawn exact transform verification failed")
                     except Exception:
                         logger.warning(
                             "Twin spawn setup failed for %s (%s); "
@@ -549,16 +740,37 @@ class TwinSync:
                             bp.id,
                             exc_info=True,
                         )
-                        try:
-                            actor.destroy()
-                        except Exception:
-                            logger.error(
-                                "Twin provisional actor cleanup failed for %s",
-                                object_id,
-                                exc_info=True,
-                            )
+                        cleanup_succeeded = self._destroy_owned_actor(
+                            track, actor, "spawn_setup_failed"
+                        )
                         actor = None
+                        if not cleanup_succeeded:
+                            break
                         continue
+                    if reviewed is not None:
+                        actual_dimensions = self._actor_dimensions_m(actor)
+                        expected_dimensions = reviewed["blueprint"][
+                            "expected_dimensions_m"
+                        ]
+                        tolerance = reviewed["blueprint"][
+                            "dimension_tolerance_m"
+                        ]
+                        if (
+                            actual_dimensions is None
+                            or any(
+                                abs(actual_dimensions[key] - expected_dimensions[key])
+                                > tolerance
+                                for key in ("length", "width", "height")
+                            )
+                        ):
+                            self._reject_strict(
+                                det, "active_blueprint_dimensions_mismatch"
+                            )
+                            self._destroy_owned_actor(
+                                track, actor, "blueprint_dimensions_mismatch"
+                            )
+                            actor = None
+                            break
                     break
                 if actor is None:
                     logger.info(
@@ -576,7 +788,9 @@ class TwinSync:
                     continue
                 track.actor_id = actor.id
                 if reviewed is not None:
-                    self._commit_reviewed_track(track, reviewed, location)
+                    self._commit_reviewed_track(
+                        track, reviewed, location, actual_dimensions
+                    )
                     self._commit_detection_metadata(
                         track, det, now, use_detection_ts
                     )
@@ -600,22 +814,45 @@ class TwinSync:
                         track.actor_id = None
                         self._reject_strict(det, "strict_actor_vanished")
                         continue
-                    try:
-                        actor.set_transform(
-                            carla.Transform(
-                                location,
-                                carla.Rotation(yaw=reviewed["heading_deg"]),
-                            )
+                    actual_dimensions = self._actor_dimensions_m(actor)
+                    expected_dimensions = reviewed["blueprint"][
+                        "expected_dimensions_m"
+                    ]
+                    dimension_tolerance = reviewed["blueprint"][
+                        "dimension_tolerance_m"
+                    ]
+                    if (
+                        getattr(actor, "type_id", None)
+                        != reviewed["blueprint"]["selected_blueprint_id"]
+                        or actual_dimensions is None
+                        or any(
+                            abs(actual_dimensions[key] - expected_dimensions[key])
+                            > dimension_tolerance
+                            for key in ("length", "width", "height")
                         )
-                    except Exception:
-                        self._reject_strict(det, "strict_exact_transform_failed")
-                        logger.warning(
-                            "Strict twin transform failed for %s",
-                            object_id,
-                            exc_info=True,
+                    ):
+                        self._reject_strict(
+                            det, "active_blueprint_dimensions_mismatch"
                         )
                         continue
-                    self._commit_reviewed_track(track, reviewed, location)
+                    intended_transform = carla.Transform(
+                        location,
+                        carla.Rotation(yaw=reviewed["heading_deg"]),
+                    )
+                    transform_error = self._set_transform_transactionally(
+                        actor, intended_transform
+                    )
+                    if transform_error is not None:
+                        self._reject_strict(det, transform_error)
+                        logger.warning(
+                            "Strict twin transform transaction failed for %s: %s",
+                            object_id,
+                            transform_error,
+                        )
+                        continue
+                    self._commit_reviewed_track(
+                        track, reviewed, location, actual_dimensions
+                    )
                     self._commit_detection_metadata(
                         track, det, now, use_detection_ts
                     )
@@ -635,20 +872,30 @@ class TwinSync:
             track = self._tracks[object_id]
             if now - track.last_seen <= self._despawn_after:
                 continue
-            self._destroy_track(track)
-            del self._tracks[object_id]
-            logger.info("Twin despawn: %s (unseen for %.0fs)", object_id, now - track.last_seen)
+            if self._destroy_track(track):
+                del self._tracks[object_id]
+                logger.info("Twin despawn: %s (unseen for %.0fs)", object_id, now - track.last_seen)
+            else:
+                logger.error(
+                    "Twin despawn retained ownership for %s after cleanup failure",
+                    object_id,
+                )
 
-    def _destroy_track(self, track: TwinTrack) -> None:
+    def _destroy_track(self, track: TwinTrack) -> bool:
         if track.actor_id is None:
-            return
+            track.cleanup_failure = None
+            return True
         try:
             actor = self._world.get_actor(track.actor_id)
-            if actor is not None:
-                actor.destroy()
+            if actor is None:
+                track.actor_id = None
+                track.cleanup_failure = None
+                return True
         except Exception:
-            logger.debug("Twin actor %s already gone", track.actor_id)
-        track.actor_id = None
+            track.cleanup_failure = "actor_lookup_failed"
+            logger.error("Twin actor lookup failed for %s", track.actor_id, exc_info=True)
+            return False
+        return self._destroy_owned_actor(track, actor, "track_cleanup")
 
     # ------------------------------------------------------------------
     # Replay (drive the twin from recorded detections)
@@ -811,6 +1058,7 @@ class TwinSync:
         actor_type = None
         transform_payload = None
         raw_to_actor_planar_m = None
+        reference_to_actor_m = None
         if track.actor_id is not None:
             try:
                 actor = self._world.get_actor(track.actor_id)
@@ -890,6 +1138,13 @@ class TwinSync:
                     actor_location["x"] - reviewed_target["x"],
                     actor_location["y"] - reviewed_target["y"],
                 )
+            if reviewed is not None and transform_payload is not None:
+                reference = reviewed["independent_reference_position_m"]
+                actor_location = transform_payload["location"]
+                reference_to_actor_m = math.sqrt(sum(
+                    (actor_location[axis] - reference[axis]) ** 2
+                    for axis in ("x", "y", "z")
+                ))
             payload.update({
                 "reviewed_placement_mode": "strict",
                 "reviewed_localization_schema": (
@@ -902,11 +1157,21 @@ class TwinSync:
                 "trajectory_sample_index": track.sample_index,
                 "reviewed_world_location": reviewed_target,
                 "reviewed_to_actor_planar_m": reviewed_to_actor_planar_m,
-                "placement_planar_error_m": reviewed_to_actor_planar_m,
-                "placement_metric_status": "reviewed_world_exact",
+                "reference_to_actor_planar_m": reference_to_actor_m,
+                "independent_reference_to_actor_m": reference_to_actor_m,
+                "placement_planar_error_m": reference_to_actor_m,
+                "placement_metric_status": "independent_reference",
                 "blueprint_family": track.blueprint_family,
                 "blueprint_selection_digest": track.placement_key_sha256,
                 "vehicle_dimensions_m": track.vehicle_dimensions_m,
+                "actual_actor_dimensions_m": track.actual_dimensions_m,
+                "blueprint_catalog_sha256": track.blueprint_catalog_sha256,
+                "blueprint_pool_sha256": track.blueprint_pool_sha256,
+                "selected_blueprint_id": (
+                    reviewed["blueprint"]["selected_blueprint_id"]
+                    if reviewed else None
+                ),
+                "cleanup_failure": track.cleanup_failure,
                 "placement_provenance": (
                     {
                         key: reviewed[key]
@@ -918,10 +1183,13 @@ class TwinSync:
                             "cameras_json_sha256",
                             "camera_config_sha256",
                             "intrinsics_artifact_sha256",
+                            "intrinsics_report_sha256",
+                            "static_calibration_sha256",
                             "opendrive_sha256",
                             "consensus_sha256",
                             "factor_graph_sha256",
                             "identity_evidence_sha256",
+                            "independent_reference_sha256",
                             "uncertainty_m",
                         )
                     }
@@ -951,6 +1219,11 @@ class TwinSync:
                 "reviewed_placement_mode": "strict",
                 "strict_rejections": dict(sorted(self._strict_rejections.items())),
                 "recent_strict_rejections": list(self._recent_strict_rejections),
+                "cleanup_failures": {
+                    track.object_id: track.cleanup_failure
+                    for track in self._tracks.values()
+                    if track.cleanup_failure is not None
+                },
                 "strict_context": {
                     "map_name": self._reviewed_context.map_name,
                     "opendrive_sha256": self._reviewed_context.opendrive_sha256,
@@ -961,9 +1234,10 @@ class TwinSync:
 
     def clear(self) -> None:
         """Destroy all twin actors and forget tracks (keeps polling)."""
-        for track in self._tracks.values():
-            self._destroy_track(track)
-        self._tracks.clear()
+        for object_id in list(self._tracks):
+            track = self._tracks[object_id]
+            if self._destroy_track(track):
+                del self._tracks[object_id]
 
     def stop(self) -> None:
         """Stop polling and destroy all twin actors."""

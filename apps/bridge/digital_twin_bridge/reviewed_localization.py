@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import math
 from pathlib import Path
@@ -26,6 +27,16 @@ VEHICLE_FAMILIES = {
     "truck": "truck",
     "bus": "bus",
 }
+AUTHORITY_SCHEMA = "v2x-review-authority-keys/v1"
+AUTHORITY_SCHEME = "hmac-sha256-v1"
+MAX_LOCALIZATION_UNCERTAINTY_M = 2.0
+MAX_INDEPENDENT_REFERENCE_ERROR_M = 2.0
+MAX_VEHICLE_SPEED_MPS = 45.0
+MAX_VEHICLE_ACCELERATION_MPS2 = 8.0
+MAX_TRANSIT_SECONDS = 30.0
+MIN_APPEARANCE_SIMILARITY = 0.60
+MAX_CONTACT_SIGMA_AT_1280_PX = 32.0
+MAX_BLUEPRINT_DIMENSION_ERROR_M = 0.25
 
 
 class ReviewedLocalizationError(ValueError):
@@ -40,6 +51,8 @@ class ReviewedLocalizationError(ValueError):
 class CameraPlacementContext:
     camera_config_sha256: str
     intrinsics_artifact_sha256: str
+    intrinsics_report_sha256: str
+    native_resolution: tuple[int, int] = (1280, 960)
 
 
 @dataclass(frozen=True)
@@ -48,6 +61,8 @@ class ReviewedPlacementContext:
     opendrive_sha256: str
     cameras_json_sha256: str
     cameras: Mapping[str, CameraPlacementContext]
+    static_calibration_sha256: str
+    authority_keys: Mapping[str, bytes]
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -91,9 +106,29 @@ def contract_sha256(value: Mapping[str, Any]) -> str:
     return sha256_bytes(canonical_json_bytes(unsigned))
 
 
-def seal_contract(value: Mapping[str, Any]) -> dict:
+def _authority_payload(value: Mapping[str, Any]) -> bytes:
+    unsigned = dict(value)
+    unsigned.pop("contract_sha256", None)
+    authority = dict(_object(unsigned.get("authority"), "authority_missing"))
+    authority.pop("signature", None)
+    unsigned["authority"] = authority
+    return canonical_json_bytes(unsigned)
+
+
+def authority_signature(value: Mapping[str, Any], key: bytes) -> str:
+    if not isinstance(key, bytes) or len(key) < 32:
+        raise ReviewedLocalizationError("authority_key_invalid")
+    return hmac.new(key, _authority_payload(value), hashlib.sha256).hexdigest()
+
+
+def seal_contract(value: Mapping[str, Any], key_id: str, key: bytes) -> dict:
     sealed = dict(value)
     sealed.pop("contract_sha256", None)
+    sealed["authority"] = {
+        "scheme": AUTHORITY_SCHEME,
+        "key_id": _text(key_id, "authority_key_id_missing"),
+    }
+    sealed["authority"]["signature"] = authority_signature(sealed, key)
     sealed["contract_sha256"] = contract_sha256(sealed)
     return sealed
 
@@ -157,25 +192,57 @@ def _matrix(value: Any, size: int, reason: str) -> list[list[float]]:
         for column in range(size):
             if abs(matrix[row][column] - matrix[column][row]) > 1e-9:
                 raise ReviewedLocalizationError(reason)
-    tolerance = 1e-9
-    if any(matrix[index][index] < -tolerance for index in range(size)):
+    if min(_symmetric_eigenvalues(matrix)) < -1e-9:
         raise ReviewedLocalizationError(reason)
-    for left in range(size):
-        for right in range(left + 1, size):
-            minor = (
-                matrix[left][left] * matrix[right][right]
-                - matrix[left][right] * matrix[right][left]
-            )
-            if minor < -tolerance:
-                raise ReviewedLocalizationError(reason)
-    if size == 3:
-        a, b, c = matrix[0]
-        d, e, f = matrix[1]
-        g, h, i = matrix[2]
-        determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-        if determinant < -tolerance:
-            raise ReviewedLocalizationError(reason)
     return matrix
+
+
+def _symmetric_eigenvalues(matrix: list[list[float]]) -> list[float]:
+    """Jacobi eigenvalues for a finite 2x2/3x3 symmetric matrix."""
+    size = len(matrix)
+    work = [row[:] for row in matrix]
+    for _ in range(32):
+        row, column = max(
+            (
+                (left, right)
+                for left in range(size)
+                for right in range(left + 1, size)
+            ),
+            key=lambda pair: abs(work[pair[0]][pair[1]]),
+        )
+        if abs(work[row][column]) <= 1e-12:
+            break
+        angle = 0.5 * math.atan2(
+            2.0 * work[row][column],
+            work[column][column] - work[row][row],
+        )
+        cosine, sine = math.cos(angle), math.sin(angle)
+        for index in range(size):
+            if index in (row, column):
+                continue
+            left = work[index][row]
+            right = work[index][column]
+            work[index][row] = work[row][index] = cosine * left - sine * right
+            work[index][column] = work[column][index] = sine * left + cosine * right
+        diagonal_row = work[row][row]
+        diagonal_column = work[column][column]
+        cross = work[row][column]
+        work[row][row] = (
+            cosine * cosine * diagonal_row
+            - 2.0 * sine * cosine * cross
+            + sine * sine * diagonal_column
+        )
+        work[column][column] = (
+            sine * sine * diagonal_row
+            + 2.0 * sine * cosine * cross
+            + cosine * cosine * diagonal_column
+        )
+        work[row][column] = work[column][row] = 0.0
+    return [work[index][index] for index in range(size)]
+
+
+def largest_covariance_eigenvalue(matrix: list[list[float]]) -> float:
+    return max(_symmetric_eigenvalues(matrix))
 
 
 def _utc(value: Any, reason: str) -> tuple[str, float]:
@@ -209,7 +276,222 @@ def _nested(value: Mapping[str, Any], *keys: str) -> Any:
     return current
 
 
-def build_runtime_context(carla_map, cameras_json_path: str) -> ReviewedPlacementContext:
+def _read_hashed_json(path_value: Any, expected_hash: Any, base: Path, reason: str):
+    expected = _sha(expected_hash, f"{reason}_hash_invalid")
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ReviewedLocalizationError(f"{reason}_path_missing")
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    try:
+        raw = path.resolve(strict=True).read_bytes()
+        parsed = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReviewedLocalizationError(f"{reason}_unavailable") from exc
+    if sha256_bytes(raw) != expected or not isinstance(parsed, dict):
+        raise ReviewedLocalizationError(f"{reason}_mismatch")
+    return raw, parsed
+
+
+def validate_measured_intrinsics(
+    camera: Mapping[str, Any], base: Path
+) -> tuple[str, str]:
+    calibration = _object(
+        camera.get("intrinsics_calibration"), "active_intrinsics_missing"
+    )
+    artifact_raw, artifact = _read_hashed_json(
+        calibration.get("artifact_path"),
+        calibration.get("artifact_sha256"),
+        base,
+        "active_intrinsics_artifact",
+    )
+    report_raw, report = _read_hashed_json(
+        calibration.get("report_path"),
+        calibration.get("report_sha256"),
+        base,
+        "active_intrinsics_report",
+    )
+    method = calibration.get("method")
+    expected_report_schema = {
+        "checkerboard": "v2x-checkerboard-calibration-report/v1",
+        "charuco": "v2x-charuco-calibration-report/v1",
+    }.get(method)
+    accepted = report.get("accepted")
+    holdouts = report.get("holdouts")
+    metrics = report.get("holdout_metrics")
+    intrinsics = _object(camera.get("intrinsics"), "active_intrinsics_model_missing")
+    expected_resolution = [intrinsics.get("width"), intrinsics.get("height")]
+    matrix = calibration.get("camera_matrix")
+    distortion = calibration.get("distortion")
+    normalized = {
+        key: calibration.get(key)
+        for key in (
+            "method", "image_count", "source_images_sha256",
+            "rms_reprojection_error_px", "resolution", "camera_matrix",
+            "distortion",
+        )
+    }
+    try:
+        fit_rms = float(calibration["rms_reprojection_error_px"])
+        holdout_rmse = float(metrics["rmse_px"])
+        holdout_max = float(metrics["max_error_px"])
+        matrix_values = [float(item) for row in matrix for item in row]
+        distortion_values = [
+            float(distortion[key]) for key in ("k1", "k2", "p1", "p2", "k3")
+        ]
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ReviewedLocalizationError("active_intrinsics_metrics_invalid") from exc
+    source_hashes = calibration.get("source_images_sha256")
+    report_items = (
+        (accepted if isinstance(accepted, list) else [])
+        + (holdouts if isinstance(holdouts, list) else [])
+    )
+    report_hash_list = [
+        item.get("sha256") if isinstance(item, dict) else None
+        for item in report_items
+    ]
+    report_hashes = {
+        value for value in report_hash_list if isinstance(value, str)
+    }
+    source_hash_set = {
+        value for value in source_hashes if isinstance(value, str)
+    } if isinstance(source_hashes, list) else set()
+    width, height = expected_resolution
+    intrinsic_values = [
+        intrinsics.get(key) for key in ("fx", "fy", "cx", "cy")
+    ]
+    if (
+        artifact != normalized
+        or expected_report_schema is None
+        or report.get("schema") != expected_report_schema
+        or not isinstance(accepted, list) or len(accepted) < 10
+        or not isinstance(holdouts, list) or len(holdouts) < 2
+        or not isinstance(source_hashes, list)
+        or len(source_hashes) < 12
+        or len(source_hashes) != len(source_hash_set)
+        or any(
+            not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+            for value in source_hashes
+        )
+        or len(report_hash_list) != len(source_hashes)
+        or len(report_hash_list) != len(report_hashes)
+        or any(
+            not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+            for value in report_hash_list
+        )
+        or source_hash_set != report_hashes
+        or calibration.get("image_count") != len(source_hashes)
+        or not isinstance(width, int) or isinstance(width, bool) or width <= 0
+        or not isinstance(height, int) or isinstance(height, bool) or height <= 0
+        or not all(_finite(value) for value in intrinsic_values)
+        or float(intrinsics.get("fx")) <= 0.0
+        or float(intrinsics.get("fy")) <= 0.0
+        or not 0.0 <= float(intrinsics.get("cx")) < width
+        or not 0.0 <= float(intrinsics.get("cy")) < height
+        or calibration.get("resolution") != expected_resolution
+        or not all(_finite(value) for value in matrix_values + distortion_values)
+        or not all(_finite(value) for value in (fit_rms, holdout_rmse, holdout_max))
+        or not 0.0 <= fit_rms <= 2.0
+        or not 0.0 <= holdout_rmse <= 2.0
+        or not 0.0 <= holdout_max <= 5.0
+        or matrix != [
+            [intrinsics.get("fx"), 0, intrinsics.get("cx")],
+            [0, intrinsics.get("fy"), intrinsics.get("cy")],
+            [0, 0, 1],
+        ]
+    ):
+        raise ReviewedLocalizationError("active_intrinsics_gate_failed")
+    return sha256_bytes(artifact_raw), sha256_bytes(report_raw)
+
+
+def load_authority_keys(path_value: str) -> Mapping[str, bytes]:
+    try:
+        path = Path(path_value).expanduser().resolve(strict=True)
+        value = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReviewedLocalizationError("authority_key_file_unavailable") from exc
+    keys = value.get("keys") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != AUTHORITY_SCHEMA
+        or not isinstance(keys, dict)
+        or not keys
+    ):
+        raise ReviewedLocalizationError("authority_key_file_invalid")
+    output = {}
+    for key_id, encoded in keys.items():
+        if not isinstance(key_id, str) or not key_id or not isinstance(encoded, str):
+            raise ReviewedLocalizationError("authority_key_file_invalid")
+        try:
+            key = bytes.fromhex(encoded)
+        except ValueError as exc:
+            raise ReviewedLocalizationError("authority_key_file_invalid") from exc
+        if len(key) < 32:
+            raise ReviewedLocalizationError("authority_key_file_invalid")
+        output[key_id] = key
+    return output
+
+
+def validate_static_calibration(
+    path_value: str,
+    cameras_json_sha256: str,
+    camera_hashes: Mapping[str, str],
+    map_name: str,
+    opendrive_sha256: str,
+) -> str:
+    path = Path(path_value).expanduser()
+    try:
+        path = path.resolve(strict=True)
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReviewedLocalizationError("static_calibration_unavailable") from exc
+    gate = value.get("heldout_gate") if isinstance(value, dict) else None
+    metrics = gate.get("cameras") if isinstance(gate, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "v2x-static-camera-survey-manifest/v1"
+        or value.get("source_cameras_json_sha256") != cameras_json_sha256
+        or value.get("map") != {
+            "name": map_name,
+            "opendrive_sha256": opendrive_sha256,
+        }
+        or not isinstance(gate, dict)
+        or gate.get("passed") is not True
+        or gate.get("reference_resolution") != [1280, 960]
+        or not isinstance(metrics, dict)
+        or set(metrics) != set(camera_hashes)
+    ):
+        raise ReviewedLocalizationError("static_calibration_gate_failed")
+    for camera_id, expected_hash in camera_hashes.items():
+        item = metrics.get(camera_id)
+        try:
+            numbers = [
+                float(item[key])
+                for key in (
+                    "landmark_rmse_px", "landmark_p95_px", "landmark_max_px",
+                    "road_rmse_px", "road_max_px",
+                )
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ReviewedLocalizationError("static_calibration_gate_failed") from exc
+        if (
+            item.get("camera_config_sha256") != expected_hash
+            or int(item.get("landmark_count", 0)) < 4
+            or not all(math.isfinite(number) for number in numbers)
+            or numbers[0] > 10.0 or numbers[1] > 16.0 or numbers[2] > 24.0
+            or numbers[3] > 6.0 or numbers[4] > 12.0
+        ):
+            raise ReviewedLocalizationError("static_calibration_gate_failed")
+    return sha256_bytes(raw)
+
+
+def build_runtime_context(
+    carla_map,
+    cameras_json_path: str,
+    static_calibration_path: str,
+    authority_key_file: str,
+) -> ReviewedPlacementContext:
     """Freeze the exact active map and camera inputs for strict validation."""
 
     path = Path(cameras_json_path).expanduser()
@@ -223,49 +505,50 @@ def build_runtime_context(carla_map, cameras_json_path: str) -> ReviewedPlacemen
     if not isinstance(cameras, list) or not cameras:
         raise ReviewedLocalizationError("active_camera_config_invalid")
     indexed: dict[str, CameraPlacementContext] = {}
+    camera_hashes = {}
     for camera in cameras:
         if not isinstance(camera, dict):
             raise ReviewedLocalizationError("active_camera_config_invalid")
         camera_id = _text(camera.get("id"), "active_camera_id_invalid")
         if camera_id in indexed:
             raise ReviewedLocalizationError("active_camera_id_duplicate")
-        calibration = _object(
-            camera.get("intrinsics_calibration"),
-            "active_intrinsics_missing",
+        camera_hash = canonical_object_sha256(camera)
+        artifact_hash, report_hash = validate_measured_intrinsics(
+            camera, path.parent
         )
-        artifact_hash = _sha(
-            calibration.get("artifact_sha256"),
-            "active_intrinsics_hash_invalid",
-        )
-        artifact_value = calibration.get("artifact_path")
-        if not isinstance(artifact_value, str) or not artifact_value.strip():
-            raise ReviewedLocalizationError("active_intrinsics_artifact_missing")
-        artifact_path = Path(artifact_value).expanduser()
-        if not artifact_path.is_absolute():
-            artifact_path = path.parent / artifact_path
-        try:
-            artifact_raw = artifact_path.resolve(strict=True).read_bytes()
-        except OSError as exc:
-            raise ReviewedLocalizationError(
-                "active_intrinsics_artifact_unavailable"
-            ) from exc
-        if sha256_bytes(artifact_raw) != artifact_hash:
-            raise ReviewedLocalizationError("active_intrinsics_artifact_mismatch")
         indexed[camera_id] = CameraPlacementContext(
-            camera_config_sha256=canonical_object_sha256(camera),
+            camera_config_sha256=camera_hash,
             intrinsics_artifact_sha256=artifact_hash,
+            intrinsics_report_sha256=report_hash,
+            native_resolution=(
+                int(camera["intrinsics"]["width"]),
+                int(camera["intrinsics"]["height"]),
+            ),
         )
+        camera_hashes[camera_id] = camera_hash
     try:
         opendrive = carla_map.to_opendrive()
     except Exception as exc:
         raise ReviewedLocalizationError("active_opendrive_unavailable") from exc
     if not isinstance(opendrive, str) or not opendrive:
         raise ReviewedLocalizationError("active_opendrive_unavailable")
+    cameras_hash = sha256_bytes(cameras_raw)
+    opendrive_hash = sha256_bytes(opendrive.encode("utf-8"))
+    map_name = _text(getattr(carla_map, "name", None), "active_map_name_invalid")
+    static_hash = validate_static_calibration(
+        static_calibration_path,
+        cameras_hash,
+        camera_hashes,
+        map_name,
+        opendrive_hash,
+    )
     return ReviewedPlacementContext(
-        map_name=_text(getattr(carla_map, "name", None), "active_map_name_invalid"),
-        opendrive_sha256=sha256_bytes(opendrive.encode("utf-8")),
-        cameras_json_sha256=sha256_bytes(cameras_raw),
+        map_name=map_name,
+        opendrive_sha256=opendrive_hash,
+        cameras_json_sha256=cameras_hash,
         cameras=indexed,
+        static_calibration_sha256=static_hash,
+        authority_keys=load_authority_keys(authority_key_file),
     )
 
 
@@ -280,13 +563,32 @@ def validate_contract(
     _exact_keys(value, {
         "schema", "event_id", "camera_id", "global_track_id",
         "trajectory_id", "sample_index", "source", "contact", "timing",
-        "review", "identity", "placement", "contract_sha256",
+        "review", "identity", "placement", "authority", "contract_sha256",
     }, "contract_fields_invalid")
     if value.get("schema") != SCHEMA:
         raise ReviewedLocalizationError("reviewed_localization_schema")
     supplied_hash = _sha(value.get("contract_sha256"), "contract_hash_missing")
     if supplied_hash != contract_sha256(value):
         raise ReviewedLocalizationError("contract_hash_mismatch")
+    authority = _object(value.get("authority"), "authority_missing")
+    _exact_keys(
+        authority,
+        {"scheme", "key_id", "signature"},
+        "authority_fields_invalid",
+    )
+    if authority.get("scheme") != AUTHORITY_SCHEME:
+        raise ReviewedLocalizationError("authority_scheme_invalid")
+    authority_key_id = _text(
+        authority.get("key_id"), "authority_key_id_missing"
+    )
+    authority_key = context.authority_keys.get(authority_key_id)
+    supplied_signature = _sha(
+        authority.get("signature"), "authority_signature_invalid"
+    )
+    if authority_key is None or not hmac.compare_digest(
+        supplied_signature, authority_signature(value, authority_key)
+    ):
+        raise ReviewedLocalizationError("authority_signature_mismatch")
 
     event_id = _text(value.get("event_id"), "contract_event_id_missing")
     if event_id != detection.get("event_id"):
@@ -311,7 +613,9 @@ def validate_contract(
     source = _object(value.get("source"), "contract_source_missing")
     _exact_keys(source, {"frame", "detector", "camera", "map"}, "source_fields_invalid")
     frame = _object(source.get("frame"), "native_frame_binding_missing")
-    _exact_keys(frame, {"sha256", "mask_sha256", "native_resolution", "frame_number"}, "native_frame_fields_invalid")
+    _exact_keys(frame, {"source_kind", "sha256", "mask_sha256", "native_resolution", "frame_number"}, "native_frame_fields_invalid")
+    if frame.get("source_kind") != "persisted_native_frame_and_instance_mask":
+        raise ReviewedLocalizationError("native_frame_source_invalid")
     frame_sha256 = _sha(frame.get("sha256"), "native_frame_hash_invalid")
     mask_sha256 = _sha(frame.get("mask_sha256"), "native_mask_hash_invalid")
     resolution = frame.get("native_resolution")
@@ -324,6 +628,8 @@ def validate_contract(
     emitted_resolution = _nested(detection, "raw_observation", "native_resolution")
     if emitted_resolution != resolution:
         raise ReviewedLocalizationError("native_frame_resolution_mismatch")
+    if resolution != list(camera_context.native_resolution):
+        raise ReviewedLocalizationError("active_camera_resolution_mismatch")
     frame_number = frame.get("frame_number")
     if not isinstance(frame_number, int) or isinstance(frame_number, bool) or frame_number < 0:
         raise ReviewedLocalizationError("native_frame_number_invalid")
@@ -347,7 +653,7 @@ def validate_contract(
         raise ReviewedLocalizationError("detector_config_hash_mismatch")
 
     camera = _object(source.get("camera"), "camera_binding_missing")
-    _exact_keys(camera, {"cameras_json_sha256", "camera_config_sha256", "intrinsics_artifact_sha256"}, "camera_fields_invalid")
+    _exact_keys(camera, {"cameras_json_sha256", "camera_config_sha256", "intrinsics_artifact_sha256", "intrinsics_report_sha256", "static_calibration_sha256"}, "camera_fields_invalid")
     cameras_json_sha256 = _sha(
         camera.get("cameras_json_sha256"), "cameras_json_hash_invalid"
     )
@@ -358,12 +664,24 @@ def validate_contract(
         camera.get("intrinsics_artifact_sha256"),
         "intrinsics_artifact_hash_invalid",
     )
+    intrinsics_report_sha256 = _sha(
+        camera.get("intrinsics_report_sha256"),
+        "intrinsics_report_hash_invalid",
+    )
+    static_calibration_sha256 = _sha(
+        camera.get("static_calibration_sha256"),
+        "static_calibration_hash_invalid",
+    )
     if cameras_json_sha256 != context.cameras_json_sha256:
         raise ReviewedLocalizationError("active_cameras_json_mismatch")
     if camera_config_sha256 != camera_context.camera_config_sha256:
         raise ReviewedLocalizationError("active_camera_config_mismatch")
     if intrinsics_artifact_sha256 != camera_context.intrinsics_artifact_sha256:
         raise ReviewedLocalizationError("active_intrinsics_mismatch")
+    if intrinsics_report_sha256 != camera_context.intrinsics_report_sha256:
+        raise ReviewedLocalizationError("active_intrinsics_report_mismatch")
+    if static_calibration_sha256 != context.static_calibration_sha256:
+        raise ReviewedLocalizationError("active_static_calibration_mismatch")
     if cameras_json_sha256 != emitted_fingerprints.get("cameras_json_sha256"):
         raise ReviewedLocalizationError("emitted_cameras_json_mismatch")
     if camera_config_sha256 != emitted_fingerprints.get("camera_config_sha256"):
@@ -393,11 +711,38 @@ def validate_contract(
     ]
     if any(abs(midpoint[index] - expected_midpoint[index]) > 1e-6 for index in range(2)):
         raise ReviewedLocalizationError("footprint_midpoint_mismatch")
-    if not (0.0 <= midpoint[0] < resolution[0] and 0.0 <= midpoint[1] < resolution[1]):
-        raise ReviewedLocalizationError("footprint_midpoint_outside_frame")
+    for pixel in (left_pixel, right_pixel, midpoint):
+        if not (0.0 <= pixel[0] < resolution[0] and 0.0 <= pixel[1] < resolution[1]):
+            raise ReviewedLocalizationError("reviewed_contact_outside_frame")
+    if (
+        right_pixel[0] <= left_pixel[0]
+        or right_pixel[0] - left_pixel[0] < 0.01 * resolution[0]
+        or abs(left_pixel[1] - right_pixel[1]) > 0.05 * resolution[1]
+    ):
+        raise ReviewedLocalizationError("reviewed_contact_endpoints_invalid")
+    bbox = detection.get("bbox") or _nested(
+        detection, "camera_data", "bifocal_metadata", "bbox"
+    )
+    if not isinstance(bbox, dict) or any(
+        not _finite(bbox.get(key)) for key in ("x1", "y1", "x2", "y2")
+    ):
+        raise ReviewedLocalizationError("reviewed_contact_bbox_missing")
+    x1, y1, x2, y2 = (float(bbox[key]) for key in ("x1", "y1", "x2", "y2"))
+    if x2 <= x1 or y2 <= y1:
+        raise ReviewedLocalizationError("reviewed_contact_bbox_invalid")
+    margin_x = 0.05 * (x2 - x1)
+    for pixel in (left_pixel, right_pixel, midpoint):
+        if not (
+            x1 - margin_x <= pixel[0] <= x2 + margin_x
+            and y1 + 0.45 * (y2 - y1) <= pixel[1] <= y2 + 0.05 * (y2 - y1)
+        ):
+            raise ReviewedLocalizationError("reviewed_contact_bbox_mismatch")
     covariance_px2 = _matrix(
         contact.get("covariance_px2"), 2, "contact_covariance_not_psd"
     )
+    contact_sigma_limit = MAX_CONTACT_SIGMA_AT_1280_PX * resolution[0] / 1280.0
+    if largest_covariance_eigenvalue(covariance_px2) > contact_sigma_limit ** 2:
+        raise ReviewedLocalizationError("contact_covariance_exceeds_gate")
 
     timing = _object(value.get("timing"), "timing_binding_missing")
     _exact_keys(timing, {"method", "trusted", "session_id", "pts_seconds", "media_timestamp_utc", "timestamp_error_ms"}, "timing_fields_invalid")
@@ -431,7 +776,7 @@ def validate_contract(
         raise ReviewedLocalizationError("timing_media_clock_mismatch")
 
     review = _object(value.get("review"), "review_provenance_missing")
-    _exact_keys(review, {"decision", "reviewer", "consensus", "factor_graph"}, "review_fields_invalid")
+    _exact_keys(review, {"decision", "reviewer", "consensus", "factor_graph", "independent_reference"}, "review_fields_invalid")
     if review.get("decision") != "accepted":
         raise ReviewedLocalizationError("review_not_accepted")
     reviewer = _object(review.get("reviewer"), "reviewer_missing")
@@ -439,6 +784,8 @@ def validate_contract(
     if reviewer.get("kind") != "human":
         raise ReviewedLocalizationError("reviewer_not_human")
     reviewer_id = _text(reviewer.get("id"), "reviewer_id_missing")
+    if reviewer_id != authority_key_id:
+        raise ReviewedLocalizationError("reviewer_authority_mismatch")
     consensus = _object(review.get("consensus"), "consensus_provenance_missing")
     _exact_keys(consensus, {"method", "artifact_sha256", "reviewer_ids"}, "consensus_fields_invalid")
     if consensus.get("method") != "independent_review_consensus":
@@ -449,9 +796,10 @@ def validate_contract(
     reviewer_ids = consensus.get("reviewer_ids")
     if (
         not isinstance(reviewer_ids, list)
+        or any(not isinstance(item, str) or not item.strip() for item in reviewer_ids)
+        or len(reviewer_ids) != len(set(reviewer_ids))
         or len(set(reviewer_ids)) < 2
         or reviewer_id not in reviewer_ids
-        or any(not isinstance(item, str) or not item.strip() for item in reviewer_ids)
     ):
         raise ReviewedLocalizationError("consensus_reviewers_invalid")
     factor_graph = _object(review.get("factor_graph"), "factor_graph_provenance_missing")
@@ -461,9 +809,24 @@ def validate_contract(
     )
     if factor_graph.get("acceptance_eligible") is not True:
         raise ReviewedLocalizationError("factor_graph_not_acceptance_eligible")
+    independent_reference = _object(
+        review.get("independent_reference"),
+        "independent_reference_provenance_missing",
+    )
+    _exact_keys(
+        independent_reference,
+        {"artifact_sha256", "acceptance_eligible"},
+        "independent_reference_fields_invalid",
+    )
+    independent_reference_sha256 = _sha(
+        independent_reference.get("artifact_sha256"),
+        "independent_reference_hash_invalid",
+    )
+    if independent_reference.get("acceptance_eligible") is not True:
+        raise ReviewedLocalizationError("independent_reference_not_accepted")
 
     identity = _object(value.get("identity"), "identity_provenance_missing")
-    _exact_keys(identity, {"status", "global_track_id", "trajectory_id", "association_method", "evidence_sha256", "camera_ids"}, "identity_fields_invalid")
+    _exact_keys(identity, {"status", "global_track_id", "trajectory_id", "association_method", "evidence_sha256", "camera_ids", "transition"}, "identity_fields_invalid")
     if identity.get("status") != "unambiguous":
         raise ReviewedLocalizationError("identity_ambiguous")
     if identity.get("global_track_id") != global_track_id:
@@ -478,14 +841,77 @@ def validate_contract(
     camera_ids = identity.get("camera_ids")
     if (
         not isinstance(camera_ids, list)
+        or any(not isinstance(item, str) or not item for item in camera_ids)
         or camera_id not in camera_ids
         or len(camera_ids) != len(set(camera_ids))
-        or any(not isinstance(item, str) or not item for item in camera_ids)
+        or any(item not in context.cameras for item in camera_ids)
     ):
         raise ReviewedLocalizationError("identity_camera_set_invalid")
+    transition = identity.get("transition")
+    if sample_index == 0:
+        if transition is not None:
+            raise ReviewedLocalizationError("identity_first_transition_invalid")
+        normalized_transition = None
+    else:
+        transition = _object(transition, "identity_transition_missing")
+        _exact_keys(
+            transition,
+            {
+                "previous_event_id", "accepted", "ambiguity", "appearance_similarity",
+                "transit_seconds", "distance_m", "speed_mps", "acceleration_mps2",
+                "trajectory_covariance_m2", "pair_evidence_sha256",
+            },
+            "identity_transition_fields_invalid",
+        )
+        previous_event_id = _text(
+            transition.get("previous_event_id"),
+            "identity_previous_event_missing",
+        )
+        pair_evidence_sha256 = _sha(
+            transition.get("pair_evidence_sha256"),
+            "identity_pair_hash_invalid",
+        )
+        numeric = {
+            key: transition.get(key)
+            for key in (
+                "appearance_similarity", "transit_seconds", "distance_m",
+                "speed_mps", "acceleration_mps2",
+            )
+        }
+        if any(not _finite(value) for value in numeric.values()):
+            raise ReviewedLocalizationError("identity_transition_nonfinite")
+        if (
+            transition.get("accepted") is not True
+            or transition.get("ambiguity") is not False
+            or float(numeric["appearance_similarity"]) < MIN_APPEARANCE_SIMILARITY
+            or not 0.0 < float(numeric["transit_seconds"]) <= MAX_TRANSIT_SECONDS
+            or float(numeric["distance_m"]) < 0.0
+            or not 0.0 <= float(numeric["speed_mps"]) <= MAX_VEHICLE_SPEED_MPS
+            or abs(float(numeric["acceleration_mps2"])) > MAX_VEHICLE_ACCELERATION_MPS2
+        ):
+            raise ReviewedLocalizationError("identity_transition_gate_failed")
+        trajectory_covariance_m2 = _matrix(
+            transition.get("trajectory_covariance_m2"),
+            3,
+            "trajectory_covariance_not_psd",
+        )
+        if math.sqrt(max(
+            0.0, largest_covariance_eigenvalue(trajectory_covariance_m2)
+        )) > MAX_LOCALIZATION_UNCERTAINTY_M:
+            raise ReviewedLocalizationError("trajectory_covariance_exceeds_gate")
+        normalized_transition = {
+            "previous_event_id": previous_event_id,
+            "appearance_similarity": float(numeric["appearance_similarity"]),
+            "transit_seconds": float(numeric["transit_seconds"]),
+            "distance_m": float(numeric["distance_m"]),
+            "speed_mps": float(numeric["speed_mps"]),
+            "acceleration_mps2": float(numeric["acceleration_mps2"]),
+            "trajectory_covariance_m2": trajectory_covariance_m2,
+            "pair_evidence_sha256": pair_evidence_sha256,
+        }
 
     placement = _object(value.get("placement"), "world_placement_missing")
-    _exact_keys(placement, {"coordinate_frame", "position_semantics", "position_m", "covariance_m2", "uncertainty_m", "heading_deg", "dimensions_m", "blueprint_family"}, "placement_fields_invalid")
+    _exact_keys(placement, {"coordinate_frame", "position_semantics", "position_m", "covariance_m2", "uncertainty_m", "heading_deg", "dimensions_m", "blueprint_family", "independent_reference", "blueprint"}, "placement_fields_invalid")
     if placement.get("coordinate_frame") != "carla_world":
         raise ReviewedLocalizationError("placement_coordinate_frame_invalid")
     if placement.get("position_semantics") != "ue5_actor_center":
@@ -498,9 +924,10 @@ def validate_contract(
         placement.get("covariance_m2"), 3, "placement_covariance_not_psd"
     )
     uncertainty_m = placement.get("uncertainty_m")
-    if not _finite(uncertainty_m) or not 0.0 <= float(uncertainty_m) <= 2.0:
+    if not _finite(uncertainty_m) or not 0.0 <= float(uncertainty_m) <= MAX_LOCALIZATION_UNCERTAINTY_M:
         raise ReviewedLocalizationError("placement_uncertainty_exceeds_2m")
-    if max(math.sqrt(max(0.0, covariance_m2[index][index])) for index in range(3)) > float(uncertainty_m) + 1e-9:
+    covariance_sigma = math.sqrt(max(0.0, largest_covariance_eigenvalue(covariance_m2)))
+    if covariance_sigma > float(uncertainty_m) + 1e-9:
         raise ReviewedLocalizationError("placement_uncertainty_understates_covariance")
     heading_deg = placement.get("heading_deg")
     if not _finite(heading_deg):
@@ -517,10 +944,67 @@ def validate_contract(
     blueprint_family = placement.get("blueprint_family")
     if VEHICLE_FAMILIES.get(object_type) != blueprint_family:
         raise ReviewedLocalizationError("blueprint_family_object_type_mismatch")
+    reference = _object(
+        placement.get("independent_reference"),
+        "independent_reference_position_missing",
+    )
+    _exact_keys(reference, {"position_m", "error_m"}, "independent_reference_position_fields_invalid")
+    reference_position = _object(
+        reference.get("position_m"), "independent_reference_position_missing"
+    )
+    _exact_keys(reference_position, {"x", "y", "z"}, "independent_reference_position_fields_invalid")
+    if any(not _finite(reference_position.get(axis)) for axis in ("x", "y", "z")):
+        raise ReviewedLocalizationError("independent_reference_position_nonfinite")
+    reference_error_m = reference.get("error_m")
+    computed_reference_error_m = math.sqrt(sum(
+        (float(position[axis]) - float(reference_position[axis])) ** 2
+        for axis in ("x", "y", "z")
+    ))
+    if (
+        not _finite(reference_error_m)
+        or abs(float(reference_error_m) - computed_reference_error_m) > 1e-6
+        or computed_reference_error_m > MAX_INDEPENDENT_REFERENCE_ERROR_M
+    ):
+        raise ReviewedLocalizationError("independent_reference_error_invalid")
+    blueprint = _object(placement.get("blueprint"), "blueprint_binding_missing")
+    _exact_keys(
+        blueprint,
+        {
+            "catalog_sha256", "pool_sha256", "selected_blueprint_id",
+            "expected_dimensions_m", "dimension_tolerance_m",
+        },
+        "blueprint_fields_invalid",
+    )
+    catalog_sha256 = _sha(
+        blueprint.get("catalog_sha256"), "blueprint_catalog_hash_invalid"
+    )
+    pool_sha256 = _sha(
+        blueprint.get("pool_sha256"), "blueprint_pool_hash_invalid"
+    )
+    selected_blueprint_id = _text(
+        blueprint.get("selected_blueprint_id"), "blueprint_id_missing"
+    )
+    expected_blueprint_dimensions = _object(
+        blueprint.get("expected_dimensions_m"), "blueprint_dimensions_missing"
+    )
+    _exact_keys(expected_blueprint_dimensions, {"length", "width", "height"}, "blueprint_dimensions_invalid")
+    if any(
+        not _finite(expected_blueprint_dimensions.get(key))
+        or abs(float(expected_blueprint_dimensions[key]) - normalized_dimensions[key]) > 1e-9
+        for key in ("length", "width", "height")
+    ):
+        raise ReviewedLocalizationError("blueprint_dimensions_mismatch")
+    dimension_tolerance_m = blueprint.get("dimension_tolerance_m")
+    if (
+        not _finite(dimension_tolerance_m)
+        or not 0.0 <= float(dimension_tolerance_m) <= MAX_BLUEPRINT_DIMENSION_ERROR_M
+    ):
+        raise ReviewedLocalizationError("blueprint_dimension_tolerance_invalid")
 
     return {
         "schema": SCHEMA,
         "contract_sha256": supplied_hash,
+        "authority_key_id": authority_key_id,
         "event_id": event_id,
         "camera_id": camera_id,
         "global_track_id": global_track_id,
@@ -537,20 +1021,39 @@ def validate_contract(
         "cameras_json_sha256": cameras_json_sha256,
         "camera_config_sha256": camera_config_sha256,
         "intrinsics_artifact_sha256": intrinsics_artifact_sha256,
+        "intrinsics_report_sha256": intrinsics_report_sha256,
+        "static_calibration_sha256": static_calibration_sha256,
         "map_name": context.map_name,
         "opendrive_sha256": opendrive_sha256,
         "footprint_midpoint_pixel": midpoint,
         "contact_covariance_px2": covariance_px2,
         "consensus_sha256": consensus_sha256,
         "factor_graph_sha256": factor_graph_sha256,
+        "independent_reference_sha256": independent_reference_sha256,
         "identity_evidence_sha256": identity_evidence_sha256,
         "identity_camera_ids": list(camera_ids),
+        "transition": normalized_transition,
         "position_m": {axis: float(position[axis]) for axis in ("x", "y", "z")},
         "covariance_m2": covariance_m2,
         "uncertainty_m": float(uncertainty_m),
+        "covariance_sigma_m": covariance_sigma,
         "heading_deg": float(heading_deg) % 360.0,
         "dimensions_m": normalized_dimensions,
         "blueprint_family": blueprint_family,
+        "independent_reference_position_m": {
+            axis: float(reference_position[axis]) for axis in ("x", "y", "z")
+        },
+        "independent_reference_error_m": computed_reference_error_m,
+        "blueprint": {
+            "catalog_sha256": catalog_sha256,
+            "pool_sha256": pool_sha256,
+            "selected_blueprint_id": selected_blueprint_id,
+            "expected_dimensions_m": {
+                key: float(expected_blueprint_dimensions[key])
+                for key in ("length", "width", "height")
+            },
+            "dimension_tolerance_m": float(dimension_tolerance_m),
+        },
         "placement_key_sha256": placement_key_sha256(
             global_track_id, blueprint_family
         ),
