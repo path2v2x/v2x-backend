@@ -588,6 +588,15 @@ def test_retention_receipt_must_bind_exact_stream_and_timestamp(tmp_path):
     assert_error("retention_receipt_binding", fixture.build)
 
 
+def test_resource_not_found_never_proves_media_retention_expiry(tmp_path):
+    fixture = AuditFixture(tmp_path, count=1, accepted=0, unavailable=1)
+    fixture.receipt_values["event-0"][0]["error_code"] = "ResourceNotFoundException"
+    fixture.refresh_unavailable("event-0")
+    fixture.rewrite_outcomes_and_authority()
+
+    assert_error("schema_invalid", fixture.build)
+
+
 @pytest.mark.parametrize("field", ["retention_seconds", "attempt_number", "attempt_count"])
 def test_retention_integer_fields_reject_integral_floats(tmp_path, field):
     fixture = AuditFixture(tmp_path, count=1, accepted=0, unavailable=1)
@@ -704,6 +713,31 @@ def test_concurrent_file_replacement_is_detected(tmp_path, monkeypatch):
     monkeypatch.setattr(audit.os, "read", replacing_read)
     assert_error("evidence_replaced", fixture.build)
     assert replaced is True
+
+
+def test_signed_receipt_deleted_before_build_returns_prevents_publication(tmp_path, monkeypatch):
+    fixture = AuditFixture(tmp_path, count=1, accepted=0, unavailable=1)
+    receipt = fixture.root / fixture.receipt_descriptors["event-0"][0]["path"]
+    output = tmp_path / "audit.json"
+    original_snapshot = audit.RetainedEvidenceStore.snapshot
+    deleted = False
+
+    def deleting_snapshot(store):
+        nonlocal deleted
+        snapshot = original_snapshot(store)
+        receipt.unlink()
+        deleted = True
+        return snapshot
+
+    monkeypatch.setattr(audit.RetainedEvidenceStore, "snapshot", deleting_snapshot)
+
+    def build_and_publish():
+        report = fixture.build()
+        audit.write_report_exclusive(output, report)
+
+    assert_error("evidence_replaced", build_and_publish)
+    assert deleted is True
+    assert not output.exists()
 
 
 def test_non_nfc_evidence_path_is_rejected(tmp_path):
@@ -849,3 +883,66 @@ def test_output_publication_never_replaces_existing_or_concurrent_result(tmp_pat
         assert sorted(result[0] for result in results) == ["ok", "output_exists"]
         assert json.loads(race_output.read_text())["marker"] in {1, 2}
         assert not list(race_dir.glob(".audit.json.tmp-*"))
+
+
+def test_publication_directory_replacement_cannot_substitute_different_bytes(
+    tmp_path, monkeypatch
+):
+    publication = tmp_path / "publication"
+    publication.mkdir()
+    displaced = tmp_path / "displaced"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    output = publication / "audit.json"
+    substitute = b'{"marker":"attacker-substitute"}\n'
+    (replacement / output.name).write_bytes(substitute)
+    original_link = audit.os.link
+    replaced = False
+
+    def replacing_link(source, destination, *args, **kwargs):
+        nonlocal replaced
+        result = original_link(source, destination, *args, **kwargs)
+        publication.rename(displaced)
+        replacement.rename(publication)
+        replaced = True
+        return result
+
+    monkeypatch.setattr(audit.os, "link", replacing_link)
+
+    assert_error(
+        "output_directory_replaced",
+        lambda: audit.write_report_exclusive(
+            output, {"schema": audit.REPORT_SCHEMA, "marker": "trusted"}
+        ),
+    )
+    assert replaced is True
+    assert output.read_bytes() == substitute
+    assert not (displaced / output.name).exists()
+
+
+def test_pinned_key_opened_descriptor_must_remain_a_single_link(tmp_path, monkeypatch):
+    fixture = AuditFixture(tmp_path, count=1, accepted=0)
+    key_path = fixture.keys_dir / "audit-key.pem"
+    raw = key_path.read_bytes()
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    replacement = fixture.keys_dir / "replacement.pem"
+    replacement.write_bytes(raw)
+    replacement_alias = fixture.keys_dir / "replacement-alias.pem"
+    os.link(replacement, replacement_alias)
+    original_open = audit.os.open
+    replaced = False
+
+    def replacing_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and Path(path) == key_path:
+            os.replace(replacement, key_path)
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(audit.os, "open", replacing_open)
+
+    assert_error(
+        "pinned_key_unsafe",
+        lambda: audit._read_pinned_public_key("audit-key", fingerprint, key_path),
+    )
+    assert replaced is True

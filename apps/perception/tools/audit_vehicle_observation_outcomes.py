@@ -20,7 +20,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-import tempfile
 import unicodedata
 import uuid
 
@@ -116,7 +115,6 @@ RETENTION_ROLES = {
 SUPPORTED_RETRIEVAL_ERRORS = {
     "FragmentNotFound",
     "NoMediaForTimestamp",
-    "ResourceNotFoundException",
 }
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -543,12 +541,38 @@ def _read_pinned_public_key(key_id, fingerprint, path_value):
     if metadata.st_size > 64 * 1024:
         fail("pinned_key_unsafe", f"pinned key {key_id} is oversized")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
     try:
         descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > 64 * 1024
+        ):
+            fail("pinned_key_unsafe", f"pinned key {key_id} opened as an unsafe file")
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            fail("pinned_key_replaced", f"pinned key {key_id} changed while it was opened")
         with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = None
             raw = stream.read(64 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+        path_after = os.lstat(path)
     except OSError as exc:
         raise OutcomeAuditError("pinned_key_unreadable", f"pinned key {key_id} is unreadable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    expected_identity = (opened.st_dev, opened.st_ino)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or (after.st_dev, after.st_ino) != expected_identity
+        or not stat.S_ISREG(path_after.st_mode)
+        or path_after.st_nlink != 1
+        or (path_after.st_dev, path_after.st_ino) != expected_identity
+    ):
+        fail("pinned_key_replaced", f"pinned key {key_id} changed while it was read")
     if sha256_bytes(raw) != fingerprint:
         fail("pinned_key_fingerprint", f"pinned key {key_id} fingerprint does not match")
     try:
@@ -1294,6 +1318,70 @@ def validate_rejected_outcome(store, event_id, outcome):
     return validated
 
 
+def _assemble_report(validated, authority, ledger, outcomes, snapshot):
+    counts = Counter(value["state"] for value in validated.values())
+    by_camera = {}
+    for camera in sorted({value["camera_id"] for value in validated.values()}):
+        camera_counts = Counter(
+            value["state"] for value in validated.values() if value["camera_id"] == camera
+        )
+        by_camera[camera] = {
+            state: camera_counts.get(state, 0) for state in sorted(TERMINAL_STATES)
+        }
+    recoverable = len(validated) - counts.get("unavailable", 0)
+    accepted = counts.get("accepted", 0)
+    accepted_fraction = accepted / recoverable if recoverable else 0.0
+    threshold_passed = (
+        math.isfinite(accepted_fraction)
+        and accepted_fraction >= MINIMUM_ACCEPTED_FRACTION
+    )
+    return {
+        "schema": REPORT_SCHEMA,
+        "acceptance_eligible": threshold_passed,
+        "audit_run_id": authority["value"]["audit_run_id"],
+        "trusted_audit_time_utc": authority["value"]["trusted_audit_time_utc"],
+        "authority": {
+            "manifest": {"path": authority["path"], "sha256": authority["sha256"]},
+            "signature": {
+                "path": authority["signature_path"],
+                "sha256": authority["signature_sha256"],
+                "key_id": authority["value"]["audit_authority"]["key_id"],
+            },
+        },
+        "inputs": {
+            "ledger_manifest": {
+                "path": ledger["manifest_path"], "sha256": ledger["manifest_sha256"]
+            },
+            "ledger_observations": {
+                "path": ledger["observations_path"], "sha256": ledger["observations_sha256"]
+            },
+            "outcomes": {"path": outcomes["path"], "sha256": outcomes["sha256"]},
+        },
+        "evidence_snapshot": snapshot,
+        "counts": {
+            "observations": len(validated),
+            "accepted_fraction_numerator": accepted,
+            "recoverable_denominator": recoverable,
+            "denominator_exclusions": {"unavailable": counts.get("unavailable", 0)},
+            **{state: counts.get(state, 0) for state in sorted(TERMINAL_STATES)},
+            "by_camera": by_camera,
+        },
+        "accepted_fraction_of_recoverable": accepted_fraction,
+        "gates": {
+            "every_observation_has_exactly_one_terminal_outcome": True,
+            "all_evidence_is_retained_root_bound_and_descriptor_pinned": True,
+            "accepted_reports_are_signed_role_separated_and_observation_bound": True,
+            "unavailable_has_signed_policy_and_exact_retrieval_receipts": True,
+            "minimum_accepted_fraction": MINIMUM_ACCEPTED_FRACTION,
+            "minimum_accepted_fraction_passed": threshold_passed,
+        },
+        "acceptance_failures": (
+            [] if threshold_passed else ["minimum_accepted_fraction_not_met"]
+        ),
+        "outcomes": [validated[event_id] for event_id in sorted(validated)],
+    }
+
+
 def build_report(
     ledger_dir,
     outcomes_path,
@@ -1344,63 +1432,12 @@ def build_report(
                 item["evidence"] = validate_rejected_outcome(store, event_id, outcome)
             validated[event_id] = item
         snapshot = store.snapshot()
-
-    counts = Counter(value["state"] for value in validated.values())
-    by_camera = {}
-    for camera in sorted({value["camera_id"] for value in validated.values()}):
-        camera_counts = Counter(
-            value["state"] for value in validated.values() if value["camera_id"] == camera
-        )
-        by_camera[camera] = {
-            state: camera_counts.get(state, 0) for state in sorted(TERMINAL_STATES)
-        }
-    recoverable = len(validated) - counts.get("unavailable", 0)
-    accepted = counts.get("accepted", 0)
-    accepted_fraction = accepted / recoverable if recoverable else 0.0
-    threshold_passed = math.isfinite(accepted_fraction) and accepted_fraction >= MINIMUM_ACCEPTED_FRACTION
-    return {
-        "schema": REPORT_SCHEMA,
-        "acceptance_eligible": threshold_passed,
-        "audit_run_id": authority["value"]["audit_run_id"],
-        "trusted_audit_time_utc": authority["value"]["trusted_audit_time_utc"],
-        "authority": {
-            "manifest": {"path": authority["path"], "sha256": authority["sha256"]},
-            "signature": {
-                "path": authority["signature_path"],
-                "sha256": authority["signature_sha256"],
-                "key_id": authority["value"]["audit_authority"]["key_id"],
-            },
-        },
-        "inputs": {
-            "ledger_manifest": {
-                "path": ledger["manifest_path"], "sha256": ledger["manifest_sha256"]
-            },
-            "ledger_observations": {
-                "path": ledger["observations_path"], "sha256": ledger["observations_sha256"]
-            },
-            "outcomes": {"path": outcomes["path"], "sha256": outcomes["sha256"]},
-        },
-        "evidence_snapshot": snapshot,
-        "counts": {
-            "observations": len(validated),
-            "accepted_fraction_numerator": accepted,
-            "recoverable_denominator": recoverable,
-            "denominator_exclusions": {"unavailable": counts.get("unavailable", 0)},
-            **{state: counts.get(state, 0) for state in sorted(TERMINAL_STATES)},
-            "by_camera": by_camera,
-        },
-        "accepted_fraction_of_recoverable": accepted_fraction,
-        "gates": {
-            "every_observation_has_exactly_one_terminal_outcome": True,
-            "all_evidence_is_retained_root_bound_and_descriptor_pinned": True,
-            "accepted_reports_are_signed_role_separated_and_observation_bound": True,
-            "unavailable_has_signed_policy_and_exact_retrieval_receipts": True,
-            "minimum_accepted_fraction": MINIMUM_ACCEPTED_FRACTION,
-            "minimum_accepted_fraction_passed": threshold_passed,
-        },
-        "acceptance_failures": [] if threshold_passed else ["minimum_accepted_fraction_not_met"],
-        "outcomes": [validated[event_id] for event_id in sorted(validated)],
-    }
+        report = _assemble_report(validated, authority, ledger, outcomes, snapshot)
+        # The snapshot check occurs before report assembly.  Recheck every retained
+        # path immediately before returning so evidence removed in that interval
+        # cannot produce a publishable report.
+        store.verify_current()
+        return report
 
 
 def write_report_exclusive(path, report):
@@ -1408,46 +1445,161 @@ def write_report_exclusive(path, report):
     if os.path.lexists(original):
         fail("output_exists", "audit output already exists")
     try:
+        payload = json.dumps(
+            report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True
+        ).encode("utf-8") + b"\n"
         original.parent.mkdir(parents=True, exist_ok=True)
         parent = original.parent.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         raise OutcomeAuditError("output_unwritable", "audit output directory is unavailable") from exc
     path = parent / original.name
     if os.path.lexists(path):
         fail("output_exists", "audit output already exists")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = None
-    temporary = None
+    published_descriptor = None
+    temporary_name = None
     directory_fd = None
+    published_identity = None
+    publication_succeeded = False
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=parent)
-        temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = None
-            stream.write(json.dumps(
-                report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True
-            ).encode("utf-8") + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        directory_fd = os.open(parent, flags)
+        directory_metadata = os.fstat(directory_fd)
+        path_metadata = os.stat(parent, follow_symlinks=False)
+        directory_identity = (directory_metadata.st_dev, directory_metadata.st_ino)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or not stat.S_ISDIR(path_metadata.st_mode)
+            or (path_metadata.st_dev, path_metadata.st_ino) != directory_identity
+        ):
+            fail("output_directory_replaced", "audit output directory changed while it was pinned")
         try:
-            os.link(temporary, path)
+            os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            fail("output_exists", "audit output already exists")
+
+        for _attempt in range(100):
+            temporary_name = f".{path.name}.tmp-{uuid.uuid4().hex}"
+            temporary_flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(
+                    temporary_name, temporary_flags, 0o600, dir_fd=directory_fd
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if descriptor is None:
+            fail("output_unwritable", "audit output temporary name space is exhausted")
+
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "short audit output write")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        temporary_metadata = os.fstat(descriptor)
+
+        try:
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise OutcomeAuditError("output_exists", "audit output already exists") from exc
-        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        published_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
+
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        temporary_name = None
+        os.close(descriptor)
+        descriptor = None
+
+        published_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        published_before = os.fstat(published_descriptor)
+        if (
+            not stat.S_ISREG(published_before.st_mode)
+            or published_before.st_nlink != 1
+            or (published_before.st_dev, published_before.st_ino) != published_identity
+            or published_before.st_size != len(payload)
+        ):
+            fail("output_replaced", "published audit output is not the staged report")
+        expected_digest = sha256_bytes(payload)
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(published_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        published_after = os.fstat(published_descriptor)
+        current_entry = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            _stable_file_fields(published_before) != _stable_file_fields(published_after)
+            or _stable_file_fields(published_before) != _stable_file_fields(current_entry)
+            or total != len(payload)
+            or digest.hexdigest() != expected_digest
+        ):
+            fail("output_replaced", "published audit output bytes changed during verification")
+
+        current_parent = os.stat(parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_parent.st_mode)
+            or (current_parent.st_dev, current_parent.st_ino) != directory_identity
+        ):
+            fail("output_directory_replaced", "audit output directory changed during publication")
+        current_path = os.stat(path, follow_symlinks=False)
+        if (current_path.st_dev, current_path.st_ino) != published_identity:
+            fail("output_replaced", "audit output path does not name the staged report")
         os.fsync(directory_fd)
+        publication_succeeded = True
     except OutcomeAuditError:
         raise
     except (OSError, TypeError, ValueError) as exc:
         raise OutcomeAuditError("output_unwritable", "audit output could not be published") from exc
     finally:
+        if published_descriptor is not None:
+            os.close(published_descriptor)
         if descriptor is not None:
             os.close(descriptor)
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
         if directory_fd is not None:
             try:
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+                if published_identity is not None and not publication_succeeded:
+                    try:
+                        current = os.stat(
+                            path.name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except FileNotFoundError:
+                        current = None
+                    if current is not None and (
+                        current.st_dev, current.st_ino
+                    ) == published_identity:
+                        os.unlink(path.name, dir_fd=directory_fd)
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            directory_fd = None
     return path
 
 
