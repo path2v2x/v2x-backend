@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import json
@@ -12,7 +12,11 @@ import pytest
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
-from capture_dense_kvs_window import DenseCaptureError, capture  # noqa: E402
+from capture_dense_kvs_window import (  # noqa: E402
+    DenseCaptureError,
+    capture,
+    request_windows,
+)
 
 
 def jpeg(value):
@@ -22,7 +26,11 @@ def jpeg(value):
     return encoded.tobytes()
 
 
-def source_report(tmp_path, schema="v2x-detection-event-frame-capture/v2"):
+def source_report(
+    tmp_path,
+    schema="v2x-detection-event-frame-capture/v2",
+    timestamps=("2026-07-11T03:32:20.000Z", "2026-07-11T03:32:21.000Z"),
+):
     frames = []
     for index in range(2):
         raw = jpeg(40 + index)
@@ -36,7 +44,7 @@ def source_report(tmp_path, schema="v2x-detection-event-frame-capture/v2"):
                 "event_id": f"event-{index}",
                 "object_id": "car-1",
                 "camera_id": "ch4",
-                "selected_frame_timestamp_utc": f"2026-07-11T03:32:2{index}.000Z",
+                "selected_frame_timestamp_utc": timestamps[index],
                 "frame": {"path": str(path), "sha256": digest},
             }
             for index, (path, digest) in enumerate(frames)
@@ -53,29 +61,21 @@ class FakeArchived:
 
     def get_images(self, **kwargs):
         self.calls.append(kwargs)
-        offset = 2 if kwargs.get("NextToken") else 0
-        return {
-            "Images": [
-                {
-                    "TimeStamp": datetime(
-                        2026,
-                        7,
-                        11,
-                        3,
-                        32,
-                        19 + offset + index,
-                        tzinfo=timezone.utc,
-                    ),
-                    "ImageContent": (
-                        base64.b64encode(jpeg(60 + offset + index)).decode()
-                        if index == 0
-                        else jpeg(60 + offset + index)
-                    ),
-                }
-                for index in range(2)
-            ],
-            **({"NextToken": "page2"} if not kwargs.get("NextToken") else {}),
-        }
+        assert "NextToken" not in kwargs
+        start = kwargs["StartTimestamp"]
+        images = []
+        for index in range(3):
+            timestamp = start.replace(tzinfo=timezone.utc) + (
+                kwargs["EndTimestamp"] - start
+            ) * (index / 2)
+            raw = jpeg(40 + int(timestamp.timestamp() * 5) % 150)
+            images.append({
+                "TimeStamp": timestamp,
+                "ImageContent": (
+                    base64.b64encode(raw).decode() if index == 0 else raw
+                ),
+            })
+        return {"Images": images}
 
 
 class FakeKvs:
@@ -113,14 +113,15 @@ def test_capture_binds_dense_frames_without_endpoint(tmp_path):
     )
     report = json.loads(report_path.read_text())
     assert report["schema"] == "v2x-dense-kvs-window/v1"
-    assert report["frame_count"] == 4
+    assert report["frame_count"] == 3
     assert report["resolution"] == [64, 48]
     assert report["safety"]["signed_endpoints_persisted"] is False
     assert "signed.invalid" not in report_path.read_text()
-    assert len(session.archived.calls) == 2
+    assert len(session.archived.calls) == 1
     assert session.archived.calls[0]["SamplingInterval"] == 200
-    assert session.archived.calls[1]["NextToken"] == "page2"
-    assert "page2" not in report_path.read_text()
+    assert session.archived.calls[0]["MaxResults"] == 25
+    assert report["request_strategy"]["whole_second_aligned"] is True
+    assert report["request_strategy"]["continuation_tokens_accepted"] is False
     for frame in report["frames"]:
         raw = (output / frame["path"]).read_bytes()
         assert hashlib.sha256(raw).hexdigest() == frame["sha256"]
@@ -136,7 +137,78 @@ def test_capture_accepts_retained_v1_report(tmp_path):
         "path",
         session_factory=FakeSession().factory,
     )
-    assert json.loads(report_path.read_text())["frame_count"] == 4
+    assert json.loads(report_path.read_text())["frame_count"] == 3
+
+
+def test_capture_chunks_long_grid_without_overlap_or_tokens(tmp_path):
+    session = FakeSession()
+    report_path = capture(
+        source_report(
+            tmp_path,
+            timestamps=(
+                "2026-07-11T03:32:20.000Z",
+                "2026-07-11T03:32:32.000Z",
+            ),
+        ),
+        "ch4",
+        "car-1",
+        tmp_path / "dense",
+        "path",
+        session_factory=session.factory,
+    )
+    report = json.loads(report_path.read_text())
+    assert report["response_page_count"] == 4
+    assert len(session.archived.calls) == 4
+    for call in session.archived.calls:
+        assert "NextToken" not in call
+        assert call["MaxResults"] == 25
+        assert call["StartTimestamp"].microsecond == 0
+        assert call["EndTimestamp"].microsecond == 0
+        assert (call["EndTimestamp"] - call["StartTimestamp"]).total_seconds() <= 4.0
+    for left, right in zip(session.archived.calls, session.archived.calls[1:]):
+        assert right["StartTimestamp"] == left["EndTimestamp"]
+    assert report["duplicate_timestamp_count"] == 3
+
+
+def test_request_chunks_align_fractional_range_and_overlap_boundaries():
+    start = datetime.fromisoformat("2026-07-11T03:32:20.125+00:00")
+    windows = request_windows(
+        start,
+        datetime.fromisoformat("2026-07-11T03:32:25.050+00:00"),
+        200,
+    )
+    assert len(windows) == 2
+    assert all(left < right for left, right in windows)
+    assert windows[0][0] == datetime.fromisoformat("2026-07-11T03:32:20+00:00")
+    assert windows[0][1] == datetime.fromisoformat("2026-07-11T03:32:24+00:00")
+    assert windows[1][0] == windows[0][1]
+    assert windows[1][1] == datetime.fromisoformat("2026-07-11T03:32:26+00:00")
+
+
+def test_request_chunks_reject_zero_range():
+    timestamp = datetime.fromisoformat("2026-07-11T03:32:20+00:00")
+    with pytest.raises(DenseCaptureError, match="positive time range"):
+        request_windows(timestamp, timestamp, 200)
+
+
+def test_capture_rejects_unexpected_bounded_page_token(tmp_path):
+    class TokenArchived(FakeArchived):
+        def get_images(self, **kwargs):
+            response = super().get_images(**kwargs)
+            response["NextToken"] = "opaque"
+            return response
+
+    session = FakeSession()
+    session.archived = TokenArchived()
+    with pytest.raises(DenseCaptureError, match="unexpectedly requires pagination"):
+        capture(
+            source_report(tmp_path),
+            "ch4",
+            "car-1",
+            tmp_path / "dense",
+            "path",
+            session_factory=session.factory,
+        )
 
 
 def test_capture_rejects_tampered_source_frame(tmp_path):

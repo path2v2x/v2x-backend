@@ -29,6 +29,9 @@ INPUT_SCHEMAS = {
 }
 OUTPUT_SCHEMA = "v2x-dense-kvs-window/v1"
 CAMERAS = {"ch1", "ch2", "ch3", "ch4"}
+MAX_IMAGES_PER_RESPONSE = 25
+MAX_REQUEST_SPAN_SECONDS = 240
+MAX_REQUEST_COUNT = 10
 
 
 class DenseCaptureError(RuntimeError):
@@ -129,6 +132,44 @@ def validate_parameters(camera_id, object_id, padding_seconds, sampling_ms):
         raise DenseCaptureError("sampling interval must be 200 through 20000 ms")
 
 
+def request_windows(start, end, sampling_ms):
+    """Split one inclusive sample grid into deterministic service-sized chunks.
+
+    GetImages currently returns at most 25 images per response even when a
+    larger MaxResults value is requested.  Continuation-token requests have
+    also produced intermittent timestamp-validation failures in the service.
+    Keeping every request at or below the documented effective page size makes
+    each time range self-contained and prevents an opaque token from becoming
+    part of the evidence acquisition contract.
+    """
+    if end <= start:
+        raise DenseCaptureError("dense KVS request has no positive time range")
+    aligned_start = start.replace(microsecond=0)
+    aligned_end = end.replace(microsecond=0)
+    if aligned_end < end:
+        aligned_end += timedelta(seconds=1)
+    # The service aligns producer-time image grids to whole seconds.  Fractional
+    # subranges can therefore return samples before StartTimestamp, and a range
+    # whose endpoints fall in one second can be rejected as equal.  Whole-second
+    # requests plus post-filtering preserve the caller's exact requested range.
+    maximum_grid_span = math.floor(
+        (MAX_IMAGES_PER_RESPONSE - 2) * sampling_ms / 1000.0
+    )
+    span_seconds = max(1, min(MAX_REQUEST_SPAN_SECONDS, maximum_grid_span))
+    span = timedelta(seconds=span_seconds)
+    cursor = aligned_start
+    windows = []
+    while cursor < aligned_end:
+        chunk_end = min(aligned_end, cursor + span)
+        windows.append((cursor, chunk_end))
+        # Boundary overlap is intentional.  KVS uses inclusive timestamps; the
+        # duplicate is content-checked and removed after decoding.
+        cursor = chunk_end
+    if len(windows) > MAX_REQUEST_COUNT:
+        raise DenseCaptureError("dense KVS capture exceeds ten bounded requests")
+    return windows
+
+
 def decode_image(item):
     timestamp = item.get("TimeStamp") if isinstance(item, dict) else None
     content = item.get("ImageContent") if isinstance(item, dict) else None
@@ -193,34 +234,61 @@ def capture(
     archived = session.client(
         "kinesis-video-archived-media", endpoint_url=endpoint
     )
-    request = {
-        "StreamName": stream_name,
-        "ImageSelectorType": "PRODUCER_TIMESTAMP",
-        "StartTimestamp": start,
-        "EndTimestamp": end,
-        "SamplingInterval": sampling_ms,
-        "Format": "JPEG",
-        "MaxResults": 100,
-    }
-    response = archived.get_images(**request)
-    image_items = list(response.get("Images", []))
-    page_count = 1
-    while response.get("NextToken"):
-        page_count += 1
-        if page_count > 10:
-            raise DenseCaptureError("KVS dense capture exceeded ten response pages")
-        response = archived.get_images(
-            **request,
-            NextToken=response["NextToken"],
-        )
-        image_items.extend(response.get("Images", []))
-        if len(image_items) > 110:
-            raise DenseCaptureError("KVS returned more images than the bounded request")
-    decoded = [
-        value for item in image_items if (value := decode_image(item))
-    ]
+    image_items = []
+    windows = request_windows(start, end, sampling_ms)
+    for chunk_start, chunk_end in windows:
+        request = {
+            "StreamName": stream_name,
+            "ImageSelectorType": "PRODUCER_TIMESTAMP",
+            "StartTimestamp": chunk_start,
+            "EndTimestamp": chunk_end,
+            "SamplingInterval": sampling_ms,
+            "Format": "JPEG",
+            # The aligned request span is sized below the service's effective
+            # 25-image response page, so any token is a fail-closed anomaly.
+            "MaxResults": MAX_IMAGES_PER_RESPONSE,
+        }
+        try:
+            response = archived.get_images(**request)
+        except Exception as exc:
+            raise DenseCaptureError("bounded KVS GetImages request failed") from exc
+        if response.get("NextToken"):
+            raise DenseCaptureError(
+                "bounded KVS GetImages response unexpectedly requires pagination"
+            )
+        values = response.get("Images", [])
+        if not isinstance(values, list) or len(values) > MAX_IMAGES_PER_RESPONSE:
+            raise DenseCaptureError("KVS returned an invalid bounded image page")
+        image_items.extend(values)
+    page_count = len(windows)
+    decoded_all = []
+    discarded_error_count = 0
+    for item in image_items:
+        value = decode_image(item)
+        if value is None:
+            discarded_error_count += 1
+        else:
+            decoded_all.append(value)
+    in_window = [value for value in decoded_all if start <= value[0] <= end]
+    discarded_out_of_window_count = len(decoded_all) - len(in_window)
+    by_timestamp = {}
+    duplicate_timestamp_count = 0
+    for value in in_window:
+        timestamp, content, _image = value
+        previous = by_timestamp.get(timestamp)
+        if previous is not None:
+            if previous[1] != content:
+                raise DenseCaptureError(
+                    "KVS returned conflicting images at one producer timestamp"
+                )
+            duplicate_timestamp_count += 1
+            continue
+        by_timestamp[timestamp] = value
+    decoded = list(by_timestamp.values())
     if len(decoded) < 3:
         raise DenseCaptureError("KVS returned fewer than three usable dense frames")
+    if len(decoded) > expected_count:
+        raise DenseCaptureError("KVS returned more images than the requested grid")
     decoded.sort(key=lambda value: value[0])
     timestamps = [value[0] for value in decoded]
     if len(set(timestamps)) != len(timestamps):
@@ -286,7 +354,18 @@ def capture(
             "frames": rows,
             "frame_count": len(rows),
             "response_page_count": page_count,
-            "discarded_error_count": len(image_items) - len(decoded),
+            "discarded_error_count": discarded_error_count,
+            "discarded_out_of_window_count": discarded_out_of_window_count,
+            "duplicate_timestamp_count": duplicate_timestamp_count,
+            "request_strategy": {
+                "whole_second_aligned": True,
+                "maximum_images_per_response": MAX_IMAGES_PER_RESPONSE,
+                "maximum_request_span_seconds": max(
+                    (right - left).total_seconds() for left, right in windows
+                ),
+                "continuation_tokens_accepted": False,
+                "exact_requested_window_post_filter": True,
+            },
             "maximum_interframe_gap_ms": max(gaps_ms) if gaps_ms else None,
             "acceptance_failures": [
                 "dense_frames_are_unreviewed_tracking_inputs",
