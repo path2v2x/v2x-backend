@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import inspect
 import json
 import math
+import errno
 import os
 from pathlib import Path
 import re
@@ -1760,6 +1761,11 @@ class FfmpegNvdecCapture:
         self._cancel_watcher = None
         self._process_lock = threading.RLock()
         self._release_lock = threading.Lock()
+        self._fifo_open_guard_fd = None
+        self._fifo_open_guard_lock = threading.Lock()
+        self._open_boundary_complete = threading.Event()
+        self._open_boundary_monitor = None
+        self._open_boundary_error = None
 
         def raise_if_cancelled():
             if cancel_event is not None and cancel_event.is_set():
@@ -1778,6 +1784,16 @@ class FfmpegNvdecCapture:
             )
             fifo_path = Path(self._temporary_directory.name) / "frames.nut"
             os.mkfifo(fifo_path, 0o600)
+            # A FIFO read open blocks in the kernel when FFmpeg exits before
+            # attaching its writer, outside OpenCV's finite interrupt timeout.
+            # Hold one owner-only read/write descriptor across the native
+            # constructor so it always crosses that kernel boundary. The guard
+            # is never inherited by FFmpeg. A bounded monitor closes it and
+            # supplies a retrying EOF wake when the producer exits; normal
+            # constructor return closes it immediately.
+            self._fifo_open_guard_fd = os.open(
+                fifo_path, os.O_RDWR | os.O_NONBLOCK
+            )
 
             pass_fds = ()
             pts_read_fd = None
@@ -1846,12 +1862,6 @@ class FfmpegNvdecCapture:
             if pts_read_fd is not None:
                 self._pts_sidecar = _FramePtsSidecar(pts_read_fd)
                 pts_read_fd = None
-            if cancel_event is not None:
-                self._cancel_watcher = threading.Thread(
-                    target=self._watch_for_cancel,
-                    daemon=True,
-                )
-                self._cancel_watcher.start()
             params = []
             open_timeout = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
             read_timeout = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
@@ -1859,17 +1869,55 @@ class FfmpegNvdecCapture:
                 params.extend([open_timeout, int(open_timeout_ms)])
             if read_timeout is not None:
                 params.extend([read_timeout, int(read_timeout_ms)])
-            self._capture = cv2.VideoCapture(
-                str(fifo_path), cv2.CAP_FFMPEG, params
-            )
+            # Cancellation after child setup must not enter the native open at
+            # all. Once it begins, the finite OpenCV timeout owns the boundary.
             raise_if_cancelled()
+            self._open_boundary_monitor = threading.Thread(
+                target=self._watch_open_boundary,
+                args=(
+                    str(fifo_path),
+                    time.monotonic()
+                    + max(0.001, float(open_timeout_ms) / 1000.0),
+                ),
+                daemon=True,
+            )
+            self._open_boundary_monitor.start()
+            try:
+                self._capture = cv2.VideoCapture(
+                    str(fifo_path), cv2.CAP_FFMPEG, params
+                )
+            finally:
+                self._open_boundary_complete.set()
+                self._close_fifo_open_guard()
+                self._join_open_boundary_monitor()
+            # The runtime cancellation watcher is intentionally not active
+            # inside this native call. The bounded open monitor is the sole
+            # producer lifecycle owner here: on cancellation, producer exit, or
+            # the configured open deadline it reaps FFmpeg and delivers FIFO
+            # EOF without ever releasing a partially constructed VideoCapture.
+            if self._open_boundary_error is not None:
+                raise self._open_boundary_error
+            raise_if_cancelled()
+            with self._process_lock:
+                opened_process = self._process
             self._opened = bool(
                 self._capture is not None
                 and self._capture.isOpened()
-                and self._process.poll() is None
+                and opened_process is not None
+                and opened_process.poll() is None
             )
             if not self._opened:
                 raise NvdecCaptureError("NVDEC capture open failed")
+            if cancel_event is not None:
+                self._cancel_watcher = threading.Thread(
+                    target=self._watch_for_cancel,
+                    daemon=True,
+                )
+                self._cancel_watcher.start()
+                # Close the race between the pre-watcher cancellation check
+                # and watcher startup. Any cancellation observed here still
+                # exits through the same owner-controlled release path.
+                raise_if_cancelled()
         except Exception:
             if pts_read_fd is not None:
                 try:
@@ -1879,6 +1927,9 @@ class FfmpegNvdecCapture:
             self.release()
             raise
         finally:
+            self._open_boundary_complete.set()
+            self._close_fifo_open_guard()
+            self._join_open_boundary_monitor()
             if self._pts_write_fd is not None:
                 try:
                     os.close(self._pts_write_fd)
@@ -1981,18 +2032,41 @@ class FfmpegNvdecCapture:
         """Return one finite, URL-free runtime timing diagnostic."""
         return self._transport_diagnostic
 
-    def release(self):
-        # Only the owning cleanup path tears down OpenCV and connection-local
-        # state.  The cancellation watcher merely wakes a blocked FIFO read by
-        # signalling FFmpeg.  Serializing here also makes concurrent terminal
-        # and proactive cleanup idempotent.
-        with self._release_lock:
-            self._cancel_watcher_stop.set()
-            self._opened = False
-            cleanup_error = None
+    def _close_fifo_open_guard(self):
+        lock = getattr(self, "_fifo_open_guard_lock", None)
+        if lock is None:
+            return
+        with lock:
+            guard, self._fifo_open_guard_fd = (
+                getattr(self, "_fifo_open_guard_fd", None),
+                None,
+            )
+        if guard is not None:
+            try:
+                os.close(guard)
+            except OSError:
+                pass
 
-            with self._process_lock:
-                process = self._process
+    def _join_open_boundary_monitor(self):
+        monitor = getattr(self, "_open_boundary_monitor", None)
+        if (
+            monitor is not None
+            and monitor is not threading.current_thread()
+            and monitor.is_alive()
+        ):
+            monitor.join(
+                timeout=(
+                    _FFMPEG_TERMINATE_WAIT_SECONDS
+                    + _FFMPEG_KILL_WAIT_SECONDS
+                    + _CANCEL_WATCHER_JOIN_TIMEOUT_SECONDS
+                )
+            )
+
+    def _terminate_ffmpeg_process(self):
+        """Serialize the one bounded TERM/KILL/reap lifecycle."""
+        cleanup_error = None
+        with self._process_lock:
+            process = self._process
             if process is not None and process.poll() is None:
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
@@ -2013,12 +2087,73 @@ class FfmpegNvdecCapture:
                                 cleanup_error = NvdecCaptureError(
                                     "NVDEC FFmpeg process did not exit"
                                 )
-
             process_dead = process is None or process.poll() is not None
-            if process_dead:
+            if process_dead and self._process is process:
+                self._process = None
+        return process_dead, cleanup_error
+
+    def _watch_open_boundary(self, fifo_path, deadline):
+        """Make local FIFO open finite even when its producer exits or stalls."""
+        while not self._open_boundary_complete.is_set():
+            with self._process_lock:
+                process = self._process
+            process_dead = process is None or process.poll() is not None
+            cancelled = (
+                self._cancel_event is not None
+                and self._cancel_event.is_set()
+            )
+            expired = time.monotonic() >= deadline
+            if (cancelled or expired) and not process_dead:
+                process_dead, error = self._terminate_ffmpeg_process()
+                if error is not None:
+                    self._open_boundary_error = error
+                    return
+            elif process_dead and process is not None:
+                # poll() reaped a naturally exited direct child. Clear the
+                # shared slot under the same lifecycle lock used by release.
                 with self._process_lock:
                     if self._process is process:
                         self._process = None
+            if process_dead:
+                # Closing the retained read/write guard supplies EOF when the
+                # OpenCV reader already exists. If producer exit won the race
+                # before cv2 entered open(), retry a temporary nonblocking
+                # writer until that reader exists, then close it to deliver EOF.
+                self._close_fifo_open_guard()
+                while not self._open_boundary_complete.is_set():
+                    try:
+                        wake_fd = os.open(
+                            fifo_path, os.O_WRONLY | os.O_NONBLOCK
+                        )
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENXIO, errno.ENOENT):
+                            self._open_boundary_error = NvdecCaptureError(
+                                "NVDEC FIFO open wake failed"
+                            )
+                            return
+                        self._open_boundary_complete.wait(0.005)
+                        continue
+                    try:
+                        return
+                    finally:
+                        os.close(wake_fd)
+                return
+            self._open_boundary_complete.wait(0.01)
+
+    def release(self):
+        # Only the owning cleanup path tears down OpenCV and connection-local
+        # state.  The cancellation watcher merely wakes a blocked FIFO read by
+        # signalling FFmpeg.  Serializing here also makes concurrent terminal
+        # and proactive cleanup idempotent.
+        with self._release_lock:
+            self._cancel_watcher_stop.set()
+            open_complete = getattr(self, "_open_boundary_complete", None)
+            if open_complete is not None:
+                open_complete.set()
+            self._close_fifo_open_guard()
+            self._join_open_boundary_monitor()
+            self._opened = False
+            process_dead, cleanup_error = self._terminate_ffmpeg_process()
 
             # cv2.VideoCapture.release() can block on a FIFO while its writer
             # is still alive.  Reap the writer first; if even SIGKILL cannot do
