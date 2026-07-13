@@ -12,10 +12,11 @@ under test are not acceptance evidence.
 
 ## 0. Durable baseline and corpus
 
-- Work only in the clean `codex/v2x-calibration-current` worktree at
-  `/home/path/.codex/worktrees/v2x-calibration-current`. Treat the superseded
-  `codex/v2x-calibration-integration` worktree as read-only evidence because it
-  contains untracked Playwright artifacts.
+- Make each source change in a dedicated clean `codex/v2x-*` worktree based on
+  the exact production candidate. Integrate only independently reviewed commits
+  into a newly created clean integration worktree based on the then-current
+  `origin/main`; never use the dirty/superseded `v2x-calibration-current` or
+  `v2x-calibration-integration` worktrees as integration truth.
 - Freeze production source/config, UE5 image and binary, map/OpenDRIVE, service
   restart counters, timers, mode, session count, and rollback bundle before a
   mutation window.
@@ -28,9 +29,10 @@ under test are not acceptance evidence.
   before optimization; no frame or resampled feature may cross splits.
 - Measure physical-camera pairwise clock offset and drift, and physical-camera
   to replay/CARLA-clock offset, from the trusted media clocks. At the fastest
-  accepted road speed, require P95 pairwise offset <= 75 ms, max <= 125 ms, and
-  absolute drift <= 10 ms/hour. These bounds reserve less than 2 m of the
-  localization budget for timing at 15 m/s; slower scenes do not relax them.
+  accepted road speed, require P95 pairwise offset <= 50 ms, max <= 75 ms, and
+  absolute drift <= 5 ms/hour. These tightened bounds reserve no more than
+  0.75 m P95 and 1.125 m max for timing at 15 m/s; slower scenes do not relax
+  them.
   Require at least 80% reciprocal one-to-one timestamp matches per camera side.
   Exact/shared zero-residual producer grids fail as likely common ingest
   stamping; the evaluator must recover a synthetic injected offset. Producer
@@ -39,6 +41,50 @@ under test are not acceptance evidence.
   annotation, or optimizer decision made after seeing its result burns that
   holdout. Replacement holdouts must be newly frozen, time-disjoint windows and
   tracks; old failures remain in the permanent audit history.
+- Cap replacement holdouts at three frozen replacements per phase. A fourth
+  attempt requires a new pre-registered model generation and external review;
+  it cannot be another tuning iteration against fresh data.
+- Store frames, raw buffers, manifests, splits, tool/model snapshots, reviews,
+  and failures under the append-only calibration evidence namespace. Before
+  optimization, publish a canonical hash/split manifest to a versioned
+  write-once remote object store and verify its retention/version ID. Local
+  ownership, permissions, exclusive publication, immutable-bit state, and the
+  remote version binding are evidence fields; a mutable directory is not a
+  frozen holdout.
+- Define `trusted schema-v2` by the exact source-controlled `is_trusted_v2`
+  implementation/commit. Require schema version 2, a matched HLS
+  program-date-time source/schema, exact media/timestamp equality, and all raw
+  producer fingerprints required by that implementation; caller booleans are
+  not trust evidence.
+- Validate exposure time with a GPS-disciplined LED/flasher or equivalent
+  GNSS-timed optical target visible to every camera. Retain controller logs,
+  UTC uncertainty, frame hashes, and independently recovered injected offsets.
+  Producer timestamps remain diagnostic until this passes.
+
+### Physical prerequisites and error budget
+
+The site owner must authorize and supply the physical observations below;
+Codex prepares acquisition tools/manifests and validates returned evidence.
+None may be inferred from ordinary traffic detections.
+
+- Four native-resolution board datasets, board measurement, focus/zoom/crop
+  state, mount-stability frames, and roadside safety authorization.
+- A current licensed survey with horizontal and vertical datum/epoch plus
+  independently authenticated surveyor/instrument provenance.
+- A GNSS-disciplined optical timing run across all four cameras.
+- An independently logged RTK-GNSS test vehicle driven through every accepted
+  camera/pair transition, with raw fixes, covariance, antenna/vehicle lever arm,
+  heading, controller clock, and calibration retained.
+- Camera/environment temperature telemetry spanning the claimed operating
+  range. Until measured, the envelope is limited to acquired conditions and an
+  excursion reopens calibration.
+
+The P95 root-sum-square development budget at 15 m/s is fixed before holdout:
+timing <= 0.75 m, static road-plane projection <= 0.50 m, reviewed contact <=
+0.35 m, map/survey <= 0.25 m, and actor/readback <= 0.05 m (combined <= 1.0 m,
+leaving >= 1.0 m to the 2 m end-to-end gate). Report covariance and signed
+residual correlations; correlated terms are summed, not hidden by RSS. Every
+held-out RTK comparison must independently pass the direct <= 2 m world gate.
 
 Exit: hashes reconcile, production remains healthy, every corpus row is
 accounted for, clocks pass the fixed offset/drift gate, and all optimization
@@ -50,6 +96,11 @@ inputs and split assignments are immutable.
   unique checkerboard/ChArUco fit images and two untouched holdouts. Require fit
   and holdout RMS <= 2 px and held-out corner max <= 5 px. Bind the physical
   board measurement, focus/zoom/crop state, and mount-stability proof.
+- Before extrinsic fitting, prove whether the measured Brown-Conrady model can
+  be represented by the deployed UE5/CARLA optical path. If not, implement and
+  hash-bind either physical-feed undistortion to the deployed pinhole model or
+  a source-controlled render-distortion path, then re-run dense-ray and scene
+  holdouts. Never substitute CARLA lens coefficients by similar names.
 - Build temporally stable, class-aware real targets for finite road/curb edges,
   lane paint, crosswalk/stop paint, horizon, vanishing directions, and unique
   stable landmarks. Exclude vehicles, people, vegetation, shadows, reflections,
@@ -120,6 +171,9 @@ independently.
   are adjudicated, and the 0.60 similarity floor is validated separately for
   every camera pair against positive and hard-negative examples. Matcher output
   never labels its own truth.
+- Set every camera-pair appearance floor on the development split only and
+  freeze it before holdout. Require Cohen's kappa >= 0.80 between blind identity
+  reviewers before adjudication; lower agreement fails the truth-labeling gate.
 - Fit one shared ground-plane trajectory, heading, velocity, dimensions, and
   bounded blueprint family per vehicle. Optimize across all available cameras
   and time using silhouette, contour, footprint/contact, projected 3-D box,
@@ -139,6 +193,11 @@ Exit:
 ## 3. Held-out UE5 same-car proof
 
 - Replay only untouched held-out tracks after all four static cameras pass.
+- Establish absolute vehicle truth with the independent RTK test vehicle, not
+  the fitted trajectory. Align the controller clock through the passed optical
+  timing model, transform antenna fixes through the surveyed lever arm and map
+  datum, and keep the RTK trajectory outside fitting. A self-fitted multi-camera
+  trajectory is diagnostic consistency evidence only.
 - Use one stable-digest UE5 blueprint and actor ID for each track across bridge
   restarts. Render the projected 3-D actor bbox, centroid, silhouette, and
   visible ground footprint in every matched view.
@@ -162,6 +221,12 @@ identity switches, zero stale actors, and zero unexplained eligible failures.
 The minimum sample prevents a single favorable event from establishing product
 accuracy; it does not permit hiding any other eligible failure.
 
+Eligibility and adjudication reasons are pre-registered before viewing the
+holdout. Two blind reviewers may adjudicate whether a fixed occlusion or
+truncation rule applies, but an adjudicated eligible failure remains a failed
+event. The zero-unexplained-eligible-failure gate is not replaced by an average
+or pass-rate threshold.
+
 ## 4. Regression, deployment, and product proof
 
 - Pass bridge, perception, web, type/protocol, AWS-route, rollback, and
@@ -184,10 +249,21 @@ accuracy; it does not permit hiding any other eligible failure.
   Any service restart, listener loss, stale feed beyond the limits above,
   session/socket accumulation, actor leak, or calibration regression triggers
   the rehearsed rollback.
+- Supervise the unattended watch with a source-controlled systemd watchdog that
+  records every sample and automatically invokes the exact rehearsed rollback
+  bundle on a fixed trigger. Prove watchdog and rollback in a non-production
+  rehearsal, record timer/unit hashes, and name the on-call owner; an unattended
+  prose instruction is not a rollback mechanism.
 - Re-run stable-landmark projection weekly and after a mount impact, refocus,
   zoom/crop change, firmware/image-pipeline change, thermal shift outside the
   validated range, or map update. Reopen Phase 1 if any landmark exceeds the
   held-out point gate or the aggregate RMS regresses by more than 20%.
+- Install the weekly check as a tracked timer with retained reports and an
+  explicit owner/escalation target. Establish the validated thermal interval
+  from Phase 0 telemetry; an unmeasured interval cannot suppress recalibration.
+- Validate shadow/exposure robustness on time-disjoint development and holdout
+  conditions spanning the claimed operating envelope. If only one day/weather
+  regime exists, state that narrower envelope and do not claim more.
 
 Exit: every gate above is green on the deployed version through both watch
 windows and rollback evidence is independently restorable.
