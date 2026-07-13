@@ -26,6 +26,7 @@ from build_twin_calibration_manifest import (  # noqa: E402
     validate_intrinsics_source_images,
     validate_annotations,
     validate_resolved_point_independence,
+    validate_strict_projection_provenance,
 )
 
 
@@ -76,6 +77,17 @@ def annotation_payload():
         "cameras_file_sha256": "c" * 64,
         "points": points,
         "roads": roads,
+    }
+
+
+def strict_projection(map_name="Carla/Maps/Richmond_Field_Station_Richmond_CA"):
+    return {
+        "source": "opendrive_georeference",
+        "strict": True,
+        "map_origin_error_m": 0.125,
+        "map_name": map_name,
+        "opendrive_sha256": "1" * 64,
+        "georeference_sha256": "2" * 64,
     }
 
 
@@ -262,6 +274,31 @@ def test_resolve_manifest_rejects_wrong_depth_resolution_before_backprojection()
             real_frame_sha256="a" * 64, twin_frame_sha256="b" * 64,
             annotation_sha256="c" * 64, cameras_file_sha256="d" * 64,
             camera_config_sha256="e" * 64, depth_raw_sha256="f" * 64,
+            projection_provenance=strict_projection(),
+            ue5_map="Carla/Maps/Richmond_Field_Station_Richmond_CA",
+            ue5_map_opendrive_sha256="1" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        None,
+        {"source": "origin_centered_fallback", "strict": False},
+        {
+            **strict_projection(),
+            "georeference_sha256": "not-a-sha256",
+        },
+    ],
+)
+def test_manifest_builder_rejects_missing_malformed_or_fallback_projection(
+    projection,
+):
+    with pytest.raises(ValueError, match="strict OpenDRIVE projection"):
+        validate_strict_projection_provenance(
+            projection,
+            map_name="Carla/Maps/Richmond_Field_Station_Richmond_CA",
+            opendrive_sha256="1" * 64,
         )
 
 
@@ -493,4 +530,7 @@ def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
             cameras_file_sha256="d" * 64,
             camera_config_sha256="e" * 64,
             depth_raw_sha256="f" * 64,
+            projection_provenance=strict_projection(),
+            ue5_map="Carla/Maps/Richmond_Field_Station_Richmond_CA",
+            ue5_map_opendrive_sha256="1" * 64,
         )

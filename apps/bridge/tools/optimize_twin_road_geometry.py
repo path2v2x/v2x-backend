@@ -41,10 +41,16 @@ from build_twin_calibration_manifest import (  # noqa: E402
     convex_hull_area,
     decoded_image_size,
     stable_depth_meters,
+    validate_strict_projection_provenance,
 )
 from build_twin_camera_landmarks import (  # noqa: E402
     depth_pixel_to_world,
     wait_for_frame,
+)
+from aggregate_twin_calibration_manifests import (  # noqa: E402
+    CAMERAS as SITE_CAMERAS,
+    SiteManifestError,
+    aggregate_site_manifests,
 )
 
 
@@ -321,6 +327,14 @@ def manifest_gate(manifest):
     map_hash = str(manifest.get("ue5_map_opendrive_sha256") or "")
     if len(map_hash) != 64 or any(char not in "0123456789abcdef" for char in map_hash):
         reasons.append("missing_ue5_map_opendrive_sha256")
+    try:
+        validate_strict_projection_provenance(
+            manifest.get("projection"),
+            map_name=manifest.get("ue5_map"),
+            opendrive_sha256=map_hash,
+        )
+    except ValueError:
+        reasons.append("invalid_strict_opendrive_projection_provenance")
     deployment = manifest.get("deployment_model")
     if not isinstance(deployment, dict) or deployment.get("type") != "twin_camera_rig_v1":
         reasons.append("missing_deployment_model")
@@ -432,6 +446,35 @@ def manifest_gate(manifest):
         for feature in train_points + held_points
     ):
         reasons.append("unverified_unique_landmark_provenance")
+    global_landmark_ids = []
+    for feature in train_points + held_points:
+        landmark_id = feature.get("global_landmark_id")
+        surveyed_world = feature.get("surveyed_world")
+        survey_record_sha256 = feature.get("survey_record_sha256")
+        if (
+            not isinstance(landmark_id, str)
+            or not landmark_id
+            or landmark_id.strip() != landmark_id
+            or not isinstance(surveyed_world, list)
+            or len(surveyed_world) != 3
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in surveyed_world
+            )
+            or not isinstance(survey_record_sha256, str)
+            or len(survey_record_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in survey_record_sha256
+            )
+        ):
+            reasons.append("unbound_global_landmark_identity")
+            break
+        global_landmark_ids.append(landmark_id)
+    if len(set(global_landmark_ids)) != len(global_landmark_ids):
+        reasons.append("duplicate_global_landmark_identity")
     if any(
         feature.get("provenance") != "manually_traced_geometry"
         for feature in train_lines + held_lines
@@ -621,6 +664,11 @@ def verify_external_evidence(
         for feature in annotations["points"]:
             expected_features.append({
                 "id": str(feature["id"]).strip(),
+                "global_landmark_id": feature["global_landmark_id"],
+                "surveyed_world": [
+                    float(value) for value in feature["surveyed_world"]
+                ],
+                "survey_record_sha256": feature["survey_record_sha256"],
                 "type": "point",
                 "split": feature["split"],
                 "provenance": feature["provenance"],
@@ -650,8 +698,9 @@ def verify_external_evidence(
         for feature in manifest.get("features", []):
             keys = (
                 (
-                    "id", "type", "split", "provenance", "category",
-                    "description", "twin", "image",
+                    "id", "global_landmark_id", "surveyed_world",
+                    "survey_record_sha256", "type", "split", "provenance",
+                    "category", "description", "twin", "image",
                 )
                 if feature.get("type") == "point"
                 else (
@@ -673,6 +722,8 @@ def verify_external_evidence(
             "ue5_map_opendrive_sha256"
         ):
             reasons.append("runtime_ue5_map_content_mismatch")
+        if runtime_evidence.get("projection") != manifest.get("projection"):
+            reasons.append("runtime_projection_provenance_mismatch")
         if runtime_evidence.get("baseline") != manifest.get("baseline"):
             reasons.append("runtime_baseline_mismatch")
         if runtime_evidence.get("deployment_model") != manifest.get(
@@ -714,7 +765,20 @@ def collect_runtime_calibration_evidence(
     client.set_timeout(20.0)
     world = client.get_world()
     carla_map = world.get_map()
-    transform = compute_twin_camera_transform(carla_map, config["site"], camera)
+    transform, projection = compute_twin_camera_transform(
+        carla_map,
+        config["site"],
+        camera,
+        require_opendrive_georeference=True,
+        return_projection_provenance=True,
+    )
+    opendrive = carla_map.to_opendrive()
+    opendrive_sha256 = hashlib.sha256(opendrive.encode("utf-8")).hexdigest()
+    projection = validate_strict_projection_provenance(
+        projection,
+        map_name=str(carla_map.name),
+        opendrive_sha256=opendrive_sha256,
+    )
     fov = twin_horizontal_fov_deg(camera)
     intrinsics = camera["intrinsics"]
     baseline = {
@@ -781,9 +845,8 @@ def collect_runtime_calibration_evidence(
             ]
     return {
         "ue5_map": str(carla_map.name),
-        "ue5_map_opendrive_sha256": hashlib.sha256(
-            carla_map.to_opendrive().encode("utf-8")
-        ).hexdigest(),
+        "ue5_map_opendrive_sha256": opendrive_sha256,
+        "projection": projection,
         "endpoint": {"host": str(host), "port": int(port)},
         "fresh_depth_frame": {
             "carla_frame": int(fresh_image.frame),
@@ -871,8 +934,74 @@ def evaluate_split(manifest, params, split):
     return {"points": point_metrics(point_errors), "lines": point_metrics(line_errors)}
 
 
+def verify_site_aggregation_report(manifest, manifest_bytes, report_bytes):
+    """Recompute the four-camera registry report and bind this exact manifest."""
+    reasons = []
+    try:
+        parsed_manifest = json.loads(manifest_bytes)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        parsed_manifest = None
+        reasons.append("optimizer_manifest_bytes_invalid")
+    if parsed_manifest != manifest:
+        reasons.append("optimizer_manifest_object_bytes_mismatch")
+    try:
+        report = json.loads(report_bytes)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        report = None
+        reasons.append("site_aggregation_report_invalid")
+    manifest_sha256 = (
+        hashlib.sha256(manifest_bytes).hexdigest()
+        if isinstance(manifest_bytes, bytes)
+        else None
+    )
+    report_sha256 = (
+        hashlib.sha256(report_bytes).hexdigest()
+        if isinstance(report_bytes, bytes)
+        else None
+    )
+    if isinstance(report, dict):
+        manifests = report.get("manifests")
+        camera_id = manifest.get("camera_id")
+        entry = manifests.get(camera_id) if isinstance(manifests, dict) else None
+        if (
+            report.get("schema") != "v2x-site-calibration-aggregation/v1"
+            or report.get("gate_passed") is not True
+            or report.get("acceptance_eligible") is not False
+            or set(manifests or {}) != set(SITE_CAMERAS)
+            or not isinstance(entry, dict)
+            or entry.get("sha256") != manifest_sha256
+        ):
+            reasons.append("site_aggregation_current_manifest_mismatch")
+        registry = report.get("site_landmark_registry")
+        try:
+            registry_path = registry["path"]
+            manifest_paths = [
+                manifests[camera]["path"] for camera in sorted(SITE_CAMERAS)
+            ]
+            recomputed = aggregate_site_manifests(
+                registry_path,
+                manifest_paths,
+            )
+        except (KeyError, TypeError, OSError, SiteManifestError):
+            recomputed = None
+            reasons.append("site_aggregation_recompute_failed")
+        if recomputed is not None and recomputed != report:
+            reasons.append("site_aggregation_report_content_mismatch")
+    return {
+        "passed": not reasons,
+        "reasons": reasons,
+        "report_sha256": report_sha256,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
 def optimize_manifest(
-    manifest, allow_incomplete=False, external_evidence_verified=False
+    manifest,
+    *,
+    manifest_bytes=None,
+    site_aggregation_report_bytes=None,
+    allow_incomplete=False,
+    external_evidence_verified=False,
 ):
     if not external_evidence_verified:
         return {
@@ -880,9 +1009,26 @@ def optimize_manifest(
             "reason": "external_evidence_not_verified",
             "reasons": ["external_evidence_not_verified"],
         }
+    site_aggregation = verify_site_aggregation_report(
+        manifest,
+        manifest_bytes,
+        site_aggregation_report_bytes,
+    )
+    if not site_aggregation["passed"]:
+        return {
+            "passed": False,
+            "reason": "site_aggregation_gate",
+            "reasons": list(site_aggregation["reasons"]),
+            "site_aggregation": site_aggregation,
+        }
     gate = manifest_gate(manifest)
     if not gate["passed"] and not allow_incomplete:
-        return {"passed": False, "dataset_gate": gate, "reason": "dataset_gate"}
+        return {
+            "passed": False,
+            "dataset_gate": gate,
+            "reason": "dataset_gate",
+            "site_aggregation": site_aggregation,
+        }
     baseline = manifest["baseline"]
     x0 = np.array([
         *baseline["location"],
@@ -1010,6 +1156,7 @@ def optimize_manifest(
             name: float(min(value - low, high - value))
             for name, value, low, high in zip(PARAMETER_NAMES, best_params, lower, upper)
         },
+        "site_aggregation": site_aggregation,
     }
 
 
@@ -1027,6 +1174,11 @@ def main():
         help="retained calibration source image; repeat once per artifact hash",
     )
     parser.add_argument("--depth-frame", required=True)
+    parser.add_argument(
+        "--site-aggregation-report",
+        required=True,
+        help="hash-bound four-camera report from aggregate_twin_calibration_manifests.py",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument(
@@ -1037,6 +1189,25 @@ def main():
     args = parser.parse_args()
     manifest_bytes = Path(args.manifest).read_bytes()
     manifest = json.loads(manifest_bytes)
+    site_aggregation_report_bytes = Path(
+        args.site_aggregation_report
+    ).read_bytes()
+    site_aggregation = verify_site_aggregation_report(
+        manifest,
+        manifest_bytes,
+        site_aggregation_report_bytes,
+    )
+    if not site_aggregation["passed"]:
+        report = {
+            "passed": False,
+            "reason": "site_aggregation_gate",
+            "reasons": list(site_aggregation["reasons"]),
+            "site_aggregation": site_aggregation,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        }
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+        return 1
     depth_frame_bytes = Path(args.depth_frame).read_bytes()
     runtime_evidence = collect_runtime_calibration_evidence(
         manifest,
@@ -1061,6 +1232,8 @@ def main():
     if external_evidence["passed"]:
         report = optimize_manifest(
             manifest,
+            manifest_bytes=manifest_bytes,
+            site_aggregation_report_bytes=site_aggregation_report_bytes,
             allow_incomplete=args.diagnostic_incomplete,
             external_evidence_verified=True,
         )
@@ -1071,6 +1244,7 @@ def main():
             "reasons": list(external_evidence["reasons"]),
         }
     report["external_evidence"] = external_evidence
+    report["site_aggregation"] = site_aggregation
     report["runtime_calibration_evidence"] = {
         key: value for key, value in runtime_evidence.items()
         if key != "feature_worlds"

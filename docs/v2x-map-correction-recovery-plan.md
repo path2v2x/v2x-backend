@@ -13,7 +13,7 @@ mutation is authorized by this document.
   crosswalks tens to hundreds of pixels from their physical locations.
 - The bounded v6 inverse-render corpus at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260712T104045Z-inverse-render-search-v6/`
-  has 896 candidates and no passing camera.
+  has 895 retained diagnostic evaluations and no passing camera.
 - The shared-cluster 19-parameter diagnostic at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260712T121500Z-joint-visual-selfcal-v1/`
   is full-rank, but five parameters hit bounds and the frozen ch1/ch2 road
@@ -30,36 +30,40 @@ mutation is authorized by this document.
   `New_RFS/Richmond_Field_Station_Richmond_CA.uasset`, but its complete Git tree
   has no `.rrscene`, FBX, OBJ, USD, glTF, OpenDRIVE, GIS, Blender, Maya, or 3ds
   Max source for Richmond.
-- The retained UE4 import metadata names the missing original export exactly:
-  `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. The file is not
-  present in the repository, Path PC V2X-owned directories, or the Path PC's
-  Windows volume.
+- The raw authoring export has now been recovered at
+  `/home/path/Downloads/entire scene-20260211T002439Z-1-001 (2)/entire scene/`.
+  `Richmond.fbx` is 163,879,392 bytes with SHA-256
+  `68e889cf8d2ab17cc2005c5e7364fd64608723b819df747c102d95a53757e3e0`.
+  The package also contains Richmond GeoJSON, RoadRunner metadata/materials,
+  and `Richmond.xodr`; the latter has SHA-256
+  `ed2e44492616901fbb20b89191ab03d666c0217620d0247e55235c116f5cf2b1`
+  and is byte-identical to the CARLA 0.10 cached/tracked Richmond OpenDRIVE.
+  Its strict transverse-Mercator georeference is therefore available. This
+  resolves raw-source availability, not geometry correctness or survey truth.
 - The connected `Reconstruction Map Overview` sheet records a completed 158 GB
   Richmond Unreal export dated 2026-03-30, but its linked Drive folder
   `1wWDuWUV6wSuFE3MnPTfTXljezI6xajiI` is no longer accessible to the connected
   account (Drive API 404). Drive and Slack searches found no replacement FBX,
-  RoadRunner project, or accessible export archive.
+  RoadRunner project, or accessible export archive. That historical Drive
+  outage is retained provenance but is no longer the source-availability
+  blocker because the local raw package above is hash-verified.
 - The approved 42 GB `ghcr.io/simforgeinc/carla-rr-maps:0.10.0` image is a
   cooked runtime. It has no source label or editable CARLA project.
 - The local `/home/path/V2XCarla/Carla` checkout is a dirty UE4 development
   project and is not an eligible UE5.5 map source.
-- A local UE5.5 comparison workspace belongs to the separate UE6 comparison
-  task and uses cross-task content. It is excluded from V2X inspection,
-  modification, build, and evidence.
-- The Path PC root filesystem currently has about 6 GB free. Its second NVMe
-  has an unmounted Windows NTFS volume with about 877 GB free; a read-only audit
-  found no Richmond source and left it unmounted. A dedicated clean CARLA UE5.5
-  source plus engine/content build needs roughly 250 GB on a Linux-compatible
-  filesystem. Reserving a large loop-backed ext4 image or repartitioning the
-  Windows volume is a separate storage authorization; do not assume it, and do
-  not reuse, delete, or mutate another task's workspace to manufacture capacity.
+- The separate UE6 comparison workspace remains excluded. Dedicated V2X UE5.5
+  source/build capacity is now resolved at `/mnt/v2x-ue5` on the 500 GB
+  loop-backed ext4 image `/mnt/v2x-capacity/v2x-ue5-build.ext4`. Continue to
+  verify both mounts after reboot and keep every source/build/evidence artifact
+  inside that V2X-owned workspace.
 
 ## Accepted recovery routes
 
 ### Route A — recover the original map-authoring source (preferred)
 
-Acquire the exact Richmond RoadRunner project/export or equivalent raw
-geometry with materials and georeference, plus source revision/provenance. It
+The recovered Richmond package is now the Route A input. Verify the exact FBX,
+GeoJSON, RoadRunner metadata/material graph, and OpenDRIVE as one immutable
+source bundle with retained revision/provenance. It
 must contain the physical road edges, lane markings, and every visible
 crosswalk. Preserve the current map origin and the accepted OpenDRIVE hash
 unless an independent survey explicitly selects and versions a replacement.
@@ -78,12 +82,13 @@ homographies.
 
 ## Implementation gate
 
-1. Provision at least 250 GB of dedicated Linux-compatible free space without
-   deleting another task's data. The unused Windows volume is a capacity option
-   only after explicit authorization of its storage impact.
-2. Create a dedicated clean V2X CARLA `ue5-dev` worktree and dedicated CARLA
-   Unreal Engine 5.5 build path. It may not share content, build products,
-   processes, ports, or evidence with UE6.
+1. Revalidate the existing dedicated `/mnt/v2x-ue5` ext4 capacity and its clean
+   V2X CARLA `ue5-dev`/Unreal Engine 5.5 source fingerprints after reboot. It
+   may not share content, build products, processes, ports, or evidence with
+   UE6.
+2. Freeze a no-replace hash inventory of the recovered FBX, XODR, GeoJSON,
+   RoadRunner metadata, and material dependencies before import. Prove the
+   recovered XODR remains byte-identical to the tracked Richmond fingerprint.
 3. Import the complete source/dependency graph into the actual CARLA UE5.5
    project. Keep the map, static ground, road-line materials, traffic controls,
    semantic tags, OpenDRIVE, and package manifest versioned together.
@@ -106,8 +111,11 @@ homographies.
 
 ## Current executable action
 
-Remain fail-closed. Recover the exact original `Richmond.fbx`/RoadRunner source
-or Route B survey control, restore access to the recorded 158 GB export if it
-contains that source, and provision dedicated disk capacity. Until both source
-truth and capacity exist, continue only hash-bound offline evidence/tooling and
-regression work; do not deploy a camera pose or place acceptance actors.
+Remain fail-closed. Source availability and dedicated UE5 capacity now exist;
+the next source-only action is to freeze the recovered package inventory,
+validate its complete dependency/material graph and coordinate conventions,
+and prepare a reviewed import/cook plan inside `/mnt/v2x-ue5`. Do not import or
+deploy from this planning update. Independent survey truth, measured physical
+intrinsics, corrected four-camera static geometry, fresh untouched holdouts,
+and the complete cook/runtime gates remain open; do not deploy a camera pose or
+place acceptance actors.

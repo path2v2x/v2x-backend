@@ -5,6 +5,7 @@ import importlib.util
 from io import BytesIO
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
@@ -18,9 +19,56 @@ SPEC.loader.exec_module(MODULE)
 
 class RoadGeometryOptimizerTests(unittest.TestCase):
     def optimize(self, manifest, **kwargs):
-        return MODULE.optimize_manifest(
-            manifest, external_evidence_verified=True, **kwargs
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_bytes, report_bytes, _paths = self.site_bundle(
+                manifest, Path(directory)
+            )
+            return MODULE.optimize_manifest(
+                manifest,
+                manifest_bytes=manifest_bytes,
+                site_aggregation_report_bytes=report_bytes,
+                external_evidence_verified=True,
+                **kwargs,
+            )
+
+    @staticmethod
+    def site_bundle(manifest, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        point_features = [
+            feature for feature in manifest["features"]
+            if feature.get("type") == "point"
+        ]
+        registry = directory / "registry.json"
+        registry.write_text(json.dumps({
+            "schema": "v2x-site-landmark-registry/v1",
+            "cameras_file_sha256": manifest["cameras_file_sha256"],
+            "landmarks": [
+                {
+                    "global_landmark_id": feature["global_landmark_id"],
+                    "split": feature["split"],
+                    "surveyed_world": feature["surveyed_world"],
+                    "survey_record_sha256": feature["survey_record_sha256"],
+                }
+                for feature in point_features
+            ],
+        }, sort_keys=True))
+        manifest_paths = []
+        manifest_bytes = None
+        for camera_id in ("ch1", "ch2", "ch3", "ch4"):
+            camera_manifest = json.loads(json.dumps(manifest))
+            camera_manifest["camera_id"] = camera_id
+            raw = json.dumps(camera_manifest, sort_keys=True).encode()
+            path = directory / f"{camera_id}.json"
+            path.write_bytes(raw)
+            manifest_paths.append(path)
+            if camera_id == manifest["camera_id"]:
+                manifest_bytes = raw
+        report = MODULE.aggregate_site_manifests(registry, manifest_paths)
+        report_bytes = json.dumps(report, sort_keys=True).encode()
+        return manifest_bytes, report_bytes, {
+            "registry": registry,
+            "manifests": manifest_paths,
+        }
 
     @staticmethod
     def intrinsics_source_images():
@@ -46,6 +94,11 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         for index, (world, pixel) in enumerate(zip(worlds[:12], pixels[:12])):
             features.append({
                 "id": f"point-{index}", "type": "point",
+                "global_landmark_id": f"rfs-landmark-{index:02d}",
+                "surveyed_world": [float(index), float(index * 2), 0.5],
+                "survey_record_sha256": hashlib.sha256(
+                    f"survey-{index}".encode()
+                ).hexdigest(),
                 "split": "train" if index < 8 else "holdout",
                 "world": world, "image": pixel.tolist(),
                 "twin": pixel.tolist(),
@@ -86,6 +139,14 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             "camera_config_sha256": hashlib.sha256(b"camera").hexdigest(),
             "ue5_map": "Carla/Maps/Richmond_Field_Station_Richmond_CA",
             "ue5_map_opendrive_sha256": hashlib.sha256(b"opendrive").hexdigest(),
+            "projection": {
+                "source": "opendrive_georeference",
+                "strict": True,
+                "map_origin_error_m": 0.1,
+                "map_name": "Carla/Maps/Richmond_Field_Station_Richmond_CA",
+                "opendrive_sha256": hashlib.sha256(b"opendrive").hexdigest(),
+                "georeference_sha256": hashlib.sha256(b"georeference").hexdigest(),
+            },
             "depth_frame": {
                 "carla_frame": 123,
                 "sensor_timestamp": 45.5,
@@ -207,35 +268,35 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
     def test_rejects_missing_independent_evidence(self):
         manifest = self.synthetic_manifest()
         manifest["features"] = manifest["features"][:4]
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"])
-        self.assertEqual(report["reason"], "dataset_gate")
+        gate = MODULE.manifest_gate(manifest)
+        self.assertFalse(gate["passed"])
+        self.assertIn("insufficient_train_points", gate["reasons"])
 
     def test_rejects_manifest_without_frozen_deployment_model(self):
         manifest = self.synthetic_manifest()
         manifest.pop("deployment_model")
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"])
-        self.assertIn("missing_deployment_model", report["dataset_gate"]["reasons"])
+        gate = MODULE.manifest_gate(manifest)
+        self.assertFalse(gate["passed"])
+        self.assertIn("missing_deployment_model", gate["reasons"])
 
     def test_rejects_manifest_without_measured_intrinsics(self):
         manifest = self.synthetic_manifest()
         manifest.pop("intrinsics_calibration")
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"])
+        gate = MODULE.manifest_gate(manifest)
+        self.assertFalse(gate["passed"])
         self.assertIn(
             "missing_measured_intrinsics_calibration",
-            report["dataset_gate"]["reasons"],
+            gate["reasons"],
         )
 
     def test_rejects_untraceable_intrinsics_source_images(self):
         manifest = self.synthetic_manifest()
         manifest["intrinsics_calibration"]["source_images_sha256"] = ["a" * 64] * 24
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"])
+        gate = MODULE.manifest_gate(manifest)
+        self.assertFalse(gate["passed"])
         self.assertIn(
             "invalid_measured_intrinsics_calibration",
-            report["dataset_gate"]["reasons"],
+            gate["reasons"],
         )
 
     def test_measured_distortion_blocks_otherwise_deployable_fit(self):
@@ -269,14 +330,31 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         manifest = self.synthetic_manifest()
         manifest.pop("annotation_sha256")
         manifest.pop("depth_frame")
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"])
+        gate = MODULE.manifest_gate(manifest)
+        self.assertFalse(gate["passed"])
         self.assertIn(
-            "missing_annotation_sha256", report["dataset_gate"]["reasons"]
+            "missing_annotation_sha256", gate["reasons"]
         )
         self.assertIn(
-            "missing_depth_frame_identity", report["dataset_gate"]["reasons"]
+            "missing_depth_frame_identity", gate["reasons"]
         )
+
+    def test_optimizer_manifest_gate_rejects_missing_malformed_and_fallback_projection(self):
+        projections = (
+            None,
+            {"source": "opendrive_georeference", "strict": True},
+            {**self.synthetic_manifest()["projection"], "source": "origin_centered_fallback", "strict": False},
+        )
+        for projection in projections:
+            with self.subTest(projection=projection):
+                manifest = self.synthetic_manifest()
+                manifest["projection"] = projection
+                gate = MODULE.manifest_gate(manifest)
+                self.assertFalse(gate["passed"])
+                self.assertIn(
+                    "invalid_strict_opendrive_projection_provenance",
+                    gate["reasons"],
+                )
 
     def test_polyline_distance_follows_segments_not_infinite_extension(self):
         points = np.array([[0.5, 1.0], [3.0, 0.0]])
@@ -290,7 +368,11 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             feature for feature in manifest["features"]
             if feature["type"] == "polyline" and feature["split"] == "holdout"
         )
-        heldout["world"] = [[0.0, -10.0, 8.0], [1.0, -10.0, 8.0]]
+        heldout["world"] = [
+            [0.0, -10.0, 8.0],
+            [0.5, -10.0, 8.0],
+            [1.0, -10.0, 8.0],
+        ]
         report = self.optimize(manifest)
         self.assertFalse(report["passed"], report)
         self.assertGreaterEqual(report["heldout"]["lines"]["max_px"], 5000.0)
@@ -306,14 +388,75 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         road = next(feature for feature in manifest["features"] if feature["type"] == "polyline")
         road["type"] = "line"
         road["image_line"] = [*road.pop("image_polyline")[0], *[0.0, 0.0]]
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"])
-        self.assertIn("infinite_line_evidence_not_allowed", report["dataset_gate"]["reasons"])
+        gate = MODULE.manifest_gate(manifest)
+        self.assertFalse(gate["passed"])
+        self.assertIn("infinite_line_evidence_not_allowed", gate["reasons"])
 
     def test_optimizer_refuses_unbound_direct_manifest(self):
         report = MODULE.optimize_manifest(self.synthetic_manifest())
         self.assertFalse(report["passed"])
         self.assertEqual(report["reason"], "external_evidence_not_verified")
+
+    def test_optimizer_refuses_missing_site_aggregation_even_if_external_bound(self):
+        manifest = self.synthetic_manifest()
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+        report = MODULE.optimize_manifest(
+            manifest,
+            manifest_bytes=manifest_bytes,
+            external_evidence_verified=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["reason"], "site_aggregation_gate")
+
+    def test_optimizer_refuses_stale_registry_map_and_resolved_world_bundles(self):
+        mutations = ("registry", "map", "resolved_world")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                manifest = self.synthetic_manifest()
+                manifest_bytes, report_bytes, paths = self.site_bundle(
+                    manifest, Path(raw)
+                )
+                if mutation == "registry":
+                    registry = json.loads(paths["registry"].read_text())
+                    registry["landmarks"][0]["survey_record_sha256"] = "f" * 64
+                    paths["registry"].write_text(json.dumps(registry))
+                else:
+                    other = paths["manifests"][1]
+                    payload = json.loads(other.read_text())
+                    if mutation == "map":
+                        payload["ue5_map_opendrive_sha256"] = "f" * 64
+                        payload["projection"]["opendrive_sha256"] = "f" * 64
+                    else:
+                        payload["features"][0]["world"][0] += 0.251
+                    other.write_text(json.dumps(payload))
+                report = MODULE.optimize_manifest(
+                    manifest,
+                    manifest_bytes=manifest_bytes,
+                    site_aggregation_report_bytes=report_bytes,
+                    external_evidence_verified=True,
+                )
+                self.assertFalse(report["passed"], report)
+                self.assertEqual(report["reason"], "site_aggregation_gate")
+
+    def test_optimizer_refuses_relabelled_landmark_after_aggregation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            original = self.synthetic_manifest()
+            _manifest_bytes, report_bytes, _paths = self.site_bundle(
+                original, Path(raw)
+            )
+            relabelled = json.loads(json.dumps(original))
+            relabelled["features"][0]["global_landmark_id"] = (
+                relabelled["features"][1]["global_landmark_id"]
+            )
+            relabelled_bytes = json.dumps(relabelled, sort_keys=True).encode()
+            report = MODULE.optimize_manifest(
+                relabelled,
+                manifest_bytes=relabelled_bytes,
+                site_aggregation_report_bytes=report_bytes,
+                external_evidence_verified=True,
+            )
+            self.assertFalse(report["passed"], report)
+            self.assertEqual(report["reason"], "site_aggregation_gate")
 
     def test_external_evidence_rebinds_every_retained_artifact(self):
         manifest = self.synthetic_manifest()
@@ -323,8 +466,9 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 annotations_payload["points"].append({
                     key: feature[key]
                     for key in (
-                        "id", "split", "provenance", "category", "description",
-                        "twin", "image",
+                        "id", "global_landmark_id", "surveyed_world",
+                        "survey_record_sha256", "split", "provenance",
+                        "category", "description", "twin", "image",
                     )
                 })
             else:
@@ -392,6 +536,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "ue5_map_opendrive_sha256": manifest[
                     "ue5_map_opendrive_sha256"
                 ],
+                "projection": manifest["projection"],
                 "endpoint": {"host": "127.0.0.1", "port": 2000},
                 "fresh_depth_frame": {
                     "carla_frame": 124,
@@ -434,6 +579,13 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         tampered_feature = json.loads(json.dumps(manifest))
         tampered_feature["features"][0]["image"][0] += 20.0
         gate = MODULE.verify_external_evidence(tampered_feature, **kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn("manifest_features_annotation_mismatch", gate["reasons"])
+        relabelled_feature = json.loads(json.dumps(manifest))
+        relabelled_feature["features"][0]["global_landmark_id"] = (
+            relabelled_feature["features"][1]["global_landmark_id"]
+        )
+        gate = MODULE.verify_external_evidence(relabelled_feature, **kwargs)
         self.assertFalse(gate["passed"])
         self.assertIn("manifest_features_annotation_mismatch", gate["reasons"])
         tampered_world = json.loads(json.dumps(manifest))

@@ -1194,7 +1194,17 @@ section:
   `docs/v2x-map-correction-recovery-plan.md`. The private
   `SimForgeinc/RFS_Reconstruction` main revision contains April Richmond
   editor assets but remains UE4.26 and has no raw RoadRunner/FBX/OBJ/USD/GIS
-  source. The production image is cooked-only. The only local comparison
+  source in that repository. The raw authoring export has now been recovered
+  at `/home/path/Downloads/entire scene-20260211T002439Z-1-001 (2)/entire scene/`:
+  `Richmond.fbx` is 163,879,392 bytes with SHA-256
+  `68e889cf8d2ab17cc2005c5e7364fd64608723b819df747c102d95a53757e3e0`,
+  and `Richmond.xodr` has SHA-256
+  `ed2e44492616901fbb20b89191ab03d666c0217620d0247e55235c116f5cf2b1`,
+  byte-identical to the CARLA 0.10 cached/tracked Richmond OpenDRIVE. GeoJSON,
+  RoadRunner metadata, and materials are present. Source availability and
+  dedicated V2X capacity are therefore resolved, but independent survey,
+  measured intrinsics, static calibration, full dependency validation, cook,
+  and untouched holdouts remain open. The production image is cooked-only. The only local comparison
   workspace with UE5.5 source belongs to the separate UE6 comparison task and
   is ineligible for V2X. Do not delete, inspect, or reuse it. A dedicated clean
   V2X UE5.5 migration workspace now exists at `/mnt/v2x-ue5` on a 500 GB
@@ -1239,10 +1249,13 @@ section:
   V2X mount. The root filesystem and all UE6/comparison paths
   remain excluded. After any reboot, verify both mounts and the image allocation
   before resuming; no persistent mount entry has been installed yet. The UE4
-  import metadata names the missing authoring file
-  as `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. A Drive
+  import metadata names the historical authoring path
+  `D:/Work/Simforge/Berkley/Road Runner/28012026/Richmond.fbx`. A Drive
   inventory records a 158 GB Richmond export dated 2026-03-30, but its linked
-  folder now returns 404 and read-only Drive/Slack searches found no replacement.
+  folder still returns 404; retain that as historical provenance, not as the
+  current raw-source blocker. Do not import or deploy the recovered package
+  until its no-replace inventory, dependency graph, coordinate conventions,
+  independent survey, and controlled UE5.5 cook plan pass review.
 - Exact source-frame evidence for `global_car_4db7ffc8_138` is retained at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260712T100128Z-object-138-exact/`.
   One representative persisted event per camera is bound to the exact fMP4
@@ -1709,7 +1722,11 @@ matcher-generated calibration rows.
 
 The 24-hour persistence gate is paginated and fail-closed. Require every
 camera to have trusted schema-v2 events spanning at least 23 hours and a recent
-upload; a query over a 24-hour window is not itself proof of 24-hour history:
+upload; a query over a 24-hour window is not itself proof of 24-hour history.
+Every accepted row must use `exact_same_session_pts`, reconstruct media time
+within 5 ms, keep decode ISO/epoch and latency within 5 ms, ingest within five
+integer seconds, expire exactly seven days from media time, and carry an event
+ID with no leading/trailing whitespace:
 
 ```bash
 /home/path/V2XCarla/perception-venv/bin/python \
@@ -1887,7 +1904,8 @@ twin pixels through a temporary UE5 depth sensor into one optimizer manifest:
 
 The builder must destroy its owned depth sensor in `finally`. Preserve the
 manifest's annotation, camera-file, per-camera, real-frame, twin-frame, depth
-frame, map, and deployment-model fingerprints. The deployment model must freeze
+frame, map/OpenDRIVE/georeference projection provenance, and deployment-model
+fingerprints. The deployment model must freeze
 the surveyed anchor, unadjusted pitch/yaw/roll/FOV, and all six UE5 lens
 attributes so the fitted absolute camera can be translated back into tracked
 `twin_pose` fields without relying on live state. Run
@@ -1901,13 +1919,31 @@ frame, cameras file, intrinsics artifact, and every calibration source image
 again. The optimizer must re-hash all inputs, decode and match every declared
 source image, re-hash the selected canonical camera object, and compare the
 calibration block with both `cameras.json` and the parsed artifact; a direct
-`optimize_manifest()` call without this binding is non-acceptable:
+`optimize_manifest()` call without this binding is non-acceptable. First build
+one report from all four complete manifests and the surveyed registry; distinct
+landmark IDs below 0.25 m, inconsistent cross-camera resolved world identity,
+mixed map fingerprints, or incomplete builder counts fail closed:
+
+```bash
+/home/path/V2XCarla/carla-venv-310/bin/python \
+  apps/bridge/tools/aggregate_twin_calibration_manifests.py \
+  --registry /path/to/site-landmark-registry.json \
+  --manifest /path/to/ch1-calibration-manifest.json \
+  --manifest /path/to/ch2-calibration-manifest.json \
+  --manifest /path/to/ch3-calibration-manifest.json \
+  --manifest /path/to/ch4-calibration-manifest.json \
+  --output /path/to/four-camera-aggregation.json
+```
+
+The optimizer re-hashes the registry and all four referenced manifests and
+recomputes that report before connecting to UE5:
 
 ```bash
 /home/path/V2XCarla/carla-venv-310/bin/python \
   apps/bridge/tools/optimize_twin_road_geometry.py \
   /path/to/ch1-calibration-manifest.json \
   --output /path/to/ch1-calibration-report.json \
+  --site-aggregation-report /path/to/four-camera-aggregation.json \
   --annotations /path/to/ch1-annotations.json \
   --real-frame /path/to/real-ch1.jpg \
   --twin-frame /path/to/twin-ch1.jpg \

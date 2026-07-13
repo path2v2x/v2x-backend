@@ -19,7 +19,7 @@ from digital_twin_bridge.twin_camera_rig import (
     twin_pose_from_absolute,
 )
 
-from tests.conftest import MockLocation
+from tests.conftest import MockLocation, MockTransform
 
 
 SITE = {"lat": 37.91560117034595, "lon": -122.33478756387032}
@@ -175,6 +175,54 @@ class TestComputeTransform:
 
 
 class TestTwinCameraRig:
+    def test_carla010_runtime_rig_requires_strict_opendrive_projection(
+        self, mock_world, monkeypatch
+    ):
+        strict_map = object()
+        calls = []
+
+        def compute(carla_map, site, camera, **kwargs):
+            calls.append(kwargs)
+            return MockTransform(), {
+                "source": "opendrive_georeference",
+                "strict": True,
+                "map_origin_error_m": 0.1,
+                "map_name": "Carla/Maps/Richmond_Field_Station_Richmond_CA",
+                "opendrive_sha256": "a" * 64,
+                "georeference_sha256": "b" * 64,
+            }
+
+        monkeypatch.setattr(
+            twin_camera_rig, "compute_twin_camera_transform", compute
+        )
+        rig = TwinCameraRig(mock_world, strict_map, make_config())
+
+        assert rig.spawn() == 1
+        assert calls == [{
+            "require_opendrive_georeference": True,
+            "return_projection_provenance": True,
+        }]
+        assert rig.status()["projection_provenance"]["ch1"]["source"] == (
+            "opendrive_georeference"
+        )
+
+    def test_carla010_runtime_rig_fails_closed_on_projection_error(
+        self, mock_world, monkeypatch
+    ):
+        monkeypatch.setattr(
+            twin_camera_rig,
+            "compute_twin_camera_transform",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ValueError("fallback projection")
+            ),
+        )
+        rig = TwinCameraRig(mock_world, object(), make_config())
+
+        assert rig.spawn() == 0
+        assert rig.status()["spawn_failures"] == {
+            "ch1": "projection_gate_failed"
+        }
+
     def test_invalid_lens_configuration_fails_closed(self, mock_world):
         config = make_config()
         config["cameras"][0]["twin_lens"] = {"lens_k": "not-a-number"}

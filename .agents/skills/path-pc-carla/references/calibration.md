@@ -26,7 +26,11 @@ passes.
 - The paginated persistence gate is row-complete and fail-closed: any unknown
   camera, rejected row, missing/blank `event_id`, or duplicate `event_id`
   anywhere in the queried window fails the global result. Duplicate page items
-  never count toward a camera's span or recency evidence.
+  never count toward a camera's span or recency evidence. Leading/trailing
+  event-ID whitespace is invalid. Every accepted row must retain
+  `exact_same_session_pts`, reconstruct media UTC within 5 ms, keep ISO and
+  epoch decode receipt within 5 ms, ingest within five integer seconds, and
+  expire at exactly seven days from media time.
 
 ## Non-circular evidence contract
 
@@ -127,16 +131,21 @@ surveyed site registry with
 all four manifests must be SHA-256-recorded by the aggregation report; one
 canonical `global_landmark_id` maps to one frozen split, surveyed XYZ, and
 survey-record hash site-wide. Reuse across cameras is valid only with that
-exact identity. Different IDs within 0.05 m, cross-camera split changes,
-malformed entries, missing cameras, or inconsistent survey identity fail
-closed. The aggregation remains `acceptance_eligible=false` and does not
-authorize deployment by itself.
+exact identity. Different IDs below 0.25 m, cross-camera split changes,
+inconsistent depth-resolved map coordinates, mixed map/OpenDRIVE fingerprints,
+incomplete builder contracts, malformed entries, missing cameras, or
+inconsistent survey identity fail closed. The aggregation remains
+`acceptance_eligible=false` and does not authorize deployment by itself. Every
+optimizer invocation must pass the retained aggregation report; the optimizer
+re-hashes all four manifests and the registry and recomputes the report before
+any UE5 runtime probe.
 
 RR/CARLA 0.10 live camera acceptance must recompute the tracked transform in
 strict projection mode and retain `projection.source="opendrive_georeference"`.
 `origin_centered_fallback` is diagnostic only. A missing/malformed declaration
 or a syntactically valid projection that disagrees with CARLA's map origin is a
-hard failure.
+hard failure. Retain the exact map name, full OpenDRIVE SHA-256, and extracted
+georeference SHA-256 in every builder manifest and runtime comparison.
 
 ## Richmond map-correction gate
 

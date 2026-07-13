@@ -18,6 +18,11 @@ if str(PERCEPTION_DIR) not in sys.path:
 from runtime_health import sanitize_source_error  # noqa: E402
 
 CAMERA_IDS = ("ch1", "ch2", "ch3", "ch4")
+MEDIA_RECONSTRUCTION_MAX_ERROR_MS = 5.0
+DECODE_EPOCH_MAX_ERROR_MS = 5.0
+DECODE_LATENCY_MAX_ERROR_MS = 5.0
+MAX_INGEST_DELAY_SECONDS = 5
+PERSISTENCE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 class VerificationError(RuntimeError):
@@ -157,6 +162,8 @@ def trusted_media_time(item):
         clock_schema = clock.get("schema_version")
         if clock_schema != 1 or isinstance(clock_schema, bool):
             reasons.append("clock_schema")
+        if clock.get("evidence_method") != "exact_same_session_pts":
+            reasons.append("clock_evidence_method")
     try:
         event_time = parse_utc(item.get("timestamp_utc"), "timestamp_utc")
         media_time = parse_utc(
@@ -169,23 +176,107 @@ def trusted_media_time(item):
         return None, reasons + ["timestamp_fields"]
     if event_time != media_time:
         reasons.append("event_media_mismatch")
+    if isinstance(clock, dict):
+        try:
+            anchor_time = parse_utc(
+                clock.get("anchor_program_date_time_utc"),
+                "media_clock.anchor_program_date_time_utc",
+            )
+            position_ms = float(clock["position_milliseconds"])
+            capture_position_ms = float(
+                clock["capture_position_milliseconds"]
+            )
+            anchor_capture_position_ms = float(
+                clock["anchor_capture_position_milliseconds"]
+            )
+            anchor_fragment_offset_ms = float(
+                clock["anchor_fragment_frame_offset_milliseconds"]
+            )
+            source_pts = clock["source_pts"]
+            time_base_numerator = clock["source_time_base_numerator"]
+            time_base_denominator = clock["source_time_base_denominator"]
+            source_position_ms = (
+                source_pts
+                * time_base_numerator
+                * 1000.0
+                / time_base_denominator
+            )
+            reconstruction_error_ms = abs(
+                (
+                    anchor_time.timestamp()
+                    + position_ms / 1000.0
+                    - media_time.timestamp()
+                )
+                * 1000.0
+            )
+            transport_values_valid = (
+                all(
+                    math.isfinite(value)
+                    for value in (
+                        position_ms,
+                        capture_position_ms,
+                        anchor_capture_position_ms,
+                        anchor_fragment_offset_ms,
+                        source_position_ms,
+                    )
+                )
+                and position_ms >= 0.0
+                and isinstance(source_pts, int)
+                and not isinstance(source_pts, bool)
+                and source_pts >= 0
+                and isinstance(time_base_numerator, int)
+                and not isinstance(time_base_numerator, bool)
+                and time_base_numerator > 0
+                and isinstance(time_base_denominator, int)
+                and not isinstance(time_base_denominator, bool)
+                and time_base_denominator > 0
+                and abs(source_position_ms - capture_position_ms) <= 0.001
+                and abs(anchor_capture_position_ms - capture_position_ms)
+                <= 0.001
+                and abs(anchor_fragment_offset_ms - position_ms) <= 0.001
+            )
+        except (KeyError, TypeError, ValueError, ZeroDivisionError, VerificationError):
+            reconstruction_error_ms = math.inf
+            transport_values_valid = False
+        if not transport_values_valid:
+            reasons.append("clock_transport_provenance")
+        if reconstruction_error_ms > MEDIA_RECONSTRUCTION_MAX_ERROR_MS:
+            reasons.append("media_reconstruction")
     latency = item.get("decode_latency_ms")
     observed_latency = (decode_time - media_time).total_seconds() * 1000.0
     if (
         not isinstance(latency, (int, float))
         or isinstance(latency, bool)
         or not math.isfinite(float(latency))
-        or abs(float(latency) - observed_latency) > 5.0
+        or abs(float(latency) - observed_latency)
+        > DECODE_LATENCY_MAX_ERROR_MS
     ):
         reasons.append("decode_latency")
+    decode_epoch = item.get("decode_received_at_epoch")
+    if (
+        not isinstance(decode_epoch, (int, float))
+        or isinstance(decode_epoch, bool)
+        or not math.isfinite(float(decode_epoch))
+        or abs(float(decode_epoch) - decode_time.timestamp()) * 1000.0
+        > DECODE_EPOCH_MAX_ERROR_MS
+    ):
+        reasons.append("decode_epoch")
     ingested_epoch = item.get("ingested_at_epoch")
     if (
-        not isinstance(ingested_epoch, (int, float))
+        not isinstance(ingested_epoch, int)
         or isinstance(ingested_epoch, bool)
-        or not math.isfinite(float(ingested_epoch))
-        or float(ingested_epoch) + 2.0 < decode_time.timestamp()
+        or not 0
+        <= ingested_epoch - int(decode_time.timestamp())
+        <= MAX_INGEST_DELAY_SECONDS
     ):
         reasons.append("ingestion_time")
+    expires_at = item.get("expires_at")
+    if (
+        not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+        or expires_at != int(media_time.timestamp()) + PERSISTENCE_TTL_SECONDS
+    ):
+        reasons.append("expiry_time")
     return event_time, reasons
 
 
@@ -217,10 +308,14 @@ def evaluate_persistence(
             invalid_event_id_indexes.add(index)
             continue
         raw_event_id = item.get("event_id")
-        if not isinstance(raw_event_id, str) or not raw_event_id.strip():
+        if (
+            not isinstance(raw_event_id, str)
+            or not raw_event_id
+            or raw_event_id.strip() != raw_event_id
+        ):
             invalid_event_id_indexes.add(index)
             continue
-        event_ids_by_index[index] = raw_event_id.strip()
+        event_ids_by_index[index] = raw_event_id
     event_id_counts = Counter(event_ids_by_index.values())
     duplicate_event_ids = {
         event_id for event_id, count in event_id_counts.items() if count > 1
@@ -273,7 +368,8 @@ def evaluate_persistence(
     if invalid_event_id_indexes:
         result["gate_passed"] = False
         result["reasons"].append(
-            f"{len(invalid_event_id_indexes)} item(s) have a missing or blank event_id"
+            f"{len(invalid_event_id_indexes)} item(s) have an invalid or "
+            "whitespace-padded event_id"
         )
     if duplicate_event_id_indexes:
         result["gate_passed"] = False

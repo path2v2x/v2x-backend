@@ -32,12 +32,21 @@ def _projection_for_map(carla_map):
     """Return the map-declared projection, cached by exact georef content."""
     origin = carla_map.transform_to_geolocation(carla.Location())
     map_name = str(getattr(carla_map, "name", "unknown"))
+    opendrive_sha256 = None
+    georeference_sha256 = None
     try:
         opendrive = carla_map.to_opendrive()
+        if not isinstance(opendrive, str) or not opendrive:
+            raise GeodesyError("OpenDRIVE document is empty")
+        opendrive_sha256 = hashlib.sha256(opendrive.encode("utf-8")).hexdigest()
         georeference = extract_opendrive_georeference(opendrive)
+        georeference_sha256 = hashlib.sha256(
+            georeference.encode("utf-8")
+        ).hexdigest()
         key = (
             map_name,
-            hashlib.sha256(georeference.encode("utf-8")).hexdigest(),
+            opendrive_sha256,
+            georeference_sha256,
         )
         cached = _MAP_PROJECTION_CACHE.get(key)
         if cached is not None:
@@ -57,6 +66,7 @@ def _projection_for_map(carla_map):
         key = (
             map_name,
             "fallback",
+            opendrive_sha256,
             round(float(origin.latitude), 12),
             round(float(origin.longitude), 12),
         )
@@ -65,7 +75,15 @@ def _projection_for_map(carla_map):
             map_name,
             exc,
         )
-    result = (projection, source)
+    result = (
+        projection,
+        source,
+        {
+            "map_name": map_name,
+            "opendrive_sha256": opendrive_sha256,
+            "georeference_sha256": georeference_sha256,
+        },
+    )
     _MAP_PROJECTION_CACHE[key] = result
     return result
 
@@ -81,7 +99,7 @@ def map_projection_with_provenance(
     that the declared projection agrees with CARLA's world-origin geolocation;
     a syntactically valid declaration for another map is not acceptable.
     """
-    projection, source = _projection_for_map(carla_map)
+    projection, source, content_identity = _projection_for_map(carla_map)
     origin = carla_map.transform_to_geolocation(carla.Location())
     origin_error_m = None
     if source == "opendrive_georeference":
@@ -106,6 +124,7 @@ def map_projection_with_provenance(
         "source": source,
         "strict": bool(require_opendrive_georeference),
         "map_origin_error_m": origin_error_m,
+        **content_identity,
     }
 
 
@@ -294,7 +313,7 @@ def carla_to_gps(
         A ``(latitude, longitude)`` tuple in decimal degrees.
     """
     if not hasattr(carla_map, "geolocation_to_transform"):
-        projection, source = _projection_for_map(carla_map)
+        projection, source, _content_identity = _projection_for_map(carla_map)
         if source != "opendrive_georeference":
             geo = carla_map.transform_to_geolocation(location)
             return geo.latitude, geo.longitude

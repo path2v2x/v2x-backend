@@ -518,6 +518,11 @@ def test_expected_camera_transform_uses_carla010_opendrive_georeference(tmp_path
     assert expected["projection"]["map_origin_error_m"] == pytest.approx(
         0.0, abs=2e-5
     )
+    assert expected["projection"]["map_name"] == carla_map.name
+    assert expected["projection"]["opendrive_sha256"] == hashlib.sha256(
+        carla_map.to_opendrive().encode()
+    ).hexdigest()
+    assert len(expected["projection"]["georeference_sha256"]) == 64
     # A stale degree-to-metre approximation ignores the OpenDRIVE k=0.75
     # scale; the tracked inverse must retain the requested projected anchor.
     assert math.hypot(shared.location.x, shared.location.y) > 300.0
@@ -616,6 +621,9 @@ def test_nonstrict_projection_exposes_fallback_as_diagnostic(tmp_path):
         "source": "origin_centered_fallback",
         "strict": False,
         "map_origin_error_m": None,
+        "map_name": "diagnostic-fallback",
+        "opendrive_sha256": None,
+        "georeference_sha256": None,
     }
 
 

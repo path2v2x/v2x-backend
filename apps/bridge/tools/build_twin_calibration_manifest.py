@@ -34,6 +34,9 @@ from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
     load_cameras_config,
     twin_horizontal_fov_deg,
 )
+from digital_twin_bridge.geo_utils import (  # noqa: E402
+    MAX_STRICT_MAP_ORIGIN_ERROR_M,
+)
 
 
 CAMERAS = {"ch1", "ch2", "ch3", "ch4"}
@@ -42,6 +45,47 @@ DISTORTION_KEYS = ("k1", "k2", "p1", "p2", "k3")
 MIN_TRAIN_HOLDOUT_WORLD_SEPARATION_M = 0.25
 MIN_TRAIN_HOLDOUT_IMAGE_SEPARATION_PX = 4.0
 MIN_TRAIN_HOLDOUT_TWIN_SEPARATION_PX = 2.0
+
+
+def _valid_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_strict_projection_provenance(
+    provenance, *, map_name, opendrive_sha256
+):
+    """Require the exact OpenDRIVE projection used for world back-projection."""
+    if not isinstance(provenance, dict):
+        raise ValueError("strict OpenDRIVE projection provenance is missing")
+    origin_error = provenance.get("map_origin_error_m")
+    if (
+        provenance.get("source") != "opendrive_georeference"
+        or provenance.get("strict") is not True
+        or provenance.get("map_name") != str(map_name)
+        or not _valid_sha256(opendrive_sha256)
+        or provenance.get("opendrive_sha256") != opendrive_sha256
+        or not _valid_sha256(provenance.get("georeference_sha256"))
+        or isinstance(origin_error, bool)
+        or not isinstance(origin_error, (int, float))
+        or not math.isfinite(float(origin_error))
+        or not 0.0 <= float(origin_error) <= MAX_STRICT_MAP_ORIGIN_ERROR_M
+    ):
+        raise ValueError(
+            "strict OpenDRIVE projection provenance is malformed, fallback, "
+            "or content-mismatched"
+        )
+    return {
+        "source": "opendrive_georeference",
+        "strict": True,
+        "map_origin_error_m": float(origin_error),
+        "map_name": str(map_name),
+        "opendrive_sha256": opendrive_sha256,
+        "georeference_sha256": provenance["georeference_sha256"],
+    }
 
 
 def decoded_image_size(image_bytes, label):
@@ -589,8 +633,16 @@ def resolve_manifest(
     cameras_file_sha256,
     camera_config_sha256,
     depth_raw_sha256,
+    projection_provenance,
+    ue5_map,
+    ue5_map_opendrive_sha256,
 ):
     """Back-project validated annotations using one frozen UE5 depth frame."""
+    projection = validate_strict_projection_provenance(
+        projection_provenance,
+        map_name=ue5_map,
+        opendrive_sha256=ue5_map_opendrive_sha256,
+    )
     if (int(depth_image.width), int(depth_image.height)) != tuple(expected_twin_size):
         raise ValueError("UE5 depth resolution does not match annotated twin frame")
     if len(depth_raw) != int(depth_image.width) * int(depth_image.height) * 4:
@@ -660,6 +712,9 @@ def resolve_manifest(
         "annotation_sha256": annotation_sha256,
         "cameras_file_sha256": cameras_file_sha256,
         "camera_config_sha256": camera_config_sha256,
+        "ue5_map": str(ue5_map),
+        "ue5_map_opendrive_sha256": ue5_map_opendrive_sha256,
+        "projection": projection,
         "depth_frame": {
             "carla_frame": int(depth_image.frame),
             "sensor_timestamp": float(depth_image.timestamp),
@@ -769,7 +824,24 @@ def main():
     client = carla.Client(args.host, args.port)
     client.set_timeout(20.0)
     world = client.get_world()
-    transform = compute_twin_camera_transform(world.get_map(), config["site"], camera)
+    carla_map = world.get_map()
+    map_name = str(carla_map.name)
+    opendrive = carla_map.to_opendrive()
+    if not isinstance(opendrive, str) or not opendrive:
+        raise SystemExit("active UE5 map has no usable OpenDRIVE document")
+    opendrive_sha256 = hashlib.sha256(opendrive.encode("utf-8")).hexdigest()
+    transform, projection_provenance = compute_twin_camera_transform(
+        carla_map,
+        config["site"],
+        camera,
+        require_opendrive_georeference=True,
+        return_projection_provenance=True,
+    )
+    projection_provenance = validate_strict_projection_provenance(
+        projection_provenance,
+        map_name=map_name,
+        opendrive_sha256=opendrive_sha256,
+    )
     blueprint = world.get_blueprint_library().find("sensor.camera.depth")
     configure_twin_camera_blueprint(
         blueprint, camera, args.twin_width, args.twin_height
@@ -798,11 +870,10 @@ def main():
                 camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             ).encode("utf-8")).hexdigest(),
             depth_raw_sha256=hashlib.sha256(depth_raw).hexdigest(),
+            projection_provenance=projection_provenance,
+            ue5_map=map_name,
+            ue5_map_opendrive_sha256=opendrive_sha256,
         )
-        manifest["ue5_map"] = str(world.get_map().name)
-        manifest["ue5_map_opendrive_sha256"] = hashlib.sha256(
-            world.get_map().to_opendrive().encode("utf-8")
-        ).hexdigest()
         Path(args.depth_frame_output).write_bytes(depth_raw)
     finally:
         try:

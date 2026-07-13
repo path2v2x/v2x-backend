@@ -286,6 +286,7 @@ class TwinCameraRig:
         self._refused_cameras: Dict[str, str] = {}
         self._spawn_failures: Dict[str, str] = {}
         self._camera_model_errors: Dict[str, str] = {}
+        self._projection_provenance: Dict[str, dict] = {}
         self._lock = threading.Lock()
         self._accepting_frames = False
 
@@ -312,6 +313,7 @@ class TwinCameraRig:
         self._accepting_frames = True
         for camera in self._config["cameras"]:
             camera_id = camera["id"]
+            self._projection_provenance.pop(camera_id, None)
             if camera.get("twin_lens"):
                 self._refused_cameras[camera_id] = "lens_override_safety_hold"
                 logger.error(
@@ -332,7 +334,31 @@ class TwinCameraRig:
             except (IndexError, RuntimeError):
                 pass  # role_name attribute is optional on sensors
 
-            transform = compute_twin_camera_transform(self._map, site, camera)
+            strict_projection = not hasattr(
+                self._map, "geolocation_to_transform"
+            )
+            try:
+                if strict_projection:
+                    transform, projection = compute_twin_camera_transform(
+                        self._map,
+                        site,
+                        camera,
+                        require_opendrive_georeference=True,
+                        return_projection_provenance=True,
+                    )
+                    self._projection_provenance[camera_id] = dict(projection)
+                else:
+                    transform = compute_twin_camera_transform(
+                        self._map, site, camera
+                    )
+            except Exception as exc:
+                self._spawn_failures[camera_id] = "projection_gate_failed"
+                logger.error(
+                    "Twin camera %s strict map projection failed: %s",
+                    camera_id,
+                    exc,
+                )
+                continue
             try:
                 actor = self._world.spawn_actor(camera_bp, transform)
             except Exception as exc:
@@ -404,6 +430,7 @@ class TwinCameraRig:
             except Exception:
                 logger.debug("Twin camera %s already gone", camera_id)
         self._cameras.clear()
+        self._projection_provenance.clear()
         with self._lock:
             self._frames.clear()
             self._frame_metadata.clear()
@@ -509,6 +536,9 @@ class TwinCameraRig:
                 "horizontal_fov_deg": horizontal_fov,
             },
             "lens": {key: float(value) for key, value in lens.items()},
+            "projection": deepcopy(
+                self._projection_provenance.get(camera_id)
+            ),
         }
 
     def status(self) -> dict:
@@ -523,4 +553,5 @@ class TwinCameraRig:
             "refused_cameras": dict(self._refused_cameras),
             "spawn_failures": dict(self._spawn_failures),
             "camera_model_errors": dict(self._camera_model_errors),
+            "projection_provenance": deepcopy(self._projection_provenance),
         }

@@ -12,6 +12,7 @@ from verify_detection_persistence import (  # noqa: E402
     evaluate_persistence,
     fetch_detection_window,
     normalize_api_base_url,
+    trusted_media_time,
 )
 
 NOW = datetime(2026, 7, 11, 1, 0, tzinfo=timezone.utc)
@@ -20,9 +21,14 @@ NOW = datetime(2026, 7, 11, 1, 0, tzinfo=timezone.utc)
 _DEFAULT_EVENT_ID = object()
 
 
+def parse_iso(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def item(camera_id, timestamp, event_id=_DEFAULT_EVENT_ID):
     media = timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
     decode = timestamp + timedelta(seconds=2.5)
+    anchor = timestamp - timedelta(milliseconds=667)
     if event_id is _DEFAULT_EVENT_ID:
         event_id = f"{camera_id}-{int(timestamp.timestamp() * 1000)}"
     return {
@@ -34,6 +40,17 @@ def item(camera_id, timestamp, event_id=_DEFAULT_EVENT_ID):
         "media_clock": {
             "source": "hls_ext_x_program_date_time",
             "schema_version": 1,
+            "evidence_method": "exact_same_session_pts",
+            "anchor_program_date_time_utc": anchor.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
+            "position_milliseconds": 667.0,
+            "anchor_fragment_frame_offset_milliseconds": 667.0,
+            "capture_position_milliseconds": 667.0,
+            "anchor_capture_position_milliseconds": 667.0,
+            "source_pts": 667,
+            "source_time_base_numerator": 1,
+            "source_time_base_denominator": 1000,
         },
         "timestamp_utc": media,
         "media_timestamp_utc": media,
@@ -41,7 +58,9 @@ def item(camera_id, timestamp, event_id=_DEFAULT_EVENT_ID):
             timespec="milliseconds"
         ).replace("+00:00", "Z"),
         "decode_latency_ms": 2_500.0,
-        "ingested_at_epoch": int(decode.timestamp()),
+        "decode_received_at_epoch": decode.timestamp(),
+        "ingested_at_epoch": int(decode.timestamp()) + 1,
+        "expires_at": int(timestamp.timestamp()) + 7 * 24 * 60 * 60,
     }
 
 
@@ -143,7 +162,7 @@ class DetectionPersistenceTests(unittest.TestCase):
 
     def test_missing_and_blank_event_ids_fail_closed(self):
         start = NOW - timedelta(hours=24)
-        for invalid_event_id in (None, "", "   "):
+        for invalid_event_id in (None, "", "   ", " leading", "trailing "):
             with self.subTest(event_id=invalid_event_id):
                 rows = []
                 for camera_id in CAMERA_IDS:
@@ -166,9 +185,46 @@ class DetectionPersistenceTests(unittest.TestCase):
                 self.assertEqual(result["invalid_event_id_items"], 1)
                 self.assertEqual(result["cameras"]["ch3"]["rejected_items"], 1)
                 self.assertIn(
-                    "1 item(s) have a missing or blank event_id",
+                    "1 item(s) have an invalid or whitespace-padded event_id",
                     result["reasons"],
                 )
+
+    def test_transport_clock_decode_ingest_and_expiry_boundaries(self):
+        baseline = item("ch1", NOW - timedelta(hours=1))
+        timestamp, reasons = trusted_media_time(baseline)
+        self.assertIsNotNone(timestamp)
+        self.assertEqual(reasons, [])
+
+        cases = []
+        wrong_method = item("ch1", NOW - timedelta(hours=1))
+        wrong_method["media_clock"]["evidence_method"] = "exact_fragment_sequence"
+        cases.append((wrong_method, "clock_evidence_method"))
+
+        reconstruction = item("ch1", NOW - timedelta(hours=1))
+        reconstruction["media_clock"]["position_milliseconds"] += 5.001
+        reconstruction["media_clock"][
+            "anchor_fragment_frame_offset_milliseconds"
+        ] += 5.001
+        cases.append((reconstruction, "media_reconstruction"))
+
+        decode_epoch = item("ch1", NOW - timedelta(hours=1))
+        decode_epoch["decode_received_at_epoch"] += 0.005001
+        cases.append((decode_epoch, "decode_epoch"))
+
+        ingest = item("ch1", NOW - timedelta(hours=1))
+        ingest["ingested_at_epoch"] = (
+            int(parse_iso(ingest["decode_received_at_utc"]).timestamp()) + 6
+        )
+        cases.append((ingest, "ingestion_time"))
+
+        expiry = item("ch1", NOW - timedelta(hours=1))
+        expiry["expires_at"] += 1
+        cases.append((expiry, "expiry_time"))
+
+        for row, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason):
+                _timestamp, row_reasons = trusted_media_time(row)
+                self.assertIn(expected_reason, row_reasons)
 
     @patch("verify_detection_persistence._fetch_json")
     def test_duplicate_event_across_pages_never_counts(self, fetch_json):
