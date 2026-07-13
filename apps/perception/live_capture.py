@@ -264,6 +264,7 @@ class _AsyncCaptureRestart:
         capture_factory,
         media_clock_factory,
         media_clock_validator,
+        prior_media_clock,
         capture_position_milliseconds,
         media_frame_identity,
         stop_event,
@@ -275,6 +276,7 @@ class _AsyncCaptureRestart:
         self._capture_factory = capture_factory
         self._media_clock_factory = media_clock_factory
         self._media_clock_validator = media_clock_validator
+        self._prior_media_clock = prior_media_clock
         self._capture_position_milliseconds = capture_position_milliseconds
         self._media_frame_identity = media_frame_identity
         self._stop_event = stop_event
@@ -326,6 +328,40 @@ class _AsyncCaptureRestart:
                 if position is None:
                     self._set_stage("capture_position")
                     continue
+                if (
+                    self._prior_media_clock is not None
+                    and self._media_clock_validator is not None
+                ):
+                    self._set_stage("prior_clock_validation")
+                    prior_frame_clock = self._prior_media_clock.metadata_at(position)
+                    prior_clock_valid = (
+                        prior_frame_clock is not None
+                        and self._media_clock_validator(
+                            prior_frame_clock, source_epoch
+                        )
+                    )
+                    if prior_clock_valid:
+                        with self._result_lock:
+                            if self._discarded.is_set():
+                                return
+                            self._result = (
+                                capture,
+                                frame,
+                                source_epoch,
+                                source_monotonic,
+                                position,
+                                self._prior_media_clock,
+                                source,
+                                clock_source,
+                            )
+                            capture = None
+                        self._set_stage("ready")
+                        return
+                    # A restarted decoder may reset its capture cursor even
+                    # against the same signed HLS session. Try the prior exact
+                    # mapping once; an invalid mapping is discarded and the
+                    # existing exact fragment matcher remains the only fallback.
+                    self._prior_media_clock = None
                 if self._media_clock_factory is None:
                     with self._result_lock:
                         if self._discarded.is_set():
@@ -393,6 +429,7 @@ class _AsyncCaptureRestart:
             self._capture_factory = None
             self._media_clock_factory = None
             self._media_clock_validator = None
+            self._prior_media_clock = None
             self._capture_position_milliseconds = None
             self._media_frame_identity = None
             if capture is not None:
@@ -687,13 +724,16 @@ class LiveStreamReader:
             self.monotonic,
         )
 
-    def _prepare_same_session_restart(self, source, clock_source):
+    def _prepare_same_session_restart(
+        self, source, clock_source, prior_media_clock
+    ):
         return _AsyncCaptureRestart(
             source,
             clock_source,
             self.capture_factory,
             self.media_clock_factory,
             self.media_clock_validator,
+            prior_media_clock,
             self.capture_position_milliseconds,
             self.media_frame_identity,
             self._stop_event,
@@ -701,7 +741,9 @@ class LiveStreamReader:
             self.monotonic,
         )
 
-    def _recover_terminal_read(self, preparation, source, clock_source):
+    def _recover_terminal_read(
+        self, preparation, source, clock_source, prior_media_clock
+    ):
         """Return one fully validated replacement within a strict time bound.
 
         A live FFmpeg FIFO can close on a single HLS discontinuity while the
@@ -732,7 +774,7 @@ class LiveStreamReader:
             if preparation is not None:
                 preparation.discard()
             candidate = self._prepare_same_session_restart(
-                source, clock_source
+                source, clock_source, prior_media_clock
             )
             method = "same_session_restart"
             may_start_fresh_attempt = True
@@ -860,6 +902,7 @@ class LiveStreamReader:
                                 proactive_preparation,
                                 capture_source,
                                 capture_clock_source,
+                                media_clock,
                             )
                             proactive_preparation = None
                             if prepared is None:

@@ -213,13 +213,111 @@ class LiveStreamReaderTests(unittest.TestCase):
                 terminal[0]["method"], "same_session_restart"
             )
             self.assertEqual(terminal[0]["stage"], "ready")
-            self.assertGreaterEqual(len(clock_sources), 2)
+            self.assertEqual(len(clock_sources), 1)
             self.assertTrue(all(
                 source == "clock-session-1" for source in clock_sources
             ))
             self.assertFalse(any(
                 event["state"] == "reconnecting" for event in states
             ))
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_terminal_restart_reuses_only_a_validator_accepted_exact_clock(self):
+        captures = []
+        clock_calls = []
+        states = []
+
+        def capture_factory(source):
+            if not captures:
+                capture = ScriptedCapture([f"{source}-primary"])
+                capture.get = lambda _property: 0.0
+            else:
+                capture = ContinuousCapture(source)
+            captures.append(capture)
+            return capture
+
+        exact_clock = FakeMediaClock()
+
+        def media_clock_factory(*_args):
+            clock_calls.append(_args)
+            return exact_clock
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session-1",
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
+            media_clock_factory=media_clock_factory,
+            media_clock_source_factory=lambda: "clock-session-1",
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            terminal_read_failover_seconds=0.5,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            replacement = reader.wait_for_frame(first["sequence"], timeout=2.0)
+            self.assertIsNotNone(replacement)
+            self.assertEqual(
+                replacement["media_clock"]["media_timestamp_utc"],
+                "2026-07-10T03:57:23.388Z",
+            )
+            # One exact match established the original clock. The same-session
+            # restart accepted that clock only through the unchanged validator.
+            self.assertEqual(len(clock_calls), 1)
+            terminal = next(
+                event for event in states
+                if event["state"] == "terminal_failover_succeeded"
+            )
+            self.assertEqual(terminal["stage"], "ready")
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_terminal_restart_reanchors_when_prior_clock_validation_fails(self):
+        captures = []
+        valid = "2026-07-10T03:57:23.388Z"
+        invalid = "2026-07-10T03:57:20.000Z"
+        clocks = [SequencedMediaClock([valid, invalid]), FakeMediaClock(valid)]
+        clock_calls = []
+
+        def capture_factory(source):
+            if not captures:
+                capture = ScriptedCapture([f"{source}-primary"])
+                capture.get = lambda _property: 0.0
+            else:
+                capture = ContinuousCapture(source)
+            captures.append(capture)
+            return capture
+
+        def media_clock_factory(*_args):
+            clock_calls.append(_args)
+            return clocks[min(len(clock_calls) - 1, 1)]
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session-1",
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=media_clock_factory,
+            media_clock_source_factory=lambda: "clock-session-1",
+            media_clock_validator=lambda frame_clock, _epoch: (
+                frame_clock["media_timestamp_utc"]
+                == "2026-07-10T03:57:23.388Z"
+            ),
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            terminal_read_failover_seconds=0.5,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            replacement = reader.wait_for_frame(first["sequence"], timeout=2.0)
+            self.assertIsNotNone(replacement)
+            self.assertEqual(
+                replacement["media_clock"]["media_timestamp_utc"], valid
+            )
+            self.assertEqual(len(clock_calls), 2)
         finally:
             reader.stop(timeout=2.0)
 
