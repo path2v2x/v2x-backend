@@ -115,6 +115,27 @@ class ExportMapCalibrationGeometryTests(unittest.TestCase):
         )
         self.assertEqual(len({item["id"] for item in ranges}), 3)
 
+    def test_road_mark_material_height_sway_type_and_explicit_lines_are_preserved(self):
+        ranges = opendrive_road_mark_ranges(b"""<OpenDRIVE>
+<road id="9" length="20"><lanes><laneSection s="0"><right><lane id="-1">
+<roadMark sOffset="0" type="custom" weight="standard" color="yellow"
+ material="thermoplastic" width="0.2" laneChange="decrease" height="0.015">
+ <sway ds="0.5" a="1" b="2" c="3" d="4"/>
+ <type name="double" width="0.4"><line length="3" space="2" tOffset="0.1"
+  sOffset="0.2" rule="caution" width="0.12"/></type>
+ <explicit><line length="4" tOffset="-0.1" sOffset="0.3" rule="no_passing" width="0.14"/></explicit>
+</roadMark></lane></right></laneSection></lanes></road></OpenDRIVE>""")
+        mark = ranges[0]
+        self.assertEqual(mark["material"], "thermoplastic")
+        self.assertEqual(mark["height_m"], 0.015)
+        self.assertEqual(mark["sway"], [{"ds_m": 0.5, "a": 1.0, "b": 2.0, "c": 3.0, "d": 4.0}])
+        self.assertEqual(mark["types"][0]["lines"][0], {
+            "length_m": 3.0, "space_m": 2.0, "t_offset_m": 0.1,
+            "s_offset_m": 0.2, "rule": "caution", "width_m": 0.12,
+        })
+        self.assertEqual(mark["explicit_lines"][0]["rule"], "no_passing")
+        self.assertEqual(mark["explicit_lines"][0]["width_m"], 0.14)
+
     def test_sampled_mark_geometry_binds_exact_xodr_range_and_attributes(self):
         lanes = [lane_geometry_from_waypoints(
             (7, 0, -1), [Waypoint(value, "Solid", "Solid") for value in range(5)]

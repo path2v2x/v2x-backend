@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -26,7 +28,7 @@ from scipy.optimize import least_squares
 ANNOTATION_SCHEMA = "v2x-map-lidar-registration-annotations/v1"
 REPORT_SCHEMA = "v2x-map-lidar-registration-report/v1"
 GEOMETRY_SCHEMA = "v2x-map-calibration-geometry/v1"
-SURVEY_SCHEMA = "v2x-current-horizontal-survey/v1"
+SURVEY_SCHEMA = "v2x-current-horizontal-survey/v2"
 
 HORIZONTAL_RMSE_MAX_M = 0.25
 HORIZONTAL_MAX_M = 0.50
@@ -52,9 +54,20 @@ BOUND_PROXIMITY_FRACTION = 1e-5
 NEAR_OPTIMAL_COST_FRACTION = 0.05
 CURRENT_SURVEY_MAX_AGE_DAYS = 90.0
 GEOMETRIC_DUPLICATE_TOLERANCE_M = 0.02
+SPATIAL_EXCLUSION_BUFFER_M = 0.50
 MAX_SURVEY_CONTROL_UNCERTAINTY_M = 0.10
 MIN_SURVEY_FIT_CONTROLS = 10
 MIN_SURVEY_HOLDOUT_CONTROLS = 4
+MIN_SURVEY_STABLE_LANDMARKS = 6
+STABLE_LANDMARK_CATEGORIES = {"StableLandmark", "TrafficLight", "TrafficSigns"}
+SURVEY_DELIVERABLE_ROLES = {
+    "raw_observations", "survey_license", "instrument_calibration"
+}
+SURVEY_OBSERVATION_COLUMNS = (
+    "observation_id", "physical_control_id", "stable_landmark_id", "split",
+    "easting_m", "northing_m", "horizontal_uncertainty_m", "observed_at_utc",
+    "surveyor_license", "instrument_serial", "source_id",
+)
 MANUAL_PROVENANCE = "manually_verified_map_lidar_polyline"
 FEATURE_KINDS = {"road_edge", "lane_marking", "crosswalk_edge", "stable_landmark"}
 CAMERA_IDS = ("ch1", "ch2", "ch3", "ch4")
@@ -156,6 +169,14 @@ def _require_metre_axes(crs, count: int, label: str) -> list[str]:
     return [axis.unit_name for axis in axes[:count]]
 
 
+def _coordinate_epoch(crs) -> float | None:
+    value = getattr(crs, "coordinate_epoch", None)
+    if value is not None:
+        return float(value)
+    match = re.search(r"FRAMEEPOCH\[([0-9.+-]+)\]", crs.to_wkt())
+    return None if match is None else float(match.group(1))
+
+
 def _semantic_crs_equal(left, right) -> bool:
     try:
         from pyproj import CRS
@@ -239,8 +260,10 @@ def load_lidar_tile(lidar_path: Path, validation_path: Path) -> dict:
         "vertical_epsg": vertical_epsg,
         "horizontal_units": horizontal_units,
         "vertical_units": vertical_units,
+        "horizontal_crs_wkt": horizontal_crs.to_wkt(),
         "horizontal_datum": horizontal_crs.datum.name if horizontal_crs.datum else None,
         "vertical_datum": vertical_crs.datum.name if vertical_crs.datum else None,
+        "horizontal_coordinate_epoch": _coordinate_epoch(horizontal_crs),
     }
 
 
@@ -317,6 +340,9 @@ def parse_opendrive(path: Path) -> dict:
         "georeference_sha256": hashlib.sha256(georeference.encode()).hexdigest(),
         "georeference_wkt": projected_crs.to_wkt(),
         "georeference_linear_units": units,
+        "georeference_epsg": projected_crs.to_epsg(),
+        "georeference_datum": projected_crs.datum.name if projected_crs.datum else None,
+        "georeference_coordinate_epoch": _coordinate_epoch(projected_crs),
     }
 
 
@@ -364,7 +390,8 @@ def _load_exporter_module():
 
 def validate_geometry_provenance(geometry: dict, geometry_path: Path,
                                  opendrive_path: Path, opendrive: dict,
-                                 pair_path: Path, cameras_path: Path) -> dict:
+                                 pair_path: Path, cameras_path: Path,
+                                 carla_source_path: Path) -> dict:
     from PIL import Image
     from types import SimpleNamespace
 
@@ -372,7 +399,9 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
     if not isinstance(provenance, dict) or provenance.get("schema") != "v2x-map-geometry-provenance/v1":
         raise RegistrationError("map geometry has no strict exporter provenance")
     pair, cameras = json.loads(pair_path.read_text()), json.loads(cameras_path.read_text())
+    carla_source = json.loads(carla_source_path.read_text())
     pair_hash, cameras_hash = sha256(pair_path), sha256(cameras_path)
+    carla_source_hash = sha256(carla_source_path)
     if pair.get("schema") != "v2x-observational-calibration-pairs/v1":
         raise RegistrationError("geometry pair manifest schema is unsupported")
     if pair.get("cameras_file_sha256") != cameras_hash:
@@ -389,6 +418,7 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
         "opendrive_georeference_sha256": opendrive["georeference_sha256"],
         "pair_manifest_sha256": pair_hash,
         "cameras_file_sha256": cameras_hash,
+        "carla_source_export_sha256": carla_source_hash,
         "radius_m": geometry.get("radius_m"),
         "lane_spacing_m": geometry.get("lane_spacing_m"),
         "geometry_payload_sha256": canonical_hash(payload),
@@ -397,8 +427,26 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
     for key, value in expected.items():
         if provenance.get(key) != value:
             raise RegistrationError(f"map geometry provenance {key} mismatch")
-    if geometry.get("pair_manifest_sha256") != pair_hash or geometry.get("cameras_file_sha256") != cameras_hash:
+    if (
+        geometry.get("pair_manifest_sha256") != pair_hash
+        or geometry.get("cameras_file_sha256") != cameras_hash
+        or geometry.get("carla_source_export_sha256") != carla_source_hash
+    ):
         raise RegistrationError("map geometry top-level pair/camera binding mismatch")
+    if (
+        carla_source.get("schema") != "v2x-retained-carla-map-export/v1"
+        or carla_source.get("map") != geometry.get("map")
+        or carla_source.get("opendrive_sha256") != opendrive["sha256"]
+        or carla_source.get("radius_m") != geometry.get("radius_m")
+        or carla_source.get("lane_spacing_m") != geometry.get("lane_spacing_m")
+    ):
+        raise RegistrationError("retained CARLA source export binding mismatch")
+    try:
+        rebuilt_payload = exporter.geometry_from_carla_source(carla_source, exact_ranges)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise RegistrationError("retained CARLA source geometry cannot be rebuilt") from exc
+    if canonical_hash(rebuilt_payload) != canonical_hash(payload):
+        raise RegistrationError("map geometry does not reproduce retained CARLA/XODR source")
     if payload.get("opendrive_road_mark_ranges") != exact_ranges:
         raise RegistrationError("map geometry exact road-mark ranges do not reproduce OpenDRIVE")
 
@@ -472,7 +520,9 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
     if canonical_hash(rebound) != canonical_hash(payload["road_mark_segments"]):
         raise RegistrationError("sampled road-mark binding does not reproduce exporter output")
     for original, recomputed in zip(payload["lanes"], rebound_lanes):
-        if original.get("road_mark_segment_ids") != recomputed.get("road_mark_segment_ids"):
+        if set(original.get("road_mark_segment_ids", [])) != set(
+            recomputed.get("road_mark_segment_ids", [])
+        ):
             raise RegistrationError("lane road-mark references do not reproduce exporter output")
     for item in payload["objects"]:
         if item["id"] != f"environment-{item.get('category')}-{item.get('source_object_id')}":
@@ -534,7 +584,7 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
             ):
                 raise RegistrationError(f"{camera_id}: geometry frame provenance mismatch")
             recomputed_projection = exporter.projected_geometry(
-                payload, transform, fov, dimensions[0], dimensions[1]
+                rebuilt_payload, transform, fov, dimensions[0], dimensions[1]
             )
             if canonical_hash(report_frame.get("projection")) != canonical_hash(recomputed_projection):
                 raise RegistrationError(f"{camera_id}: geometry projection cannot be reproduced")
@@ -544,11 +594,15 @@ def validate_geometry_provenance(geometry: dict, geometry_path: Path,
             overlay_path = geometry_path.parent / overlay_name
             if sha256(overlay_path) != report_frame.get("overlay_sha256"):
                 raise RegistrationError(f"{camera_id}: geometry overlay hash mismatch")
+            rebuilt_overlay = exporter.render_overlay_bytes(frame_path, recomputed_projection)
+            if rebuilt_overlay != overlay_path.read_bytes():
+                raise RegistrationError(f"{camera_id}: geometry overlay pixels cannot be reproduced")
     return {
         "geometry_path": str(geometry_path.resolve()),
         "geometry_sha256": sha256(geometry_path),
         "pair_manifest_sha256": pair_hash,
         "cameras_file_sha256": cameras_hash,
+        "carla_source_export_sha256": carla_source_hash,
         "geometry_payload_sha256": expected["geometry_payload_sha256"],
         "exporter_sha256": expected["exporter_sha256"],
     }
@@ -705,6 +759,24 @@ def load_features(annotation: dict, geometry: dict, tiles: dict) -> list[dict]:
                         f"{side} geometric duplicate/resampling leaks between "
                         f"{left['id']}:{left['split']} and {right['id']}:{right['split']}"
                     )
+                if left["split"] != right["split"]:
+                    pairwise = np.linalg.norm(
+                        left[side][:, None, :2] - right[side][None, :, :2], axis=2
+                    )
+                    endpoint_pairwise = np.linalg.norm(
+                        left[side][[0, -1], None, :2]
+                        - right[side][None, [0, -1], :2], axis=2
+                    )
+                    if np.min(pairwise) <= 1e-9 or np.min(endpoint_pairwise) <= 1e-9:
+                        raise RegistrationError(
+                            f"{side} fit/holdout coordinate or endpoint overlap between "
+                            f"{left['id']} and {right['id']}"
+                        )
+                    if minimum_polyline_distance(left[side], right[side]) <= SPATIAL_EXCLUSION_BUFFER_M:
+                        raise RegistrationError(
+                            f"{side} fit/holdout spatial exclusion buffer violated between "
+                            f"{left['id']} and {right['id']}"
+                        )
     return features
 
 
@@ -730,6 +802,14 @@ def polylines_geometrically_duplicate(left: np.ndarray, right: np.ndarray) -> bo
         np.max(left_to_right) <= GEOMETRIC_DUPLICATE_TOLERANCE_M
         or np.max(right_to_left) <= GEOMETRIC_DUPLICATE_TOLERANCE_M
     )
+
+
+def minimum_polyline_distance(left: np.ndarray, right: np.ndarray) -> float:
+    left_samples, right_samples = resample_polyline(left), resample_polyline(right)
+    return float(min(
+        np.min(nearest_segments(left_samples, right_samples)["horizontal"]),
+        np.min(nearest_segments(right_samples, left_samples)["horizontal"]),
+    ))
 
 
 def transform_points(points: np.ndarray, parameters: np.ndarray) -> np.ndarray:
@@ -1123,14 +1203,16 @@ def _survey_residual_metrics(controls: list[dict], parameters: np.ndarray) -> di
     }
 
 
-def _validate_survey_crs(block: dict, horizontal_epsg: int | None) -> dict:
+def _validate_survey_crs(block: dict, horizontal_epsg: int | None,
+                         horizontal_wkt: str | None = None,
+                         coordinate_epoch: float | None = None) -> dict:
     from pyproj import CRS
 
     if not isinstance(block, dict) or horizontal_epsg is None:
         raise RegistrationError("current horizontal survey CRS block is missing")
     try:
         declared = CRS.from_wkt(block["wkt"])
-        expected = CRS.from_epsg(horizontal_epsg)
+        expected = CRS.from_wkt(horizontal_wkt) if horizontal_wkt else CRS.from_epsg(horizontal_epsg)
     except (KeyError, TypeError, ValueError) as exc:
         raise RegistrationError("current horizontal survey CRS is malformed") from exc
     axes = declared.axis_info
@@ -1152,11 +1234,123 @@ def _validate_survey_crs(block: dict, horizontal_epsg: int | None) -> dict:
     datum = declared.datum.name if declared.datum is not None else None
     if not datum or block.get("datum") != datum:
         raise RegistrationError("current horizontal survey datum is not exact")
-    return {"epsg": horizontal_epsg, "linear_units": unit_names[0], "datum": datum}
+    if "coordinate_epoch" not in block or block.get("coordinate_epoch") != coordinate_epoch:
+        raise RegistrationError("current horizontal survey coordinate epoch is not exact")
+    return {
+        "epsg": horizontal_epsg, "wkt": declared.to_wkt(),
+        "linear_units": unit_names[0], "datum": datum,
+        "coordinate_epoch": coordinate_epoch,
+    }
+
+
+def _survey_deliverable_evidence(survey: dict, deliverable_paths: list[Path] | None,
+                                 observations_path: Path | None) -> dict:
+    paths = [Path(value).resolve() for value in (deliverable_paths or [])]
+    if observations_path is None or not paths:
+        raise RegistrationError("licensed survey raw deliverables are required")
+    observations_path = observations_path.resolve()
+    if observations_path.suffix.lower() != ".csv" or observations_path not in paths:
+        raise RegistrationError("licensed survey observations must be a retained CSV deliverable")
+    if any(path.suffix.lower() == ".json" or not path.is_file() for path in paths):
+        raise RegistrationError("self-authored JSON is not a licensed survey raw deliverable")
+    if len(paths) != len(set(paths)):
+        raise RegistrationError("licensed survey raw deliverable paths are duplicated")
+    declarations = survey.get("raw_deliverables")
+    if not isinstance(declarations, list) or len(declarations) != len(paths):
+        raise RegistrationError("licensed survey raw deliverable manifest is incomplete")
+    declared_by_hash = {}
+    for item in declarations:
+        if not isinstance(item, dict) or item.get("role") not in SURVEY_DELIVERABLE_ROLES:
+            raise RegistrationError("licensed survey deliverable role is invalid")
+        identity = item.get("sha256")
+        if not isinstance(identity, str) or identity in declared_by_hash:
+            raise RegistrationError("licensed survey deliverable hash is invalid")
+        declared_by_hash[identity] = item
+    actual = []
+    for path in paths:
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        declared = declared_by_hash.get(digest)
+        if (
+            not content or declared is None or declared.get("file_name") != path.name
+            or int(declared.get("bytes", -1)) != len(content)
+        ):
+            raise RegistrationError("licensed survey raw deliverable hash/size/name mismatch")
+        if declared["role"] in {"survey_license", "instrument_calibration"}:
+            if path.suffix.lower() != ".pdf" or not content.startswith(b"%PDF-"):
+                raise RegistrationError("licensed survey authority evidence must be retained PDF")
+        actual.append({
+            "path": str(path), "file_name": path.name, "sha256": digest,
+            "bytes": len(content), "role": declared["role"],
+        })
+    roles = {item["role"] for item in actual}
+    if roles != SURVEY_DELIVERABLE_ROLES:
+        raise RegistrationError("licensed survey deliverable roles are incomplete")
+    observation_digest = sha256(observations_path)
+    observation_binding = survey.get("observations")
+    if (
+        not isinstance(observation_binding, dict)
+        or observation_binding.get("format") != "csv"
+        or observation_binding.get("sha256") != observation_digest
+        or observation_binding.get("file_name") != observations_path.name
+        or int(observation_binding.get("bytes", -1)) != observations_path.stat().st_size
+        or declared_by_hash[observation_digest].get("role") != "raw_observations"
+    ):
+        raise RegistrationError("licensed survey observation binding mismatch")
+    return {
+        "deliverables": sorted(actual, key=lambda item: item["sha256"]),
+        "observations_path": str(observations_path),
+        "observations_sha256": observation_digest,
+    }
+
+
+def _survey_identity(survey: dict, deliverable_evidence: dict) -> dict:
+    source = survey.get("licensed_source")
+    if not isinstance(source, dict):
+        raise RegistrationError("licensed survey source identity is missing")
+    surveyor, instrument = source.get("surveyor"), source.get("instrument")
+    required_source = (source.get("provider"), source.get("source_id"), source.get("project_id"))
+    if any(not isinstance(value, str) or not value.strip() for value in required_source):
+        raise RegistrationError("licensed survey provider/source/project identity is incomplete")
+    if not isinstance(surveyor, dict) or any(
+        not isinstance(surveyor.get(key), str) or not surveyor[key].strip()
+        for key in ("name", "license_number", "licensing_authority")
+    ):
+        raise RegistrationError("licensed surveyor identity is incomplete")
+    if not isinstance(instrument, dict) or any(
+        not isinstance(instrument.get(key), str) or not instrument[key].strip()
+        for key in ("manufacturer", "model", "serial_number")
+    ):
+        raise RegistrationError("licensed survey instrument identity is incomplete")
+    hashes_by_role = {
+        item["role"]: item["sha256"] for item in deliverable_evidence["deliverables"]
+    }
+    if (
+        source.get("survey_license_deliverable_sha256") != hashes_by_role["survey_license"]
+        or instrument.get("calibration_deliverable_sha256")
+        != hashes_by_role["instrument_calibration"]
+    ):
+        raise RegistrationError("licensed survey authority/instrument evidence is not hash-bound")
+    return {
+        "provider": source["provider"], "source_id": source["source_id"],
+        "project_id": source["project_id"],
+        "surveyor_name": surveyor["name"],
+        "surveyor_license": surveyor["license_number"],
+        "licensing_authority": surveyor["licensing_authority"],
+        "instrument": {
+            "manufacturer": instrument["manufacturer"], "model": instrument["model"],
+            "serial_number": instrument["serial_number"],
+            "calibration_deliverable_sha256": instrument["calibration_deliverable_sha256"],
+        },
+    }
 
 
 def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: str,
-                            opendrive_hash: str, horizontal_epsg: int | None) -> dict:
+                            opendrive_hash: str, horizontal_epsg: int | None,
+                            deliverable_paths: list[Path] | None = None,
+                            observations_path: Path | None = None,
+                            horizontal_wkt: str | None = None,
+                            coordinate_epoch: float | None = None) -> dict:
     if path is None:
         return {"present": False, "passed": False, "reasons": ["current_horizontal_survey_missing"]}
     survey = json.loads(path.read_text())
@@ -1168,70 +1362,135 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
     if survey.get("opendrive_sha256") != opendrive_hash:
         reasons.append("current_horizontal_survey_opendrive_hash")
     try:
-        crs_summary = _validate_survey_crs(survey.get("horizontal_crs"), horizontal_epsg)
+        crs_summary = _validate_survey_crs(
+            survey.get("horizontal_crs"), horizontal_epsg, horizontal_wkt, coordinate_epoch
+        )
     except RegistrationError:
         crs_summary = None
         reasons.append("current_horizontal_survey_crs")
     try:
-        observed = datetime.fromisoformat(str(survey.get("observed_at_utc")).replace("Z", "+00:00"))
-        if observed.tzinfo is None:
-            raise ValueError("survey timestamp must include an explicit UTC offset")
-        age_days = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds() / 86400
-        if age_days < -1 or age_days > CURRENT_SURVEY_MAX_AGE_DAYS:
-            reasons.append("current_horizontal_survey_age")
-    except (TypeError, ValueError):
-        age_days = None
-        reasons.append("current_horizontal_survey_timestamp")
-    raw_controls = survey.get("controls")
+        deliverable_evidence = _survey_deliverable_evidence(
+            survey, deliverable_paths, observations_path
+        )
+        source_identity = _survey_identity(survey, deliverable_evidence)
+    except RegistrationError:
+        deliverable_evidence = source_identity = None
+        reasons.append("current_horizontal_survey_licensed_deliverables")
+    raw_controls = []
+    age_days = None
+    if deliverable_evidence is not None:
+        try:
+            with Path(deliverable_evidence["observations_path"]).open(newline="") as stream:
+                reader = csv.DictReader(stream)
+                if tuple(reader.fieldnames or ()) != SURVEY_OBSERVATION_COLUMNS:
+                    raise RegistrationError("licensed survey observation columns are not exact")
+                raw_controls = list(reader)
+        except (OSError, csv.Error, RegistrationError):
+            raw_controls = []
+            reasons.append("current_horizontal_survey_raw_observations")
+    bindings = survey.get("control_bindings")
+    if not isinstance(bindings, list):
+        bindings = []
+        reasons.append("current_horizontal_survey_control_bindings")
+    binding_by_id = {}
+    for item in bindings:
+        if (
+            not isinstance(item, dict) or not isinstance(item.get("observation_id"), str)
+            or item["observation_id"] in binding_by_id
+        ):
+            binding_by_id = {}
+            reasons.append("current_horizontal_survey_control_bindings")
+            break
+        binding_by_id[item["observation_id"]] = item.get("map")
     controls, control_ids, physical_ids = [], set(), set()
-    feature_splits, positions = {}, []
-    if not isinstance(raw_controls, list):
-        reasons.append("current_horizontal_survey_raw_controls")
-        raw_controls = []
+    feature_splits, map_positions, survey_positions, observed_times = {}, [], [], []
+    stable_landmark_ids = set()
     for raw in raw_controls:
         try:
-            identity, physical_id, split = raw["id"], raw["physical_control_id"], raw["split"]
+            identity, physical_id, split = (
+                raw["observation_id"].strip(), raw["physical_control_id"].strip(),
+                raw["split"].strip(),
+            )
             if (
                 not isinstance(identity, str) or not identity or identity in control_ids
                 or not isinstance(physical_id, str) or not physical_id or physical_id in physical_ids
                 or split not in {"fit", "holdout"}
             ):
                 raise RegistrationError("survey control identities/split are invalid")
-            if raw.get("provenance") != "licensed_survey_raw_control":
-                raise RegistrationError("survey control provenance is invalid")
-            map_point = resolve_map_control(geometry, raw.get("map", {}), identity)
-            declared_map = np.asarray(raw.get("map_xyz"), dtype=float)
-            surveyed_xy = np.asarray(raw.get("survey_xy"), dtype=float)
-            uncertainty = float(raw.get("horizontal_uncertainty_m"))
+            if source_identity is None or (
+                raw["surveyor_license"].strip() != source_identity["surveyor_license"]
+                or raw["instrument_serial"].strip()
+                != source_identity["instrument"]["serial_number"]
+                or raw["source_id"].strip() != source_identity["source_id"]
+            ):
+                raise RegistrationError("survey observation source identity mismatch")
+            stable_id = raw["stable_landmark_id"].strip()
+            reference = binding_by_id.get(identity)
             if (
-                declared_map.shape != (3,) or surveyed_xy.shape != (2,)
-                or not np.isfinite(declared_map).all() or not np.isfinite(surveyed_xy).all()
-                or not np.allclose(declared_map, map_point, atol=1e-9, rtol=0)
+                not stable_id or not isinstance(reference, dict)
+                or reference.get("collection") != "objects"
+                or reference.get("feature_id") != stable_id
+                or reference.get("point_field") != "center_world"
+                or reference.get("vertex_index") not in (None, 0)
+            ):
+                raise RegistrationError("survey control is not a bound stable landmark")
+            landmark_matches = [
+                item for item in geometry.get("geometry", {}).get("objects", [])
+                if item.get("id") == stable_id
+            ]
+            if (
+                len(landmark_matches) != 1
+                or landmark_matches[0].get("category") not in STABLE_LANDMARK_CATEGORIES
+            ):
+                raise RegistrationError(
+                    "survey control does not reference an eligible stable landmark category"
+                )
+            map_point = resolve_map_control(geometry, reference, identity)
+            surveyed_xy = np.asarray([raw["easting_m"], raw["northing_m"]], dtype=float)
+            uncertainty = float(raw["horizontal_uncertainty_m"])
+            observed = datetime.fromisoformat(raw["observed_at_utc"].strip().replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                raise RegistrationError("survey observation timestamp has no timezone")
+            observed_times.append(observed.astimezone(timezone.utc))
+            if (
+                surveyed_xy.shape != (2,) or not np.isfinite(surveyed_xy).all()
                 or not math.isfinite(uncertainty) or uncertainty <= 0
                 or uncertainty > MAX_SURVEY_CONTROL_UNCERTAINTY_M
             ):
                 raise RegistrationError("survey control coordinates/uncertainty are invalid")
-            source_key = (
-                raw["map"].get("collection"), raw["map"].get("feature_id"),
-                raw["map"].get("point_field"),
-            )
+            source_key = ("objects", stable_id, "center_world")
             if source_key in feature_splits and feature_splits[source_key] != split:
                 raise RegistrationError("survey source feature leaks across fit and holdout")
             feature_splits[source_key] = split
-            if any(np.linalg.norm(declared_map[:2] - other) <= 1e-6 for other in positions):
+            if any(np.linalg.norm(map_point[:2] - other) <= 1e-6 for other in map_positions):
                 raise RegistrationError("survey controls contain duplicate geometry")
-            positions.append(declared_map[:2])
+            if any(np.linalg.norm(surveyed_xy - other) <= 1e-6 for other in survey_positions):
+                raise RegistrationError("survey observations contain duplicate coordinates")
+            map_positions.append(map_point[:2])
+            survey_positions.append(surveyed_xy)
             control_ids.add(identity)
             physical_ids.add(physical_id)
+            stable_landmark_ids.add(stable_id)
             controls.append({
                 "id": identity, "physical_control_id": physical_id, "split": split,
-                "map_reference": raw["map"], "map_xyz": declared_map,
+                "stable_landmark_id": stable_id,
+                "map_reference": reference, "map_xyz": map_point,
                 "survey_xy": surveyed_xy, "horizontal_uncertainty_m": uncertainty,
             })
         except (KeyError, TypeError, ValueError, RegistrationError):
-            reasons.append("current_horizontal_survey_raw_controls")
+            reasons.append("current_horizontal_survey_raw_observations")
             controls = []
             break
+    if set(binding_by_id) != control_ids:
+        reasons.append("current_horizontal_survey_control_bindings")
+    if observed_times:
+        age_days = (
+            datetime.now(timezone.utc) - max(observed_times)
+        ).total_seconds() / 86400
+        if age_days < -1 or age_days > CURRENT_SURVEY_MAX_AGE_DAYS:
+            reasons.append("current_horizontal_survey_age")
+    else:
+        reasons.append("current_horizontal_survey_timestamp")
     fit = [item for item in controls if item["split"] == "fit"]
     holdout = [item for item in controls if item["split"] == "holdout"]
     transform = fit_metrics = holdout_metrics = None
@@ -1240,6 +1499,17 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
         reasons.append("current_horizontal_survey_fit_control_count")
     if len(holdout) < MIN_SURVEY_HOLDOUT_CONTROLS:
         reasons.append("current_horizontal_survey_holdout_control_count")
+    if len(stable_landmark_ids) < MIN_SURVEY_STABLE_LANDMARKS:
+        reasons.append("current_horizontal_survey_stable_landmark_count")
+    for left in fit:
+        for right in holdout:
+            if (
+                np.linalg.norm(left["map_xyz"][:2] - right["map_xyz"][:2])
+                <= SPATIAL_EXCLUSION_BUFFER_M
+                or np.linalg.norm(left["survey_xy"] - right["survey_xy"])
+                <= SPATIAL_EXCLUSION_BUFFER_M
+            ):
+                reasons.append("current_horizontal_survey_spatial_exclusion")
     if len(fit) >= MIN_SURVEY_FIT_CONTROLS and len(holdout) >= MIN_SURVEY_HOLDOUT_CONTROLS:
         fit_map = np.asarray([item["map_xyz"][:2] for item in fit])
         fit_survey = np.asarray([item["survey_xy"] for item in fit])
@@ -1273,9 +1543,20 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
         "sha256": sha256(path),
         "age_days": age_days,
         "crs": crs_summary,
+        "licensed_source": source_identity,
+        "raw_deliverable_evidence": deliverable_evidence,
         "raw_control_count": len(controls),
+        "stable_landmark_count": len(stable_landmark_ids),
         "fit_control_ids": [item["id"] for item in fit],
         "holdout_control_ids": [item["id"] for item in holdout],
+        "raw_control_coordinates": [{
+            "observation_id": item["id"],
+            "stable_landmark_id": item["stable_landmark_id"],
+            "split": item["split"],
+            "map_xy": item["map_xyz"][:2].tolist(),
+            "survey_xy": item["survey_xy"].tolist(),
+            "horizontal_uncertainty_m": item["horizontal_uncertainty_m"],
+        } for item in controls],
         "fit_nonzero_pairwise_distance_count": fit_pairwise_distance_count,
         "recomputed_transform": None if transform is None else {
             "tx_m": float(transform[0]), "ty_m": float(transform[1]),
@@ -1283,9 +1564,134 @@ def validate_current_survey(path: Path | None, geometry: dict, geometry_hash: st
         },
         "recomputed_fit_metrics": fit_metrics,
         "recomputed_holdout_metrics": holdout_metrics,
-        "raw_controls_recomputed": bool(controls and transform is not None),
+        "raw_controls_recomputed": bool(
+            controls and transform is not None and deliverable_evidence and source_identity
+        ),
         "passed": not reasons,
         "reasons": sorted(set(reasons)),
+    }
+
+
+def validate_crs_reconciliation(opendrive: dict, lidar_tile: dict, survey: dict,
+                                artifact_path: Path | None = None) -> dict:
+    from pyproj import CRS, Transformer
+
+    lidar_crs = CRS.from_wkt(lidar_tile["horizontal_crs_wkt"])
+    opendrive_crs = CRS.from_wkt(opendrive["georeference_wkt"])
+    lidar_epoch = lidar_tile.get("horizontal_coordinate_epoch")
+    opendrive_epoch = opendrive.get("georeference_coordinate_epoch")
+    survey_crs = survey.get("crs") if survey.get("present") else None
+    survey_equal = not survey.get("present") or (
+        isinstance(survey_crs, dict)
+        and CRS.from_wkt(survey_crs["wkt"]).equals(lidar_crs)
+        and survey_crs.get("datum") == lidar_tile.get("horizontal_datum")
+        and survey_crs.get("coordinate_epoch") == lidar_epoch
+    )
+    if not survey_equal:
+        raise RegistrationError("current survey CRS/datum/epoch differs from LiDAR")
+    direct_equal = (
+        opendrive_crs.equals(lidar_crs)
+        and opendrive.get("georeference_datum") == lidar_tile.get("horizontal_datum")
+        and opendrive_epoch == lidar_epoch
+        and survey_equal
+    )
+    if direct_equal:
+        return {
+            "method": "direct_crs_equality", "passed": True,
+            "opendrive_epsg": opendrive.get("georeference_epsg"),
+            "lidar_epsg": lidar_tile.get("horizontal_epsg"),
+            "datum": lidar_tile.get("horizontal_datum"),
+            "coordinate_epoch": lidar_epoch,
+        }
+    if artifact_path is None:
+        raise RegistrationError(
+            "OpenDRIVE, LiDAR, and survey CRS/datum/epoch differ without reconciliation"
+        )
+    artifact_path = artifact_path.resolve()
+    artifact = json.loads(artifact_path.read_text())
+    if artifact.get("schema") != "v2x-crs-reconciliation/v1":
+        raise RegistrationError("CRS reconciliation schema is unsupported")
+    pipeline = artifact.get("proj_pipeline")
+    if (
+        not isinstance(pipeline, str) or not pipeline.strip()
+        or artifact.get("proj_pipeline_sha256")
+        != hashlib.sha256(pipeline.encode()).hexdigest()
+        or artifact.get("source_crs_wkt_sha256")
+        != hashlib.sha256(opendrive["georeference_wkt"].encode()).hexdigest()
+        or artifact.get("target_crs_wkt_sha256")
+        != hashlib.sha256(lidar_tile["horizontal_crs_wkt"].encode()).hexdigest()
+        or artifact.get("source_coordinate_epoch") != opendrive_epoch
+        or artifact.get("target_coordinate_epoch") != lidar_epoch
+    ):
+        raise RegistrationError("CRS reconciliation pipeline/source/target binding mismatch")
+    if any(
+        not isinstance(artifact.get(key), str) or not artifact[key].strip()
+        for key in ("authority", "operation_id", "source_deliverable_sha256")
+    ):
+        raise RegistrationError("CRS reconciliation authority identity is incomplete")
+    survey_hashes = {
+        item["sha256"] for item in (
+            survey.get("raw_deliverable_evidence") or {}
+        ).get("deliverables", [])
+    }
+    if artifact["source_deliverable_sha256"] not in survey_hashes:
+        raise RegistrationError("CRS reconciliation is not bound to a licensed deliverable")
+    checks = artifact.get("check_points")
+    if not isinstance(checks, list) or len(checks) < MIN_SURVEY_STABLE_LANDMARKS:
+        raise RegistrationError("CRS reconciliation has insufficient independent check points")
+    identities, source_points, target_points = set(), [], []
+    survey_controls = {
+        item.get("observation_id"): item
+        for item in survey.get("raw_control_coordinates", [])
+        if isinstance(item, dict)
+    }
+    for item in checks:
+        try:
+            identity = item["id"]
+            source_xy = np.asarray(item["source_xy"], dtype=float)
+            target_xy = np.asarray(item["target_xy"], dtype=float)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RegistrationError("CRS reconciliation check point is malformed") from exc
+        if (
+            not isinstance(identity, str) or not identity or identity in identities
+            or source_xy.shape != (2,) or target_xy.shape != (2,)
+            or not np.isfinite(source_xy).all() or not np.isfinite(target_xy).all()
+        ):
+            raise RegistrationError("CRS reconciliation check point is invalid")
+        raw_control = survey_controls.get(identity)
+        if (
+            raw_control is None
+            or not np.allclose(source_xy, raw_control.get("map_xy"), atol=1e-9, rtol=0)
+            or not np.allclose(target_xy, raw_control.get("survey_xy"), atol=1e-9, rtol=0)
+        ):
+            raise RegistrationError(
+                "CRS reconciliation check point does not reproduce licensed observations"
+            )
+        identities.add(identity)
+        source_points.append(source_xy)
+        target_points.append(target_xy)
+    source_array, target_array = np.asarray(source_points), np.asarray(target_points)
+    if any(np.linalg.matrix_rank(values - np.mean(values, axis=0), tol=1e-6) != 2 for values in (
+        source_array, target_array
+    )):
+        raise RegistrationError("CRS reconciliation check points are rank deficient")
+    try:
+        transformer = Transformer.from_pipeline(pipeline)
+        transformed = np.column_stack(transformer.transform(
+            source_array[:, 0], source_array[:, 1]
+        ))
+    except Exception as exc:
+        raise RegistrationError("CRS reconciliation pipeline cannot be executed") from exc
+    residuals = np.linalg.norm(transformed - target_array, axis=1)
+    if not np.isfinite(residuals).all() or float(np.max(residuals)) > MAX_SURVEY_CONTROL_UNCERTAINTY_M:
+        raise RegistrationError("CRS reconciliation independently recomputed residuals fail")
+    return {
+        "method": "hash_bound_proj_pipeline", "passed": True,
+        "artifact_path": str(artifact_path), "artifact_sha256": sha256(artifact_path),
+        "authority": artifact["authority"], "operation_id": artifact["operation_id"],
+        "check_point_count": len(checks),
+        "recomputed_horizontal_rmse_m": math.sqrt(float(np.mean(np.square(residuals)))),
+        "recomputed_horizontal_max_m": float(np.max(residuals)),
     }
 
 
@@ -1445,8 +1851,12 @@ def parse_args():
     parser.add_argument("--geometry", type=Path, required=True)
     parser.add_argument("--pair-manifest", type=Path, required=True)
     parser.add_argument("--cameras-json", type=Path, required=True)
+    parser.add_argument("--carla-source-export", type=Path, required=True)
     parser.add_argument("--annotations", type=Path, required=True)
     parser.add_argument("--current-horizontal-survey", type=Path)
+    parser.add_argument("--survey-deliverable", action="append", type=Path)
+    parser.add_argument("--survey-observations", type=Path)
+    parser.add_argument("--crs-reconciliation", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--deployment-output", type=Path)
     parser.add_argument(
@@ -1468,10 +1878,18 @@ def write_registration_outputs(report: dict, survey: dict, output: Path,
                                deployment_output: Path | None = None) -> None:
     write_json_exclusive(output, report)
     if deployment_output is not None:
-        if not survey.get("passed") or not survey.get("raw_controls_recomputed"):
+        if (
+            not survey.get("passed") or not survey.get("raw_controls_recomputed")
+            or survey.get("stable_landmark_count", 0) < MIN_SURVEY_STABLE_LANDMARKS
+            or not survey.get("licensed_source")
+            or not (survey.get("raw_deliverable_evidence") or {}).get("deliverables")
+        ):
             raise RegistrationError(
-                "refusing deployment output without a passing current horizontal survey"
+                "refusing deployment output without licensed recomputed survey evidence"
             )
+        crs_evidence = (report.get("evidence") or {}).get("crs_reconciliation")
+        if not isinstance(crs_evidence, dict) or crs_evidence.get("passed") is not True:
+            raise RegistrationError("refusing deployment output without CRS reconciliation")
         if not report["deployment_eligible"]:
             raise RegistrationError(
                 "refusing deployment output because strict registration gates did not pass"
@@ -1494,13 +1912,19 @@ def main() -> int:
     if len(tiles) != len(tile_list):
         raise SystemExit("duplicate raw LiDAR tiles are not allowed")
     crs_identities = {(item["horizontal_epsg"], item["vertical_epsg"]) for item in tile_list}
-    if len(crs_identities) != 1:
+    if len(crs_identities) != 1 or any(
+        not _semantic_crs_equal(item["horizontal_crs_wkt"], tile_list[0]["horizontal_crs_wkt"])
+        or item["horizontal_coordinate_epoch"] != tile_list[0]["horizontal_coordinate_epoch"]
+        or item["horizontal_datum"] != tile_list[0]["horizontal_datum"]
+        for item in tile_list[1:]
+    ):
         raise SystemExit("raw LiDAR tiles do not share one horizontal/vertical CRS")
     horizontal_epsg, vertical_epsg = next(iter(crs_identities))
 
     metadata_path, opendrive_path = args.metadata.resolve(), args.opendrive.resolve()
     geometry_path, annotation_path = args.geometry.resolve(), args.annotations.resolve()
     pair_path, cameras_path = args.pair_manifest.resolve(), args.cameras_json.resolve()
+    carla_source_path = args.carla_source_export.resolve()
     metadata, geometry, annotation = (
         json.loads(metadata_path.read_text()), json.loads(geometry_path.read_text()),
         json.loads(annotation_path.read_text()),
@@ -1508,7 +1932,8 @@ def main() -> int:
     opendrive = parse_opendrive(opendrive_path)
     verify_artifact_bindings(annotation, tiles, metadata_path, opendrive, geometry_path, geometry)
     geometry_validation = validate_geometry_provenance(
-        geometry, geometry_path, opendrive_path, opendrive, pair_path, cameras_path
+        geometry, geometry_path, opendrive_path, opendrive, pair_path, cameras_path,
+        carla_source_path,
     )
     metadata_record = select_metadata_record(metadata, annotation.get("metadata_selector", {}))
     if int(metadata_record.get("horiz_crs") or metadata_record.get("horizontal_epsg")) != horizontal_epsg:
@@ -1518,11 +1943,20 @@ def main() -> int:
     survey = validate_current_survey(
         args.current_horizontal_survey.resolve() if args.current_horizontal_survey else None,
         geometry, sha256(geometry_path), opendrive["sha256"], horizontal_epsg,
+        [path.resolve() for path in (args.survey_deliverable or [])],
+        args.survey_observations.resolve() if args.survey_observations else None,
+        tile_list[0]["horizontal_crs_wkt"],
+        tile_list[0]["horizontal_coordinate_epoch"],
+    )
+    crs_reconciliation = validate_crs_reconciliation(
+        opendrive, tile_list[0], survey,
+        args.crs_reconciliation.resolve() if args.crs_reconciliation else None,
     )
     metadata_summary = {
         "annotations": {"path": str(annotation_path), "sha256": sha256(annotation_path)},
         "geometry": {"path": str(geometry_path), "sha256": sha256(geometry_path)},
         "geometry_provenance_validation": geometry_validation,
+        "crs_reconciliation": crs_reconciliation,
         "opendrive": opendrive,
         "metadata": {
             "path": str(metadata_path), "sha256": sha256(metadata_path),
@@ -1535,7 +1969,8 @@ def main() -> int:
             {key: item[key] for key in (
                 "path", "sha256", "validation_path", "validation_sha256", "point_count",
                 "bytes", "bounds", "scales", "horizontal_epsg", "vertical_epsg",
-                "horizontal_units", "vertical_units", "horizontal_datum", "vertical_datum"
+                "horizontal_units", "vertical_units", "horizontal_datum", "vertical_datum",
+                "horizontal_crs_wkt", "horizontal_coordinate_epoch",
             )} for item in tile_list
         ],
     }

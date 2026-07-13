@@ -205,3 +205,46 @@ def test_vertical_lateral_lane_offset_and_junction_assignment_drift_is_explicit(
         "road-1-lateral_shape-s0.000000000-t0.000000000"
     ]
     assert report["road_junction_assignment"]["changed"] == ["1"]
+
+
+def test_complete_nested_road_mark_semantic_drift_is_explicit(tmp_path):
+    template = """<OpenDRIVE><header><geoReference>same</geoReference></header>
+<road id="1" length="10" junction="-1">
+<planView><geometry s="0" x="0" y="0" hdg="0" length="10"><line/></geometry></planView>
+<lanes><laneSection s="0"><right><lane id="-1" type="driving">
+<width sOffset="0" a="3.5" b="0" c="0" d="0"/>
+<roadMark sOffset="0" type="custom" color="white" weight="standard"
+ material="{material}" width="0.2" laneChange="both" height="{height}">
+ <sway ds="0.5" a="{sway}" b="2" c="3" d="4"/>
+ <type name="{type_name}" width="0.4"><line length="{length}" space="{space}"
+  tOffset="{type_t}" sOffset="{type_s}" rule="{type_rule}" width="{type_width}"/></type>
+ <explicit><line length="{explicit_length}" space="1" tOffset="{explicit_t}"
+  sOffset="{explicit_s}" rule="{explicit_rule}" width="{explicit_width}"/></explicit>
+</roadMark></lane></right></laneSection></lanes></road></OpenDRIVE>"""
+    base = dict(
+        material="paint", height="0.01", sway="1", type_name="double",
+        length="3", space="2", type_t="0.1", type_s="0.2",
+        type_rule="caution", type_width="0.12", explicit_length="4",
+        explicit_t="-0.1", explicit_s="0.3", explicit_rule="no_passing",
+        explicit_width="0.14",
+    )
+    changed = dict(
+        material="thermoplastic", height="0.02", sway="1.5", type_name="triple",
+        length="3.5", space="2.5", type_t="0.15", type_s="0.25",
+        type_rule="warning", type_width="0.13", explicit_length="4.5",
+        explicit_t="-0.2", explicit_s="0.35", explicit_rule="stop",
+        explicit_width="0.16",
+    )
+    deployed_path, candidate_path = tmp_path / "marks-a.xodr", tmp_path / "marks-b.xodr"
+    deployed_path.write_text(template.format(**base))
+    candidate_path.write_text(template.format(**changed))
+    deployed = tool.parse_map(deployed_path)
+    mark = deployed["lane_profiles"][0]["road_marks"][0]
+    assert mark["material"] == "paint" and mark["height"] == 0.01
+    assert mark["sway"][0]["a"] == 1.0
+    assert mark["types"][0]["lines"][0]["space_m"] == 2.0
+    assert mark["explicit_lines"][0]["rule"] == "no_passing"
+    report = tool.compare_maps(deployed, tool.parse_map(candidate_path))
+    assert report["lane_profiles"]["road_mark_changed"] == [
+        "road-1-section-s0.000-lane--1"
+    ]

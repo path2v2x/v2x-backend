@@ -241,6 +241,48 @@ def _float_attributes(element, names):
     return {name: float(element.get(name, 0.0)) for name in names}
 
 
+def _optional_float(element, name):
+    value = element.get(name)
+    return None if value is None else float(value)
+
+
+def _road_mark_line_record(element):
+    return {
+        "length_m": _optional_float(element, "length"),
+        "space_m": _optional_float(element, "space"),
+        "t_offset_m": _optional_float(element, "tOffset"),
+        "s_offset_m": _optional_float(element, "sOffset"),
+        "rule": element.get("rule"),
+        "width_m": _optional_float(element, "width"),
+    }
+
+
+def parse_road_mark_record(element):
+    explicit = element.find("explicit")
+    return {
+        "s_offset": float(element.get("sOffset")),
+        "type": element.get("type"),
+        "color": element.get("color"),
+        "weight": element.get("weight"),
+        "material": element.get("material"),
+        "lane_change": element.get("laneChange"),
+        "width": _optional_float(element, "width"),
+        "height": _optional_float(element, "height"),
+        "sway": [{
+            "ds": float(item.get("ds")),
+            **_float_attributes(item, ("a", "b", "c", "d")),
+        } for item in element.findall("sway")],
+        "types": [{
+            "name": item.get("name"),
+            "width": _optional_float(item, "width"),
+            "lines": [_road_mark_line_record(line) for line in item.findall("line")],
+        } for item in element.findall("type")],
+        "explicit_lines": [] if explicit is None else [
+            _road_mark_line_record(line) for line in explicit.findall("line")
+        ],
+    }
+
+
 def parse_lane_profiles(road):
     sections = road.findall("./lanes/laneSection")
     road_length = float(road.get("length"))
@@ -261,17 +303,7 @@ def parse_lane_profiles(road):
                 for item in lane.findall("width")
             ]
             widths.sort(key=lambda item: item["s_offset"])
-            road_marks = [
-                {
-                    "s_offset": float(item.get("sOffset")),
-                    "type": item.get("type"),
-                    "color": item.get("color"),
-                    "weight": item.get("weight"),
-                    "lane_change": item.get("laneChange"),
-                    "width": float(item.get("width")) if item.get("width") is not None else None,
-                }
-                for item in lane.findall("roadMark")
-            ]
+            road_marks = [parse_road_mark_record(item) for item in lane.findall("roadMark")]
             road_marks.sort(key=lambda item: item["s_offset"])
             link = lane.find("link")
             profiles.append({

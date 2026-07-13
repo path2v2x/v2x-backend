@@ -1,4 +1,5 @@
 import copy
+import csv
 from datetime import datetime, timezone
 import importlib.util
 import json
@@ -64,10 +65,26 @@ def synthetic_evidence(warp_holdout=None, initial=None):
                 },
             })
     raw_points = np.asarray(raw_points)
+    landmark_coordinates = [
+        [0.0, 30.0, 0.0], [5.0, 30.0, 0.0], [10.0, 30.0, 0.0],
+        [15.0, 30.0, 0.0], [20.0, 30.0, 0.0], [0.0, 35.0, 0.0],
+        [5.0, 35.0, 0.0], [10.0, 35.0, 0.0], [15.0, 35.0, 0.0],
+        [20.0, 35.0, 0.0], [30.0, 40.0, 0.0], [35.0, 40.0, 0.0],
+        [30.0, 45.0, 0.0], [35.0, 45.0, 0.0],
+    ]
+    objects = [{
+        "id": f"environment-StableLandmark-landmark-{index:02d}",
+        "source_object_id": f"landmark-{index:02d}", "category": "StableLandmark",
+        "name": f"survey monument {index:02d}", "center_world": point,
+        "extent": [0.1, 0.1, 0.5],
+    } for index, point in enumerate(landmark_coordinates)]
     geometry = {
         "schema": tool.GEOMETRY_SCHEMA,
         "opendrive_sha256": "xodr-hash",
-        "geometry": {"lanes": geometry_items, "crosswalks": [], "road_mark_segments": []},
+        "geometry": {
+            "lanes": geometry_items, "crosswalks": [], "road_mark_segments": [],
+            "objects": objects,
+        },
     }
     annotation = {
         "schema": tool.ANNOTATION_SCHEMA,
@@ -103,31 +120,44 @@ def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive
                          corrupt_summary=False):
     from pyproj import CRS
 
-    fit_features = [item for item in geometry["geometry"]["lanes"] if item["id"].endswith("-fit")]
-    holdout_features = [item for item in geometry["geometry"]["lanes"] if item["id"].endswith("-holdout")]
-    selected = []
-    for feature in fit_features:
-        for vertex_index, point in enumerate(feature["left_boundary_world"]):
-            selected.append(("fit", feature, vertex_index, point))
-    selected = selected[:10] + [
-        ("holdout", feature, 0, feature["left_boundary_world"][0])
-        for feature in holdout_features
-    ]
-    controls = []
-    for index, (split, feature, vertex_index, point) in enumerate(selected):
-        controls.append({
-            "id": f"survey-{split}-{index}",
+    objects = geometry["geometry"]["objects"]
+    observations = tmp_path / "licensed-observations.csv"
+    fieldnames = list(tool.SURVEY_OBSERVATION_COLUMNS)
+    rows, bindings = [], []
+    for index, feature in enumerate(objects[:14]):
+        split = "fit" if index < 10 else "holdout"
+        surveyed = apply_transform([feature["center_world"]])[0, :2]
+        observation_id = f"survey-{split}-{index}"
+        rows.append({
+            "observation_id": observation_id,
             "physical_control_id": f"monument-{index}",
-            "split": split,
-            "provenance": "licensed_survey_raw_control",
-            "map": {
-                "collection": "lanes", "feature_id": feature["id"],
-                "point_field": "left_boundary_world", "vertex_index": vertex_index,
-            },
-            "map_xyz": point,
-            "survey_xy": apply_transform([point])[0, :2].tolist(),
-            "horizontal_uncertainty_m": 0.02,
+            "stable_landmark_id": feature["id"], "split": split,
+            "easting_m": f"{surveyed[0]:.12f}", "northing_m": f"{surveyed[1]:.12f}",
+            "horizontal_uncertainty_m": "0.02",
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "surveyor_license": "PLS-12345", "instrument_serial": "TS-9000-001",
+            "source_id": "licensed-field-book-2026-07",
         })
+        bindings.append({
+            "observation_id": observation_id,
+            "map": {
+                "collection": "objects", "feature_id": feature["id"],
+                "point_field": "center_world", "vertex_index": 0,
+            },
+        })
+    with observations.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    survey_license = tmp_path / "surveyor-license.pdf"
+    instrument_calibration = tmp_path / "instrument-calibration.pdf"
+    survey_license.write_bytes(b"%PDF-1.7\nlicensed surveyor PLS-12345\n%%EOF\n")
+    instrument_calibration.write_bytes(b"%PDF-1.7\ninstrument TS-9000-001 calibration\n%%EOF\n")
+    deliverables = [observations, survey_license, instrument_calibration]
+    roles = {
+        observations: "raw_observations", survey_license: "survey_license",
+        instrument_calibration: "instrument_calibration",
+    }
     crs = CRS.from_epsg(26910)
     value = {
         "schema": tool.SURVEY_SCHEMA,
@@ -139,14 +169,51 @@ def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive
             "wkt": crs.to_wkt(),
             "linear_units": crs.axis_info[0].unit_name,
             "datum": crs.datum.name,
+            "coordinate_epoch": None,
         },
-        "controls": controls,
+        "licensed_source": {
+            "provider": "Licensed Survey Provider LLC",
+            "source_id": "licensed-field-book-2026-07",
+            "project_id": "RICHMOND-V2X-2026",
+            "surveyor": {
+                "name": "Licensed Surveyor", "license_number": "PLS-12345",
+                "licensing_authority": "California Board for Professional Engineers",
+            },
+            "instrument": {
+                "manufacturer": "Leica", "model": "TS16",
+                "serial_number": "TS-9000-001",
+                "calibration_deliverable_sha256": tool.sha256(instrument_calibration),
+            },
+            "survey_license_deliverable_sha256": tool.sha256(survey_license),
+        },
+        "raw_deliverables": [{
+            "file_name": item.name, "sha256": tool.sha256(item),
+            "bytes": item.stat().st_size, "role": roles[item],
+        } for item in deliverables],
+        "observations": {
+            "file_name": observations.name, "sha256": tool.sha256(observations),
+            "bytes": observations.stat().st_size, "format": "csv",
+        },
+        "control_bindings": bindings,
     }
     if corrupt_summary:
         value.update({"horizontal_rmse_m": 0.0, "horizontal_max_m": 0.0})
     path = tmp_path / "survey.json"
     path.write_text(json.dumps(value))
-    return path
+    return path, deliverables, observations
+
+
+def rebind_observations(path, observations):
+    value = json.loads(path.read_text())
+    digest = tool.sha256(observations)
+    value["observations"].update({
+        "sha256": digest, "bytes": observations.stat().st_size,
+    })
+    declaration = next(
+        item for item in value["raw_deliverables"] if item["role"] == "raw_observations"
+    )
+    declaration.update({"sha256": digest, "bytes": observations.stat().st_size})
+    path.write_text(json.dumps(value))
 
 
 def test_known_site_transform_passes_numerical_gates_but_2018_ql2_stays_ineligible():
@@ -245,6 +312,31 @@ def test_geometric_resampling_duplicate_with_new_source_id_is_rejected():
     }
     assert duplicate["left_boundary_world"] != original
     with pytest.raises(tool.RegistrationError, match="geometric duplicate/resampling"):
+        tool.load_features(annotation, geometry, tiles)
+
+
+def test_fit_holdout_endpoint_overlap_is_rejected_even_with_distinct_ids():
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    fit_feature, holdout_feature = annotation["features"][0], annotation["features"][1]
+    geometry["geometry"]["lanes"][1]["left_boundary_world"][0] = list(
+        geometry["geometry"]["lanes"][0]["left_boundary_world"][0]
+    )
+    holdout_feature["lidar"]["xyz"][0] = list(fit_feature["lidar"]["xyz"][0])
+    holdout_index = holdout_feature["lidar"]["point_indices"][0]
+    tiles["tile-hash"]["points"][holdout_index] = fit_feature["lidar"]["xyz"][0]
+    with pytest.raises(tool.RegistrationError, match="coordinate or endpoint overlap"):
+        tool.load_features(annotation, geometry, tiles)
+
+
+def test_fit_holdout_polylines_inside_spatial_exclusion_buffer_are_rejected():
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    holdout_map = [[0.25, 0.0, 0.0], [0.25, 8.0, 0.0], [0.25, 16.0, 0.0]]
+    geometry["geometry"]["lanes"][1]["left_boundary_world"] = holdout_map
+    transformed = apply_transform(holdout_map)
+    annotation["features"][1]["lidar"]["xyz"] = transformed.tolist()
+    indices = annotation["features"][1]["lidar"]["point_indices"]
+    tiles["tile-hash"]["points"][indices] = transformed
+    with pytest.raises(tool.RegistrationError, match="spatial exclusion buffer"):
         tool.load_features(annotation, geometry, tiles)
 
 
@@ -399,44 +491,58 @@ def strict_geometry_fixture(tmp_path):
     pair = tmp_path / "pairs.json"
     pair.write_text(json.dumps(pair_value))
     exact_ranges = exporter.opendrive_road_mark_ranges(xodr.read_bytes())
-    boundary = [[float(value), 0.0, 0.0] for value in range(5)]
-    sampled = [{
-        "id": f"unbound-{side}", "road_id": 7, "section_id": 0, "lane_id": -1,
-        "side": side, "type": "solid", "color": "white", "width_m": 0.15,
-        "lane_change": "both", "start_s_m": 0.0, "end_s_m": 4.0,
-        "sample_count": 5, "boundary_world": boundary, "usable_as_polyline": True,
-    } for side in ("left", "right")]
-    lane = {
-        "id": "road-7-section-0-lane--1", "road_id": 7, "section_id": 0,
-        "lane_id": -1, "s_range_m": [0.0, 4.0], "lane_width_m": 4.0,
-        "lane_width_range_m": [4.0, 4.0], "center_world": boundary,
-        "left_boundary_world": [[point[0], -2.0, point[2]] for point in boundary],
-        "right_boundary_world": [[point[0], 2.0, point[2]] for point in boundary],
-        "road_mark_segment_ids": [item["id"] for item in sampled],
-        "road_mark_segments": sampled,
+    marking = {"type": "solid", "color": "white", "width_m": 0.15, "lane_change": "both"}
+    source_value = {
+        "schema": "v2x-retained-carla-map-export/v1",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "map": "SyntheticMap", "opendrive_sha256": opendrive["sha256"],
+        "radius_m": 80.0, "lane_spacing_m": 1.0,
+        "anchor_world": [1.0, 2.0, 3.0],
+        "crosswalk_polygons": [
+            [[8.0, -1.0, 0.0], [9.0, -1.0, 0.0], [9.0, 1.0, 0.0],
+             [8.0, 1.0, 0.0], [8.0, -1.0, 0.0]],
+        ],
+        "lane_waypoint_groups": [{
+            "road_id": 7, "section_id": 0, "lane_id": -1,
+            "waypoints": [{
+                "s_m": float(value), "location": [float(value), 0.0, 0.0],
+                "yaw_deg": 0.0, "lane_width_m": 4.0,
+                "left_lane_marking": marking, "right_lane_marking": marking,
+            } for value in range(5)],
+        }],
+        "environment_objects": [{
+            "source_object_id": "signal-1", "name": "signal",
+            "category": "TrafficLight", "center_world": [5.0, 0.0, 2.0],
+            "extent": [0.2, 0.2, 1.0],
+        }],
     }
-    road_mark_segments = exporter.bind_sampled_road_marks([lane], exact_ranges, 1.0)
-    payload = {
-        "crosswalks": [], "lanes": [lane], "road_mark_segments": road_mark_segments,
-        "opendrive_road_mark_ranges": exact_ranges, "objects": [],
-    }
+    carla_source = tmp_path / "carla-source-export.json"
+    carla_source.write_text(json.dumps(source_value))
+    payload = exporter.geometry_from_carla_source(source_value, exact_ranges)
     transform = SimpleNamespace(
         location=SimpleNamespace(x=1.0, y=2.0, z=3.0),
         rotation=SimpleNamespace(pitch=-5.0, yaw=10.0, roll=0.0),
     )
-    for report_camera in report_cameras.values():
+    for camera_id, report_camera in report_cameras.items():
         for kind in ("real", "twin"):
             report_camera[kind]["projection"] = exporter.projected_geometry(
                 payload, transform, 90.0, 16, 12
             )
+            image_path = tmp_path / pair_cameras[camera_id][kind]["file"]
+            overlay_path = tmp_path / report_camera[kind]["overlay"]
+            exporter.render_overlay(
+                image_path, report_camera[kind]["projection"], overlay_path
+            )
+            report_camera[kind]["overlay_sha256"] = tool.sha256(overlay_path)
     geometry_value = {
         "schema": tool.GEOMETRY_SCHEMA,
         "map": "SyntheticMap",
         "opendrive_sha256": opendrive["sha256"],
         "pair_manifest_sha256": tool.sha256(pair),
         "cameras_file_sha256": tool.sha256(cameras),
+        "carla_source_export_sha256": tool.sha256(carla_source),
         "radius_m": 80.0,
-        "lane_spacing_m": 0.5,
+        "lane_spacing_m": 1.0,
         "geometry": payload,
         "cameras": report_cameras,
     }
@@ -448,56 +554,99 @@ def strict_geometry_fixture(tmp_path):
         "opendrive_georeference_sha256": opendrive["georeference_sha256"],
         "pair_manifest_sha256": tool.sha256(pair),
         "cameras_file_sha256": tool.sha256(cameras),
+        "carla_source_export_sha256": tool.sha256(carla_source),
         "radius_m": 80.0,
-        "lane_spacing_m": 0.5,
+        "lane_spacing_m": 1.0,
         "geometry_payload_sha256": tool.canonical_hash(payload),
         "exact_road_mark_ranges_sha256": tool.canonical_hash(exact_ranges),
     }
     geometry = tmp_path / "geometry-strict.json"
     geometry.write_text(json.dumps(geometry_value))
-    return geometry, geometry_value, xodr, opendrive, pair, cameras
+    return geometry, geometry_value, xodr, opendrive, pair, cameras, carla_source
 
 
 def test_geometry_provenance_recomputes_exporter_pair_frames_and_payload(tmp_path):
-    geometry, value, xodr, opendrive, pair, cameras = strict_geometry_fixture(tmp_path)
-    result = tool.validate_geometry_provenance(value, geometry, xodr, opendrive, pair, cameras)
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
+    result = tool.validate_geometry_provenance(
+        value, geometry, xodr, opendrive, pair, cameras, source
+    )
     assert result["geometry_payload_sha256"] == tool.canonical_hash(value["geometry"])
     assert result["exporter_sha256"] == tool.sha256(TOOL_PATH.with_name("export_map_calibration_geometry.py"))
 
 
 def test_schema_and_xodr_hash_without_full_geometry_provenance_is_rejected(tmp_path):
-    geometry, value, xodr, opendrive, pair, cameras = strict_geometry_fixture(tmp_path)
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
     del value["geometry_provenance"]
     with pytest.raises(tool.RegistrationError, match="no strict exporter provenance"):
-        tool.validate_geometry_provenance(value, geometry, xodr, opendrive, pair, cameras)
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
 
 
 def test_geometry_payload_or_retained_frame_tamper_is_rejected(tmp_path):
-    geometry, value, xodr, opendrive, pair, cameras = strict_geometry_fixture(tmp_path)
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
     value["geometry"]["objects"].append({"id": "fabricated"})
     with pytest.raises(tool.RegistrationError, match="geometry_payload_sha256 mismatch"):
-        tool.validate_geometry_provenance(value, geometry, xodr, opendrive, pair, cameras)
-    geometry, value, xodr, opendrive, pair, cameras = strict_geometry_fixture(tmp_path / "frames")
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(
+        tmp_path / "frames"
+    )
     (pair.parent / "ch1-real.jpg").write_bytes(b"tampered")
     with pytest.raises(tool.RegistrationError, match="source frame hash mismatch"):
-        tool.validate_geometry_provenance(value, geometry, xodr, opendrive, pair, cameras)
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
 
 
 def test_geometry_camera_projection_is_independently_recomputed(tmp_path):
-    geometry, value, xodr, opendrive, pair, cameras = strict_geometry_fixture(tmp_path)
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
     value["cameras"]["ch1"]["real"]["projection"]["objects"].append({"fabricated": True})
     with pytest.raises(tool.RegistrationError, match="projection cannot be reproduced"):
-        tool.validate_geometry_provenance(value, geometry, xodr, opendrive, pair, cameras)
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
+
+
+def test_geometry_world_coordinates_are_rebuilt_from_retained_carla_source(tmp_path):
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
+    source_value = json.loads(source.read_text())
+    source_value["lane_waypoint_groups"][0]["waypoints"][2]["location"][1] += 1.0
+    source.write_text(json.dumps(source_value))
+    source_hash = tool.sha256(source)
+    value["carla_source_export_sha256"] = source_hash
+    value["geometry_provenance"]["carla_source_export_sha256"] = source_hash
+    with pytest.raises(tool.RegistrationError, match="does not reproduce retained CARLA/XODR"):
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
+
+
+def test_geometry_overlay_pixels_are_rerendered_not_trusted_by_hash(tmp_path):
+    from PIL import Image
+
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
+    report_frame = value["cameras"]["ch1"]["real"]
+    overlay = geometry.parent / report_frame["overlay"]
+    Image.new("RGB", (16, 12), color="black").save(overlay, quality=94)
+    report_frame["overlay_sha256"] = tool.sha256(overlay)
+    with pytest.raises(tool.RegistrationError, match="overlay pixels cannot be reproduced"):
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
 
 
 def test_geometry_road_mark_binding_is_independently_recomputed(tmp_path):
-    geometry, value, xodr, opendrive, pair, cameras = strict_geometry_fixture(tmp_path)
+    geometry, value, xodr, opendrive, pair, cameras, source = strict_geometry_fixture(tmp_path)
     value["geometry"]["road_mark_segments"][0]["opendrive_source_lane_id"] = 999
     value["geometry_provenance"]["geometry_payload_sha256"] = tool.canonical_hash(
         value["geometry"]
     )
-    with pytest.raises(tool.RegistrationError, match="does not reproduce exporter output"):
-        tool.validate_geometry_provenance(value, geometry, xodr, opendrive, pair, cameras)
+    with pytest.raises(tool.RegistrationError, match="does not reproduce retained CARLA/XODR"):
+        tool.validate_geometry_provenance(
+            value, geometry, xodr, opendrive, pair, cameras, source
+        )
 
 
 @pytest.mark.parametrize("binding", [
@@ -588,6 +737,116 @@ def test_opendrive_georeference_must_be_projected_metres(tmp_path):
         tool.parse_opendrive(path)
 
 
+def test_epsg3857_opendrive_cannot_silently_mix_with_epsg26910_lidar(tmp_path):
+    from pyproj import CRS
+
+    path = tmp_path / "web-mercator.xodr"
+    path.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:3857</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(path)
+    lidar_crs = CRS.from_epsg(26910)
+    lidar = {
+        "horizontal_crs_wkt": lidar_crs.to_wkt(), "horizontal_epsg": 26910,
+        "horizontal_datum": lidar_crs.datum.name,
+        "horizontal_coordinate_epoch": None,
+    }
+    survey = {"present": False, "passed": False, "reasons": []}
+    with pytest.raises(tool.RegistrationError, match="differ without reconciliation"):
+        tool.validate_crs_reconciliation(opendrive, lidar, survey)
+
+
+def test_crs_reconciliation_pipeline_hash_and_licensed_source_are_fail_closed(tmp_path):
+    from pyproj import CRS
+
+    path = tmp_path / "web-mercator.xodr"
+    path.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:3857</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(path)
+    lidar_crs = CRS.from_epsg(26910)
+    lidar = {
+        "horizontal_crs_wkt": lidar_crs.to_wkt(), "horizontal_epsg": 26910,
+        "horizontal_datum": lidar_crs.datum.name,
+        "horizontal_coordinate_epoch": None,
+    }
+    survey = {
+        "present": True, "crs": {
+            "wkt": lidar_crs.to_wkt(), "datum": lidar_crs.datum.name,
+            "coordinate_epoch": None,
+        },
+        "raw_deliverable_evidence": {
+            "deliverables": [{"sha256": "licensed-deliverable"}],
+        },
+    }
+    artifact = tmp_path / "crs-reconciliation.json"
+    artifact.write_text(json.dumps({
+        "schema": "v2x-crs-reconciliation/v1",
+        "proj_pipeline": "+proj=noop", "proj_pipeline_sha256": "fabricated",
+        "source_crs_wkt_sha256": tool.hashlib.sha256(
+            opendrive["georeference_wkt"].encode()
+        ).hexdigest(),
+        "target_crs_wkt_sha256": tool.hashlib.sha256(
+            lidar["horizontal_crs_wkt"].encode()
+        ).hexdigest(),
+        "source_coordinate_epoch": None, "target_coordinate_epoch": None,
+        "authority": "licensed authority", "operation_id": "operation-1",
+        "source_deliverable_sha256": "licensed-deliverable", "check_points": [],
+    }))
+    with pytest.raises(tool.RegistrationError, match="pipeline/source/target binding"):
+        tool.validate_crs_reconciliation(opendrive, lidar, survey, artifact)
+
+
+def test_hash_bound_crs_pipeline_recomputes_licensed_survey_check_points(tmp_path):
+    from pyproj import CRS
+
+    _, geometry, _, _, _ = synthetic_evidence()
+    survey_path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    survey = tool.validate_current_survey(
+        survey_path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    xodr = tmp_path / "different-crs.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:3857</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(xodr)
+    lidar_crs = CRS.from_epsg(26910)
+    lidar = {
+        "horizontal_crs_wkt": lidar_crs.to_wkt(), "horizontal_epsg": 26910,
+        "horizontal_datum": lidar_crs.datum.name,
+        "horizontal_coordinate_epoch": None,
+    }
+    cosine, sine = math.cos(math.radians(2.0)), math.sin(math.radians(2.0))
+    pipeline = (
+        "+proj=pipeline +step +proj=affine +xoff=100 +yoff=-50 "
+        f"+s11={cosine} +s12={-sine} +s21={sine} +s22={cosine}"
+    )
+    artifact = tmp_path / "crs-reconciliation-valid.json"
+    artifact.write_text(json.dumps({
+        "schema": "v2x-crs-reconciliation/v1", "proj_pipeline": pipeline,
+        "proj_pipeline_sha256": tool.hashlib.sha256(pipeline.encode()).hexdigest(),
+        "source_crs_wkt_sha256": tool.hashlib.sha256(
+            opendrive["georeference_wkt"].encode()
+        ).hexdigest(),
+        "target_crs_wkt_sha256": tool.hashlib.sha256(
+            lidar["horizontal_crs_wkt"].encode()
+        ).hexdigest(),
+        "source_coordinate_epoch": None, "target_coordinate_epoch": None,
+        "authority": "Licensed Survey Provider LLC", "operation_id": "site-grid-2026",
+        "source_deliverable_sha256": tool.sha256(deliverables[1]),
+        "check_points": [{
+            "id": item["observation_id"], "source_xy": item["map_xy"],
+            "target_xy": item["survey_xy"],
+        } for item in survey["raw_control_coordinates"]],
+    }))
+    result = tool.validate_crs_reconciliation(opendrive, lidar, survey, artifact)
+    assert result["passed"] is True
+    assert result["method"] == "hash_bound_proj_pipeline"
+    assert result["check_point_count"] == 14
+    assert result["recomputed_horizontal_max_m"] < 1e-8
+
+
 def test_deployment_output_requires_current_survey(tmp_path):
     _, geometry, _, _, _ = synthetic_evidence()
     survey = tool.validate_current_survey(None, geometry, "geometry", "opendrive", 26910)
@@ -599,7 +858,7 @@ def test_deployment_output_requires_current_survey(tmp_path):
         "deployment_eligible": True,
         "model": {"transform": {"tx_m": 1, "ty_m": 2, "yaw_deg": 3, "z_bias_m": 4}},
     }
-    with pytest.raises(tool.RegistrationError, match="without a passing current horizontal survey"):
+    with pytest.raises(tool.RegistrationError, match="without licensed recomputed survey evidence"):
         tool.write_registration_outputs(
             report, survey, tmp_path / "report.json", tmp_path / "deployment.json"
         )
@@ -609,7 +868,13 @@ def test_deployment_output_requires_current_survey(tmp_path):
 
 def test_2018_ql2_cannot_emit_deployment_even_with_current_survey(tmp_path):
     report = run_synthetic()
-    survey = {"passed": True, "raw_controls_recomputed": True, "reasons": []}
+    report["evidence"]["crs_reconciliation"] = {"passed": True}
+    survey = {
+        "passed": True, "raw_controls_recomputed": True, "stable_landmark_count": 6,
+        "licensed_source": {"provider": "licensed"},
+        "raw_deliverable_evidence": {"deliverables": [{"sha256": "bound"}]},
+        "reasons": [],
+    }
     with pytest.raises(tool.RegistrationError, match="strict registration gates"):
         tool.write_registration_outputs(
             report, survey, tmp_path / "report.json", tmp_path / "deployment.json"
@@ -633,13 +898,18 @@ def test_summary_only_current_survey_cannot_pass(tmp_path):
     }))
     survey = tool.validate_current_survey(path, geometry, "geometry", "opendrive", 26910)
     assert survey["passed"] is False
-    assert "current_horizontal_survey_raw_controls" in survey["reasons"]
+    assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
 
 
 def test_current_survey_recomputes_raw_fit_and_holdout_controls(tmp_path):
     _, geometry, _, _, _ = synthetic_evidence()
-    path = write_current_survey(tmp_path, geometry, corrupt_summary=True)
-    survey = tool.validate_current_survey(path, geometry, "geometry", "opendrive", 26910)
+    path, deliverables, observations = write_current_survey(
+        tmp_path, geometry, corrupt_summary=True
+    )
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
     assert survey["passed"] is True
     assert survey["raw_controls_recomputed"] is True
     assert survey["raw_control_count"] == 14
@@ -651,26 +921,101 @@ def test_current_survey_recomputes_raw_fit_and_holdout_controls(tmp_path):
 
 def test_survey_raw_control_uncertainty_and_datum_fail_closed(tmp_path):
     _, geometry, _, _, _ = synthetic_evidence()
-    path = write_current_survey(tmp_path, geometry)
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
     value = json.loads(path.read_text())
     value["horizontal_crs"]["datum"] = "fabricated datum"
-    value["controls"][0]["horizontal_uncertainty_m"] = 0.5
     path.write_text(json.dumps(value))
-    survey = tool.validate_current_survey(path, geometry, "geometry", "opendrive", 26910)
+    with observations.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    rows[0]["horizontal_uncertainty_m"] = "0.5"
+    with observations.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(tool.SURVEY_OBSERVATION_COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+    observation_hash = tool.sha256(observations)
+    value["observations"]["sha256"] = observation_hash
+    value["observations"]["bytes"] = observations.stat().st_size
+    observation_declaration = next(
+        item for item in value["raw_deliverables"] if item["role"] == "raw_observations"
+    )
+    observation_declaration["sha256"] = observation_hash
+    observation_declaration["bytes"] = observations.stat().st_size
+    path.write_text(json.dumps(value))
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
     assert survey["passed"] is False
     assert "current_horizontal_survey_crs" in survey["reasons"]
-    assert "current_horizontal_survey_raw_controls" in survey["reasons"]
+    assert "current_horizontal_survey_raw_observations" in survey["reasons"]
 
 
 def test_survey_geometric_control_duplicate_across_splits_is_rejected(tmp_path):
     _, geometry, _, _, _ = synthetic_evidence()
-    lanes = geometry["geometry"]["lanes"]
-    fit = next(item for item in lanes if item["id"].endswith("-fit"))
-    holdout = next(item for item in lanes if item["id"].endswith("-holdout"))
-    holdout["left_boundary_world"][0] = list(fit["left_boundary_world"][0])
-    path = write_current_survey(tmp_path, geometry)
+    objects = geometry["geometry"]["objects"]
+    objects[10]["center_world"] = list(objects[0]["center_world"])
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
     survey = tool.validate_current_survey(
-        path, geometry, "geometry", "opendrive", 26910
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
     )
     assert survey["passed"] is False
-    assert "current_horizontal_survey_raw_controls" in survey["reasons"]
+    assert "current_horizontal_survey_raw_observations" in survey["reasons"]
+
+
+def test_survey_raw_deliverable_byte_tamper_is_rejected(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    license_path = next(item for item in deliverables if item.name == "surveyor-license.pdf")
+    license_path.write_bytes(license_path.read_bytes() + b"tampered")
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
+
+
+def test_survey_observation_surveyor_instrument_and_source_identity_are_enforced(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    with observations.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    rows[0]["surveyor_license"] = "self-authored"
+    rows[0]["instrument_serial"] = "unknown"
+    rows[0]["source_id"] = "renamed-source"
+    with observations.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(tool.SURVEY_OBSERVATION_COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+    rebind_observations(path, observations)
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_raw_observations" in survey["reasons"]
+
+
+def test_survey_requires_six_distinct_stable_landmark_controls(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    geometry["geometry"]["objects"] = geometry["geometry"]["objects"][:5]
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_stable_landmark_count" in survey["reasons"]
+
+
+def test_survey_rejects_generic_environment_object_as_stable_landmark(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    geometry["geometry"]["objects"][0]["category"] = "Other"
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_raw_observations" in survey["reasons"]

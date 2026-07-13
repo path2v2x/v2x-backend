@@ -12,6 +12,7 @@ identity still requires topology review before it can become acceptance input.
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -159,6 +160,52 @@ def marking_signature(marking):
     }
 
 
+def _optional_float(element, name):
+    value = element.get(name)
+    return None if value is None else float(value)
+
+
+def _road_mark_line_record(element):
+    return {
+        "length_m": _optional_float(element, "length"),
+        "space_m": _optional_float(element, "space"),
+        "t_offset_m": _optional_float(element, "tOffset"),
+        "s_offset_m": _optional_float(element, "sOffset"),
+        "rule": element.get("rule"),
+        "width_m": _optional_float(element, "width"),
+    }
+
+
+def road_mark_record(element):
+    """Preserve every OpenDRIVE roadMark semantic field and child record."""
+    explicit = element.find("explicit")
+    return {
+        "s_offset_m": float(element.get("sOffset")),
+        "type": _normalized_marking_value(element.get("type")),
+        "weight": element.get("weight"),
+        "color": _normalized_marking_value(element.get("color")),
+        "material": element.get("material"),
+        "width_m": _optional_float(element, "width"),
+        "lane_change": _normalized_marking_value(element.get("laneChange")),
+        "height_m": _optional_float(element, "height"),
+        "sway": [{
+            "ds_m": float(item.get("ds")),
+            "a": float(item.get("a")),
+            "b": float(item.get("b")),
+            "c": float(item.get("c")),
+            "d": float(item.get("d")),
+        } for item in element.findall("sway")],
+        "types": [{
+            "name": item.get("name"),
+            "width_m": _optional_float(item, "width"),
+            "lines": [_road_mark_line_record(line) for line in item.findall("line")],
+        } for item in element.findall("type")],
+        "explicit_lines": [] if explicit is None else [
+            _road_mark_line_record(line) for line in explicit.findall("line")
+        ],
+    }
+
+
 def segmented_road_marks(key, waypoints):
     """Preserve each contiguous sampled road-mark range with a stable ID."""
     output = []
@@ -238,6 +285,7 @@ def opendrive_road_mark_ranges(opendrive_bytes):
                         raise RuntimeError(
                             f"road {road_id} lane {lane.get('id')} has an invalid roadMark range"
                         )
+                    record = road_mark_record(mark)
                     values = {
                         "road_id": road_id,
                         "section_index": section_index,
@@ -245,11 +293,7 @@ def opendrive_road_mark_ranges(opendrive_bytes):
                         "lane_id": lane.get("id"),
                         "start_s_m": round(start_s, 6),
                         "end_s_m": round(end_s, 6),
-                        "type": _normalized_marking_value(mark.get("type")),
-                        "color": _normalized_marking_value(mark.get("color")),
-                        "weight": mark.get("weight"),
-                        "lane_change": _normalized_marking_value(mark.get("laneChange")),
-                        "width_m": float(mark.get("width")) if mark.get("width") else None,
+                        **record,
                     }
                     ranges.append({
                         "id": f"opendrive-road-mark-{canonical_hash(values)[:16]}",
@@ -320,7 +364,71 @@ def bind_sampled_road_marks(lanes, exact_ranges, spacing_m):
     return sorted(output, key=lambda item: item["id"])
 
 
-def nearby_lane_polylines(carla_map, anchor, radius_m, spacing_m):
+def waypoint_source_record(waypoint):
+    location = waypoint.transform.location
+    return {
+        "s_m": float(waypoint.s),
+        "location": [float(location.x), float(location.y), float(location.z)],
+        "yaw_deg": float(waypoint.transform.rotation.yaw),
+        "lane_width_m": float(waypoint.lane_width),
+        "left_lane_marking": marking_signature(waypoint.left_lane_marking),
+        "right_lane_marking": marking_signature(waypoint.right_lane_marking),
+    }
+
+
+def _waypoint_from_source(record):
+    from types import SimpleNamespace
+
+    location = record["location"]
+    if (
+        not isinstance(location, list) or len(location) != 3
+        or not all(math.isfinite(float(value)) for value in location)
+    ):
+        raise RuntimeError("retained CARLA waypoint location is invalid")
+    width = float(record["lane_width_m"])
+    if not math.isfinite(width) or width <= 0:
+        raise RuntimeError("retained CARLA waypoint width is invalid")
+
+    def marking(value):
+        required = {"type", "color", "width_m", "lane_change"}
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("retained CARLA lane marking is malformed")
+        return SimpleNamespace(
+            type=value["type"], color=value["color"], width=value["width_m"],
+            lane_change=value["lane_change"],
+        )
+
+    return SimpleNamespace(
+        s=float(record["s_m"]),
+        lane_width=width,
+        transform=SimpleNamespace(
+            location=SimpleNamespace(x=location[0], y=location[1], z=location[2]),
+            rotation=SimpleNamespace(yaw=float(record["yaw_deg"])),
+        ),
+        left_lane_marking=marking(record["left_lane_marking"]),
+        right_lane_marking=marking(record["right_lane_marking"]),
+    )
+
+
+def lanes_from_source(groups):
+    lanes = []
+    for group in groups:
+        try:
+            key = (int(group["road_id"]), int(group["section_id"]), int(group["lane_id"]))
+            waypoints = [_waypoint_from_source(item) for item in group["waypoints"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("retained CARLA lane source is malformed") from exc
+        waypoints.sort(key=lambda item: item.s)
+        if len(waypoints) < 3:
+            raise RuntimeError("retained CARLA lane source has fewer than three waypoints")
+        lanes.append(lane_geometry_from_waypoints(key, waypoints))
+    identities = [item["id"] for item in lanes]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("retained CARLA lane source identities are not unique")
+    return sorted(lanes, key=lambda item: item["id"])
+
+
+def nearby_lane_source(carla_map, anchor, radius_m, spacing_m):
     import carla
 
     groups = {}
@@ -338,11 +446,18 @@ def nearby_lane_polylines(carla_map, anchor, radius_m, spacing_m):
         waypoints.sort(key=lambda item: float(item.s))
         if len(waypoints) < 3:
             continue
-        output.append(lane_geometry_from_waypoints(key, waypoints))
+        output.append({
+            "road_id": key[0], "section_id": key[1], "lane_id": key[2],
+            "waypoints": [waypoint_source_record(item) for item in waypoints],
+        })
     return output
 
 
-def static_objects(world, label_name, anchor, radius_m):
+def nearby_lane_polylines(carla_map, anchor, radius_m, spacing_m):
+    return lanes_from_source(nearby_lane_source(carla_map, anchor, radius_m, spacing_m))
+
+
+def static_object_source(world, label_name, anchor, radius_m):
     import carla
 
     label = getattr(carla.CityObjectLabel, label_name)
@@ -352,7 +467,6 @@ def static_objects(world, label_name, anchor, radius_m):
         if distance_xy(location, anchor) > radius_m:
             continue
         output.append({
-            "id": f"environment-{label_name}-{item.id}",
             "source_object_id": str(item.id),
             "name": str(item.name),
             "category": label_name,
@@ -363,7 +477,57 @@ def static_objects(world, label_name, anchor, radius_m):
                 item.bounding_box.extent.z,
             ],
         })
-    return sorted(output, key=lambda item: item["id"])
+    return sorted(output, key=lambda item: (item["category"], item["source_object_id"]))
+
+
+def objects_from_source(values):
+    output = []
+    for item in values:
+        center, extent = item.get("center_world"), item.get("extent")
+        if (
+            not isinstance(center, list) or len(center) != 3
+            or not isinstance(extent, list) or len(extent) != 3
+            or not all(math.isfinite(float(value)) for value in center + extent)
+            or any(float(value) < 0 for value in extent)
+        ):
+            raise RuntimeError("retained CARLA environment object geometry is invalid")
+        source_id, category = item.get("source_object_id"), item.get("category")
+        if not isinstance(source_id, str) or not source_id or not isinstance(category, str) or not category:
+            raise RuntimeError("retained CARLA environment object identity is invalid")
+        output.append({
+            "id": f"environment-{category}-{source_id}",
+            "source_object_id": source_id,
+            "name": str(item.get("name", "")),
+            "category": category,
+            "center_world": [float(value) for value in center],
+            "extent": [float(value) for value in extent],
+        })
+    output.sort(key=lambda item: item["id"])
+    if len({item["id"] for item in output}) != len(output):
+        raise RuntimeError("retained CARLA environment object identities are not unique")
+    return output
+
+
+def geometry_from_carla_source(source, exact_ranges):
+    if source.get("schema") != "v2x-retained-carla-map-export/v1":
+        raise RuntimeError("retained CARLA map export schema is unsupported")
+    polygons = []
+    for points in source.get("crosswalk_polygons", []):
+        polygons.append({"id": stable_crosswalk_id(points), "world": points})
+    polygons.sort(key=lambda item: item["id"])
+    if len({item["id"] for item in polygons}) != len(polygons):
+        raise RuntimeError("retained CARLA crosswalk identities are not unique")
+    lanes = lanes_from_source(source.get("lane_waypoint_groups", []))
+    segments = bind_sampled_road_marks(
+        lanes, exact_ranges, float(source["lane_spacing_m"])
+    )
+    return {
+        "crosswalks": polygons,
+        "lanes": lanes,
+        "road_mark_segments": segments,
+        "opendrive_road_mark_ranges": exact_ranges,
+        "objects": objects_from_source(source.get("environment_objects", [])),
+    }
 
 
 def visible_polyline(points, depths, width, height):
@@ -392,7 +556,7 @@ def draw_segments(draw, points, color, width):
             previous = None
 
 
-def render_overlay(image_path, projection, output_path):
+def render_overlay_image(image_path, projection):
     image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
     width, height = image.size
@@ -415,7 +579,17 @@ def render_overlay(image_path, projection, output_path):
             radius = 5 if item["category"] == "TrafficLight" else 3
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=(255, 0, 255), width=2)
             draw.text((x + 4, y + 3), item["short_id"], fill=(255, 255, 255))
-    image.save(output_path, quality=94)
+    return image
+
+
+def render_overlay_bytes(image_path, projection):
+    stream = io.BytesIO()
+    render_overlay_image(image_path, projection).save(stream, format="JPEG", quality=94)
+    return stream.getvalue()
+
+
+def render_overlay(image_path, projection, output_path):
+    Path(output_path).write_bytes(render_overlay_bytes(image_path, projection))
 
 
 def projected_geometry(geometry, transform, fov, width, height):
@@ -512,33 +686,37 @@ def main():
             carla_map, config["site"], camera
         )
     anchor = transforms["ch1"].location
-    polygons = []
+    crosswalk_polygons = []
     for polygon in split_crosswalk_polygons(carla_map.get_crosswalks()):
         if min(math.hypot(point[0] - anchor.x, point[1] - anchor.y) for point in polygon) <= args.radius_m:
-            polygons.append({"id": stable_crosswalk_id(polygon), "world": polygon})
-    polygons.sort(key=lambda item: item["id"])
-    if len({item["id"] for item in polygons}) != len(polygons):
-        raise SystemExit("active map contains duplicate content-identical crosswalk polygons")
-    lanes = nearby_lane_polylines(carla_map, anchor, args.radius_m, args.lane_spacing_m)
-    road_mark_segments = bind_sampled_road_marks(
-        lanes, exact_road_mark_ranges, args.lane_spacing_m
-    )
-    objects = []
+            crosswalk_polygons.append(polygon)
+    lane_source = nearby_lane_source(carla_map, anchor, args.radius_m, args.lane_spacing_m)
+    object_source = []
     for label in ("TrafficLight", "TrafficSigns"):
-        objects.extend(static_objects(world, label, anchor, args.radius_m))
+        object_source.extend(static_object_source(world, label, anchor, args.radius_m))
     # The custom Richmond asset classifies poles, cabinets, and signal arms as
     # ``Other`` rather than ``Poles``.  Keep only the immediate intersection
     # neighborhood so those globally identified objects remain reviewable.
-    objects.extend(static_objects(world, "Other", anchor, min(args.radius_m, 30.0)))
-    geometry = {
-        "crosswalks": polygons,
-        "lanes": lanes,
-        "road_mark_segments": road_mark_segments,
-        "opendrive_road_mark_ranges": exact_road_mark_ranges,
-        "objects": objects,
+    object_source.extend(
+        static_object_source(world, "Other", anchor, min(args.radius_m, 30.0))
+    )
+    source_export = {
+        "schema": "v2x-retained-carla-map-export/v1",
+        "created_at_utc": utc_now(),
+        "map": carla_map.name,
+        "opendrive_sha256": hashlib.sha256(opendrive).hexdigest(),
+        "radius_m": args.radius_m,
+        "lane_spacing_m": args.lane_spacing_m,
+        "anchor_world": [float(anchor.x), float(anchor.y), float(anchor.z)],
+        "crosswalk_polygons": crosswalk_polygons,
+        "lane_waypoint_groups": lane_source,
+        "environment_objects": object_source,
     }
+    geometry = geometry_from_carla_source(source_export, exact_road_mark_ranges)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    source_export_path = output_dir / "carla-source-export.json"
+    source_export_path.write_text(json.dumps(source_export, indent=2, sort_keys=True) + "\n")
     camera_reports = {}
     for camera_id in CAMERAS:
         camera = next(item for item in config["cameras"] if item["id"] == camera_id)
@@ -620,6 +798,7 @@ def main():
         "opendrive_georeference_sha256": hashlib.sha256(georeference.encode()).hexdigest(),
         "pair_manifest_sha256": hashlib.sha256(pair_bytes).hexdigest(),
         "cameras_file_sha256": hashlib.sha256(cameras_bytes).hexdigest(),
+        "carla_source_export_sha256": sha256(source_export_path),
         "radius_m": args.radius_m,
         "lane_spacing_m": args.lane_spacing_m,
         "geometry_payload_sha256": canonical_hash(geometry),
@@ -634,6 +813,8 @@ def main():
         "opendrive_sha256": hashlib.sha256(opendrive).hexdigest(),
         "pair_manifest_sha256": hashlib.sha256(pair_bytes).hexdigest(),
         "cameras_file_sha256": hashlib.sha256(cameras_bytes).hexdigest(),
+        "carla_source_export": source_export_path.name,
+        "carla_source_export_sha256": sha256(source_export_path),
         "radius_m": args.radius_m,
         "lane_spacing_m": args.lane_spacing_m,
         "geometry_provenance": geometry_provenance,
