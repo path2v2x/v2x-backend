@@ -20,9 +20,12 @@ split/model/config choices are frozen and the authority manifest has passed
 review.
 
 The writer role and a named, actively logging CloudTrail trail with write-capable
-S3 object data events for the exact bucket prefix must already exist. The bucket
-policy restricts writes to that role and denies object deletion, retention
-changes, and governance bypass.
+S3 object data events for the exact bucket prefix must already exist. Advanced
+selectors are accepted only when their complete field set proves unfiltered S3
+object writes for that prefix; read-only or event-name-filtered selectors are
+rejected. The bucket policy restricts writes to that role and denies object
+deletion, retention changes, and governance bypass. Existing lifecycle rules
+and their transition-size compatibility mode are preserved and verified.
 Per-object COMPLIANCE retention is the write-once control; administrators can
 still change bucket policy/defaults for future objects, so organization SCPs
 and CloudTrail monitoring should alert on bucket policy, lifecycle, and Object

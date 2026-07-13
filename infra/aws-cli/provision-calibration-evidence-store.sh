@@ -106,11 +106,24 @@ if [[ -n "${CLOUDTRAIL_TRAIL_NAME}" ]]; then
          and any(.DataResources[]?;
            .Type == "AWS::S3::Object" and any(.Values[]?; . == $prefix)))
        or any(.AdvancedEventSelectors[]?;
-         (any(.FieldSelectors[]?;
-           .Field == "resources.ARN" and any(.StartsWith[]?; . == $prefix)))
-         and (([.FieldSelectors[]? | select(.Field == "readOnly")] | length) == 0
-           or any(.FieldSelectors[]?;
-             .Field == "readOnly" and any(.Equals[]?; . == "false"))))
+         . as $selector
+         | ($selector.FieldSelectors | type) == "array"
+         and (($selector.FieldSelectors | length) == 3
+           or ($selector.FieldSelectors | length) == 4)
+         and ([ $selector.FieldSelectors[]?
+           | select(. == {Field:"eventCategory",Equals:["Data"]})
+         ] | length) == 1
+         and ([ $selector.FieldSelectors[]?
+           | select(. == {Field:"resources.type",Equals:["AWS::S3::Object"]})
+         ] | length) == 1
+         and ([ $selector.FieldSelectors[]?
+           | select(. == {Field:"resources.ARN",StartsWith:[$prefix]})
+         ] | length) == 1
+         and ((($selector.FieldSelectors | length) == 3
+             and ([ $selector.FieldSelectors[]? | select(.Field == "readOnly") ] | length) == 0)
+           or ([ $selector.FieldSelectors[]?
+             | select(. == {Field:"readOnly",Equals:["false"]})
+           ] | length) == 1))
      ' <<<"${cloudtrail_selectors_json}" >/dev/null; then
     CLOUDTRAIL_COVERAGE=true
   fi
@@ -185,9 +198,15 @@ jq -nS --arg bucket "${BUCKET}" --arg writer "${EVIDENCE_WRITER_ROLE_ARN}" '{
 jq -nS --argjson existing "${existing_policy}" --slurpfile managed "${WORKDIR}/managed-policy.json" '
   $existing
   | .Version = "2012-10-17"
-  | .Statement = ([.Statement[]? | select(.Sid as $sid | [
-      "DenyInsecureTransport","DenyEvidenceDeletionOrRetentionBypass",
-      "DenyUnapprovedEvidenceWriters"] | index($sid) | not)] + $managed[0].Statement)
+  | .Statement = (
+      (.Statement
+        | if type == "array" then .
+          elif type == "object" then [.]
+          else error("bucket policy Statement must be an object or array") end)
+      | [ .[] | select(.Sid as $sid | [
+          "DenyInsecureTransport","DenyEvidenceDeletionOrRetentionBypass",
+          "DenyUnapprovedEvidenceWriters"] | index($sid) | not) ]
+      ) + $managed[0].Statement
 ' >"${POLICY_FILE}"
 
 existing_tags='[]'
@@ -200,8 +219,18 @@ jq -nS --argjson existing "${existing_tags}" '{TagSet:(
   | sort_by(.Key))}' >"${TAGGING_FILE}"
 
 existing_rules='[]'
+LIFECYCLE_TRANSITION_DEFAULT='all_storage_classes_128K'
 if [[ "${BUCKET_EXISTS}" == "true" ]]; then
   existing_rules="$(jq -c '.Rules // []' "${WORKDIR}/lifecycle.json")"
+  if (( $(jq -r '.Rules // [] | length' "${WORKDIR}/lifecycle.json") > 0 )); then
+    LIFECYCLE_TRANSITION_DEFAULT="$(jq -er '
+      .TransitionDefaultMinimumObjectSize
+      | select(. == "all_storage_classes_128K" or . == "varies_by_storage_class")
+    ' "${WORKDIR}/lifecycle.json")" || {
+      echo "Existing lifecycle transition default is absent or unreadable; refusing to replace it" >&2
+      exit 4
+    }
+  fi
 fi
 jq -nS --argjson existing "${existing_rules}" '{Rules:(
   [$existing[] | select(.ID != "AbortIncompleteCalibrationEvidenceUploads")]
@@ -212,6 +241,7 @@ jq -nS \
   --arg bucket "${BUCKET}" --arg region "${AWS_REGION}" \
   --arg writer "${EVIDENCE_WRITER_ROLE_ARN}" \
   --arg mode "${RETENTION_MODE}" --argjson days "${RETENTION_DAYS}" \
+  --arg lifecycle_transition_default "${LIFECYCLE_TRANSITION_DEFAULT}" \
   --argjson policy "$(<"${POLICY_FILE}")" \
   --argjson tags "$(<"${TAGGING_FILE}")" \
   --argjson lifecycle "$(<"${LIFECYCLE_FILE}")" \
@@ -221,6 +251,7 @@ jq -nS \
     encryption:"AES256",public_access_block_all:true,
     object_lock:{enabled:true,mode:$mode,days:$days},
     policy:$policy,tags:$tags,lifecycle:$lifecycle,
+    lifecycle_transition_default_minimum_object_size:$lifecycle_transition_default,
     cloudtrail_data_events_covered:$cloudtrail_covered}' >"${DESIRED}"
 
 CURRENT_STATE_HASH="$(sha256sum "${CURRENT}" | awk '{print $1}')"
@@ -303,7 +334,9 @@ s3api put-bucket-versioning --bucket "${BUCKET}" --versioning-configuration Stat
 s3api put-object-lock-configuration --bucket "${BUCKET}" --object-lock-configuration "{\"ObjectLockEnabled\":\"Enabled\",\"Rule\":{\"DefaultRetention\":{\"Mode\":\"${RETENTION_MODE}\",\"Days\":${RETENTION_DAYS}}}}" >/dev/null
 s3api put-bucket-policy --bucket "${BUCKET}" --policy "file://${POLICY_FILE}" >/dev/null
 s3api put-bucket-tagging --bucket "${BUCKET}" --tagging "file://${TAGGING_FILE}" >/dev/null
-s3api put-bucket-lifecycle-configuration --bucket "${BUCKET}" --lifecycle-configuration "file://${LIFECYCLE_FILE}" >/dev/null
+s3api put-bucket-lifecycle-configuration --bucket "${BUCKET}" \
+  --lifecycle-configuration "file://${LIFECYCLE_FILE}" \
+  --transition-default-minimum-object-size "${LIFECYCLE_TRANSITION_DEFAULT}" >/dev/null
 
 verify_error=''
 for attempt in 1 2 3 4 5; do
@@ -315,7 +348,9 @@ for attempt in 1 2 3 4 5; do
   actual_encryption="$(s3api get-bucket-encryption --bucket "${BUCKET}" --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' --output text)"
   actual_policy="$(s3api get-bucket-policy --bucket "${BUCKET}" --query Policy --output text | jq -S .)"
   actual_tags="$(s3api get-bucket-tagging --bucket "${BUCKET}" --output json | jq -S '.TagSet|sort_by(.Key)')"
-  actual_lifecycle="$(s3api get-bucket-lifecycle-configuration --bucket "${BUCKET}" --output json | jq -S '.Rules|sort_by(.ID)')"
+  actual_lifecycle_response="$(s3api get-bucket-lifecycle-configuration --bucket "${BUCKET}" --output json)"
+  actual_lifecycle="$(jq -S '.Rules|sort_by(.ID)' <<<"${actual_lifecycle_response}")"
+  actual_lifecycle_transition_default="$(jq -r '.TransitionDefaultMinimumObjectSize // ""' <<<"${actual_lifecycle_response}")"
   expected_policy="$(jq -S . "${POLICY_FILE}")"
   expected_tags="$(jq -S '.TagSet|sort_by(.Key)' "${TAGGING_FILE}")"
   expected_lifecycle="$(jq -S '.Rules|sort_by(.ID)' "${LIFECYCLE_FILE}")"
@@ -327,7 +362,8 @@ for attempt in 1 2 3 4 5; do
         "$(jq -r '[.BlockPublicAcls,.IgnorePublicAcls,.BlockPublicPolicy,.RestrictPublicBuckets]|all' <<<"${actual_public}")" == "true" &&
         "${actual_ownership}" == "BucketOwnerEnforced" && "${actual_encryption}" == "AES256" &&
         "${actual_policy}" == "${expected_policy}" && "${actual_tags}" == "${expected_tags}" &&
-        "${actual_lifecycle}" == "${expected_lifecycle}" ]]; then
+        "${actual_lifecycle}" == "${expected_lifecycle}" &&
+        "${actual_lifecycle_transition_default}" == "${LIFECYCLE_TRANSITION_DEFAULT}" ]]; then
     verify_error=''
     break
   fi
