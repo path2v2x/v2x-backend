@@ -13,6 +13,7 @@ sys.path.insert(0, str(PERCEPTION_DIR))
 
 from ffmpeg_capture import (  # noqa: E402
     FfmpegNvdecCapture,
+    FragmentFrameSequenceMatch,
     NvdecCaptureError,
     build_nvdec_frame_identity,
     build_nvdec_command,
@@ -197,6 +198,77 @@ class FfmpegCaptureTests(unittest.TestCase):
             capture_factory=lambda _path: FakeCapture([b"a", b"b"], [0, 50]),
         )
         self.assertIsNone(result)
+
+    def test_fragment_match_requires_one_unique_contiguous_sequence(self):
+        result = match_fragment_frame_nvdec(
+            b"init",
+            b"segment",
+            (b"target-1", b"target-2", b"target-3"),
+            lambda frame: frame,
+            capture_factory=lambda _path: FakeCapture(
+                [b"left", b"target-1", b"target-2", b"target-3", b"right"],
+                [0, 50, 100, 150, 200],
+            ),
+        )
+        self.assertEqual(result, FragmentFrameSequenceMatch(
+            frame_offset_milliseconds=150.0,
+            frame_positions_milliseconds=(50.0, 100.0, 150.0),
+        ))
+
+        duplicate = match_fragment_frame_nvdec(
+            b"init",
+            b"segment",
+            (b"target-1", b"target-2"),
+            lambda frame: frame,
+            capture_factory=lambda _path: FakeCapture(
+                [b"target-1", b"target-2", b"gap", b"target-1", b"target-2"],
+                [0, 50, 100, 150, 200],
+            ),
+        )
+        self.assertIsNone(duplicate)
+
+        non_monotonic = match_fragment_frame_nvdec(
+            b"init",
+            b"segment",
+            (b"target-1", b"target-2", b"target-3"),
+            lambda frame: frame,
+            capture_factory=lambda _path: FakeCapture(
+                [b"target-1", b"target-2", b"target-3"],
+                [100, 50, 150],
+            ),
+        )
+        self.assertIsNone(non_monotonic)
+
+    def test_nvdec_sequence_hashes_exact_pixels_only_for_quick_candidates(self):
+        frames = [
+            np.full((32, 32, 3), value, dtype=np.uint8)
+            for value in (0, 1, 2, 3)
+        ]
+        exact_calls = []
+
+        def exact(frame):
+            exact_calls.append(int(frame[0, 0, 0]))
+            return frame.tobytes()
+
+        targets = tuple(
+            build_nvdec_frame_identity(frame, exact)
+            for frame in frames[1:3]
+        )
+        exact_calls.clear()
+        result = match_fragment_frame_nvdec(
+            b"init",
+            b"segment",
+            targets,
+            exact,
+            capture_factory=lambda _path: FakeCapture(
+                frames, [0, 50, 100, 150]
+            ),
+        )
+        self.assertEqual(result, FragmentFrameSequenceMatch(
+            frame_offset_milliseconds=100.0,
+            frame_positions_milliseconds=(50.0, 100.0),
+        ))
+        self.assertEqual(exact_calls, [1, 2])
 
     def test_quick_identity_only_runs_exact_hash_for_candidates(self):
         frames = [

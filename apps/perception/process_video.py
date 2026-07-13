@@ -128,6 +128,13 @@ def assess_media_clock(
             and float(value) >= 0
         ):
             safe_clock[key] = value
+    match_frame_count = raw_clock.get("anchor_match_frame_count")
+    if (
+        isinstance(match_frame_count, int)
+        and not isinstance(match_frame_count, bool)
+        and match_frame_count in (1, 3)
+    ):
+        safe_clock["anchor_match_frame_count"] = match_frame_count
 
     try:
         anchor_epoch = datetime.fromisoformat(

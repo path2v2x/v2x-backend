@@ -19,6 +19,7 @@ from kinesis_utils import (  # noqa: E402
     resolve_hls_media_clock,
 )
 import kinesis_utils  # noqa: E402
+from ffmpeg_capture import FragmentFrameSequenceMatch  # noqa: E402
 from decoder_admission import (  # noqa: E402
     AUXILIARY_DECODER_ADMISSION,
     acquire_auxiliary_decoder_slot,
@@ -334,6 +335,7 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
         self.assertEqual(metadata["media_clock"]["anchor_fragment_id"], "frag-123")
         self.assertEqual(metadata["media_clock"]["anchor_media_sequence"], 17)
         self.assertEqual(metadata["media_clock"]["schema_version"], 1)
+        self.assertEqual(metadata["media_clock"]["anchor_match_frame_count"], 1)
         self.assertEqual(metadata["media_clock"]["position_milliseconds"], 2218.5)
         self.assertEqual(
             metadata["media_clock"]["capture_position_milliseconds"], 250.5
@@ -361,6 +363,121 @@ getMP4MediaFragment.mp4?FragmentNumber=frag-123&SessionToken=media-secret
         ):
             self.assertNotIn(secret, serialized)
             self.assertNotIn(secret, rendered_clock)
+
+    def test_sequence_anchor_uses_unique_match_and_last_capture_position(self):
+        playlist = (
+            "#EXTM3U\n"
+            "#EXT-X-MAP:URI=init.mp4?SessionToken=init-secret\n"
+            "#EXT-X-MEDIA-SEQUENCE:21\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23.000Z\n"
+            "#EXTINF:2.0,\n"
+            "segment.mp4?SessionToken=segment-secret\n"
+        )
+        responses = iter((
+            Response(text=playlist),
+            Response(content=b"init"),
+            Response(content=b"segment"),
+        ))
+        observed = []
+
+        def matcher(init, segment, target, identity):
+            observed.append((init, segment, target, identity))
+            return FragmentFrameSequenceMatch(
+                frame_offset_milliseconds=500.0,
+                frame_positions_milliseconds=(400.0, 450.0, 500.0),
+            )
+
+        clock = resolve_hls_media_clock(
+            "https://example.invalid/media.m3u8?SessionToken=session-secret",
+            reference_frame="latest-frame",
+            capture_position_milliseconds=999.0,
+            frame_identity=lambda frame: f"identity:{frame}",
+            reference_sequence=(("frame-1", 10.0), ("frame-2", 60.0),
+                                ("frame-3", 110.0)),
+            http_get=lambda _url, timeout: next(responses),
+            fragment_matcher=matcher,
+        )
+
+        self.assertIsNotNone(clock)
+        self.assertEqual(observed[0][2], (
+            "identity:frame-1", "identity:frame-2", "identity:frame-3"
+        ))
+        metadata = clock.metadata_at(160.0)
+        self.assertEqual(
+            metadata["media_timestamp_utc"], "2026-07-10T03:57:23.550Z"
+        )
+        self.assertEqual(
+            metadata["media_clock"]["capture_position_milliseconds"], 160.0
+        )
+        self.assertEqual(
+            metadata["media_clock"][
+                "anchor_fragment_frame_offset_milliseconds"
+            ],
+            500.0,
+        )
+        self.assertEqual(
+            metadata["media_clock"]["anchor_match_frame_count"], 3
+        )
+        rendered = json.dumps(metadata) + repr(clock)
+        for secret in (
+            "session-secret", "init-secret", "segment-secret", "SessionToken"
+        ):
+            self.assertNotIn(secret, rendered)
+
+    def test_sequence_anchor_rejects_weak_or_invalid_temporal_evidence(self):
+        invalid_sequences = (
+            (("frame-1", 0.0), ("frame-2", 50.0)),
+            (("frame-1", 0.0), ("frame-2", 50.0), ("frame-3", 50.0)),
+            (("frame-1", 0.0), ("frame-2", float("nan")),
+             ("frame-3", 100.0)),
+        )
+        for sequence in invalid_sequences:
+            with self.subTest(sequence=sequence):
+                self.assertIsNone(resolve_hls_media_clock(
+                    "https://example.invalid/media.m3u8?token=secret",
+                    reference_frame="frame",
+                    capture_position_milliseconds=0.0,
+                    frame_identity=lambda frame: frame,
+                    reference_sequence=sequence,
+                    http_get=lambda *_args, **_kwargs: self.fail(
+                        "invalid temporal evidence issued a request"
+                    ),
+                ))
+
+        playlist = (
+            "#EXTM3U\n"
+            "#EXT-X-MAP:URI=init.mp4\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23Z\n"
+            "#EXTINF:2.0,\nsegment.mp4\n"
+        )
+        self.assertIsNone(resolve_hls_media_clock(
+            "https://example.invalid/media.m3u8",
+            reference_frame="static",
+            capture_position_milliseconds=0.0,
+            frame_identity=lambda _frame: "same-identity",
+            reference_sequence=(("static", 0.0), ("static", 50.0),
+                                ("static", 100.0)),
+            http_get=lambda _url, timeout: Response(text=playlist),
+            fragment_matcher=lambda *_args: self.fail(
+                "constant sequence reached fragment matching"
+            ),
+        ))
+
+        self.assertIsNone(resolve_hls_media_clock(
+            "https://example.invalid/media.m3u8",
+            reference_frame="frame-3",
+            capture_position_milliseconds=100.0,
+            frame_identity=lambda frame: frame,
+            reference_sequence=(("frame-1", 0.0), ("frame-2", 50.0),
+                                ("frame-3", 100.0)),
+            http_get=lambda _url, timeout: Response(
+                text=playlist, content=b"fragment"
+            ),
+            fragment_matcher=lambda *_args: FragmentFrameSequenceMatch(
+                frame_offset_milliseconds=150.0,
+                frame_positions_milliseconds=(0.0, 50.0, 150.0),
+            ),
+        ))
 
     def test_playlist_without_program_date_time_has_no_media_clock(self):
         response = Response(text="#EXTM3U\n#EXTINF:2.0,\nsegment.mp4\n")

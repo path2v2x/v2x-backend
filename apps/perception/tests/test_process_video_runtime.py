@@ -250,6 +250,7 @@ class MediaClockPersistenceTests(unittest.TestCase):
                     "anchor_program_date_time_utc": "2026-07-10T03:57:23.138Z",
                     "anchor_fragment_id": "frag-123",
                     "position_milliseconds": 250.5,
+                    "anchor_match_frame_count": 3,
                     "signed_url": "https://example.invalid/?SessionToken=secret",
                 },
             },
@@ -267,6 +268,9 @@ class MediaClockPersistenceTests(unittest.TestCase):
             record["ts_event"], "2026-07-10T03:57:23.388Z#event-1"
         )
         self.assertEqual(record["media_clock_status"], "matched")
+        self.assertEqual(
+            record["media_clock"]["anchor_match_frame_count"], 3
+        )
         self.assertNotIn("signed_url", record["media_clock"])
 
     def test_missing_exact_match_is_marked_unavailable(self):
