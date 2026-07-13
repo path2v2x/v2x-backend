@@ -9,15 +9,48 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 13:47 UTC; verify rather than assume. These items
+Observed through 2026-07-13 14:49 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
-- Canonical `origin/main` is now PR 47 merge
-  `b0e47026036694245e3477a5729f9c79216583eb`. PR 47 is not deployed. Live
+- Canonical `origin/main` is now PR 48 merge
+  `40fc4a363d7ca464d459c5f0a5d45e339fd021b0`. PR 48 is not deployed. Live
   production remains the exact, detached, clean PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
-  environment and timers restored. Do not describe PR 42-47 or the bounded-
+  environment and timers restored. Do not describe PR 42-48 or the eager-
   cleanup follow-up below as production.
+- PR 48 merged the source-clear bounded cleanup described below. Its first
+  upload-disabled window at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T143815Z-pr48-bounded-cleanup-canary/`
+  passed all 24 exact-clock health samples and three changing four-feed rounds,
+  but was correctly rejected because the unchanged 700-published-frame floor
+  was impossible inside the original 120-second wall: ch1-ch4 advanced only
+  212/219/222/217 published frames while inference advanced 559/528/511/513.
+  Do not lower 700; extend the soak and explicitly validate the natural
+  240-second helper transition.
+- The second PR 48 window at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T144604Z-pr48-bounded-cleanup-canary/`
+  accelerated proactive renewal to 30 seconds to reach the shutdown race
+  deterministically. It captured all-four exact health with
+  `in_use=1`, `proactive_preparations=1`, zero cleanup failures, four FFmpeg,
+  and 4,081 MiB free. The first harness incorrectly required the fifth FFmpeg
+  immediately and invoked rollback. That rollback became decisive new source
+  evidence: PR 48 avoided SIGKILL but stopped after 21 seconds with
+  `terminal decoder cleanup exceeded its bounded deadline`, so systemd recorded
+  `Result=exit-code`. Exact PR 35 and all timers were restored by 14:47:05 UTC;
+  CARLA, Drive, and web fingerprints did not change. Do not redeploy PR 48
+  unchanged.
+- Current source-only branch `codex/v2x-eager-proactive-cancel` starts every
+  registered proactive cleanup immediately when pipeline shutdown begins,
+  before joining any active reader. Preparation captures use a separate discard
+  event, so this preserves the full shared deadline instead of waiting up to an
+  active read timeout before cancellation. The existing exact incident
+  subprocess already proves immediate global cancellation plus a claimed
+  handover reaches zero helpers, leases, cleanups, failures, and real child PIDs.
+  The new ordering regression proves helper cancellation occurs after every
+  reader stop request but before any reader join; all 230 perception tests pass
+  with warnings treated as errors. This branch is not merged or deployed.
+  Require independent review, canonical merge, and the unchanged five-child
+  stop canary before promotion.
 - PR 47's upload-disabled canary is rejected at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T133034Z-pr47-affine-discontinuity-canary/`;
   its verified rollback is
@@ -33,7 +66,7 @@ override every older PR 32/candidate statement below.
   systemd killed Python and one surviving FFmpeg. PR 35 was restored by
   13:32:36 UTC; CARLA, Drive, and web did not restart. Do not retry PR 47
   unchanged or relax the zero-helper gate.
-- Current source-only branch `codex/v2x-bounded-cleanup` starts from PR 47. It
+- PR 48's merged bounded-cleanup source starts from PR 47. It
   serializes capture release, kills and reaps the FIFO writer before calling
   OpenCV release, leaves mediator/state teardown with the owner rather than the
   cancellation watcher, skips terminal recovery after shutdown is requested,
@@ -45,8 +78,9 @@ override every older PR 32/candidate statement below.
   inference shutdown, real-child SIGTERM, and stubborn-reader cases. Twenty
   standalone real Kinesis/NVDEC sessions returned 400 matched frames, reaped
   every child, and returned descriptors/threads exactly to baseline.
-  This branch is not merged, deployed, or canary-proven. Fable still fails
-  authentication before file access; never claim a Fable pass.
+  It is merged but rejected by the newer canary evidence above and is not
+  deployed. Fable still fails authentication before file access; never claim a
+  Fable pass.
 - The next live gate is a fresh zero-session perception-only rollback window.
   In addition to unchanged exact-clock, freshness, inference, feed, GPU, and
   fingerprint gates, deliberately stop once while a proactive helper is active

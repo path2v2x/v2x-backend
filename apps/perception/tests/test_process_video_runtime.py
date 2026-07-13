@@ -846,6 +846,52 @@ class LivePipelineTimestampTests(unittest.TestCase):
         self.assertTrue(reader.joined)
         self.assertTrue(reader.kwargs["reserve_proactive_decoder_slot"])
 
+    def test_pipeline_cancels_proactive_helpers_before_reader_join(self):
+        order = []
+
+        class OrderedReader(self.FakeReader):
+            instances = []
+
+            def request_stop(self, deadline=None):
+                order.append("reader_stop")
+                return super().request_stop(deadline=deadline)
+
+            def join(self, timeout=None):
+                order.append("reader_join")
+                return super().join(timeout)
+
+        def cancel_helpers(timeout=0.0):
+            self.assertEqual(timeout, 0.0)
+            order.append("helper_cancel")
+            return False
+
+        pipeline = object.__new__(MultiCameraPipeline)
+        pipeline.detectors = [self.FakeDetector()]
+        pipeline.all_clean_detections = []
+        pipeline.global_tracks = {}
+        pipeline.local_to_global = {}
+        pipeline.next_global_id = 0
+        pipeline.extractor = Mock()
+        shutdown = threading.Event()
+        shutdown.set()
+
+        with patch("process_video.LiveStreamReader", OrderedReader), patch(
+            "process_video._cancel_proactive_preparations",
+            side_effect=cancel_helpers,
+        ):
+            pipeline.process_streams(
+                ["v2x-backend-cam-ch1"],
+                show_live=False,
+                upload=False,
+                stream_broadcaster=FrameBroadcaster(["ch1"]),
+                camera_ids=["ch1"],
+                shutdown_event=shutdown,
+            )
+
+        self.assertEqual(
+            order[:3], ["reader_stop", "helper_cancel", "reader_join"]
+        )
+
     def test_pipeline_shutdown_uses_only_bounded_reader_join(self):
         class BoundedReader(self.FakeReader):
             instances = []

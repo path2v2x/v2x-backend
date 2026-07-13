@@ -20,6 +20,7 @@ from decoder_admission import AUXILIARY_DECODER_ADMISSION
 from live_capture import (
     LiveStreamReader,
     _TRANSPORT_DIAGNOSTICS,
+    _cancel_proactive_preparations,
     capture_preparation_topology,
     wait_for_terminal_cleanups,
 )
@@ -1735,6 +1736,12 @@ class MultiCameraPipeline:
             )
             for reader in live_readers:
                 reader.request_stop(deadline=stop_deadline)
+            # Preparation captures use their own discard event so a blocked
+            # active reader cannot delay cancellation until its finally block.
+            # Start every tracked helper cleanup at the instant SIGTERM enters
+            # the pipeline; the shared deadline then remains available for
+            # child reap, claimed handover, and topology quiescence.
+            _cancel_proactive_preparations(timeout=0.0)
             inference_executor.shutdown(wait=False, cancel_futures=True)
             for reader in live_readers:
                 reader.join(max(0.0, stop_deadline - time.monotonic()))
