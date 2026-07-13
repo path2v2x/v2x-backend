@@ -9,15 +9,53 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 08:04 UTC; verify rather than assume. These items
+Observed through 2026-07-13 10:55 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
-- Canonical `origin/main` is now PR 43 merge
-  `ea4cc270ba9c0e5e2b88b99712f6caf4856b864a`. PR 43 is not deployed. Live
+- Canonical `origin/main` is now PR 44 merge
+  `602096ffd4a73701cb781e6ec50dbe3333b61782`. PR 44 is not deployed. Live
   production remains the exact, detached, clean PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
   environment and timers restored. Do not describe PR 42, PR 43, or the
   same-session PTS follow-up below as production.
+- PR 44's first real zero-overlap NVDEC canary is rejected. Evidence is at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T103200Z-pr44-same-session-pts-canary/`
+  and the verified rollback is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T103200Z-pr44-same-session-pts/`.
+  All four channels briefly produced `exact_same_session_pts`, proving the
+  host split-output/framecrc/NUT path can establish a real initial mapping.
+  That evidence then disappeared at runtime: ch1/ch2/ch4 froze on their last
+  trusted frames for 134-141 seconds, while ch3 remained fresh but untrusted.
+  The bounded topology reached six FFmpeg children, two admitted auxiliaries,
+  and three registered proactive preparations; no terminal recovery ran. The
+  unchanged 150-second all-four/clean-topology gate failed before feed, forced-
+  reader, upload, or persistence work. The harness automatically restored
+  exact PR 35 in 19 seconds with four healthy readers and every timer active.
+  CARLA, Drive, and web did not restart inside the candidate window. Do not
+  redeploy PR 44 unchanged or call the initial frame matches a release pass.
+- The PR 44 runtime failure is now reproduced against current read-only KVS
+  transport data. KVS periodically emits a valid 0.78-0.80 second adjacent-
+  fragment keyframe/preroll overlap. PR 44 rejects
+  `later.first_pts <= earlier.last_pts`, then permanently clears the transport
+  clock. Across observed ch1/ch2/ch4 overlap pairs, PDT delta matched first-PTS
+  delta; a fresh ch3 pair had 780 ms interval overlap, no duplicate packet PTS,
+  and only 0.000238 ms affine-origin difference. A PR 44-equivalent four-
+  fragment decode emitted a strictly increasing PTS subset and every emitted
+  PTS existed in the probed union. The six-FFmpeg/two-auxiliary topology is the
+  downstream replacement response, not the primary fault.
+- The current source-only branch is `codex/v2x-pts-runtime-diagnostics` on PR
+  44 main. It accepts preroll overlap only when every fragment agrees with one
+  frozen session-wide PTS/PDT affine origin within max(1 ms, packet ticks),
+  while still rejecting backward PTS/PDT, duplicate sequence, changed fragment
+  metadata, accumulated drift, and conflicting duplicate-PTS UTC. It also adds
+  a finite allowlisted per-camera transport diagnostic and linearizes mediator
+  failure state with clock classification; health/logs cannot contain a URL,
+  raw exception, packet, credential, or numeric fragment detail. The focused
+  diagnostic suite passes 116 tests and the full perception suite passes 215,
+  plus syntax/diff checks. This source is not merged or deployed and still
+  requires independent re-review, canonical merge, and a rollback-gated,
+  upload-disabled four-camera NVDEC canary. Do not widen the 150-second,
+  freshness, topology, or GPU thresholds.
 - PR 43's first zero-overlap, upload-disabled startup at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T062453Z-pr43-evidence-controlled-startup/`
   reached all-four trusted clocks and clean topology in 35 seconds: ch1 used
@@ -33,8 +71,7 @@ override every older PR 32/candidate statement below.
   gate that proves decoded-pixel uniqueness is not deterministic for an empty
   or visually static road; do not retry PR 43 for luck and do not widen the
   150-second threshold.
-- The current source-only follow-up branch is `codex/v2x-same-session-pts` on
-  PR 43 main. It mediates the exact capture HLS session through a capability-
+- PR 44's merged implementation mediates the exact capture HLS session through a capability-
   scoped loopback server, observes the exact init/fragment bytes actually
   served to FFmpeg, and pairs every OpenCV frame with the same FFmpeg graph's
   source PTS from a bounded `framecrc` sidecar. Exact UTC is
@@ -58,11 +95,10 @@ override every older PR 32/candidate statement below.
   `7.707-9.678` seconds. Their advances matched each playlist PDT, supporting
   the same-session piecewise mapping without pixel change. This is transport
   evidence only, not a four-camera decoder canary or deployment pass. The
-  current root suite passes 211 perception tests plus syntax/diff checks; an
-  earlier independent adversarial review correctly blocked the first draft and
-  the fixed draft still requires a fresh independent re-review, full repository
-  regression, canonical merge, and an actual zero-overlap four-camera NVDEC
-  canary before release. Fable remains unavailable because Claude CLI OAuth
+  source gate passed 211 perception tests plus syntax/diff checks; an
+  independent adversarial review correctly blocked the first draft and cleared
+  the merged source. The rejected live transition above is newer, decisive
+  evidence and supersedes that source-only verdict. Fable remains unavailable because Claude CLI OAuth
   expires before file access; never claim a Fable pass.
 - The next live gate remains perception-only and rollback-first: require exact
   source/rollback fingerprints, Richmond LIVE, zero Drive sessions/actors/

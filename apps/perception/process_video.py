@@ -18,6 +18,7 @@ from ffmpeg_capture import FfmpegNvdecCapture
 from decoder_admission import AUXILIARY_DECODER_ADMISSION
 from live_capture import (
     LiveStreamReader,
+    _TRANSPORT_DIAGNOSTICS,
     capture_preparation_topology,
     wait_for_terminal_cleanups,
 )
@@ -382,6 +383,7 @@ class FrameBroadcaster:
                 "decode_latency_ms": None,
                 "anchor_match_frame_count": None,
                 "media_clock_evidence_method": None,
+                "transport_clock_diagnostic": None,
             }
             for camera_id in self.camera_ids
         }
@@ -536,6 +538,15 @@ class FrameBroadcaster:
                 "last_error": None,
                 "reconnect_attempts": 0,
             })
+            self.condition.notify_all()
+
+    def mark_transport_diagnostic(self, camera_id, diagnostic):
+        if diagnostic not in _TRANSPORT_DIAGNOSTICS:
+            raise ValueError("transport clock diagnostic is invalid")
+        with self.condition:
+            self.camera_health[camera_id][
+                "transport_clock_diagnostic"
+            ] = diagnostic
             self.condition.notify_all()
 
     def mark_terminal_failover(
@@ -698,6 +709,9 @@ class FrameBroadcaster:
                     ],
                     "media_clock_evidence_method": entry[
                         "media_clock_evidence_method"
+                    ],
+                    "transport_clock_diagnostic": entry[
+                        "transport_clock_diagnostic"
                     ],
                 }
             decoder_topology = AUXILIARY_DECODER_ADMISSION.snapshot()
@@ -1332,6 +1346,16 @@ class MultiCameraPipeline:
                             stream_broadcaster.mark_connected(camera_ids[index])
                         return
                     if state == "renewed":
+                        return
+                    if state == "transport_diagnostic":
+                        if stream_broadcaster:
+                            stream_broadcaster.mark_transport_diagnostic(
+                                camera_ids[index], stage
+                            )
+                        print(
+                            f"Camera {camera_ids[index]} transport clock "
+                            f"diagnostic: {stage}."
+                        )
                         return
                     if state.startswith("terminal_failover_"):
                         outcome = state.removeprefix("terminal_failover_")

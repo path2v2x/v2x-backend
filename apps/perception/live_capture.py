@@ -27,6 +27,37 @@ _TERMINAL_RECOVERIES = 0
 _TERMINAL_CLEANUPS = {}
 _TERMINAL_CLEANUPS_LOCK = threading.Lock()
 _TERMINAL_CLEANUP_FAILURES = 0
+_TRANSPORT_DIAGNOSTICS = {
+    "starting",
+    "matched",
+    "position_unavailable",
+    "position_invalid",
+    "position_before_window",
+    "position_after_window",
+    "position_inside_gap",
+    "mapping_empty",
+    "mediator_unavailable",
+    "packet_probe_failed",
+    "fragment_clock_rejected",
+    "discontinuity",
+    "transport_disabled",
+    "sidecar_unavailable",
+    "sidecar_invalid",
+    "sidecar_line_too_long",
+    "sidecar_non_ascii",
+    "sidecar_time_base_invalid",
+    "sidecar_time_base_changed",
+    "sidecar_record_invalid",
+    "sidecar_missing_time_base",
+    "sidecar_queue_overflow",
+    "sidecar_pts_nonmonotonic",
+    "sidecar_io_error",
+    "sidecar_timeout",
+    "sidecar_eof",
+    "sidecar_waiting",
+    "sidecar_ready",
+    "closed",
+}
 
 
 class _AsyncTerminalCleanup:
@@ -235,6 +266,21 @@ def _capture_transport_media_clock(capture):
     if getattr(clock, "evidence_method", None) != "exact_same_session_pts":
         return None
     return clock
+
+
+def _capture_transport_diagnostic(capture):
+    accessor = getattr(capture, "transport_clock_diagnostic", None)
+    if accessor is None:
+        return None
+    try:
+        diagnostic = accessor()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return "transport_disabled"
+    return (
+        diagnostic
+        if diagnostic in _TRANSPORT_DIAGNOSTICS
+        else "transport_disabled"
+    )
 
 
 class _ProactiveRenewal(Exception):
@@ -1282,6 +1328,7 @@ class LiveStreamReader:
             maxlen=min(64, self.frame_identity_history_size)
         )
         self._consecutive_duplicate_frames = 0
+        self._last_transport_diagnostic = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -1908,6 +1955,17 @@ class LiveStreamReader:
                         except (AttributeError, TypeError, ValueError):
                             capture_position = None
                     transport_clock = _capture_transport_media_clock(cap)
+                    transport_diagnostic = _capture_transport_diagnostic(cap)
+                    if (
+                        transport_diagnostic is not None
+                        and transport_diagnostic
+                        != self._last_transport_diagnostic
+                    ):
+                        self._notify(
+                            "transport_diagnostic",
+                            stage=transport_diagnostic,
+                        )
+                        self._last_transport_diagnostic = transport_diagnostic
                     transport_clock_lost = False
                     if transport_clock is not None:
                         if clock_resolution is not None:

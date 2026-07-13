@@ -359,6 +359,25 @@ class FrameBroadcasterTests(unittest.TestCase):
         self.assertNotIn("other.example", last_error)
         self.assertNotIn("another-secret", last_error)
 
+    def test_transport_diagnostic_is_finite_and_secret_free(self):
+        self.broadcaster.mark_transport_diagnostic(
+            "ch1", "position_after_window"
+        )
+        camera = self.broadcaster.snapshot_health()["cameras"]["ch1"]
+        self.assertEqual(
+            camera["transport_clock_diagnostic"],
+            "position_after_window",
+        )
+        with self.assertRaisesRegex(ValueError, "diagnostic"):
+            self.broadcaster.mark_transport_diagnostic(
+                "ch1", "https://example.invalid/?SessionToken=secret"
+            )
+        rendered = repr(
+            self.broadcaster.snapshot_health()["cameras"]["ch1"]
+        )
+        self.assertNotIn("SessionToken", rendered)
+        self.assertNotIn("https://", rendered)
+
     def test_latest_detection_exposes_media_clock_for_correlation(self):
         media_clock = {
             "source": "hls_ext_x_program_date_time",

@@ -257,6 +257,10 @@ class FfmpegCaptureTests(unittest.TestCase):
                     __import__("os").write(write_fd, body)
                     __import__("os").close(write_fd)
                     self.assertIsNone(sidecar.take(1.0))
+                    self.assertIn(
+                        sidecar.diagnostic(),
+                        {"sidecar_missing_time_base", "sidecar_record_invalid"},
+                    )
                 finally:
                     try:
                         __import__("os").close(write_fd)
@@ -315,6 +319,13 @@ class FfmpegCaptureTests(unittest.TestCase):
         self.assertNotIn("SessionToken", rendered)
         self.assertNotIn("example.test", rendered)
         self.assertIsNone(clock.metadata_at(200.0))
+        self.assertEqual(clock.classify_position(150.0), "matched")
+        self.assertEqual(
+            clock.classify_position(200.0), "position_after_window"
+        )
+        self.assertEqual(
+            clock.classify_position(50.0), "position_before_window"
+        )
 
         collision = _MediatedFragment(
             program_date_time_epoch=1_783_655_845.0,
@@ -362,7 +373,7 @@ class FfmpegCaptureTests(unittest.TestCase):
             "1970-01-01T00:00:00.500Z",
         )
 
-    def test_transport_clock_requires_continuous_multi_fragment_pdt(self):
+    def test_transport_clock_accepts_affine_preroll_overlap(self):
         def fragment(sequence, fragment_id, epoch):
             return _MediatedFragment(
                 epoch,
@@ -383,18 +394,83 @@ class FfmpegCaptureTests(unittest.TestCase):
             _PacketSample(0, Fraction(2), Fraction(1, 1000)),
             _PacketSample(1, Fraction(3), Fraction(1, 1000)),
         ))
-        self.assertIsNotNone(clock.metadata_at(2000.0))
+        clock.add_fragment(fragment(3, "overlap", 1003.0), (
+            _PacketSample(0, Fraction(3), Fraction(1, 1000)),
+            _PacketSample(1, Fraction(4), Fraction(1, 1000)),
+        ))
+        self.assertEqual(
+            clock.metadata_at(3000.0)["media_timestamp_utc"],
+            "1970-01-01T00:16:43.000Z",
+        )
+        self.assertEqual(
+            clock.metadata_at(3000.0)["media_clock"]["anchor_fragment_id"],
+            "f2",
+        )
+
+        real_shaped = SameSessionTransportClock()
+        real_shaped.add_fragment(fragment(10, "kvs-a", 2000.0), (
+            _PacketSample(0, Fraction(6366, 1000), Fraction(1, 1000)),
+            _PacketSample(1, Fraction(7569, 1000), Fraction(1, 1000)),
+            _PacketSample(2, Fraction(8330, 1000), Fraction(1, 1000)),
+        ))
+        real_shaped.add_fragment(fragment(11, "kvs-b", 2001.203), (
+            _PacketSample(0, Fraction(7569, 1000), Fraction(1, 1000)),
+            _PacketSample(1, Fraction(8330, 1000), Fraction(1, 1000)),
+            _PacketSample(2, Fraction(9543, 1000), Fraction(1, 1000)),
+        ))
+        for pts in (6366.0, 7569.0, 8330.0, 9543.0):
+            self.assertEqual(real_shaped.classify_position(pts), "matched")
+        self.assertEqual(
+            real_shaped.metadata_at(8330.0)["media_timestamp_utc"],
+            "1970-01-01T00:33:21.964Z",
+        )
+
+    def test_transport_clock_rejects_non_affine_or_backward_fragments(self):
+        def fragment(sequence, fragment_id, epoch):
+            return _MediatedFragment(
+                epoch,
+                "1970-01-01T00:00:00.000Z",
+                2.0,
+                sequence,
+                fragment_id,
+                "https://example.test/init",
+                "https://example.test/segment?FragmentNumber=" + fragment_id,
+            )
+
+        def seeded_clock():
+            clock = SameSessionTransportClock()
+            clock.add_fragment(fragment(1, "f1", 1000.0), (
+                _PacketSample(0, Fraction(0), Fraction(1, 1000)),
+                _PacketSample(1, Fraction(1), Fraction(1, 1000)),
+            ))
+            clock.add_fragment(fragment(2, "f2", 1002.0), (
+                _PacketSample(0, Fraction(2), Fraction(1, 1000)),
+                _PacketSample(1, Fraction(3), Fraction(1, 1000)),
+            ))
+            return clock
 
         with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
-            clock.add_fragment(fragment(3, "overlap", 1003.0), (
+            seeded_clock().add_fragment(fragment(3, "shifted", 1003.002), (
                 _PacketSample(0, Fraction(3), Fraction(1, 1000)),
             ))
         with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
-            clock.add_fragment(fragment(3, "backward", 999.0), (
+            seeded_clock().add_fragment(fragment(3, "backward-pdt", 999.0), (
                 _PacketSample(0, Fraction(4), Fraction(1, 1000)),
             ))
         with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
-            clock.add_fragment(fragment(3, "misaligned", 1005.0), (
+            seeded_clock().add_fragment(fragment(3, "backward-pts", 1003.0), (
+                _PacketSample(0, Fraction(1), Fraction(1, 1000)),
+            ))
+
+        drifting = SameSessionTransportClock()
+        drifting.add_fragment(fragment(1, "drift-1", 1000.0), (
+            _PacketSample(0, Fraction(0), Fraction(1, 1000)),
+        ))
+        drifting.add_fragment(fragment(2, "drift-2", 1002.00075), (
+            _PacketSample(0, Fraction(2), Fraction(1, 1000)),
+        ))
+        with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
+            drifting.add_fragment(fragment(3, "drift-3", 1004.0015), (
                 _PacketSample(0, Fraction(4), Fraction(1, 1000)),
             ))
 
@@ -418,6 +494,33 @@ class FfmpegCaptureTests(unittest.TestCase):
         self.assertIsNone(clock.metadata_at(1000.0))
         self.assertIsNone(clock.metadata_at(2000.0))
 
+    def test_transport_clock_affine_origin_survives_fragment_pruning(self):
+        clock = SameSessionTransportClock(max_positions=2)
+
+        def add(sequence, origin_shift=0.0):
+            pts = Fraction(sequence - 1)
+            fragment = _MediatedFragment(
+                1000.0 + float(pts) + origin_shift,
+                "1970-01-01T00:00:00.000Z",
+                1.0,
+                sequence,
+                f"fragment-{sequence}",
+                "https://example.test/init",
+                "https://example.test/segment?FragmentNumber="
+                f"fragment-{sequence}",
+            )
+            clock.add_fragment(fragment, (
+                _PacketSample(0, pts, Fraction(1, 1000)),
+            ))
+
+        for sequence in range(1, 131):
+            add(sequence)
+        with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
+            add(131, origin_shift=0.002)
+        clock.clear()
+        add(1, origin_shift=1.0)
+        self.assertEqual(clock.classify_position(0.0), "matched")
+
     def test_capture_exposes_source_pts_and_only_an_exact_current_clock(self):
         frame = np.zeros((2, 2, 3), dtype=np.uint8)
         capture = object.__new__(FfmpegNvdecCapture)
@@ -438,7 +541,10 @@ class FfmpegCaptureTests(unittest.TestCase):
         clock.add_fragment(fragment, (
             _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
         ))
-        capture._mediator = SimpleNamespace(clock=clock)
+        capture._mediator = SimpleNamespace(
+            clock=clock,
+            transport_diagnostic=clock.classify_position,
+        )
         positions = iter((Fraction(1, 10), Fraction(1, 5)))
         capture._pts_sidecar = SimpleNamespace(
             take=lambda _timeout: next(positions)
@@ -817,15 +923,15 @@ class FfmpegCaptureTests(unittest.TestCase):
             raise AssertionError("unexpected URL")
 
         probes = (
-            lambda *_args: (_ for _ in ()).throw(
+            (lambda *_args: (_ for _ in ()).throw(
                 NvdecCaptureError("synthetic probe failure")
-            ),
-            lambda *_args: (
+            ), "packet_probe_failed"),
+            (lambda *_args: (
                 _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
                 _PacketSample(1, Fraction(1, 10), Fraction(1, 20)),
-            ),
+            ), "fragment_clock_rejected"),
         )
-        for probe in probes:
+        for probe, expected_diagnostic in probes:
             with self.subTest(probe=probe):
                 mediator = _LoopbackHlsMediator(
                     source, master, http_get=get, packet_probe=probe
@@ -851,9 +957,67 @@ class FfmpegCaptureTests(unittest.TestCase):
                     self.assertEqual(segment.status_code, 200)
                     self.assertEqual(segment.content, b"exact-segment")
                     self.assertFalse(mediator._transport_evidence_enabled)
+                    self.assertEqual(
+                        mediator.transport_diagnostic(0.0),
+                        expected_diagnostic,
+                    )
                     self.assertIsNone(mediator.clock.metadata_at(100.0))
                 finally:
                     mediator.close()
+
+    def test_transport_diagnostic_is_linearized_with_failure_reason(self):
+        entered = threading.Event()
+        release = threading.Event()
+        disabled = threading.Event()
+        result = {}
+
+        class BlockingClock:
+            def classify_position(self, _position):
+                entered.set()
+                self_test.assertTrue(release.wait(1.0))
+                return "matched"
+
+            def clear(self):
+                return None
+
+        self_test = self
+        mediator = _LoopbackHlsMediator(
+            "https://example.test/master.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia.m3u8\n",
+            http_get=lambda *_args, **_kwargs: None,
+            packet_probe=None,
+        )
+        mediator.clock = BlockingClock()
+
+        def classify():
+            result["diagnostic"] = mediator.transport_diagnostic(0.0)
+
+        def disable():
+            mediator._disable_transport_evidence("packet_probe_failed")
+            disabled.set()
+
+        classify_thread = threading.Thread(target=classify)
+        disable_thread = threading.Thread(target=disable)
+        try:
+            classify_thread.start()
+            self.assertTrue(entered.wait(1.0))
+            disable_thread.start()
+            self.assertFalse(disabled.wait(0.05))
+            release.set()
+            classify_thread.join(1.0)
+            disable_thread.join(1.0)
+            self.assertFalse(classify_thread.is_alive())
+            self.assertFalse(disable_thread.is_alive())
+            self.assertEqual(result["diagnostic"], "matched")
+            self.assertEqual(
+                mediator.transport_diagnostic(0.0),
+                "packet_probe_failed",
+            )
+        finally:
+            release.set()
+            classify_thread.join(1.0)
+            disable_thread.join(1.0)
+            mediator.close()
 
     def test_discontinuity_disables_evidence_without_blocking_decode(self):
         source = "https://example.test/master.m3u8?SessionToken=master"

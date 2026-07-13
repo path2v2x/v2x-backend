@@ -93,6 +93,9 @@ class TransportClockCapture:
     def transport_media_clock(self):
         return None if self.current_position is None else self.clock
 
+    def transport_clock_diagnostic(self):
+        return "starting" if self.current_position is None else "matched"
+
     def release(self):
         self.released = True
 
@@ -241,10 +244,12 @@ class LiveStreamReaderTests(unittest.TestCase):
         )
         clock_source_calls = []
         fallback_calls = []
+        states = []
         reader = LiveStreamReader(
             source_factory=lambda: "capture-source",
             capture_factory=lambda _source: capture,
             recovery=StreamRecovery(0.1, 0.1),
+            state_callback=lambda **event: states.append(event),
             media_clock_factory=lambda *_args, **_kwargs: (
                 fallback_calls.append(True)
             ),
@@ -265,6 +270,11 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertGreater(second["sequence"], first["sequence"])
             self.assertEqual(clock_source_calls, [])
             self.assertEqual(fallback_calls, [])
+            self.assertTrue(any(
+                event["state"] == "transport_diagnostic"
+                and event["stage"] == "matched"
+                for event in states
+            ))
         finally:
             reader.stop(timeout=2.0)
 

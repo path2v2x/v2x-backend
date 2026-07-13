@@ -139,6 +139,8 @@ class SameSessionTransportClock:
         self._positions = OrderedDict()
         self._float_positions = {}
         self._fragments = OrderedDict()
+        self._affine_origin_epoch = None
+        self._affine_origin_tick = None
 
     @staticmethod
     def _position_key(position_milliseconds):
@@ -183,6 +185,22 @@ class SameSessionTransportClock:
             if existing is not None and existing != timeline:
                 raise NvdecCaptureError("HLS fragment timeline changed")
             if existing is None:
+                candidate_origin = (
+                    timeline.program_date_time_epoch
+                    - float(timeline.first_pts)
+                )
+                if self._affine_origin_epoch is not None:
+                    origin_tolerance = max(
+                        0.001,
+                        float(self._affine_origin_tick),
+                        float(timeline.tick),
+                    )
+                    if abs(
+                        candidate_origin - self._affine_origin_epoch
+                    ) > origin_tolerance:
+                        raise NvdecCaptureError(
+                            "HLS fragment PDT timeline is inconsistent"
+                        )
                 candidate_timelines = tuple(self._fragments.values()) + (
                     timeline,
                 )
@@ -202,29 +220,15 @@ class SameSessionTransportClock:
                 if len({item.media_sequence for item in ordered}) != len(ordered):
                     raise NvdecCaptureError("HLS media sequence is ambiguous")
                 for earlier, later in zip(ordered, ordered[1:]):
-                    pts_delta = later.first_pts - earlier.first_pts
-                    pdt_delta = (
-                        later.program_date_time_epoch
-                        - earlier.program_date_time_epoch
-                    )
-                    tolerance = max(
-                        0.001,
-                        float(earlier.tick),
-                        float(later.tick),
-                    )
                     if (
-                        pts_delta <= 0
-                        or later.first_pts <= earlier.last_pts
-                        or pdt_delta <= 0.0
-                        or abs(float(pts_delta) - pdt_delta) > tolerance
+                        later.first_pts <= earlier.first_pts
+                        or later.program_date_time_epoch
+                        <= earlier.program_date_time_epoch
                     ):
                         raise NvdecCaptureError(
                             "HLS fragment PDT timeline is inconsistent"
                         )
-                self._fragments[fragment.fragment_id] = timeline
-                self._fragments.move_to_end(fragment.fragment_id)
-                while len(self._fragments) > 128:
-                    self._fragments.popitem(last=False)
+            candidate_points = []
             for presentation_index, sample in enumerate(samples):
                 offset = sample.pts - first_pts
                 point = _TransportPoint(
@@ -243,10 +247,38 @@ class SameSessionTransportClock:
                 key = sample.pts
                 missing = object()
                 prior = self._positions.get(key, missing)
-                if prior is not missing and prior != point:
-                    self._positions[key] = None
-                else:
-                    self._positions[key] = point
+                if prior is None:
+                    raise NvdecCaptureError(
+                        "HLS overlapping packet UTC is ambiguous"
+                    )
+                if prior is not missing:
+                    tolerance = max(
+                        0.001,
+                        float(prior.sample_time_base),
+                        float(point.sample_time_base),
+                    )
+                    if abs(prior.media_epoch - point.media_epoch) > tolerance:
+                        raise NvdecCaptureError(
+                            "HLS overlapping packet UTC is inconsistent"
+                        )
+                    # KVS can repeat keyframe/preroll packets in adjacent
+                    # fragments.  An identical source PTS with the same affine
+                    # UTC mapping is unambiguous in time.  Retain the earliest
+                    # served fragment as the canonical timestamp anchor; the
+                    # FFmpeg sidecar still proves which source PTS was emitted.
+                    continue
+                candidate_points.append((key, point))
+
+            if existing is None:
+                if self._affine_origin_epoch is None:
+                    self._affine_origin_epoch = candidate_origin
+                    self._affine_origin_tick = timeline.tick
+                self._fragments[fragment.fragment_id] = timeline
+                self._fragments.move_to_end(fragment.fragment_id)
+                while len(self._fragments) > 128:
+                    self._fragments.popitem(last=False)
+            for key, point in candidate_points:
+                self._positions[key] = point
                 self._positions.move_to_end(key)
                 while len(self._positions) > self._max_positions:
                     self._positions.popitem(last=False)
@@ -270,6 +302,32 @@ class SameSessionTransportClock:
                 and rational_position is not None
                 and self._positions.get(rational_position) is not None
             )
+
+    def classify_position(self, position_milliseconds):
+        """Return one finite secret-free reason for a missing exact mapping."""
+        key = self._position_key(position_milliseconds)
+        with self._lock:
+            if key is None:
+                return "position_invalid"
+            if not self._float_positions:
+                return "mapping_empty"
+            rational_position = self._float_positions.get(key)
+            if (
+                rational_position is not None
+                and self._positions.get(rational_position) is not None
+            ):
+                return "matched"
+            finite_positions = tuple(
+                value for value in self._float_positions
+                if value is not None and math.isfinite(value)
+            )
+            if not finite_positions:
+                return "mapping_empty"
+            if key < min(finite_positions):
+                return "position_before_window"
+            if key > max(finite_positions):
+                return "position_after_window"
+            return "position_inside_gap"
 
     def metadata_at(self, position_milliseconds):
         key = self._position_key(position_milliseconds)
@@ -318,6 +376,8 @@ class SameSessionTransportClock:
             self._positions.clear()
             self._float_positions.clear()
             self._fragments.clear()
+            self._affine_origin_epoch = None
+            self._affine_origin_tick = None
 
 
 def quick_frame_identity(frame, axis_samples=64):
@@ -969,24 +1029,27 @@ class _FramePtsSidecar:
         self._time_base = None
         self._last_pts = None
         self._failed = False
+        self._failure_reason = None
         self._done = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _fail(self):
+    def _fail(self, reason="sidecar_invalid"):
         with self._condition:
             self._failed = True
+            if self._failure_reason is None:
+                self._failure_reason = str(reason)
             self._records.clear()
             self._condition.notify_all()
 
     def _parse_line(self, raw):
         if len(raw) > _SIDECAR_LINE_LIMIT:
-            self._fail()
+            self._fail("sidecar_line_too_long")
             return
         try:
             line = raw.decode("ascii").strip()
         except UnicodeDecodeError:
-            self._fail()
+            self._fail("sidecar_non_ascii")
             return
         if not line:
             return
@@ -996,11 +1059,12 @@ class _FramePtsSidecar:
                     line.split(":", 1)[1].strip(), "frame PTS time base"
                 )
             except NvdecCaptureError:
-                self._fail()
+                self._fail("sidecar_time_base_invalid")
                 return
             with self._condition:
                 if self._time_base is not None and self._time_base != time_base:
                     self._failed = True
+                    self._failure_reason = "sidecar_time_base_changed"
                     self._records.clear()
                 self._time_base = time_base
                 self._condition.notify_all()
@@ -1019,19 +1083,24 @@ class _FramePtsSidecar:
             if not re.fullmatch(r"0x[0-9A-Fa-f]{8}", fields[5]):
                 raise ValueError
         except ValueError:
-            self._fail()
+            self._fail("sidecar_record_invalid")
             return
         with self._condition:
             if self._failed or self._time_base is None:
                 self._failed = True
+                self._failure_reason = (
+                    self._failure_reason or "sidecar_missing_time_base"
+                )
                 self._records.clear()
             elif len(self._records) >= self._queue_limit:
                 self._failed = True
+                self._failure_reason = "sidecar_queue_overflow"
                 self._records.clear()
             else:
                 source_pts = Fraction(pts) * self._time_base
                 if self._last_pts is not None and source_pts <= self._last_pts:
                     self._failed = True
+                    self._failure_reason = "sidecar_pts_nonmonotonic"
                     self._records.clear()
                 else:
                     self._last_pts = source_pts
@@ -1055,7 +1124,7 @@ class _FramePtsSidecar:
                     break
                 pending += chunk
                 if len(pending) > _SIDECAR_LINE_LIMIT and b"\n" not in pending:
-                    self._fail()
+                    self._fail("sidecar_line_too_long")
                     pending = b""
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
@@ -1063,7 +1132,7 @@ class _FramePtsSidecar:
             if pending:
                 self._parse_line(pending)
         except OSError:
-            self._fail()
+            self._fail("sidecar_io_error")
         finally:
             try:
                 os.close(descriptor)
@@ -1080,11 +1149,22 @@ class _FramePtsSidecar:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     self._failed = True
+                    self._failure_reason = "sidecar_timeout"
                     break
                 self._condition.wait(remaining)
             if self._failed or not self._records:
                 return None
             return self._records.popleft()
+
+    def diagnostic(self):
+        with self._condition:
+            if self._failed:
+                return self._failure_reason or "sidecar_invalid"
+            if self._done and not self._records:
+                return "sidecar_eof"
+            if not self._records:
+                return "sidecar_waiting"
+            return "sidecar_ready"
 
     def close(self, timeout=1.0):
         self._thread.join(max(0.0, float(timeout)))
@@ -1126,6 +1206,7 @@ class _LoopbackHlsMediator:
         self._active_requests = 0
         self._transport_evidence_lock = threading.RLock()
         self._transport_evidence_enabled = True
+        self._transport_failure_reason = None
         self.clock = SameSessionTransportClock()
 
         mediator = self
@@ -1230,10 +1311,24 @@ class _LoopbackHlsMediator:
             cancel_event=self._stopping,
         )
 
-    def _disable_transport_evidence(self):
+    def _disable_transport_evidence(self, reason="transport_disabled"):
         with self._transport_evidence_lock:
             self._transport_evidence_enabled = False
+            if self._transport_failure_reason is None:
+                self._transport_failure_reason = str(reason)
             self.clock.clear()
+
+    def transport_diagnostic(self, position_milliseconds=None):
+        with self._transport_evidence_lock:
+            if not self._transport_evidence_enabled:
+                return self._transport_failure_reason or "transport_disabled"
+            if position_milliseconds is None:
+                return "position_unavailable"
+            # Keep the mediator state and its clock classification in one
+            # linearized read.  Otherwise a concurrent probe failure can clear
+            # the clock between these checks and hide its real finite cause
+            # behind a misleading ``mapping_empty`` diagnostic.
+            return self.clock.classify_position(position_milliseconds)
 
     def _probe_packets_bounded(self, init_bytes, segment_bytes):
         with self._transport_evidence_lock:
@@ -1263,8 +1358,12 @@ class _LoopbackHlsMediator:
     def _record_transport_evidence(self, fragment, init_bytes, segment_bytes):
         try:
             samples = self._probe_packets_bounded(init_bytes, segment_bytes)
-            if samples is None:
-                return
+        except Exception:
+            self._disable_transport_evidence("packet_probe_failed")
+            return
+        if samples is None:
+            return
+        try:
             with self._transport_evidence_lock:
                 if not self._transport_evidence_enabled:
                     return
@@ -1273,7 +1372,7 @@ class _LoopbackHlsMediator:
             # Packet metadata is optional evidence. The exact fMP4 body still
             # belongs to this mediated decode session and must remain usable by
             # the legacy pixel matcher, while transport evidence fails closed.
-            self._disable_transport_evidence()
+            self._disable_transport_evidence("fragment_clock_rejected")
 
     def _local_route(self, kind, payload, generation):
         route = secrets.token_urlsafe(24)
@@ -1349,7 +1448,7 @@ class _LoopbackHlsMediator:
                 line.strip() == "#EXT-X-DISCONTINUITY"
                 for line in text.splitlines()
             ):
-                self._disable_transport_evidence()
+                self._disable_transport_evidence("discontinuity")
             return 200, "application/vnd.apple.mpegurl", self._rewrite_media(
                 fragments
             )
@@ -1392,7 +1491,7 @@ class _LoopbackHlsMediator:
             self._routes.clear()
             self._route_generations.clear()
             self._init_bytes.clear()
-        self._disable_transport_evidence()
+        self._disable_transport_evidence("closed")
         self._media_url = None
         self._origin_url = None
         self._http_get = None
@@ -1603,6 +1702,7 @@ class FfmpegNvdecCapture:
         self._pts_write_fd = None
         self._last_source_position_ms = None
         self._last_transport_exact = False
+        self._transport_diagnostic = "starting"
         self._source_pts_timeout_seconds = max(
             0.0, float(source_pts_timeout_ms) / 1000.0
         )
@@ -1768,12 +1868,19 @@ class FfmpegNvdecCapture:
             if source_pts is not None:
                 self._last_source_position_ms = float(source_pts * 1000)
                 mediator = self._mediator
-                self._last_transport_exact = bool(
-                    mediator is not None
-                    and mediator.clock.has_position(
+                if mediator is None:
+                    self._transport_diagnostic = "mediator_unavailable"
+                else:
+                    self._transport_diagnostic = mediator.transport_diagnostic(
                         self._last_source_position_ms
                     )
-                )
+                    self._last_transport_exact = (
+                        self._transport_diagnostic == "matched"
+                    )
+            else:
+                self._transport_diagnostic = sidecar.diagnostic()
+        else:
+            self._transport_diagnostic = "sidecar_unavailable"
         return ok, frame
 
     def get(self, property_id):
@@ -1798,6 +1905,10 @@ class FfmpegNvdecCapture:
         if not mediator.clock.has_position(self._last_source_position_ms):
             return None
         return mediator.clock
+
+    def transport_clock_diagnostic(self):
+        """Return one finite, URL-free runtime timing diagnostic."""
+        return self._transport_diagnostic
 
     def release(self):
         self._cancel_watcher_stop.set()
