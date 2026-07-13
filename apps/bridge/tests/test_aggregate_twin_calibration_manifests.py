@@ -14,20 +14,53 @@ from tools.aggregate_twin_calibration_manifests import (
 CAMERAS = ("ch1", "ch2", "ch3", "ch4")
 
 
+def rewrite_registry_from_manifests(registry, manifests):
+    original = json.loads(registry.read_text())
+    landmarks = {}
+    for manifest_path in manifests:
+        manifest = json.loads(manifest_path.read_text())
+        for feature in manifest["features"]:
+            if feature.get("type") != "point":
+                continue
+            landmarks.setdefault(feature["global_landmark_id"], {
+                "global_landmark_id": feature["global_landmark_id"],
+                "split": feature["split"],
+                "surveyed_world": feature["surveyed_world"],
+                "survey_record_sha256": feature["survey_record_sha256"],
+                "survey_record_path": feature["survey_record_path"],
+                "survey_record_size_bytes": feature["survey_record"]["size_bytes"],
+            })
+    original["landmarks"] = list(landmarks.values())
+    registry.write_text(json.dumps(original))
+
+
 def fixture(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    cameras_hash = "c" * 64
+    def artifact(name, payload):
+        path = (tmp_path / name).resolve()
+        path.write_bytes(payload)
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        }
+
+    cameras_artifact = artifact("cameras.json", b"frozen-cameras")
+    cameras_hash = cameras_artifact["sha256"]
     map_name = "Carla/Maps/Richmond_Field_Station_Richmond_CA"
     opendrive_hash = "d" * 64
     landmarks = []
     for index in range(12):
+        survey_record = artifact(
+            f"survey-{index}.json", f"survey-{index}".encode()
+        )
         landmarks.append({
             "global_landmark_id": f"rfs-landmark-{index:02d}",
             "split": "train" if index < 8 else "holdout",
             "surveyed_world": [float(index), float(index * 2), 0.5],
-            "survey_record_sha256": hashlib.sha256(
-                f"survey-{index}".encode()
-            ).hexdigest(),
+            "survey_record_sha256": survey_record["sha256"],
+            "survey_record_path": survey_record["path"],
+            "survey_record_size_bytes": survey_record["size_bytes"],
         })
     registry = tmp_path / "registry.json"
     registry.write_text(json.dumps({
@@ -35,6 +68,12 @@ def fixture(tmp_path):
         "cameras_file_sha256": cameras_hash,
         "landmarks": landmarks,
     }))
+    intrinsics_artifact = artifact("intrinsics.json", b"frozen-intrinsics")
+    intrinsics_sources = [
+        artifact(f"intrinsics-source-{index}.png", f"source-{index}".encode())
+        for index in range(10)
+    ]
+    depth_artifact = artifact("depth.bgra", b"\0" * (1280 * 960 * 4))
     manifests = []
     for camera_id in CAMERAS:
         path = tmp_path / f"{camera_id}.json"
@@ -43,6 +82,11 @@ def fixture(tmp_path):
                 "id": f"{camera_id}-feature-{index}",
                 "type": "point",
                 **copy.deepcopy(landmark),
+                "survey_record": {
+                    "path": landmark["survey_record_path"],
+                    "sha256": landmark["survey_record_sha256"],
+                    "size_bytes": landmark["survey_record_size_bytes"],
+                },
                 "world": copy.deepcopy(landmark["surveyed_world"]),
                 "image": [200.0 + index * 20.0, 300.0 + index * 20.0],
                 "twin": [100.0 + index * 10.0, 150.0 + index * 10.0],
@@ -77,16 +121,33 @@ def fixture(tmp_path):
             }
             for index in range(5)
         ]
+        annotation_artifact = artifact(
+            f"{camera_id}-annotations.json", f"annotations-{camera_id}".encode()
+        )
+        real_artifact = artifact(
+            f"{camera_id}-real.jpg", f"real-{camera_id}".encode()
+        )
+        twin_artifact = artifact(
+            f"{camera_id}-twin.jpg", f"twin-{camera_id}".encode()
+        )
         path.write_text(json.dumps({
             "schema_version": 1,
             "camera_id": camera_id,
             "width": 2560,
             "height": 1920,
-            "source_frame_sha256": "1" * 64,
-            "twin_frame_sha256": "2" * 64,
-            "annotation_sha256": "3" * 64,
+            "source_frame_sha256": real_artifact["sha256"],
+            "twin_frame_sha256": twin_artifact["sha256"],
+            "annotation_sha256": annotation_artifact["sha256"],
             "cameras_file_sha256": cameras_hash,
             "camera_config_sha256": "4" * 64,
+            "source_artifacts": {
+                "annotations": annotation_artifact,
+                "real_frame": real_artifact,
+                "twin_frame": twin_artifact,
+                "cameras_file": cameras_artifact,
+                "intrinsics_artifact": intrinsics_artifact,
+                "intrinsics_source_images": intrinsics_sources,
+            },
             "ue5_map": map_name,
             "ue5_map_opendrive_sha256": opendrive_hash,
             "projection": {
@@ -102,8 +163,9 @@ def fixture(tmp_path):
                 "sensor_timestamp": 45.5,
                 "width": 1280,
                 "height": 960,
-                "raw_data_sha256": "5" * 64,
+                "raw_data_sha256": depth_artifact["sha256"],
                 "raw_data_size": 1280 * 960 * 4,
+                "path": depth_artifact["path"],
             },
             "baseline": {
                 "location": [0.0, 0.0, 8.0],
@@ -135,11 +197,10 @@ def fixture(tmp_path):
             },
             "intrinsics_calibration": {
                 "method": "charuco",
-                "artifact_sha256": "6" * 64,
+                "artifact_sha256": intrinsics_artifact["sha256"],
                 "image_count": 10,
                 "source_images_sha256": [
-                    hashlib.sha256(f"source-{index}".encode()).hexdigest()
-                    for index in range(10)
+                    item["sha256"] for item in intrinsics_sources
                 ],
                 "rms_reprojection_error_px": 0.5,
                 "resolution": [2560, 1920],
@@ -174,6 +235,12 @@ def test_four_camera_registry_allows_canonical_cross_camera_reuse(tmp_path):
         landmark["cameras"] == list(CAMERAS)
         for landmark in report["landmarks"].values()
     )
+    assert report["contract"]["shared_landmark_count"] == 12
+    assert report["contract"]["connected_camera_count"] == 4
+    assert report["contract"]["cross_camera_edge_count"] == 6
+    assert report["contract"]["shared_landmarks_per_camera"] == {
+        camera: 12 for camera in CAMERAS
+    }
     assert report["site_landmark_registry"]["sha256"] == hashlib.sha256(
         registry.read_bytes()
     ).hexdigest()
@@ -199,7 +266,6 @@ def test_renamed_near_duplicate_landmark_is_rejected_site_wide(tmp_path):
     renamed = copy.deepcopy(registry_value["landmarks"][0])
     renamed["global_landmark_id"] = "caller-renamed-landmark"
     renamed["surveyed_world"][0] += 0.01
-    renamed["survey_record_sha256"] = "d" * 64
     registry_value["landmarks"].append(renamed)
     registry.write_text(json.dumps(registry_value))
     manifest_value = json.loads(manifests[0].read_text())
@@ -242,7 +308,6 @@ def test_survey_world_or_record_hash_disagreement_is_rejected(tmp_path):
     registry, manifests = fixture(tmp_path)
     value = json.loads(manifests[2].read_text())
     value["features"][3]["surveyed_world"][0] += 1.0
-    value["features"][3]["survey_record_sha256"] = "e" * 64
     manifests[2].write_text(json.dumps(value))
 
     with pytest.raises(SiteManifestError, match="surveyed world identity"):
@@ -324,4 +389,77 @@ def test_builder_counts_and_measured_intrinsics_must_be_complete(tmp_path):
     value["intrinsics_calibration"]["source_images_sha256"] = ["a" * 64] * 10
     manifests[0].write_text(json.dumps(value))
     with pytest.raises(SiteManifestError, match="measured-intrinsics contract"):
+        aggregate_site_manifests(registry, manifests)
+
+
+def test_zero_shared_landmarks_are_rejected_even_with_four_complete_cameras(tmp_path):
+    registry, manifests = fixture(tmp_path)
+    for camera_index, path in enumerate(manifests):
+        value = json.loads(path.read_text())
+        for feature in value["features"]:
+            if feature.get("type") != "point":
+                continue
+            feature["global_landmark_id"] = (
+                f"{value['camera_id']}-{feature['global_landmark_id']}"
+            )
+            feature["surveyed_world"][0] += 100.0 * camera_index
+            feature["world"][0] += 100.0 * camera_index
+        path.write_text(json.dumps(value))
+    rewrite_registry_from_manifests(registry, manifests)
+
+    with pytest.raises(SiteManifestError, match="every camera must participate"):
+        aggregate_site_manifests(registry, manifests)
+
+
+def test_two_disconnected_shared_camera_islands_are_rejected(tmp_path):
+    registry, manifests = fixture(tmp_path)
+    for path in manifests[2:]:
+        value = json.loads(path.read_text())
+        for feature in value["features"]:
+            if feature.get("type") != "point":
+                continue
+            feature["global_landmark_id"] = "east-" + feature["global_landmark_id"]
+            feature["surveyed_world"][0] += 200.0
+            feature["world"][0] += 200.0
+        path.write_text(json.dumps(value))
+    rewrite_registry_from_manifests(registry, manifests)
+
+    with pytest.raises(SiteManifestError, match="disconnected camera islands"):
+        aggregate_site_manifests(registry, manifests)
+
+
+@pytest.mark.parametrize(
+    "artifact_kind",
+    ["annotations", "real_frame", "twin_frame", "intrinsics", "depth", "survey"],
+)
+def test_missing_or_tampered_retained_artifact_cannot_pass_by_hash_string(
+    tmp_path, artifact_kind
+):
+    registry, manifests = fixture(tmp_path)
+    manifest = json.loads(manifests[0].read_text())
+    if artifact_kind in {"annotations", "real_frame", "twin_frame"}:
+        path = Path(manifest["source_artifacts"][artifact_kind]["path"])
+    elif artifact_kind == "intrinsics":
+        path = Path(
+            manifest["source_artifacts"]["intrinsics_source_images"][0]["path"]
+        )
+    elif artifact_kind == "depth":
+        path = Path(manifest["depth_frame"]["path"])
+    else:
+        path = Path(manifest["features"][0]["survey_record_path"])
+    path.write_bytes(path.read_bytes() + b"tampered")
+
+    with pytest.raises(SiteManifestError, match="artifact"):
+        aggregate_site_manifests(registry, manifests)
+
+
+def test_nonexistent_artifact_path_is_rejected_not_accepted_from_declared_hash(tmp_path):
+    registry, manifests = fixture(tmp_path)
+    value = json.loads(manifests[0].read_text())
+    value["source_artifacts"]["annotations"]["path"] = str(
+        (tmp_path / "does-not-exist.json").resolve()
+    )
+    manifests[0].write_text(json.dumps(value))
+
+    with pytest.raises(SiteManifestError, match="artifact is missing"):
         aggregate_site_manifests(registry, manifests)

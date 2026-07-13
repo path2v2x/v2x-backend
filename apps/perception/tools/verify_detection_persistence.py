@@ -271,10 +271,15 @@ def trusted_media_time(item):
     ):
         reasons.append("ingestion_time")
     expires_at = item.get("expires_at")
+    expiry_delta_seconds = (
+        expires_at - int(media_time.timestamp())
+        if isinstance(expires_at, int) and not isinstance(expires_at, bool)
+        else None
+    )
     if (
         not isinstance(expires_at, int)
         or isinstance(expires_at, bool)
-        or expires_at != int(media_time.timestamp()) + PERSISTENCE_TTL_SECONDS
+        or expiry_delta_seconds != PERSISTENCE_TTL_SECONDS
     ):
         reasons.append("expiry_time")
     return event_time, reasons

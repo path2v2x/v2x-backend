@@ -50,6 +50,34 @@ def _valid_sha256(value):
     )
 
 
+def _retained_identity(identity, label, *, expected_sha256=None, expected_size=None):
+    """Re-read a retained artifact and return its canonical identity."""
+    if not isinstance(identity, dict):
+        raise SiteManifestError(f"{label} retained artifact identity is missing")
+    path_value = identity.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        raise SiteManifestError(f"{label} retained artifact path is invalid")
+    try:
+        path = Path(path_value).expanduser().resolve(strict=True)
+        if not path.is_file() or str(path) != path_value:
+            raise OSError("path is not one canonical regular file")
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise SiteManifestError(f"{label} retained artifact is missing") from exc
+    actual = {
+        "path": str(path),
+        "sha256": _sha256(raw),
+        "size_bytes": len(raw),
+    }
+    if identity != actual:
+        raise SiteManifestError(f"{label} retained artifact identity mismatches disk")
+    if expected_sha256 is not None and actual["sha256"] != expected_sha256:
+        raise SiteManifestError(f"{label} retained artifact hash mismatches contract")
+    if expected_size is not None and actual["size_bytes"] != expected_size:
+        raise SiteManifestError(f"{label} retained artifact size mismatches contract")
+    return actual
+
+
 def _world(value, label):
     if (
         not isinstance(value, list)
@@ -218,6 +246,46 @@ def _builder_contract(manifest):
         != depth.get("width") * depth.get("height") * 4
     ):
         raise SiteManifestError("camera manifest depth identity is invalid")
+    source_artifacts = manifest.get("source_artifacts")
+    if not isinstance(source_artifacts, dict):
+        raise SiteManifestError("camera manifest retained source artifacts are missing")
+    for key, expected_hash in (
+        ("annotations", manifest["annotation_sha256"]),
+        ("real_frame", manifest["source_frame_sha256"]),
+        ("twin_frame", manifest["twin_frame_sha256"]),
+        ("cameras_file", manifest["cameras_file_sha256"]),
+        ("intrinsics_artifact", calibration["artifact_sha256"]),
+    ):
+        _retained_identity(
+            source_artifacts.get(key),
+            f"camera manifest {key}",
+            expected_sha256=expected_hash,
+        )
+    source_image_identities = source_artifacts.get("intrinsics_source_images")
+    if (
+        not isinstance(source_image_identities, list)
+        or len(source_image_identities) != image_count
+    ):
+        raise SiteManifestError("camera manifest intrinsics source artifacts are incomplete")
+    verified_source_hashes = [
+        _retained_identity(item, f"intrinsics source image {index}")["sha256"]
+        for index, item in enumerate(source_image_identities)
+    ]
+    if (
+        len(set(verified_source_hashes)) != len(verified_source_hashes)
+        or set(verified_source_hashes) != set(source_hashes)
+    ):
+        raise SiteManifestError("camera manifest intrinsics source artifacts mismatch")
+    _retained_identity(
+        {
+            "path": depth.get("path"),
+            "sha256": depth.get("raw_data_sha256"),
+            "size_bytes": depth.get("raw_data_size"),
+        },
+        "camera manifest depth frame",
+        expected_sha256=depth["raw_data_sha256"],
+        expected_size=depth["raw_data_size"],
+    )
     features = manifest.get("features")
     if not isinstance(features, list):
         raise SiteManifestError("camera manifest feature contract is invalid")
@@ -256,6 +324,13 @@ def _builder_contract(manifest):
                 or not isinstance(feature.get("depth_neighborhood"), dict)
             ):
                 raise SiteManifestError("camera point lacks depth evidence")
+            survey_identity = _retained_identity(
+                feature.get("survey_record"),
+                f"{feature_id} survey record",
+                expected_sha256=feature.get("survey_record_sha256"),
+            )
+            if feature.get("survey_record_path") != survey_identity["path"]:
+                raise SiteManifestError("camera point survey record path mismatches")
         else:
             counts[f"{split}_polylines"] += 1
             worlds = feature.get("world")
@@ -335,6 +410,11 @@ def aggregate_site_manifests(registry_path, manifest_paths):
             if isinstance(entry, dict)
             else None
         )
+        survey_record_path = (
+            entry.get("survey_record_path")
+            if isinstance(entry, dict)
+            else None
+        )
         if (
             not isinstance(landmark_id, str)
             or not landmark_id
@@ -342,12 +422,25 @@ def aggregate_site_manifests(registry_path, manifest_paths):
             or landmark_id in landmark_index
             or split not in SPLITS
             or not _valid_sha256(survey_record_sha256)
+            or not isinstance(survey_record_path, str)
+            or not survey_record_path
         ):
             raise SiteManifestError("site landmark registry entry is malformed")
+        survey_record = _retained_identity(
+            {
+                "path": survey_record_path,
+                "sha256": survey_record_sha256,
+                "size_bytes": entry.get("survey_record_size_bytes"),
+            },
+            f"registry {landmark_id} survey record",
+            expected_sha256=survey_record_sha256,
+        )
         landmark_index[landmark_id] = {
             "split": split,
             "surveyed_world": _world(entry.get("surveyed_world"), landmark_id),
             "survey_record_sha256": survey_record_sha256,
+            "survey_record_path": survey_record["path"],
+            "survey_record_size_bytes": survey_record["size_bytes"],
         }
     ordered_landmarks = sorted(landmark_index.items())
     for index, (left_id, left) in enumerate(ordered_landmarks):
@@ -404,6 +497,7 @@ def aggregate_site_manifests(registry_path, manifest_paths):
             landmark_id = feature.get("global_landmark_id")
             split = feature.get("split")
             survey_record_sha256 = feature.get("survey_record_sha256")
+            survey_record_path = feature.get("survey_record_path")
             if (
                 not isinstance(landmark_id, str)
                 or not landmark_id
@@ -412,6 +506,7 @@ def aggregate_site_manifests(registry_path, manifest_paths):
                 or landmark_id not in landmark_index
                 or split not in SPLITS
                 or not _valid_sha256(survey_record_sha256)
+                or not isinstance(survey_record_path, str)
             ):
                 raise SiteManifestError("camera point landmark identity is malformed")
             seen_camera_landmarks.add(landmark_id)
@@ -423,6 +518,7 @@ def aggregate_site_manifests(registry_path, manifest_paths):
             if (
                 split != canonical["split"]
                 or survey_record_sha256 != canonical["survey_record_sha256"]
+                or survey_record_path != canonical["survey_record_path"]
                 or math.dist(surveyed_world, canonical["surveyed_world"])
                 > WORLD_IDENTITY_TOLERANCE_M
             ):
@@ -468,6 +564,40 @@ def aggregate_site_manifests(registry_path, manifest_paths):
     if unused:
         raise SiteManifestError("registry contains landmarks absent from all manifests")
 
+    shared_landmarks = {
+        landmark_id: sorted(set(cameras))
+        for landmark_id, cameras in occurrences.items()
+        if len(set(cameras)) >= 2
+    }
+    shared_by_camera = {camera: set() for camera in CAMERAS}
+    camera_graph = {camera: set() for camera in CAMERAS}
+    cross_camera_edges = set()
+    for landmark_id, cameras in shared_landmarks.items():
+        for camera in cameras:
+            shared_by_camera[camera].add(landmark_id)
+        for index, left in enumerate(cameras):
+            for right in cameras[index + 1:]:
+                edge = tuple(sorted((left, right)))
+                cross_camera_edges.add(edge)
+                camera_graph[left].add(right)
+                camera_graph[right].add(left)
+    if not shared_landmarks or any(not values for values in shared_by_camera.values()):
+        raise SiteManifestError(
+            "every camera must participate in genuine shared survey landmarks"
+        )
+    connected = set()
+    frontier = {next(iter(CAMERAS))}
+    while frontier:
+        camera = frontier.pop()
+        if camera in connected:
+            continue
+        connected.add(camera)
+        frontier.update(camera_graph[camera] - connected)
+    if connected != set(CAMERAS):
+        raise SiteManifestError("shared survey landmarks form disconnected camera islands")
+    for camera_id in CAMERAS:
+        manifests[camera_id]["shared_landmarks"] = len(shared_by_camera[camera_id])
+
     return {
         "schema": "v2x-site-calibration-aggregation/v1",
         "gate_passed": True,
@@ -488,6 +618,12 @@ def aggregate_site_manifests(registry_path, manifest_paths):
                 "survey_record_sha256": landmark_index[landmark_id][
                     "survey_record_sha256"
                 ],
+                "survey_record_path": landmark_index[landmark_id][
+                    "survey_record_path"
+                ],
+                "survey_record_size_bytes": landmark_index[landmark_id][
+                    "survey_record_size_bytes"
+                ],
                 "resolved_world": list(resolved_worlds[landmark_id]),
                 "cameras": sorted(cameras),
             }
@@ -502,6 +638,15 @@ def aggregate_site_manifests(registry_path, manifest_paths):
             ),
             "one_map_opendrive_fingerprint": True,
             "complete_builder_contracts": True,
+            "shared_landmark_count": len(shared_landmarks),
+            "shared_landmarks_per_camera": {
+                camera: len(shared_by_camera[camera])
+                for camera in sorted(CAMERAS)
+            },
+            "cross_camera_edge_count": len(cross_camera_edges),
+            "cross_camera_edges": [list(edge) for edge in sorted(cross_camera_edges)],
+            "connected_camera_count": len(connected),
+            "shared_landmark_graph_connected": True,
             "renamed_near_duplicates_rejected_below_m": (
                 MIN_DISTINCT_LANDMARK_SEPARATION_M
             ),

@@ -581,6 +581,16 @@ class _StrictProjectionMap:
             "usable OpenDRIVE georeference",
         ),
         (
+            "duplicate",
+            "<OpenDRIVE><header>"
+            "<geoReference>+proj=tmerc +lat_0=37.9 +lon_0=-122.3 "
+            "+datum=WGS84 +units=m</geoReference>"
+            "<geoReference>+proj=tmerc +lat_0=0 +lon_0=0 "
+            "+datum=WGS84 +units=m</geoReference>"
+            "</header></OpenDRIVE>",
+            "usable OpenDRIVE georeference",
+        ),
+        (
             "wrong-map",
             "<OpenDRIVE><header><geoReference><![CDATA["
             "+proj=tmerc +lat_0=0 +lon_0=0 +k=1 +x_0=0 +y_0=0 "

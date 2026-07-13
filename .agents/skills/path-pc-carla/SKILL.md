@@ -1183,6 +1183,15 @@ section:
   actual complete UE5.5 Richmond source map/dependency graph (or an authorized,
   independently surveyed complete road-marking replacement), a fingerprinted
   full cook, and fresh untouched holdouts before production calibration.
+- The shared projection chain itself is accurate to about 0.015 mm at the
+  retained anchor, but one global SE(2) fails approach-held-out stability and
+  cannot repair topology. The diagnostic map exporter currently overwrites
+  per-waypoint marking metadata, retaining only the final left/right marking
+  for a lane, and uses unstable enumeration-only crosswalk IDs. Correction work
+  must preserve segmented OpenDRIVE `roadMark` s/t ranges under stable
+  road/lane/range identities and stable road/object crosswalk IDs. QL2 vertical
+  RMSE/P95 of about 0.044/0.087 m has no horizontal residual or current-paint
+  truth and is not an alignment acceptance gate.
 - A joint-rig diagnostic that forbids independent per-camera translation is at
   `/home/path/V2XCarla/v2x-evidence/calibration/20260712T121500Z-joint-visual-selfcal-v1/`.
   The 19 visual parameters are full-rank with condition about 1.5e3, but five
@@ -1200,13 +1209,18 @@ section:
   `68e889cf8d2ab17cc2005c5e7364fd64608723b819df747c102d95a53757e3e0`,
   and `Richmond.xodr` has SHA-256
   `ed2e44492616901fbb20b89191ab03d666c0217620d0247e55235c116f5cf2b1`,
-  byte-identical to the CARLA 0.10 cached/tracked Richmond OpenDRIVE. GeoJSON,
-  RoadRunner metadata, and materials are present. Source availability and
-  dedicated V2X capacity are therefore resolved, but independent survey,
-  measured intrinsics, static calibration, full dependency validation, cook,
-  and untouched holdouts remain open. The production image is cooked-only. The only local comparison
-  workspace with UE5.5 source belongs to the separate UE6 comparison task and
-  is ineligible for V2X. Do not delete, inspect, or reuse it. A dedicated clean
+  with 222 roads/29 junctions. It is byte-identical only to the older local
+  CARLA cache, not to the deployed UE5.5 OpenDRIVE. Live evidence reports
+  SHA-256 `0737f3d9f9f344c06b2c63fe669afa8a15f814568ee9c16046795338f56f5ee1`
+  with 208 roads/32 junctions; the exact retained comparison is
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260712T104500Z-opendrive-source-audit/compare-old-richmond.json`.
+  GeoJSON, RoadRunner metadata, and materials are present. A source candidate
+  and dedicated V2X capacity are therefore available, but OpenDRIVE lineage,
+  independent survey, measured intrinsics, static calibration, full dependency
+  validation, cook, and untouched holdouts remain open. The production image
+  is cooked-only. The only local comparison workspace with UE5.5 source belongs
+  to the separate UE6 comparison task and is ineligible for V2X. Do not delete,
+  inspect, or reuse it. A dedicated clean
   V2X UE5.5 migration workspace now exists at `/mnt/v2x-ue5` on a 500 GB
   loop-backed ext4 image stored as the single removable file
   `/mnt/v2x-capacity/v2x-ue5-build.ext4` on the secondary Windows volume. The
@@ -1728,6 +1742,14 @@ within 5 ms, keep decode ISO/epoch and latency within 5 ms, ingest within five
 integer seconds, expire exactly seven days from media time, and carry an event
 ID with no leading/trailing whitespace:
 
+Run the row-content verifier while the target rows are still within that
+seven-day lifetime. Its TTL gate is the exact producer delta
+`expires_at - int(media_timestamp) == 604800`; it intentionally does not compare
+expiry with verifier wall time, because API/read latency and DynamoDB's
+asynchronous post-expiry purge are not producer-schema failures. A later long
+watch validates purge/availability behavior separately and must not require an
+already purged item to remain readable.
+
 ```bash
 /home/path/V2XCarla/perception-venv/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_detection_persistence.py \
@@ -1765,6 +1787,13 @@ registry with `aggregate_twin_calibration_manifests.py` before any joint fit.
 Require one canonical landmark ID to retain one split and surveyed world
 identity across every camera; reject renamed near-duplicates and keep the
 aggregation `acceptance_eligible=false` until every independent gate passes.
+Every camera must participate in at least one genuinely shared survey identity,
+and shared identities must connect all four cameras rather than form isolated
+pairs. The report must state shared-landmark counts per camera and graph edges.
+Hash strings alone are not evidence: aggregation and optimization must each
+re-open and SHA-256-check the exact annotation, real/twin frames, cameras file,
+intrinsics artifact and source images, raw depth buffer, and external survey
+records from canonical retained paths.
 For RR/CARLA 0.10 live acceptance, the shared transform must report strict
 `opendrive_georeference` provenance; `origin_centered_fallback` is never an
 accepted live projection.
@@ -1844,6 +1873,12 @@ spawns a depth sensor. Quantify the full measured physical
 model against the deployed UE5 centered-pinhole render over the image; an
 optical mismatch above 0.25 px keeps deployment closed until a shared render
 distortion or physical-feed undistortion path is implemented and verified.
+The live repeated K (`fx=fy=1325.4`, `cx=1280`, `cy=960`) remains assumed, and
+perception currently consumes missing/zero distortion. The acquisition tool
+does not yet bind camera channel/device, exact board SVG and physical
+measurement/photo, capture timestamp, encoder/crop/focus/zoom state, or
+before/after mount stability. Add and test those fail-closed bindings and wire
+measured distortion consumption before calling any physical intrinsics measured.
 
 Generate a dimensioned board with the tracked acquisition tool, print it at
 100% scale, and verify one square with a physical ruler before capture:

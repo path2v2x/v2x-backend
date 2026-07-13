@@ -60,3 +60,51 @@ def test_extracts_cdata_and_rejects_wrong_projection():
         TransverseMercator.from_proj_string(
             "+proj=utm +zone=10 +datum=WGS84 +units=m"
         )
+
+
+@pytest.mark.parametrize(
+    "opendrive",
+    [
+        "<OpenDRIVE><header/></OpenDRIVE>",
+        "<OpenDRIVE><header><geoReference>   </geoReference></header></OpenDRIVE>",
+        "<OpenDRIVE><header><geoReference>\n\t</geoReference></header></OpenDRIVE>",
+    ],
+)
+def test_rejects_missing_or_whitespace_only_georeference(opendrive):
+    with pytest.raises(GeodesyError, match="georeference"):
+        extract_opendrive_georeference(opendrive)
+
+
+@pytest.mark.parametrize(
+    "right",
+    [GEOREFERENCE, "+proj=tmerc +lat_0=0 +lon_0=0 +datum=WGS84 +units=m"],
+)
+def test_rejects_duplicate_or_conflicting_georeferences(right):
+    opendrive = (
+        "<OpenDRIVE><header><geoReference>"
+        + GEOREFERENCE
+        + "</geoReference><geoReference>"
+        + right
+        + "</geoReference></header></OpenDRIVE>"
+    )
+    with pytest.raises(GeodesyError, match="exactly one"):
+        extract_opendrive_georeference(opendrive)
+
+
+def test_accepts_namespaced_single_georeference_with_surrounding_xml_whitespace():
+    opendrive = (
+        '<OpenDRIVE xmlns="urn:asam:opendrive"><header><geoReference>\n  '
+        + GEOREFERENCE
+        + "\n</geoReference></header></OpenDRIVE>"
+    )
+    assert extract_opendrive_georeference(opendrive) == GEOREFERENCE
+
+
+def test_rejects_malformed_xml_and_nested_georeference_markup():
+    with pytest.raises(GeodesyError, match="malformed"):
+        extract_opendrive_georeference("<OpenDRIVE><header>")
+    with pytest.raises(GeodesyError, match="nested markup"):
+        extract_opendrive_georeference(
+            "<OpenDRIVE><header><geoReference><value>bad</value>"
+            "</geoReference></header></OpenDRIVE>"
+        )

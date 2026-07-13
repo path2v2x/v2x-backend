@@ -16,11 +16,13 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import build_twin_calibration_manifest as manifest_builder  # noqa: E402
 from build_twin_calibration_manifest import (  # noqa: E402
+    bind_survey_record_artifacts,
     build_deployment_model,
     decoded_image_size,
     depth_neighborhood_evidence,
     stable_depth_meters,
     resolve_manifest,
+    retained_artifact_identity,
     validate_intrinsics_artifact,
     validate_intrinsics_calibration,
     validate_intrinsics_source_images,
@@ -52,6 +54,7 @@ def annotation_payload():
             "survey_record_sha256": hashlib.sha256(
                 f"survey-record-{index}".encode()
             ).hexdigest(),
+            "survey_record_path": f"/retained/survey-record-{index}.json",
             "split": "train" if index < 8 else "holdout",
             "provenance": "manually_verified_unique",
             "category": "signal_corner",
@@ -99,6 +102,40 @@ def test_accepts_complete_frozen_manual_evidence():
     assert sum(item["type"] == "point" for item in features) == 12
     assert sum(item["type"] == "polyline" for item in features) == 5
     assert sum(item["split"] == "holdout" for item in features) == 6
+
+
+def test_survey_records_are_real_files_not_unverified_hash_strings(tmp_path):
+    payload = annotation_payload()
+    for index, point in enumerate(payload["points"]):
+        path = tmp_path / f"survey-{index}.json"
+        raw = f"survey-record-{index}".encode()
+        path.write_bytes(raw)
+        point["survey_record_path"] = str(path.resolve())
+        point["survey_record_sha256"] = hashlib.sha256(raw).hexdigest()
+    features = validate_annotations(
+        payload, "ch1", (2560, 1920), (1280, 960)
+    )
+    bound = bind_survey_record_artifacts(features)
+    assert all(
+        feature.get("type") != "point"
+        or feature["survey_record"]["path"] == feature["survey_record_path"]
+        for feature in bound
+    )
+    Path(bound[0]["survey_record_path"]).unlink()
+    with pytest.raises(ValueError, match="missing or unreadable"):
+        bind_survey_record_artifacts(features)
+
+
+def test_retained_artifact_identity_rejects_nonexistent_and_tampered_hash(tmp_path):
+    missing = tmp_path / "missing.json"
+    with pytest.raises(ValueError, match="missing or unreadable"):
+        retained_artifact_identity(missing, "test")
+    retained = tmp_path / "retained.json"
+    retained.write_bytes(b"real-evidence")
+    with pytest.raises(ValueError, match="hash does not match"):
+        retained_artifact_identity(
+            retained, "test", expected_sha256="0" * 64
+        )
 
 
 @pytest.mark.parametrize("kind", ["payload", "point", "road"])
@@ -274,6 +311,8 @@ def test_resolve_manifest_rejects_wrong_depth_resolution_before_backprojection()
             real_frame_sha256="a" * 64, twin_frame_sha256="b" * 64,
             annotation_sha256="c" * 64, cameras_file_sha256="d" * 64,
             camera_config_sha256="e" * 64, depth_raw_sha256="f" * 64,
+            depth_frame_artifact={"path": "/retained/depth.bgra"},
+            source_artifacts={},
             projection_provenance=strict_projection(),
             ue5_map="Carla/Maps/Richmond_Field_Station_Richmond_CA",
             ue5_map_opendrive_sha256="1" * 64,
@@ -453,6 +492,12 @@ def test_resolved_holdouts_reject_proximity_to_train_in_every_space(
         "global_landmark_id": "rfs-train-point",
         "surveyed_world": [0.0, 0.0, 0.0],
         "survey_record_sha256": "a" * 64,
+        "survey_record_path": "/retained/train-survey.json",
+        "survey_record": {
+            "path": "/retained/train-survey.json",
+            "sha256": "a" * 64,
+            "size_bytes": 1,
+        },
         "type": "point",
         "split": "train",
         "image": [100.0, 100.0],
@@ -464,6 +509,12 @@ def test_resolved_holdouts_reject_proximity_to_train_in_every_space(
         "global_landmark_id": "rfs-holdout-point",
         "surveyed_world": [10.0, 10.0, 10.0],
         "survey_record_sha256": "b" * 64,
+        "survey_record_path": "/retained/holdout-survey.json",
+        "survey_record": {
+            "path": "/retained/holdout-survey.json",
+            "sha256": "b" * 64,
+            "size_bytes": 1,
+        },
         "type": "point",
         "split": "holdout",
         "image": [500.0, 500.0],
@@ -485,6 +536,12 @@ def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
             "global_landmark_id": "rfs-train-point",
             "surveyed_world": [0.0, 0.0, 0.0],
             "survey_record_sha256": "a" * 64,
+            "survey_record_path": "/retained/train-survey.json",
+            "survey_record": {
+                "path": "/retained/train-survey.json",
+                "sha256": "a" * 64,
+                "size_bytes": 1,
+            },
             "type": "point",
             "split": "train",
             "provenance": "manually_verified_unique",
@@ -498,6 +555,12 @@ def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
             "global_landmark_id": "rfs-holdout-point",
             "surveyed_world": [10.0, 10.0, 10.0],
             "survey_record_sha256": "b" * 64,
+            "survey_record_path": "/retained/holdout-survey.json",
+            "survey_record": {
+                "path": "/retained/holdout-survey.json",
+                "sha256": "b" * 64,
+                "size_bytes": 1,
+            },
             "type": "point",
             "split": "holdout",
             "provenance": "manually_verified_unique",
@@ -530,6 +593,8 @@ def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
             cameras_file_sha256="d" * 64,
             camera_config_sha256="e" * 64,
             depth_raw_sha256="f" * 64,
+            depth_frame_artifact={"path": "/retained/depth.bgra"},
+            source_artifacts={},
             projection_provenance=strict_projection(),
             ue5_map="Carla/Maps/Richmond_Field_Station_Richmond_CA",
             ue5_map_opendrive_sha256="1" * 64,

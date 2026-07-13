@@ -320,6 +320,8 @@ def manifest_gate(manifest):
         value = str(manifest.get(field) or "")
         if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
             reasons.append(f"missing_{field}")
+    if not isinstance(manifest.get("source_artifacts"), dict):
+        reasons.append("missing_retained_source_artifacts")
     if not str(manifest.get("ue5_map") or "").lower().endswith(
         "richmond_field_station_richmond_ca"
     ):
@@ -421,6 +423,8 @@ def manifest_gate(manifest):
             or isinstance(raw_size, bool)
             or not isinstance(raw_size, int)
             or raw_size != depth_width * depth_height * 4
+            or not isinstance(depth.get("path"), str)
+            or not depth.get("path")
         ):
             reasons.append("invalid_depth_frame_identity")
     features = manifest.get("features") or []
@@ -451,6 +455,8 @@ def manifest_gate(manifest):
         landmark_id = feature.get("global_landmark_id")
         surveyed_world = feature.get("surveyed_world")
         survey_record_sha256 = feature.get("survey_record_sha256")
+        survey_record_path = feature.get("survey_record_path")
+        survey_record = feature.get("survey_record")
         if (
             not isinstance(landmark_id, str)
             or not landmark_id
@@ -469,6 +475,9 @@ def manifest_gate(manifest):
                 character not in "0123456789abcdef"
                 for character in survey_record_sha256
             )
+            or not isinstance(survey_record_path, str)
+            or not survey_record_path
+            or not isinstance(survey_record, dict)
         ):
             reasons.append("unbound_global_landmark_identity")
             break
@@ -538,6 +547,92 @@ def manifest_gate(manifest):
     }
 
 
+def verify_retained_artifact_paths(manifest):
+    """Independently re-read every filesystem artifact bound by the manifest."""
+    reasons = []
+
+    def verify(identity, label, expected_sha256=None, expected_size=None):
+        if not isinstance(identity, dict):
+            reasons.append(f"retained_artifact_identity_missing:{label}")
+            return None
+        path_value = identity.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            reasons.append(f"retained_artifact_path_invalid:{label}")
+            return None
+        try:
+            path = Path(path_value).expanduser().resolve(strict=True)
+            if not path.is_file() or str(path) != path_value:
+                raise OSError("not a canonical regular file")
+            payload = path.read_bytes()
+        except OSError:
+            reasons.append(f"retained_artifact_missing:{label}")
+            return None
+        actual_hash = hashlib.sha256(payload).hexdigest()
+        if (
+            identity.get("sha256") != actual_hash
+            or identity.get("size_bytes") != len(payload)
+            or (expected_sha256 is not None and actual_hash != expected_sha256)
+            or (expected_size is not None and len(payload) != expected_size)
+        ):
+            reasons.append(f"retained_artifact_identity_mismatch:{label}")
+            return None
+        return str(path)
+
+    sources = manifest.get("source_artifacts")
+    calibration = manifest.get("intrinsics_calibration") or {}
+    if not isinstance(sources, dict):
+        reasons.append("retained_source_artifacts_missing")
+        sources = {}
+    for key, expected_hash in (
+        ("annotations", manifest.get("annotation_sha256")),
+        ("real_frame", manifest.get("source_frame_sha256")),
+        ("twin_frame", manifest.get("twin_frame_sha256")),
+        ("cameras_file", manifest.get("cameras_file_sha256")),
+        ("intrinsics_artifact", calibration.get("artifact_sha256")),
+    ):
+        verify(sources.get(key), key, expected_sha256=expected_hash)
+    source_images = sources.get("intrinsics_source_images")
+    expected_source_hashes = calibration.get("source_images_sha256") or []
+    if not isinstance(source_images, list) or len(source_images) != len(
+        expected_source_hashes
+    ):
+        reasons.append("retained_intrinsics_source_artifacts_incomplete")
+    else:
+        verified_hashes = []
+        for index, identity in enumerate(source_images):
+            if verify(identity, f"intrinsics_source_image:{index}") is not None:
+                verified_hashes.append(identity["sha256"])
+        if (
+            len(verified_hashes) != len(expected_source_hashes)
+            or len(set(verified_hashes)) != len(verified_hashes)
+            or set(verified_hashes) != set(expected_source_hashes)
+        ):
+            reasons.append("retained_intrinsics_source_artifacts_mismatch")
+    depth = manifest.get("depth_frame") or {}
+    verify(
+        {
+            "path": depth.get("path"),
+            "sha256": depth.get("raw_data_sha256"),
+            "size_bytes": depth.get("raw_data_size"),
+        },
+        "depth_frame",
+        expected_sha256=depth.get("raw_data_sha256"),
+        expected_size=depth.get("raw_data_size"),
+    )
+    for feature in manifest.get("features") or []:
+        if isinstance(feature, dict) and feature.get("type") == "point":
+            path = verify(
+                feature.get("survey_record"),
+                f"survey_record:{feature.get('id')}",
+                expected_sha256=feature.get("survey_record_sha256"),
+            )
+            if path is not None and feature.get("survey_record_path") != path:
+                reasons.append(
+                    f"retained_survey_record_path_mismatch:{feature.get('id')}"
+                )
+    return {"passed": not reasons, "reasons": reasons}
+
+
 def verify_external_evidence(
     manifest,
     *,
@@ -549,9 +644,62 @@ def verify_external_evidence(
     intrinsics_source_image_bytes,
     depth_frame_bytes,
     runtime_evidence,
+    external_evidence_paths=None,
 ):
     """Re-bind a mutable optimizer manifest to every retained source artifact."""
     reasons = []
+    retained = verify_retained_artifact_paths(manifest)
+    if not retained["passed"]:
+        reasons.extend(retained["reasons"])
+    sources = manifest.get("source_artifacts") or {}
+    depth_identity = manifest.get("depth_frame") or {}
+    if not isinstance(external_evidence_paths, dict):
+        reasons.append("external_evidence_paths_missing")
+    else:
+        path_bindings = (
+            ("annotations", "annotations"),
+            ("real_frame", "real_frame"),
+            ("twin_frame", "twin_frame"),
+            ("cameras_file", "cameras_file"),
+            ("intrinsics_artifact", "intrinsics_artifact"),
+        )
+        for cli_key, source_key in path_bindings:
+            try:
+                actual_path = str(
+                    Path(external_evidence_paths[cli_key])
+                    .expanduser()
+                    .resolve(strict=True)
+                )
+            except (KeyError, OSError, TypeError):
+                actual_path = None
+            if actual_path != (sources.get(source_key) or {}).get("path"):
+                reasons.append(f"external_evidence_path_mismatch:{cli_key}")
+        try:
+            actual_depth_path = str(
+                Path(external_evidence_paths["depth_frame"])
+                .expanduser()
+                .resolve(strict=True)
+            )
+        except (KeyError, OSError, TypeError):
+            actual_depth_path = None
+        if actual_depth_path != depth_identity.get("path"):
+            reasons.append("external_evidence_path_mismatch:depth_frame")
+        try:
+            source_paths = {
+                str(Path(path).expanduser().resolve(strict=True))
+                for path in external_evidence_paths["intrinsics_source_images"]
+            }
+        except (KeyError, OSError, TypeError):
+            source_paths = set()
+        expected_paths = {
+            identity.get("path")
+            for identity in sources.get("intrinsics_source_images") or []
+            if isinstance(identity, dict)
+        }
+        if source_paths != expected_paths or len(source_paths) != len(
+            sources.get("intrinsics_source_images") or []
+        ):
+            reasons.append("external_evidence_path_mismatch:intrinsics_source_images")
     bindings = (
         ("annotation_sha256", annotations_bytes),
         ("source_frame_sha256", real_frame_bytes),
@@ -561,7 +709,6 @@ def verify_external_evidence(
     for field, payload in bindings:
         if hashlib.sha256(payload).hexdigest() != manifest.get(field):
             reasons.append(f"{field}_mismatch")
-    depth_identity = manifest.get("depth_frame") or {}
     if hashlib.sha256(depth_frame_bytes).hexdigest() != depth_identity.get(
         "raw_data_sha256"
     ):
@@ -669,6 +816,7 @@ def verify_external_evidence(
                     float(value) for value in feature["surveyed_world"]
                 ],
                 "survey_record_sha256": feature["survey_record_sha256"],
+                "survey_record_path": feature["survey_record_path"],
                 "type": "point",
                 "split": feature["split"],
                 "provenance": feature["provenance"],
@@ -699,7 +847,8 @@ def verify_external_evidence(
             keys = (
                 (
                     "id", "global_landmark_id", "surveyed_world",
-                    "survey_record_sha256", "type", "split", "provenance",
+                    "survey_record_sha256", "survey_record_path", "type",
+                    "split", "provenance",
                     "category", "description", "twin", "image",
                 )
                 if feature.get("type") == "point"
@@ -937,6 +1086,9 @@ def evaluate_split(manifest, params, split):
 def verify_site_aggregation_report(manifest, manifest_bytes, report_bytes):
     """Recompute the four-camera registry report and bind this exact manifest."""
     reasons = []
+    retained = verify_retained_artifact_paths(manifest)
+    if not retained["passed"]:
+        reasons.extend(retained["reasons"])
     try:
         parsed_manifest = json.loads(manifest_bytes)
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
@@ -992,6 +1144,7 @@ def verify_site_aggregation_report(manifest, manifest_bytes, report_bytes):
         "reasons": reasons,
         "report_sha256": report_sha256,
         "manifest_sha256": manifest_sha256,
+        "retained_artifacts": retained,
     }
 
 
@@ -1228,6 +1381,15 @@ def main():
         ],
         depth_frame_bytes=depth_frame_bytes,
         runtime_evidence=runtime_evidence,
+        external_evidence_paths={
+            "annotations": args.annotations,
+            "real_frame": args.real_frame,
+            "twin_frame": args.twin_frame,
+            "cameras_file": args.cameras_json,
+            "intrinsics_artifact": args.intrinsics_artifact,
+            "intrinsics_source_images": args.intrinsics_source_image,
+            "depth_frame": args.depth_frame,
+        },
     )
     if external_evidence["passed"]:
         report = optimize_manifest(

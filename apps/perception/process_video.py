@@ -51,6 +51,7 @@ from v2x_common.geodesy import local_xz_to_geodetic  # noqa: E402
 
 
 TIMESTAMP_SCHEMA_VERSION = 2
+DETECTION_TTL_SECONDS = 7 * 24 * 60 * 60
 _INFERENCE_SHUTDOWN_POLL_SECONDS = 0.05
 _COOPERATIVE_SHUTDOWN_MARGIN_SECONDS = 2.0
 _COOPERATIVE_SHUTDOWN_CEILING_SECONDS = 45.0
@@ -485,7 +486,9 @@ def attach_media_clock_metadata(
         record["media_timestamp_utc"] = media_timestamp
         record["media_clock"] = dict(assessment["media_clock"])
         record["decode_latency_ms"] = assessment["decode_latency_ms"]
-        record["expires_at"] = int(assessment["media_epoch"]) + 86400
+        record["expires_at"] = (
+            int(assessment["media_epoch"]) + DETECTION_TTL_SECONDS
+        )
         event_id = record.get("event_id")
         if event_id:
             record["ts_event"] = f"{media_timestamp}#{event_id}"
@@ -3066,7 +3069,7 @@ class VideoObjectDetector:
                           f"dist={world['distance']:.1f}m"),
                 "device_id": self.device_id,
                 "ts_event": f"{now_utc}#{event_id}",
-                "expires_at": epoch_now + 86400,   # expire in 24 h
+                "expires_at": epoch_now + DETECTION_TTL_SECONDS,
                 "ingested_at_epoch": epoch_now,
                 "track_id": det.get('track_id')
             }

@@ -24,6 +24,7 @@ from process_video import (  # noqa: E402
     _BOUNDED_DIAGNOSTIC_THREAD_LIMIT,
     _COOPERATIVE_SHUTDOWN_CEILING_SECONDS,
     _COOPERATIVE_SHUTDOWN_MARGIN_SECONDS,
+    DETECTION_TTL_SECONDS,
     _OUTER_SHUTDOWN_RESERVE_SECONDS,
     _emit_bounded_shutdown_diagnostics,
     _live_pipeline_shutdown_timeout_seconds,
@@ -711,6 +712,10 @@ class MediaClockPersistenceTests(unittest.TestCase):
             record["ts_event"], "2026-07-10T03:57:23.388Z#event-1"
         )
         self.assertEqual(record["media_clock_status"], "matched")
+        self.assertEqual(
+            record["expires_at"],
+            1_783_655_843 + DETECTION_TTL_SECONDS,
+        )
         self.assertEqual(
             record["media_clock"]["anchor_match_frame_count"], 3
         )

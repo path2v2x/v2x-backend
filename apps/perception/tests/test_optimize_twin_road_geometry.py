@@ -1,5 +1,6 @@
 """Synthetic recovery and fail-closed tests for the road-geometry optimizer."""
 
+import copy
 import hashlib
 import importlib.util
 from io import BytesIO
@@ -32,8 +33,74 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             )
 
     @staticmethod
+    def materialize_manifest_artifacts(manifest, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+
+        def artifact(name, payload):
+            path = (directory / name).resolve()
+            path.write_bytes(payload)
+            return {
+                "path": str(path),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+
+        annotations = artifact("annotations.json", b"annotations")
+        real_frame = artifact("real-frame.jpg", b"frame")
+        twin_frame = artifact("twin-frame.jpg", b"twin")
+        cameras = artifact("cameras.json", b"cameras")
+        intrinsics = artifact("intrinsics.json", b"intrinsics")
+        source_images = [
+            artifact(f"intrinsics-{index}.png", payload)
+            for index, payload in enumerate(
+                RoadGeometryOptimizerTests.intrinsics_source_images()
+            )
+        ]
+        depth_payload = b"\0" * manifest["depth_frame"]["raw_data_size"]
+        depth = artifact("depth.bgra", depth_payload)
+        manifest.update({
+            "annotation_sha256": annotations["sha256"],
+            "source_frame_sha256": real_frame["sha256"],
+            "twin_frame_sha256": twin_frame["sha256"],
+            "cameras_file_sha256": cameras["sha256"],
+            "source_artifacts": {
+                "annotations": annotations,
+                "real_frame": real_frame,
+                "twin_frame": twin_frame,
+                "cameras_file": cameras,
+                "intrinsics_artifact": intrinsics,
+                "intrinsics_source_images": source_images,
+            },
+        })
+        manifest["intrinsics_calibration"]["artifact_sha256"] = intrinsics["sha256"]
+        manifest["intrinsics_calibration"]["source_images_sha256"] = [
+            item["sha256"] for item in source_images
+        ]
+        manifest["intrinsics_calibration"]["image_count"] = len(source_images)
+        manifest["depth_frame"].update({
+            "path": depth["path"],
+            "raw_data_sha256": depth["sha256"],
+            "raw_data_size": depth["size_bytes"],
+        })
+        for index, feature in enumerate(manifest["features"]):
+            if feature.get("type") != "point":
+                continue
+            survey = artifact(
+                f"survey-{index}.json", f"survey-{index}".encode()
+            )
+            feature.update({
+                "survey_record_sha256": survey["sha256"],
+                "survey_record_path": survey["path"],
+                "survey_record": survey,
+            })
+        return manifest
+
+    @staticmethod
     def site_bundle(manifest, directory):
         directory.mkdir(parents=True, exist_ok=True)
+        RoadGeometryOptimizerTests.materialize_manifest_artifacts(
+            manifest, directory / "artifacts"
+        )
         point_features = [
             feature for feature in manifest["features"]
             if feature.get("type") == "point"
@@ -48,6 +115,10 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                     "split": feature["split"],
                     "surveyed_world": feature["surveyed_world"],
                     "survey_record_sha256": feature["survey_record_sha256"],
+                    "survey_record_path": feature["survey_record_path"],
+                    "survey_record_size_bytes": feature["survey_record"][
+                        "size_bytes"
+                    ],
                 }
                 for feature in point_features
             ],
@@ -458,8 +529,38 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             self.assertFalse(report["passed"], report)
             self.assertEqual(report["reason"], "site_aggregation_gate")
 
+    def test_optimizer_independently_rehashes_retained_manifest_artifacts(self):
+        with tempfile.TemporaryDirectory() as raw:
+            manifest = self.synthetic_manifest()
+            manifest_bytes, report_bytes, _paths = self.site_bundle(
+                manifest, Path(raw)
+            )
+            annotation_path = Path(
+                manifest["source_artifacts"]["annotations"]["path"]
+            )
+            annotation_path.write_bytes(annotation_path.read_bytes() + b"tampered")
+
+            report = MODULE.optimize_manifest(
+                manifest,
+                manifest_bytes=manifest_bytes,
+                site_aggregation_report_bytes=report_bytes,
+                external_evidence_verified=True,
+            )
+
+            self.assertFalse(report["passed"], report)
+            self.assertEqual(report["reason"], "site_aggregation_gate")
+            self.assertTrue(any(
+                reason.startswith("retained_artifact_identity_mismatch:annotations")
+                for reason in report["reasons"]
+            ))
+
     def test_external_evidence_rebinds_every_retained_artifact(self):
         manifest = self.synthetic_manifest()
+        retained_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(retained_directory.cleanup)
+        self.materialize_manifest_artifacts(
+            manifest, Path(retained_directory.name)
+        )
         annotations_payload = {"points": [], "roads": []}
         for feature in manifest["features"]:
             if feature["type"] == "point":
@@ -467,7 +568,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                     key: feature[key]
                     for key in (
                         "id", "global_landmark_id", "surveyed_world",
-                        "survey_record_sha256", "split", "provenance",
+                        "survey_record_sha256", "survey_record_path",
+                        "split", "provenance",
                         "category", "description", "twin", "image",
                     )
                 })
@@ -523,6 +625,21 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             ).encode()).hexdigest(),
         })
+
+        def rewrite_source(key, payload):
+            identity = manifest["source_artifacts"][key]
+            path = Path(identity["path"])
+            path.write_bytes(payload)
+            identity.update(
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size_bytes=len(payload),
+            )
+
+        rewrite_source("annotations", annotations)
+        rewrite_source("real_frame", real_frame)
+        rewrite_source("twin_frame", twin_frame)
+        rewrite_source("cameras_file", cameras)
+        rewrite_source("intrinsics_artifact", artifact)
         kwargs = {
             "annotations_bytes": annotations,
             "real_frame_bytes": real_frame,
@@ -550,9 +667,35 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                     for feature in manifest["features"]
                 },
             },
+            "external_evidence_paths": {
+                "annotations": manifest["source_artifacts"]["annotations"]["path"],
+                "real_frame": manifest["source_artifacts"]["real_frame"]["path"],
+                "twin_frame": manifest["source_artifacts"]["twin_frame"]["path"],
+                "cameras_file": manifest["source_artifacts"]["cameras_file"]["path"],
+                "intrinsics_artifact": manifest["source_artifacts"][
+                    "intrinsics_artifact"
+                ]["path"],
+                "intrinsics_source_images": [
+                    item["path"] for item in manifest["source_artifacts"][
+                        "intrinsics_source_images"
+                    ]
+                ],
+                "depth_frame": manifest["depth_frame"]["path"],
+            },
         }
         valid_gate = MODULE.verify_external_evidence(manifest, **kwargs)
         self.assertTrue(valid_gate["passed"], valid_gate)
+        alternate_annotations = Path(retained_directory.name) / "same-bytes-new-path.json"
+        alternate_annotations.write_bytes(annotations)
+        wrong_path_kwargs = copy.deepcopy(kwargs)
+        wrong_path_kwargs["external_evidence_paths"]["annotations"] = str(
+            alternate_annotations.resolve()
+        )
+        gate = MODULE.verify_external_evidence(manifest, **wrong_path_kwargs)
+        self.assertFalse(gate["passed"])
+        self.assertIn(
+            "external_evidence_path_mismatch:annotations", gate["reasons"]
+        )
         unsafe_camera = json.loads(json.dumps(camera))
         unsafe_camera["twin_lens"] = {"lens_k": -1.0}
         unsafe_cameras = json.dumps({"cameras": [unsafe_camera]}).encode()

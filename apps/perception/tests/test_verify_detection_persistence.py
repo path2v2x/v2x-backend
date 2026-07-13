@@ -226,6 +226,20 @@ class DetectionPersistenceTests(unittest.TestCase):
                 _timestamp, row_reasons = trusted_media_time(row)
                 self.assertIn(expected_reason, row_reasons)
 
+    def test_exact_producer_ttl_is_independent_of_read_time_and_ddb_purge_lag(self):
+        # DynamoDB TTL deletion is asynchronous.  If an exactly formed row is
+        # still readable after expires_at, observation latency must not rewrite
+        # or invalidate its producer-time seven-day delta.
+        expired_but_not_yet_purged = item("ch1", NOW - timedelta(days=8))
+        timestamp, reasons = trusted_media_time(expired_but_not_yet_purged)
+        self.assertIsNotNone(timestamp)
+        self.assertEqual(reasons, [])
+        self.assertEqual(
+            expired_but_not_yet_purged["expires_at"]
+            - int(timestamp.timestamp()),
+            604_800,
+        )
+
     @patch("verify_detection_persistence._fetch_json")
     def test_duplicate_event_across_pages_never_counts(self, fetch_json):
         start = NOW - timedelta(hours=24)

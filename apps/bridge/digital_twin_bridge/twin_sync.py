@@ -483,7 +483,7 @@ class TwinSync:
     def start_replay(self, start_epoch: float, speed: float = 1.0) -> None:
         """Switch the twin to replaying recorded detections from a timestamp.
 
-        The detections DB keeps 24h (TTL), so any timestamp in that window
+        The detections DB keeps seven days (TTL), so any timestamp in that window
         replays; the rig cameras then render the past scene live.
         """
         if self._range_fetcher is None:

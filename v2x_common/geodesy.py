@@ -7,8 +7,8 @@ one projection without requiring pyproj in the CARLA 3.10 environment.
 
 from dataclasses import dataclass
 import math
-import re
 import shlex
+import xml.etree.ElementTree as ET
 
 WGS84_A = 6_378_137.0
 WGS84_F = 1.0 / 298.257223563
@@ -198,18 +198,34 @@ class TransverseMercator:
 
 
 def extract_opendrive_georeference(opendrive):
+    """Return the one authoritative, non-empty OpenDRIVE geoReference.
+
+    A first-match text search is unsafe here: a document containing a second,
+    conflicting declaration would silently select whichever element happened
+    to appear first.  Parse the complete document and require cardinality one.
+    CDATA is exposed as normal element text by ElementTree.
+    """
     if not isinstance(opendrive, str):
         raise GeodesyError("OpenDRIVE content is missing")
-    match = re.search(
-        r"<geoReference>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</geoReference>",
-        opendrive,
-        flags=re.DOTALL,
-    )
-    if match is None:
-        raise GeodesyError("OpenDRIVE georeference is missing")
-    value = match.group(1).strip()
-    if value.endswith("]]>"):
-        value = value[:-3].strip()
+    try:
+        root = ET.fromstring(opendrive)
+    except ET.ParseError as exc:
+        raise GeodesyError("OpenDRIVE document is malformed") from exc
+    declarations = [
+        element
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "geoReference"
+    ]
+    if len(declarations) != 1:
+        raise GeodesyError(
+            "OpenDRIVE must contain exactly one authoritative georeference"
+        )
+    declaration = declarations[0]
+    if list(declaration):
+        raise GeodesyError("OpenDRIVE georeference contains nested markup")
+    value = (declaration.text or "").strip()
+    if not value:
+        raise GeodesyError("OpenDRIVE georeference is empty")
     return value
 
 

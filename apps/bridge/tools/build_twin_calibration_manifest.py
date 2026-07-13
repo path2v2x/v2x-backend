@@ -55,6 +55,40 @@ def _valid_sha256(value):
     )
 
 
+def retained_artifact_identity(path, label, *, expected_sha256=None):
+    """Resolve and hash one real retained file; hash strings alone are invalid."""
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+        if not resolved.is_file():
+            raise OSError("not a regular file")
+        payload = resolved.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"{label} artifact is missing or unreadable") from exc
+    identity = {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+    if expected_sha256 is not None and identity["sha256"] != expected_sha256:
+        raise ValueError(f"{label} artifact hash does not match its declaration")
+    return identity
+
+
+def bind_survey_record_artifacts(features):
+    """Re-hash every external survey record before any UE5 connection."""
+    bound = []
+    for feature in features:
+        item = dict(feature)
+        if feature.get("type") == "point":
+            item["survey_record"] = retained_artifact_identity(
+                feature["survey_record_path"],
+                f"{feature['id']} survey record",
+                expected_sha256=feature["survey_record_sha256"],
+            )
+        bound.append(item)
+    return bound
+
+
 def validate_strict_projection_provenance(
     provenance, *, map_name, opendrive_sha256
 ):
@@ -517,6 +551,7 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
         global_landmark_ids.add(global_landmark_id)
         surveyed_world = feature.get("surveyed_world")
         survey_record_sha256 = feature.get("survey_record_sha256")
+        survey_record_path = feature.get("survey_record_path")
         if (
             not isinstance(surveyed_world, list)
             or len(surveyed_world) != 3
@@ -532,6 +567,9 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
                 character not in "0123456789abcdef"
                 for character in survey_record_sha256
             )
+            or not isinstance(survey_record_path, str)
+            or not survey_record_path
+            or survey_record_path.strip() != survey_record_path
         ):
             raise ValueError(
                 f"{identifier}: surveyed world identity is invalid or unbound"
@@ -549,6 +587,7 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
             "global_landmark_id": global_landmark_id,
             "surveyed_world": [float(value) for value in surveyed_world],
             "survey_record_sha256": survey_record_sha256,
+            "survey_record_path": survey_record_path,
             "type": "point",
             "split": split,
             "provenance": "manually_verified_unique",
@@ -633,6 +672,8 @@ def resolve_manifest(
     cameras_file_sha256,
     camera_config_sha256,
     depth_raw_sha256,
+    depth_frame_artifact,
+    source_artifacts,
     projection_provenance,
     ue5_map,
     ue5_map_opendrive_sha256,
@@ -683,6 +724,8 @@ def resolve_manifest(
             base["global_landmark_id"] = feature["global_landmark_id"]
             base["surveyed_world"] = feature["surveyed_world"]
             base["survey_record_sha256"] = feature["survey_record_sha256"]
+            base["survey_record_path"] = feature["survey_record_path"]
+            base["survey_record"] = feature["survey_record"]
             world, depth_evidence = world_at(feature["twin"])
             base.update({
                 "world": world,
@@ -712,6 +755,7 @@ def resolve_manifest(
         "annotation_sha256": annotation_sha256,
         "cameras_file_sha256": cameras_file_sha256,
         "camera_config_sha256": camera_config_sha256,
+        "source_artifacts": source_artifacts,
         "ue5_map": str(ue5_map),
         "ue5_map_opendrive_sha256": ue5_map_opendrive_sha256,
         "projection": projection,
@@ -722,6 +766,7 @@ def resolve_manifest(
             "height": int(depth_image.height),
             "raw_data_sha256": depth_raw_sha256,
             "raw_data_size": len(depth_raw),
+            "path": depth_frame_artifact["path"],
         },
         "baseline": {
             "location": [
@@ -773,10 +818,13 @@ def main():
     )
     args = parser.parse_args()
 
-    annotation_bytes = Path(args.annotations).read_bytes()
+    annotation_artifact = retained_artifact_identity(args.annotations, "annotation")
+    annotation_bytes = Path(annotation_artifact["path"]).read_bytes()
     payload = json.loads(annotation_bytes)
-    real_bytes = Path(args.real_frame).read_bytes()
-    twin_bytes = Path(args.twin_frame).read_bytes()
+    real_frame_artifact = retained_artifact_identity(args.real_frame, "real frame")
+    twin_frame_artifact = retained_artifact_identity(args.twin_frame, "twin frame")
+    real_bytes = Path(real_frame_artifact["path"]).read_bytes()
+    twin_bytes = Path(twin_frame_artifact["path"]).read_bytes()
     real_hash = hashlib.sha256(real_bytes).hexdigest()
     twin_hash = hashlib.sha256(twin_bytes).hexdigest()
     if payload.get("real_frame_sha256") != real_hash:
@@ -787,6 +835,8 @@ def main():
     cameras_path = Path(args.cameras_json) if args.cameras_json else (
         Path(__file__).resolve().parents[3] / "config" / "cameras.json"
     )
+    cameras_artifact = retained_artifact_identity(cameras_path, "cameras file")
+    cameras_path = Path(cameras_artifact["path"])
     cameras_bytes = cameras_path.read_bytes()
     cameras_hash = hashlib.sha256(cameras_bytes).hexdigest()
     if payload.get("cameras_file_sha256") != cameras_hash:
@@ -795,8 +845,17 @@ def main():
     camera = next(item for item in config["cameras"] if item["id"] == args.camera)
     # Fail before connecting to or spawning anything in UE5 if the physical
     # camera's optical model has no independent measurement evidence.
-    validate_intrinsics_artifact(camera, Path(args.intrinsics_artifact).read_bytes())
+    intrinsics_artifact = retained_artifact_identity(
+        args.intrinsics_artifact, "intrinsics calibration"
+    )
+    validate_intrinsics_artifact(
+        camera, Path(intrinsics_artifact["path"]).read_bytes()
+    )
     validate_intrinsics_source_images(camera, args.intrinsics_source_image)
+    intrinsics_source_artifacts = [
+        retained_artifact_identity(path, f"intrinsics source {index}")
+        for index, path in enumerate(args.intrinsics_source_image)
+    ]
     real_size = decoded_image_size(real_bytes, "real")
     twin_size = decoded_image_size(twin_bytes, "twin")
     expected_real_size = (
@@ -812,12 +871,42 @@ def main():
             f"twin frame dimensions {twin_size} do not match depth render "
             f"{(args.twin_width, args.twin_height)}"
         )
-    annotations = validate_annotations(
+    annotations = bind_survey_record_artifacts(validate_annotations(
         payload,
         args.camera,
         (int(camera["intrinsics"]["width"]), int(camera["intrinsics"]["height"])),
         (args.twin_width, args.twin_height),
-    )
+    ))
+
+    depth_output_path = Path(args.depth_frame_output).expanduser().resolve()
+    manifest_output_path = Path(args.output).expanduser().resolve()
+    retained_input_paths = {
+        identity["path"]
+        for identity in (
+            annotation_artifact,
+            real_frame_artifact,
+            twin_frame_artifact,
+            cameras_artifact,
+            intrinsics_artifact,
+            *intrinsics_source_artifacts,
+        )
+    }
+    if depth_output_path.exists() or manifest_output_path.exists():
+        raise SystemExit("manifest and depth outputs must not already exist")
+    if (
+        depth_output_path == manifest_output_path
+        or str(depth_output_path) in retained_input_paths
+        or str(manifest_output_path) in retained_input_paths
+    ):
+        raise SystemExit("manifest and depth outputs must be distinct from inputs")
+    source_artifacts = {
+        "annotations": annotation_artifact,
+        "real_frame": real_frame_artifact,
+        "twin_frame": twin_frame_artifact,
+        "cameras_file": cameras_artifact,
+        "intrinsics_artifact": intrinsics_artifact,
+        "intrinsics_source_images": intrinsics_source_artifacts,
+    }
 
     import carla
 
@@ -854,33 +943,49 @@ def main():
         if depth_image is None:
             raise RuntimeError("no UE5 depth frame received")
         depth_raw = bytes(depth_image.raw_data)
-        manifest = resolve_manifest(
-            annotations,
-            camera_id=args.camera,
-            camera=camera,
-            transform=transform,
-            depth_image=depth_image,
-            depth_raw=depth_raw,
-            expected_twin_size=(args.twin_width, args.twin_height),
-            real_frame_sha256=real_hash,
-            twin_frame_sha256=twin_hash,
-            annotation_sha256=hashlib.sha256(annotation_bytes).hexdigest(),
-            cameras_file_sha256=cameras_hash,
-            camera_config_sha256=hashlib.sha256(json.dumps(
-                camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-            ).encode("utf-8")).hexdigest(),
-            depth_raw_sha256=hashlib.sha256(depth_raw).hexdigest(),
-            projection_provenance=projection_provenance,
-            ue5_map=map_name,
-            ue5_map_opendrive_sha256=opendrive_sha256,
+        depth_output_path.write_bytes(depth_raw)
+        depth_frame_artifact = retained_artifact_identity(
+            depth_output_path,
+            "depth frame",
+            expected_sha256=hashlib.sha256(depth_raw).hexdigest(),
         )
-        Path(args.depth_frame_output).write_bytes(depth_raw)
+        try:
+            manifest = resolve_manifest(
+                annotations,
+                camera_id=args.camera,
+                camera=camera,
+                transform=transform,
+                depth_image=depth_image,
+                depth_raw=depth_raw,
+                expected_twin_size=(args.twin_width, args.twin_height),
+                real_frame_sha256=real_hash,
+                twin_frame_sha256=twin_hash,
+                annotation_sha256=hashlib.sha256(annotation_bytes).hexdigest(),
+                cameras_file_sha256=cameras_hash,
+                camera_config_sha256=hashlib.sha256(json.dumps(
+                    camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode("utf-8")).hexdigest(),
+                depth_raw_sha256=hashlib.sha256(depth_raw).hexdigest(),
+                depth_frame_artifact=depth_frame_artifact,
+                source_artifacts=source_artifacts,
+                projection_provenance=projection_provenance,
+                ue5_map=map_name,
+                ue5_map_opendrive_sha256=opendrive_sha256,
+            )
+        except Exception:
+            depth_output_path.unlink(missing_ok=True)
+            raise
     finally:
         try:
             actor.stop()
         finally:
             actor.destroy()
-    Path(args.output).write_text(json.dumps(manifest, indent=2) + "\n")
+    try:
+        with manifest_output_path.open("x", encoding="utf-8") as output:
+            output.write(json.dumps(manifest, indent=2) + "\n")
+    except Exception:
+        depth_output_path.unlink(missing_ok=True)
+        raise
     print(f"wrote {len(manifest['features'])} frozen features to {args.output}")
     return 0
 

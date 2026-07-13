@@ -21,6 +21,13 @@ passes.
   `acceptance_eligible=false`. The calibrated reconciliation branch is
   source-only and not deployed. Do not modify its holdouts or optimizer, relax
   a threshold, or promote a diagnostic pose.
+- Measured physical intrinsics remain absent. Live config repeats assumed
+  `fx=fy=1325.4`, `cx=1280`, `cy=960`, while perception consumes missing/zero
+  distortion. The acquisition tool does not yet bind channel/device, exact
+  board SVG plus physical measurement/photo, capture UTC, encoder/crop/focus/
+  zoom state, or before/after mount stability. Those fail-closed bindings and
+  distortion consumption are implementation/acquisition blockers; never call
+  the current K or zero coefficients measured.
 - The isolated V2X UE5 source workspace is `/mnt/v2x-ue5`. UE6 is a separate
   task and is excluded from this workflow, its evidence, and its gates.
 - The paginated persistence gate is row-complete and fail-closed: any unknown
@@ -31,6 +38,10 @@ passes.
   `exact_same_session_pts`, reconstruct media UTC within 5 ms, keep ISO and
   epoch decode receipt within 5 ms, ingest within five integer seconds, and
   expire at exactly seven days from media time.
+  Run row-content verification before the selected evidence expires. Score TTL
+  as the exact producer delta of 604800 seconds, independent of verifier/read
+  time; DynamoDB may purge later and the long watch must not require a purged
+  item to remain readable.
 
 ## Non-circular evidence contract
 
@@ -130,8 +141,13 @@ surveyed site registry with
 `apps/bridge/tools/aggregate_twin_calibration_manifests.py`. The registry and
 all four manifests must be SHA-256-recorded by the aggregation report; one
 canonical `global_landmark_id` maps to one frozen split, surveyed XYZ, and
-survey-record hash site-wide. Reuse across cameras is valid only with that
-exact identity. Different IDs below 0.25 m, cross-camera split changes,
+external survey-record path/hash/size site-wide. Every input annotation,
+real/twin frame, cameras file, intrinsics artifact/source image, depth buffer,
+and survey record must exist and be re-hashed by both aggregation and optimizer.
+Every camera must participate in shared landmark identities and those identities
+must form one connected four-camera graph; zero-sharing and disconnected camera
+islands fail. Reuse across cameras is valid only with that exact identity.
+Different IDs below 0.25 m, cross-camera split changes,
 inconsistent depth-resolved map coordinates, mixed map/OpenDRIVE fingerprints,
 incomplete builder contracts, malformed entries, missing cameras, or
 inconsistent survey identity fail closed. The aggregation remains
@@ -170,6 +186,20 @@ georeference SHA-256 in every builder manifest and runtime comparison.
   crosswalks disagreeing by tens to hundreds of pixels. Do not reinterpret this
   as a camera-pose residual: a single projective camera cannot make mutually
   inconsistent coplanar correspondences agree.
+- The shared projection chain has about 0.015 mm retained anchor error, but one
+  global SE(2) still fails approach-held-out stability and cannot cure topology.
+  The current `export_map_calibration_geometry.py` overwrites waypoint marking
+  state and keeps only the final left/right marking for a lane, while
+  enumeration-only crosswalk IDs are unstable. Require segmented OpenDRIVE
+  `roadMark` ranges with stable road/lane/s/t identities and stable road/object
+  crosswalk IDs. QL2 vertical RMSE/P95 of about 0.044/0.087 m lacks horizontal
+  residual and current-paint truth and is not a correction gate.
+- The recovered raw bundle OpenDRIVE is the older SHA-256
+  `ed2e44492616901fbb20b89191ab03d666c0217620d0247e55235c116f5cf2b1`
+  with 222 roads/29 junctions. The deployed UE5.5 map is
+  `0737f3d9f9f344c06b2c63fe669afa8a15f814568ee9c16046795338f56f5ee1`
+  with 208 roads/32 junctions. They are not byte-identical; keep map-source
+  lineage open until that topology difference is explained.
 - Runtime environment-object inspection is not a correction mechanism. The
   deployed worker exposes eight aggregate `RoadLines` objects containing the
   road-paint layer; individual crosswalks cannot be disabled, and disabling the
