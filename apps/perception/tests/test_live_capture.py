@@ -93,6 +93,34 @@ class GatedPositionCapture:
         self.released = True
 
 
+class PositionedScriptedCapture:
+    def __init__(self, frames, positions, block_after_frames=None):
+        self.frames = list(frames)
+        self.positions = list(positions)
+        self.block_after_frames = block_after_frames
+        self.current_position = None
+        self.released = False
+
+    def isOpened(self):
+        return not self.released
+
+    def read(self):
+        if self.released:
+            return False, None
+        if self.frames:
+            self.current_position = self.positions.pop(0)
+            return True, self.frames.pop(0)
+        if self.block_after_frames is not None:
+            self.block_after_frames.wait(1.0)
+        return False, None
+
+    def get(self, _property):
+        return self.current_position
+
+    def release(self):
+        self.released = True
+
+
 class ContinuousCapture:
     def __init__(self, prefix):
         self.prefix = prefix
@@ -281,6 +309,7 @@ class LiveStreamReaderTests(unittest.TestCase):
         states = []
         hold_replacement = threading.Event()
         fail_primary = threading.Event()
+        release_fragment_match = threading.Event()
 
         class ReanchorableClock(FakeMediaClock):
             def __init__(self):
@@ -295,27 +324,35 @@ class LiveStreamReaderTests(unittest.TestCase):
                     previous_position_milliseconds,
                     new_position_milliseconds,
                 ))
+                release_fragment_match.set()
                 return self
 
         exact_clock = ReanchorableClock()
 
         def capture_factory(_source):
             if not captures:
-                capture = GatedPositionCapture(
-                    ["shared-frame"], [0.0], fail_primary
+                capture = PositionedScriptedCapture(
+                    ["shared-1", "shared-2", "shared-3"],
+                    [0.0, 50.0, 100.0],
+                    block_after_frames=fail_primary,
                 )
             else:
-                capture = ScriptedCapture(
-                    ["shared-frame", "new-frame"],
+                capture = PositionedScriptedCapture(
+                    ["shared-1", "shared-2", "shared-3", "new-frame"],
+                    [0.0, 50.0, 100.0, 150.0],
                     block_after_frames=hold_replacement,
                 )
-                capture.get = lambda _property: 0.0
             captures.append(capture)
             return capture
 
         def media_clock_factory(*_args):
+            if clock_calls:
+                release_fragment_match.wait(1.0)
             clock_calls.append(_args)
             return exact_clock
+
+        def validate_clock(*_args):
+            return not fail_primary.is_set() or bool(exact_clock.reanchors)
 
         reader = LiveStreamReader(
             source_factory=lambda: "signed-session-1",
@@ -324,19 +361,21 @@ class LiveStreamReaderTests(unittest.TestCase):
             state_callback=lambda **event: states.append(event),
             media_clock_factory=media_clock_factory,
             media_clock_source_factory=lambda: "clock-session-1",
-            media_clock_validator=lambda *_args: True,
+            media_clock_validator=validate_clock,
             capture_position_milliseconds=lambda cap: cap.get(0),
             terminal_read_failover_seconds=0.5,
         )
         reader.start()
         try:
             first = reader.wait_for_frame(0, timeout=1.0)
-            self.assertEqual(first["frame"], "shared-frame")
+            while first is not None and first["sequence"] < 3:
+                first = reader.wait_for_frame(first["sequence"], timeout=1.0)
+            self.assertEqual(first["frame"], "shared-3")
             fail_primary.set()
             replacement = reader.wait_for_frame(first["sequence"], timeout=2.0)
             self.assertEqual(replacement["frame"], "new-frame")
-            self.assertEqual(exact_clock.reanchors, [(0.0, 0.0)])
-            self.assertEqual(len(clock_calls), 1)
+            self.assertEqual(exact_clock.reanchors, [(100.0, 100.0)])
+            self.assertEqual(len(clock_calls), 2)
             terminal = next(
                 event for event in states
                 if event["state"] == "terminal_failover_succeeded"
@@ -345,6 +384,7 @@ class LiveStreamReaderTests(unittest.TestCase):
         finally:
             fail_primary.set()
             hold_replacement.set()
+            release_fragment_match.set()
             reader.stop(timeout=2.0)
 
     def test_terminal_restart_reanchors_when_prior_clock_validation_fails(self):

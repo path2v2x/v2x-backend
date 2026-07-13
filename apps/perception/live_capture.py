@@ -316,6 +316,7 @@ class _AsyncCaptureRestart:
         self._recent_exact_media_anchors = tuple(
             recent_exact_media_anchors or ()
         )
+        self._restart_exact_frames = deque(maxlen=3)
         self._prior_media_clock = prior_media_clock
         self._prior_media_time_utc = None
         if (
@@ -387,12 +388,44 @@ class _AsyncCaptureRestart:
                 ):
                     self._set_stage("recent_exact_anchor")
                     target_identity = self._media_frame_identity(frame)
-                    anchor_matches = [
-                        anchor for anchor in self._recent_exact_media_anchors
-                        if anchor[0] == target_identity
-                    ]
+                    self._restart_exact_frames.append(
+                        (target_identity, position)
+                    )
+                    restart_identities = tuple(
+                        item[0] for item in self._restart_exact_frames
+                    )
+                    anchor_matches = []
+                    if (
+                        len(restart_identities) == 3
+                        and len(set(restart_identities)) == 3
+                    ):
+                        anchors = self._recent_exact_media_anchors
+                        for offset in range(max(0, len(anchors) - 2)):
+                            window = anchors[offset:offset + 3]
+                            if tuple(item[0] for item in window) != (
+                                restart_identities
+                            ):
+                                continue
+                            old_delta = float(window[-1][2]) - float(
+                                window[0][2]
+                            )
+                            new_delta = float(
+                                self._restart_exact_frames[-1][1]
+                            ) - float(self._restart_exact_frames[0][1])
+                            if (
+                                old_delta > 0.0
+                                and new_delta > 0.0
+                                and math.isclose(
+                                    old_delta,
+                                    new_delta,
+                                    rel_tol=0.0,
+                                    abs_tol=1.0,
+                                )
+                            ):
+                                anchor_matches.append(window)
                     if len(anchor_matches) == 1:
-                        _, anchor_clock, anchor_position = anchor_matches[0]
+                        anchor_window = anchor_matches[0]
+                        _, anchor_clock, anchor_position = anchor_window[-1]
                         reanchor = getattr(
                             anchor_clock,
                             "reanchor_from_exact_match",
@@ -538,6 +571,7 @@ class _AsyncCaptureRestart:
             self._media_clock_factory = None
             self._media_clock_validator = None
             self._recent_exact_media_anchors = None
+            self._restart_exact_frames = None
             self._prior_media_clock = None
             self._prior_media_time_utc = None
             self._capture_position_milliseconds = None
