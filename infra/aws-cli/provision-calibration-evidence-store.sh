@@ -16,6 +16,7 @@ PLAN_ONLY="${PLAN_ONLY:-true}"
 RETENTION_MODE="${RETENTION_MODE:-COMPLIANCE}"
 RETENTION_DAYS="${RETENTION_DAYS:-90}"
 EXPECTED_CURRENT_STATE_HASH="${EXPECTED_CURRENT_STATE_HASH:-}"
+EXPECTED_DESIRED_STATE_HASH="${EXPECTED_DESIRED_STATE_HASH:-}"
 CONFIRM_OBJECT_LOCK_IRREVERSIBLE="${CONFIRM_OBJECT_LOCK_IRREVERSIBLE:-}"
 CLOUDTRAIL_TRAIL_NAME="${CLOUDTRAIL_TRAIL_NAME:-}"
 BACKUP_ROOT="${BACKUP_ROOT:-/home/path/V2XCarla/v2x-backend-backups/calibration-evidence-store}"
@@ -85,15 +86,32 @@ else
 fi
 
 CLOUDTRAIL_COVERAGE=false
+cloudtrail_selectors_json='{}'
+cloudtrail_status_json='{}'
 cloudtrail_json='{}'
 if [[ -n "${CLOUDTRAIL_TRAIL_NAME}" ]]; then
-  cloudtrail_json="$(aws cloudtrail get-event-selectors --trail-name "${CLOUDTRAIL_TRAIL_NAME}" --output json)"
-  if jq -e --arg prefix "arn:aws:s3:::${BUCKET}/" '
-    any(.EventSelectors[]?.DataResources[]?;
-      .Type == "AWS::S3::Object" and any(.Values[]?; startswith($prefix)))
-    or any(.AdvancedEventSelectors[]?.FieldSelectors[]?;
-      .Field == "resources.ARN" and any(.StartsWith[]?; startswith($prefix)))
-  ' <<<"${cloudtrail_json}" >/dev/null; then
+  cloudtrail_selectors_json="$(aws cloudtrail get-event-selectors --trail-name "${CLOUDTRAIL_TRAIL_NAME}" --output json)"
+  cloudtrail_status_json="$(aws cloudtrail get-trail-status --name "${CLOUDTRAIL_TRAIL_NAME}" --output json)"
+  cloudtrail_json="$(jq -nS \
+    --argjson selectors "${cloudtrail_selectors_json}" \
+    --argjson status "${cloudtrail_status_json}" \
+    '{selectors:$selectors,status:{
+      IsLogging:($status.IsLogging // false),
+      LatestDeliveryError:($status.LatestDeliveryError // "")}}')"
+  if [[ "$(jq -r '.IsLogging // false' <<<"${cloudtrail_status_json}")" == "true" ]] &&
+     [[ -z "$(jq -r '.LatestDeliveryError // ""' <<<"${cloudtrail_status_json}")" ]] &&
+     jq -e --arg prefix "arn:aws:s3:::${BUCKET}/" '
+       any(.EventSelectors[]?;
+         ((.ReadWriteType // "All") == "All" or .ReadWriteType == "WriteOnly")
+         and any(.DataResources[]?;
+           .Type == "AWS::S3::Object" and any(.Values[]?; . == $prefix)))
+       or any(.AdvancedEventSelectors[]?;
+         (any(.FieldSelectors[]?;
+           .Field == "resources.ARN" and any(.StartsWith[]?; . == $prefix)))
+         and (([.FieldSelectors[]? | select(.Field == "readOnly")] | length) == 0
+           or any(.FieldSelectors[]?;
+             .Field == "readOnly" and any(.Equals[]?; . == "false"))))
+     ' <<<"${cloudtrail_selectors_json}" >/dev/null; then
     CLOUDTRAIL_COVERAGE=true
   fi
 fi
@@ -206,10 +224,12 @@ jq -nS \
     cloudtrail_data_events_covered:$cloudtrail_covered}' >"${DESIRED}"
 
 CURRENT_STATE_HASH="$(sha256sum "${CURRENT}" | awk '{print $1}')"
+DESIRED_STATE_HASH="$(sha256sum "${DESIRED}" | awk '{print $1}')"
 echo "Account: ${ACCOUNT_ID}"
 echo "Region: ${AWS_REGION}"
 echo "Bucket: ${BUCKET}"
 echo "Current state hash: ${CURRENT_STATE_HASH}"
+echo "Desired state hash: ${DESIRED_STATE_HASH}"
 echo "Exists: ${BUCKET_EXISTS}"
 echo "Plan only: ${PLAN_ONLY}"
 echo "Current state:"
@@ -224,6 +244,10 @@ fi
 
 if [[ "${EXPECTED_CURRENT_STATE_HASH}" != "${CURRENT_STATE_HASH}" ]]; then
   echo "EXPECTED_CURRENT_STATE_HASH does not match current state" >&2
+  exit 5
+fi
+if [[ "${EXPECTED_DESIRED_STATE_HASH}" != "${DESIRED_STATE_HASH}" ]]; then
+  echo "EXPECTED_DESIRED_STATE_HASH does not match desired state" >&2
   exit 5
 fi
 if [[ "${CONFIRM_OBJECT_LOCK_IRREVERSIBLE}" != "CONFIGURE_OBJECT_LOCKED_EVIDENCE_BUCKET" ]]; then
@@ -241,8 +265,13 @@ if [[ "${BUCKET_EXISTS}" == "true" ]]; then
   existing_lock="$(jq -r '.object_lock.ObjectLockConfiguration.ObjectLockEnabled // ""' "${CURRENT}")"
   existing_mode="$(jq -r '.object_lock.ObjectLockConfiguration.Rule.DefaultRetention.Mode // ""' "${CURRENT}")"
   existing_days="$(jq -r '.object_lock.ObjectLockConfiguration.Rule.DefaultRetention.Days // 0' "${CURRENT}")"
+  existing_years="$(jq -r '.object_lock.ObjectLockConfiguration.Rule.DefaultRetention.Years // empty' "${CURRENT}")"
   if [[ "${existing_lock}" != "Enabled" ]]; then
     echo "Refusing to retrofit an existing non-Object-Lock bucket" >&2
+    exit 6
+  fi
+  if [[ -n "${existing_years}" ]]; then
+    echo "Refusing to rewrite Years-based default retention as Days; use a separately reviewed migration" >&2
     exit 6
   fi
   if (( RETENTION_DAYS < existing_days )) ||
