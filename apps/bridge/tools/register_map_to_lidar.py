@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Register immutable map polylines to authoritative LiDAR development control.
 
-The executable is deliberately offline.  It fits one site-wide SE(2) transform
+The executable reads evidence offline except for one authenticated, allowlisted
+append-only holdout-registry consumption.  It fits one site-wide SE(2) transform
 and one additive Z bias from manually identified, hash-bound finite polylines.
 Fit and holdout identities are disjoint, every direction is scored, and old
 USGS QL2 data remains development-only even when its numerical fit is good.
@@ -10,19 +11,26 @@ USGS QL2 data remains development-only even when its numerical fit is good.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter, defaultdict
 import csv
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata as importlib_metadata
+import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import platform
 import re
+import secrets
+import stat
 import sys
+import warnings
 import xml.etree.ElementTree as ET
+from urllib.parse import quote, urlparse
 
 # Import numerical libraries only after establishing deterministic single-thread
 # defaults. Explicit non-1 caller values are rejected by the toolchain gate.
@@ -56,6 +64,10 @@ VERTICAL_DATUM_AUTHORITY_ATTESTATION_SCHEMA = (
 ANNOTATION_REVIEW_SCHEMA = "v2x-map-lidar-annotation-review/v1"
 HOLDOUT_LEDGER_SCHEMA = "v2x-map-lidar-holdout-ledger/v1"
 HOLDOUT_BURN_RECEIPT_SCHEMA = "v2x-map-lidar-holdout-burn-receipt/v1"
+HOLDOUT_REGISTRY_HEAD_SCHEMA = "v2x-map-lidar-holdout-registry-head/v1"
+HOLDOUT_REGISTRY_ENTRY_SCHEMA = "v2x-map-lidar-holdout-registry-entry/v1"
+HOLDOUT_REGISTRY_CONSUME_SCHEMA = "v2x-map-lidar-holdout-registry-consume/v1"
+HOLDOUT_REGISTRY_RECEIPT_SCHEMA = "v2x-map-lidar-holdout-registry-receipt/v1"
 TOOLCHAIN_LOCK_SCHEMA = "v2x-map-lidar-toolchain-lock/v1"
 
 HORIZONTAL_RMSE_MAX_M = 0.25
@@ -92,6 +104,12 @@ MIN_CRS_AUTHORITY_CHECKPOINTS = 6
 MIN_VERTICAL_AUTHORITY_CHECKPOINTS = 6
 ANNOTATION_REPEATABILITY_MAX_M = 0.10
 MIN_AUTHORITY_PDF_BYTES = 4096
+MAX_AUTHORITY_PDF_BYTES = 25 * 1024 * 1024
+MAX_SURVEY_DELIVERABLE_BYTES = 25 * 1024 * 1024
+MAX_VERTICAL_SOURCE_ARTIFACT_BYTES = 256 * 1024 * 1024
+HOLDOUT_REGISTRY_HEAD_MAX_AGE_SECONDS = 300.0
+HOLDOUT_REGISTRY_HTTP_TIMEOUT_SECONDS = 10.0
+HOLDOUT_REGISTRY_RESPONSE_MAX_BYTES = 1024 * 1024
 AUTHORITY_ATTESTATION_MAX_AGE_DAYS = 90.0
 AUTHORITY_ATTESTATION_MAX_VALIDITY_DAYS = 366.0
 NATIVE_OBJECT_SEMANTIC_SCHEMA = "v2x-carla-native-environment-object/v1"
@@ -108,6 +126,8 @@ TRUSTED_CRS_AUTHORITY_SIGNERS = {}
 TRUSTED_ANNOTATION_AUTHORITY_SIGNERS = {}
 TRUSTED_LIDAR_VALIDATION_SIGNERS = {}
 TRUSTED_VERTICAL_DATUM_SIGNERS = {}
+TRUSTED_HOLDOUT_REGISTRY_SIGNERS = {}
+TRUSTED_HOLDOUT_REGISTRY_ENDPOINTS = {}
 SURVEY_DELIVERABLE_ROLES = {
     "raw_observations", "survey_license", "instrument_calibration"
 }
@@ -140,6 +160,12 @@ def canonical_hash(value) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def canonical_json_bytes(value) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
 
 
 def _parse_authority_time(value, label: str) -> datetime:
@@ -236,6 +262,147 @@ def _verify_detached_attestation(attestation_path: Path | None,
     }
 
 
+def _holdout_registry_config(registry_id: str) -> dict:
+    endpoint = TRUSTED_HOLDOUT_REGISTRY_ENDPOINTS.get(registry_id)
+    if not isinstance(endpoint, dict) or endpoint.get("registry_id") != registry_id:
+        raise RegistrationError("holdout registry endpoint is not pinned and trusted")
+    base_url = endpoint.get("base_url")
+    if not isinstance(base_url, str):
+        raise RegistrationError("holdout registry endpoint is malformed")
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+        or parsed.password is not None or parsed.query or parsed.fragment
+        or base_url.endswith("/")
+    ):
+        raise RegistrationError("holdout registry endpoint is not an exact HTTPS origin")
+    return {"registry_id": registry_id, "base_url": base_url}
+
+
+def _verify_holdout_registry_head(envelope: dict, registry_id: str) -> dict:
+    if not isinstance(envelope, dict) or set(envelope) != {"head", "signature_base64"}:
+        raise RegistrationError("holdout registry signed head envelope is malformed")
+    head = envelope.get("head")
+    expected_keys = {
+        "schema", "registry_id", "sequence", "entry_sha256", "prior_head_sha256",
+        "observed_at_utc", "signing_key_id", "public_key_sha256", "producer", "source",
+    }
+    if not isinstance(head, dict) or set(head) != expected_keys:
+        raise RegistrationError("holdout registry signed head is malformed")
+    sequence = head.get("sequence")
+    if (
+        head.get("schema") != HOLDOUT_REGISTRY_HEAD_SCHEMA
+        or head.get("registry_id") != registry_id
+        or not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0
+        or re.fullmatch(r"[0-9a-f]{64}", str(head.get("entry_sha256"))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(head.get("prior_head_sha256"))) is None
+    ):
+        raise RegistrationError("holdout registry signed head binding is invalid")
+    key_id = head.get("signing_key_id")
+    signer = TRUSTED_HOLDOUT_REGISTRY_SIGNERS.get(key_id) if isinstance(key_id, str) else None
+    if (
+        not isinstance(signer, dict)
+        or signer.get("registry_id") != registry_id
+        or head.get("producer") != signer.get("producer")
+        or head.get("source") != signer.get("source")
+    ):
+        raise RegistrationError("holdout registry signer is not pinned and trusted")
+    pem = signer.get("public_key_pem")
+    if isinstance(pem, str):
+        pem = pem.encode("ascii")
+    if not isinstance(pem, bytes) or not pem:
+        raise RegistrationError("holdout registry pinned public key is unavailable")
+    key_hash = hashlib.sha256(pem).hexdigest()
+    if head.get("public_key_sha256") != key_hash:
+        raise RegistrationError("holdout registry pinned public key fingerprint is not bound")
+    try:
+        signature = base64.b64decode(envelope["signature_base64"], validate=True)
+    except (TypeError, ValueError) as exc:
+        raise RegistrationError("holdout registry head signature is malformed") from exc
+    if len(signature) != 64:
+        raise RegistrationError("holdout registry head signature is malformed")
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        public_key = serialization.load_pem_public_key(pem)
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise RegistrationError("holdout registry pinned key is not Ed25519")
+        public_key.verify(signature, canonical_json_bytes(head))
+    except InvalidSignature as exc:
+        raise RegistrationError("holdout registry head signature is invalid") from exc
+    except RegistrationError:
+        raise
+    except Exception as exc:
+        raise RegistrationError("holdout registry pinned public key is malformed") from exc
+    observed = _parse_authority_time(
+        head.get("observed_at_utc"), "holdout registry head observation time"
+    )
+    age_seconds = (datetime.now(timezone.utc) - observed).total_seconds()
+    if (
+        age_seconds < -HOLDOUT_REGISTRY_HEAD_MAX_AGE_SECONDS
+        or age_seconds > HOLDOUT_REGISTRY_HEAD_MAX_AGE_SECONDS
+    ):
+        raise RegistrationError("holdout registry signed head is stale")
+    return {
+        "head": head,
+        "head_sha256": canonical_hash(head),
+        "signature_sha256": hashlib.sha256(signature).hexdigest(),
+        "signing_key_id": key_id,
+        "public_key_sha256": key_hash,
+        "producer": head["producer"],
+        "source": head["source"],
+    }
+
+
+class HoldoutRegistryClient:
+    """Minimal pinned HTTPS client for one atomic holdout consume operation."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+
+    def _request(self, method: str, suffix: str, payload: dict | None = None) -> dict:
+        try:
+            import requests
+
+            response = requests.request(
+                method, f"{self.base_url}{suffix}",
+                json=payload, timeout=HOLDOUT_REGISTRY_HTTP_TIMEOUT_SECONDS,
+                allow_redirects=False,
+                headers={"Accept": "application/json"},
+            )
+        except Exception as exc:
+            raise RegistrationError("holdout registry request failed") from exc
+        if response.is_redirect or response.status_code >= 400:
+            raise RegistrationError(
+                f"holdout registry request was refused with HTTP {response.status_code}"
+            )
+        content = response.content
+        if len(content) > HOLDOUT_REGISTRY_RESPONSE_MAX_BYTES:
+            raise RegistrationError("holdout registry response is too large")
+        try:
+            value = response.json()
+        except (TypeError, ValueError) as exc:
+            raise RegistrationError("holdout registry response is not JSON") from exc
+        if not isinstance(value, dict):
+            raise RegistrationError("holdout registry response is malformed")
+        return value
+
+    def get_head(self) -> dict:
+        return self._request("GET", "/head")
+
+    def consume(self, request: dict) -> dict:
+        return self._request("POST", "/consume", request)
+
+    def get_entry(self, sequence: int) -> dict:
+        return self._request("GET", f"/entries/{quote(str(sequence), safe='')}")
+
+
+def _new_holdout_registry_client(config: dict) -> HoldoutRegistryClient:
+    return HoldoutRegistryClient(config["base_url"])
+
+
 def _runtime_toolchain_identity() -> dict:
     try:
         configuration = np.show_config(mode="dicts")
@@ -256,7 +423,7 @@ def _runtime_toolchain_identity() -> dict:
             for name, distribution in {
                 "numpy": "numpy", "scipy": "scipy", "laspy": "laspy",
                 "pyproj": "pyproj", "Pillow": "Pillow",
-                "cryptography": "cryptography",
+                "cryptography": "cryptography", "pypdf": "pypdf",
             }.items()
         },
         "blas": {
@@ -1286,6 +1453,9 @@ def validate_holdout_ledger(annotation_path: Path, ledger_path: Path | None,
     now = datetime.now(timezone.utc)
     receipt_value = ledger.get("burn_receipt_path")
     receipt_path = Path(receipt_value) if isinstance(receipt_value, str) else None
+    registry_id = ledger.get("registry_id")
+    prior_sequence = ledger.get("registry_prior_sequence")
+    prior_head_sha256 = ledger.get("registry_prior_head_sha256")
     if (
         ledger.get("schema") != HOLDOUT_LEDGER_SCHEMA
         or ledger.get("annotation_sha256") != sha256(annotation_path)
@@ -1296,6 +1466,10 @@ def validate_holdout_ledger(annotation_path: Path, ledger_path: Path | None,
         or ledger.get("prior_evaluation_count") != 0
         or ledger.get("maximum_evaluation_count") != 1
         or ledger.get("prior_evaluation_ids") != []
+        or not isinstance(registry_id, str) or not registry_id.strip()
+        or not isinstance(prior_sequence, int) or isinstance(prior_sequence, bool)
+        or prior_sequence < 0
+        or re.fullmatch(r"[0-9a-f]{64}", str(prior_head_sha256)) is None
         or receipt_path is None or not receipt_path.is_absolute()
         or receipt_path.parent != ledger_path.parent
         or receipt_path.suffix != ".json"
@@ -1310,7 +1484,11 @@ def validate_holdout_ledger(annotation_path: Path, ledger_path: Path | None,
         "present": True, "passed": True,
         "path": str(ledger_path), "sha256": sha256(ledger_path),
         "evaluation_id": ledger["evaluation_id"],
+        "annotation_sha256": ledger["annotation_sha256"],
         "holdout_set_sha256": ledger["holdout_set_sha256"],
+        "registry_id": registry_id,
+        "registry_prior_sequence": prior_sequence,
+        "registry_prior_head_sha256": prior_head_sha256,
         "burn_receipt_path": str(receipt_path),
         "reasons": [],
     }
@@ -1335,6 +1513,9 @@ def validate_annotation_authority(annotation_path: Path, review: dict, ledger: d
         "holdout_ledger_sha256": ledger["sha256"],
         "holdout_set_sha256": review["holdout_set_sha256"],
         "reviewers": review["reviewers"],
+        "registry_id": ledger["registry_id"],
+        "registry_prior_sequence": ledger["registry_prior_sequence"],
+        "registry_prior_head_sha256": ledger["registry_prior_head_sha256"],
     }
     if any(attestation.get(key) != value for key, value in expected.items()):
         raise RegistrationError(
@@ -1351,7 +1532,127 @@ def validate_annotation_authority(annotation_path: Path, review: dict, ledger: d
     return {**evidence, **expected, "verification_result": attestation["verification_result"]}
 
 
-def burn_holdout_evaluation(ledger: dict, annotation_authority: dict) -> dict:
+def consume_holdout_registry(ledger: dict, annotation_authority: dict,
+                             registry_client=None) -> dict:
+    registry_id = ledger["registry_id"]
+    config = _holdout_registry_config(registry_id)
+    client = registry_client or _new_holdout_registry_client(config)
+    initial = _verify_holdout_registry_head(client.get_head(), registry_id)
+    if (
+        initial["producer"] == annotation_authority.get("producer")
+        or initial["source"] == annotation_authority.get("source")
+    ):
+        raise RegistrationError(
+            "holdout registry is not independent from annotation authority"
+        )
+    if (
+        initial["head"]["sequence"] != ledger["registry_prior_sequence"]
+        or initial["head_sha256"] != ledger["registry_prior_head_sha256"]
+    ):
+        raise RegistrationError(
+            "holdout registry head does not match the signed authorization base"
+        )
+    tool_hash = sha256(Path(__file__))
+    toolchain_lock_hash = sha256(
+        Path(__file__).with_name("map_lidar_toolchain_lock.json")
+    )
+    request = {
+        "schema": HOLDOUT_REGISTRY_CONSUME_SCHEMA,
+        "registry_id": registry_id,
+        "evaluation_id": ledger["evaluation_id"],
+        "holdout_ledger_sha256": ledger["sha256"],
+        "annotation_sha256": ledger["annotation_sha256"],
+        "holdout_set_sha256": ledger["holdout_set_sha256"],
+        "registration_tool_sha256": tool_hash,
+        "toolchain_lock_sha256": toolchain_lock_hash,
+        "expected_prior_sequence": ledger["registry_prior_sequence"],
+        "expected_prior_head_sha256": ledger["registry_prior_head_sha256"],
+        "annotation_authority_attestation_sha256": annotation_authority[
+            "attestation_sha256"
+        ],
+        "request_nonce": secrets.token_hex(32),
+        "requested_at_utc": utc_now(),
+    }
+    receipt = client.consume(request)
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema", "registry_id", "consume_request_sha256", "entry", "head_envelope"
+    }:
+        raise RegistrationError("holdout registry consume receipt is malformed")
+    request_hash = canonical_hash(request)
+    if (
+        receipt.get("schema") != HOLDOUT_REGISTRY_RECEIPT_SCHEMA
+        or receipt.get("registry_id") != registry_id
+        or receipt.get("consume_request_sha256") != request_hash
+    ):
+        raise RegistrationError("holdout registry consume receipt binding is invalid")
+    entry = receipt.get("entry")
+    expected_entry_keys = {
+        "schema", "registry_id", "sequence", "evaluation_id",
+        "holdout_ledger_sha256", "annotation_sha256", "holdout_set_sha256",
+        "registration_tool_sha256", "toolchain_lock_sha256",
+        "annotation_authority_attestation_sha256",
+        "prior_head_sha256", "request_nonce", "consumed_at_utc", "status",
+    }
+    expected_entry = {
+        "schema": HOLDOUT_REGISTRY_ENTRY_SCHEMA,
+        "registry_id": registry_id,
+        "sequence": ledger["registry_prior_sequence"] + 1,
+        "evaluation_id": ledger["evaluation_id"],
+        "holdout_ledger_sha256": ledger["sha256"],
+        "annotation_sha256": ledger["annotation_sha256"],
+        "holdout_set_sha256": ledger["holdout_set_sha256"],
+        "registration_tool_sha256": tool_hash,
+        "toolchain_lock_sha256": toolchain_lock_hash,
+        "annotation_authority_attestation_sha256": annotation_authority[
+            "attestation_sha256"
+        ],
+        "prior_head_sha256": ledger["registry_prior_head_sha256"],
+        "request_nonce": request["request_nonce"],
+        "status": "consumed",
+    }
+    if (
+        not isinstance(entry, dict) or set(entry) != expected_entry_keys
+        or any(entry.get(key) != value for key, value in expected_entry.items())
+    ):
+        raise RegistrationError("holdout registry consumed entry binding is invalid")
+    consumed = _parse_authority_time(
+        entry.get("consumed_at_utc"), "holdout registry consumption time"
+    )
+    consumed_age = (datetime.now(timezone.utc) - consumed).total_seconds()
+    if (
+        consumed_age < -HOLDOUT_REGISTRY_HEAD_MAX_AGE_SECONDS
+        or consumed_age > HOLDOUT_REGISTRY_HEAD_MAX_AGE_SECONDS
+    ):
+        raise RegistrationError("holdout registry consumed entry is stale")
+    final = _verify_holdout_registry_head(receipt["head_envelope"], registry_id)
+    if (
+        final["head"]["sequence"] != entry["sequence"]
+        or final["head"]["entry_sha256"] != canonical_hash(entry)
+        or final["head"]["prior_head_sha256"] != ledger["registry_prior_head_sha256"]
+    ):
+        raise RegistrationError("holdout registry append chain is invalid")
+    confirmed_entry = client.get_entry(entry["sequence"])
+    if confirmed_entry != {"entry": entry}:
+        raise RegistrationError("holdout registry consumed entry inclusion is not confirmed")
+    confirmed_head = _verify_holdout_registry_head(client.get_head(), registry_id)
+    if confirmed_head["head_sha256"] != final["head_sha256"]:
+        raise RegistrationError("holdout registry consumed head confirmation changed")
+    return {
+        "registry_id": registry_id,
+        "endpoint": config["base_url"],
+        "consume_request_sha256": request_hash,
+        "entry": entry,
+        "entry_sha256": canonical_hash(entry),
+        "head": final["head"],
+        "head_sha256": final["head_sha256"],
+        "head_signature_sha256": final["signature_sha256"],
+        "signing_key_id": final["signing_key_id"],
+        "confirmed": True,
+    }
+
+
+def burn_holdout_evaluation(ledger: dict, annotation_authority: dict,
+                            registry_consumption: dict) -> dict:
     receipt_path = Path(ledger["burn_receipt_path"])
     receipt = {
         "schema": HOLDOUT_BURN_RECEIPT_SCHEMA,
@@ -1362,6 +1663,10 @@ def burn_holdout_evaluation(ledger: dict, annotation_authority: dict) -> dict:
         "annotation_authority_attestation_sha256": annotation_authority[
             "attestation_sha256"
         ],
+        "registry_id": registry_consumption["registry_id"],
+        "registry_entry_sha256": registry_consumption["entry_sha256"],
+        "registry_head_sha256": registry_consumption["head_sha256"],
+        "registry_sequence": registry_consumption["entry"]["sequence"],
         "status": "evaluation_started_holdout_burned",
     }
     write_json_exclusive(receipt_path, receipt)
@@ -1369,11 +1674,13 @@ def burn_holdout_evaluation(ledger: dict, annotation_authority: dict) -> dict:
         **ledger,
         "burned": True,
         "burn_receipt_sha256": sha256(receipt_path),
+        "registry_consumption": registry_consumption,
     }
 
 
 def authorize_and_burn_holdout(review: dict, ledger: dict,
-                               annotation_authority: dict | None) -> dict:
+                               annotation_authority: dict | None,
+                               registry_client=None) -> dict:
     """Fail closed before any CLI path can compute sealed holdout metrics."""
     if not review.get("passed"):
         raise RegistrationError(
@@ -1387,7 +1694,12 @@ def authorize_and_burn_holdout(review: dict, ledger: dict,
         raise RegistrationError(
             "refusing to evaluate sealed holdout without authenticated annotation authority"
         )
-    return burn_holdout_evaluation(ledger, annotation_authority)
+    registry_consumption = consume_holdout_registry(
+        ledger, annotation_authority, registry_client
+    )
+    return burn_holdout_evaluation(
+        ledger, annotation_authority, registry_consumption
+    )
 
 
 def transform_points(points: np.ndarray, parameters: np.ndarray) -> np.ndarray:
@@ -1840,6 +2152,66 @@ def _validate_survey_crs(block: dict, horizontal_epsg: int | None,
     }
 
 
+def _strict_pdf_evidence(content: bytes, label: str) -> dict:
+    if (
+        len(content) < MIN_AUTHORITY_PDF_BYTES
+        or len(content) > MAX_AUTHORITY_PDF_BYTES
+        or not content.startswith(b"%PDF-")
+        or not content.rstrip().endswith(b"%%EOF")
+        or b"startxref" not in content
+    ):
+        raise RegistrationError(f"{label} is not a complete bounded PDF document")
+    try:
+        from pypdf import PdfReader
+        from pypdf.errors import PdfReadError
+    except ImportError as exc:
+        raise RegistrationError("strict pinned PDF parser is unavailable") from exc
+    warning_log = io.StringIO()
+    handler = logging.StreamHandler(warning_log)
+    pdf_logger = logging.getLogger("pypdf")
+    old_level, old_propagate = pdf_logger.level, pdf_logger.propagate
+    pdf_logger.setLevel(logging.WARNING)
+    pdf_logger.propagate = False
+    pdf_logger.addHandler(handler)
+    recorded = []
+    try:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            reader = PdfReader(io.BytesIO(content), strict=True)
+            if reader.is_encrypted:
+                raise RegistrationError(f"{label} is encrypted")
+            trailer = reader.trailer
+            root_reference = trailer.get("/Root") if trailer is not None else None
+            root = root_reference.get_object() if root_reference is not None else None
+            if root is None or str(root.get("/Type")) != "/Catalog":
+                raise RegistrationError(f"{label} has no valid trailer root Catalog")
+            if not reader.xref and not reader.xref_objStm:
+                raise RegistrationError(f"{label} has no parsed cross-reference table")
+            pages = list(reader.pages)
+            if not pages or any(str(page.get("/Type")) != "/Page" for page in pages):
+                raise RegistrationError(f"{label} has no valid PDF page tree")
+            recorded = list(captured)
+    except RegistrationError:
+        raise
+    except (PdfReadError, OSError, TypeError, ValueError, KeyError) as exc:
+        raise RegistrationError(f"{label} failed strict PDF parsing") from exc
+    finally:
+        pdf_logger.removeHandler(handler)
+        pdf_logger.setLevel(old_level)
+        pdf_logger.propagate = old_propagate
+    if recorded or warning_log.getvalue().strip():
+        raise RegistrationError(f"{label} emitted strict PDF parser warnings")
+    return {
+        "parser": "pypdf",
+        "parser_version": importlib_metadata.version("pypdf"),
+        "strict": True,
+        "page_count": len(pages),
+        "xref_sections": len(reader.xref),
+        "object_stream_entries": len(reader.xref_objStm),
+        "encrypted": False,
+    }
+
+
 def _survey_deliverable_evidence(survey: dict, deliverable_paths: list[Path] | None,
                                  observations_path: Path | None) -> dict:
     paths = [Path(value).resolve() for value in (deliverable_paths or [])]
@@ -1865,7 +2237,19 @@ def _survey_deliverable_evidence(survey: dict, deliverable_paths: list[Path] | N
         declared_by_hash[identity] = item
     actual = []
     for path in paths:
+        file_status = path.stat()
+        if (
+            not stat.S_ISREG(file_status.st_mode) or file_status.st_size <= 0
+            or file_status.st_size > MAX_SURVEY_DELIVERABLE_BYTES
+        ):
+            raise RegistrationError(
+                "licensed survey raw deliverable is not a bounded regular file"
+            )
         content = path.read_bytes()
+        if len(content) != file_status.st_size:
+            raise RegistrationError(
+                "licensed survey raw deliverable changed size while being read"
+            )
         digest = hashlib.sha256(content).hexdigest()
         declared = declared_by_hash.get(digest)
         try:
@@ -1876,19 +2260,19 @@ def _survey_deliverable_evidence(survey: dict, deliverable_paths: list[Path] | N
             ) from exc
         if not content or declared is None or declared.get("file_name") != path.name or declared_bytes != len(content):
             raise RegistrationError("licensed survey raw deliverable hash/size/name mismatch")
+        pdf_validation = None
         if declared["role"] in {"survey_license", "instrument_calibration"}:
-            if (
-                path.suffix.lower() != ".pdf"
-                or len(content) < MIN_AUTHORITY_PDF_BYTES
-                or not content.startswith(b"%PDF-")
-                or not content.rstrip().endswith(b"%%EOF")
-            ):
+            if path.suffix.lower() != ".pdf":
                 raise RegistrationError(
                     "licensed survey authority evidence is not a substantive retained PDF"
                 )
+            pdf_validation = _strict_pdf_evidence(
+                content, f"licensed survey {declared['role']} deliverable"
+            )
         actual.append({
             "path": str(path), "file_name": path.name, "sha256": digest,
             "bytes": len(content), "role": declared["role"],
+            **({"pdf_validation": pdf_validation} if pdf_validation else {}),
         })
     roles = {item["role"] for item in actual}
     if roles != SURVEY_DELIVERABLE_ROLES:
@@ -2436,14 +2820,87 @@ def validate_crs_reconciliation(opendrive: dict, lidar_tile: dict, survey: dict,
     }
 
 
+def _read_all_from_fd(file_descriptor: int, expected_bytes: int) -> bytes:
+    chunks, remaining = [], expected_bytes
+    while remaining:
+        chunk = os.read(file_descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    extra = os.read(file_descriptor, 1)
+    if remaining or extra:
+        raise RegistrationError("vertical source artifact changed size while being read")
+    return b"".join(chunks)
+
+
+def read_retained_vertical_source_artifact(path: Path | None) -> dict:
+    if path is None:
+        raise RegistrationError("retained vertical source artifact is required")
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RegistrationError(
+            "retained vertical source artifact cannot be safely opened"
+        ) from exc
+    try:
+        before = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_size <= 0 or before.st_size > MAX_VERTICAL_SOURCE_ARTIFACT_BYTES
+        ):
+            raise RegistrationError(
+                "retained vertical source artifact is not a bounded single-link regular file"
+            )
+        content = _read_all_from_fd(file_descriptor, before.st_size)
+        after = os.fstat(file_descriptor)
+        try:
+            path_after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise RegistrationError(
+                "retained vertical source artifact path changed while being read"
+            ) from exc
+        identity_before = (
+            before.st_dev, before.st_ino, before.st_mode, before.st_nlink,
+            before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev, after.st_ino, after.st_mode, after.st_nlink,
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+        )
+        path_identity = (
+            path_after.st_dev, path_after.st_ino, path_after.st_mode,
+            path_after.st_nlink, path_after.st_size, path_after.st_mtime_ns,
+            path_after.st_ctime_ns,
+        )
+        if identity_after != identity_before or path_identity != identity_before:
+            raise RegistrationError(
+                "retained vertical source artifact changed while being read"
+            )
+    finally:
+        os.close(file_descriptor)
+    return {
+        "path": str(path.absolute()),
+        "file_name": path.name,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "bytes": len(content),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "link_count": before.st_nlink,
+    }
+
+
 def validate_vertical_datum_reconciliation(opendrive: dict, lidar_tile: dict,
                                            survey: dict,
                                            artifact_path: Path | None = None,
                                            authority_attestation_path: Path | None = None,
-                                           authority_signature_path: Path | None = None) -> dict:
+                                           authority_signature_path: Path | None = None,
+                                           source_artifact_path: Path | None = None) -> dict:
     if (
         artifact_path is None and authority_attestation_path is None
-        and authority_signature_path is None
+        and authority_signature_path is None and source_artifact_path is None
     ):
         return {
             "present": False, "passed": False,
@@ -2471,6 +2928,11 @@ def validate_vertical_datum_reconciliation(opendrive: dict, lidar_tile: dict,
         or not isinstance(source_reference.get("source_artifact_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", source_reference["source_artifact_sha256"])
         is None
+        or not isinstance(source_reference.get("source_artifact_file_name"), str)
+        or not source_reference["source_artifact_file_name"].strip()
+        or not isinstance(source_reference.get("source_artifact_bytes"), int)
+        or isinstance(source_reference.get("source_artifact_bytes"), bool)
+        or source_reference["source_artifact_bytes"] <= 0
         or target_reference != {
             "epsg": lidar_tile.get("vertical_epsg"),
             "datum": lidar_tile.get("vertical_datum"),
@@ -2490,6 +2952,23 @@ def validate_vertical_datum_reconciliation(opendrive: dict, lidar_tile: dict,
         )
     ):
         raise RegistrationError("vertical datum reconciliation binding is invalid")
+    source_artifact_evidence = read_retained_vertical_source_artifact(
+        source_artifact_path
+    )
+    if {
+        "source_artifact_sha256": source_artifact_evidence["sha256"],
+        "source_artifact_file_name": source_artifact_evidence["file_name"],
+        "source_artifact_bytes": source_artifact_evidence["bytes"],
+    } != {
+        key: source_reference[key]
+        for key in (
+            "source_artifact_sha256", "source_artifact_file_name",
+            "source_artifact_bytes",
+        )
+    }:
+        raise RegistrationError(
+            "vertical datum retained source artifact does not match signed reference"
+        )
     attestation, authority_evidence = _verify_detached_attestation(
         authority_attestation_path, authority_signature_path,
         TRUSTED_VERTICAL_DATUM_SIGNERS,
@@ -2558,6 +3037,7 @@ def validate_vertical_datum_reconciliation(opendrive: dict, lidar_tile: dict,
         "artifact_path": str(artifact_path), "artifact_sha256": sha256(artifact_path),
         "authority": artifact["authority"], "operation_id": artifact["operation_id"],
         "authenticated_offset_m": float(operation["offset_m"]),
+        "retained_source_artifact": source_artifact_evidence,
         "control_count": len(checks),
         "recomputed_vertical_rmse_m": math.sqrt(float(np.mean(np.square(residuals)))),
         "recomputed_vertical_max_m": max(residuals),
@@ -2787,6 +3267,7 @@ def parse_args():
     parser.add_argument("--crs-authority-attestation", type=Path)
     parser.add_argument("--crs-authority-signature", type=Path)
     parser.add_argument("--vertical-datum-reconciliation", type=Path)
+    parser.add_argument("--vertical-source-artifact", type=Path)
     parser.add_argument("--vertical-datum-authority-attestation", type=Path)
     parser.add_argument("--vertical-datum-authority-signature", type=Path)
     parser.add_argument("--output", type=Path, required=True)
@@ -2956,6 +3437,8 @@ def main() -> int:
         if args.vertical_datum_authority_attestation else None,
         args.vertical_datum_authority_signature.resolve()
         if args.vertical_datum_authority_signature else None,
+        args.vertical_source_artifact.resolve()
+        if args.vertical_source_artifact else None,
     )
     metadata_summary = {
         "annotations": {"path": str(annotation_path), "sha256": sha256(annotation_path)},

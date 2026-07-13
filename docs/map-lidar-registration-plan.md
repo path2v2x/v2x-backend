@@ -2,7 +2,9 @@
 
 ## Scope and safety
 
-Implement an offline, immutable-evidence registration tool. It reads only a
+Implement an immutable-evidence registration tool. It reads evidence locally
+and makes exactly one allowlisted HTTPS compare-and-append transaction to the
+independent holdout registry before exposing sealed holdout metrics. It reads a
 hash-bound raw LAS/LAZ, its independent validation and authoritative metadata,
 the exact OpenDRIVE document, a map-geometry export, and manual feature
 annotations. It never connects to CARLA, Unreal, AWS, or a running service and
@@ -57,6 +59,9 @@ future holdout vault are out of scope.
    signature over a separate attestation from a source-pinned, allowlisted,
    independent producer. It binds the exact manifest and deliverables, all
    identities and statuses, verification/expiry times, and pinned-key hash.
+   Parse both PDFs with pinned `pypdf` in strict mode; require a bounded complete
+   document, parsed cross-reference/trailer, root Catalog, and at least one Page,
+   and reject encryption, trailing polyglot bytes, parser warnings, or errors.
    Tiny or malformed PDFs fail before attestation. The checked-in production
    signer allowlist is intentionally empty until genuine authority keys and
    evidence are reviewed; no authority evidence is invented. Read coordinates
@@ -79,13 +84,16 @@ future holdout vault are out of scope.
    allowlist also remains empty until genuine keys/evidence are reviewed.
 7. Reconcile vertical truth separately. Require a pinned-authority-signed
    artifact that binds the exact OpenDRIVE, LiDAR vertical WKT/EPSG/datum,
-   source vertical reference and retained-source hash, target reference,
+   source vertical reference and retained-source hash/name/byte count, target reference,
    operation, and at least six independent controls. Recompute the operation's
    residuals and require the authenticated offset to agree with the fitted Z
-   bias within 0.10 m. A missing artifact is an acceptance blocker; an unsigned
-   supplied offset is an error.
+   bias within 0.10 m. The exact retained source is a required CLI input opened
+   with `O_NOFOLLOW`; it must be a bounded single-link regular file whose
+   descriptor/path identity remains unchanged across the read, and its recomputed
+   byte hash, name, and size must equal the signed reference. A missing artifact
+   is an acceptance blocker; an unsigned supplied offset is an error.
 8. Bind execution to the tracked deterministic toolchain lock: exact CPython,
-   NumPy, SciPy, LAS, PROJ, Pillow, cryptography, OpenBLAS identity, Linux
+   NumPy, SciPy, LAS, PROJ, Pillow, cryptography, strict PDF parser, OpenBLAS identity, Linux
    architecture, a forced `Haswell` OpenBLAS kernel family, and single-thread
    numerical environment. The CLI has no
    alternate-lock option. A mismatch fails before evidence evaluation, and the
@@ -115,7 +123,8 @@ future holdout vault are out of scope.
 4. Run deterministic multi-start optimization using center, near-bound seeds
    on every parameter axis, and deterministic low-discrepancy interior seeds.
    Cluster converged solutions into basins and run leave-one-approach-out
-   refits. Report seed-bound coverage, Jacobian rank/condition/covariance,
+   refits over at least four distinct approaches. Report seed-bound coverage,
+   Jacobian rank/condition/covariance,
    bound proximity, near-optimal separated modes, fold transform spread, and
    every failed gate.
 
@@ -209,11 +218,17 @@ therefore provides no unburned diagnostic path that reveals sealed holdout
 metrics. Fit-only exploration must use a separately prepared development
 artifact that contains no holdout truth and cannot satisfy this schema.
 
-The local exclusive receipt prevents accidental/repeated use by an honest
-operator but is not an append-only security boundary: restoring a filesystem
-snapshot can restore the pre-burn state. Production one-use authorization must
-therefore also be recorded by the independent annotation authority in its own
-append-only registry. Before the real burn, run a full dress rehearsal with a
+Before creating the local receipt, the CLI requires a source-pinned HTTPS
+registry ID and a separately pinned Ed25519 registry key. It verifies a fresh
+signed prior head exactly matching the authority-signed ledger, submits one
+atomic compare-and-append request, and verifies the fresh signed successor head,
+exact consumed entry, sequence, prior-head link, and independent inclusion read.
+The entry binds the evaluation, ledger, annotation, holdout, annotation-authority,
+registration-tool, and toolchain-lock hashes. Deleting or restoring the local
+receipt cannot reuse the authorization because the external head already advanced;
+rollback, fork, replay, and concurrent double-consume responses fail closed.
+Production registry endpoint and signer allowlists remain empty until reviewed.
+Before the real burn, run a full dress rehearsal with a
 real-shaped but explicitly non-acceptance annotation bundle and separate test
 keys through every parser, signature, CRS, optimizer, report, and refusal path.
 If any failure occurs after the production receipt is created, the holdout stays
@@ -235,9 +250,11 @@ the failed receipt is forbidden.
    authority separately signs each exact raw-cloud/validation pair.
 4. Two independent annotation organizations prepare and reproduce the complete
    fixed feature denominator. A third annotation authority signs their review,
-   registers the one-use holdout authorization externally, and supplies the
-   signed ledger.
-5. The release owner verifies all pinned keys through out-of-band channels,
+   requests the one-use holdout authorization, and supplies the signed ledger.
+5. A separately operated append-only registry supplies its independently
+   authenticated HTTPS endpoint and Ed25519 key, publishes the signed prior
+   head, and atomically records the exact one-use consumption.
+6. The release owner verifies all pinned keys through out-of-band channels,
    completes the non-holdout dress rehearsal, then performs exactly one final
    acceptance invocation. The site-count inventory and genuine artifacts are
    currently absent, so this feasibility gate is explicitly not passed.
@@ -270,13 +287,16 @@ Add tests for a synthetic known transform, a local warp that one global model
 must reject, exact and near-buffer split leakage despite distinct IDs, raw
 deliverable and identity tampering, ineligible landmark categories, retained
 CARLA-source and overlay-pixel tampering, complete nested road-mark drift,
-tiny/fake PDFs, missing/tampered/unpinned authority signatures, caller
+tiny/padded/truncated/encrypted/polyglot PDFs, missing/tampered/unpinned authority signatures, caller
 `StableLandmark` labels, exact 0.495 m/intersection/degenerate segment cases,
 unreconciled EPSG:3857/EPSG:26910, unsigned arbitrary affine transforms,
 renamed survey controls reused as CRS checkpoints, and valid signed,
 independently executed PROJ pipelines, plus every hash binding, degenerate
 geometry, optimizer-bound contact, coarse coordinate resolution, and
-old-vs-live map mismatch. Run
+old-vs-live map mismatch. Add adversarial registry
+deletion/restore/replay/rollback/fork/concurrent-consume tests and vertical
+source missing/tamper/substitution/symlink/hardlink/oversize/concurrent-
+replacement tests without contacting a real registry. Run
 focused and full bridge tests with Python warnings treated as errors and an
 explicit asyncio fixture-loop scope. A non-acceptable report exits nonzero by
 default; a numeric-only development report may exit zero only with the explicit
@@ -298,3 +318,7 @@ A second final Fable review after the holdout fail-closed change is retained at
 `docs/reviews/map-lidar-registration-fable-20260713-final.md`, SHA-256
 `7ef5a54f823cf516f647fa66bd4bca0023d056a37f6f7a18dafbf3fe6af38491`;
 its feasible findings and explicit external blockers are incorporated above.
+The scoped registry/vertical-source/PDF hardening review and final PASS are
+retained at
+`docs/reviews/map-lidar-registration-fable-20260713-hardening.md`, SHA-256
+`4e9f995d6b5eb91171783d91f5990986059513f0e805bf4de95a9cc593309c5d`.

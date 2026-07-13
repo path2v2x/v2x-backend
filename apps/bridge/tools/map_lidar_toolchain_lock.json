@@ -10,6 +10,7 @@
       "cryptography": "41.0.7",
       "laspy": "2.7.0",
       "numpy": "2.4.2",
+      "pypdf": "6.14.2",
       "pyproj": "3.7.2",
       "scipy": "1.17.1"
     },

@@ -1,10 +1,13 @@
+import base64
 import copy
 import csv
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
+import logging
 import math
 from pathlib import Path
+import threading
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -23,11 +26,14 @@ CRS_AUTHORITY_KEY_ID = "test-crs-authority-ed25519"
 ANNOTATION_AUTHORITY_KEY_ID = "test-annotation-authority-ed25519"
 LIDAR_AUTHORITY_KEY_ID = "test-lidar-authority-ed25519"
 VERTICAL_AUTHORITY_KEY_ID = "test-vertical-authority-ed25519"
+HOLDOUT_REGISTRY_KEY_ID = "test-holdout-registry-ed25519"
+HOLDOUT_REGISTRY_ID = "test-annotation-holdout-registry"
 SURVEY_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
 CRS_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(33, 65)))
 ANNOTATION_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(65, 97)))
 LIDAR_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(97, 129)))
 VERTICAL_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(129, 161)))
+HOLDOUT_REGISTRY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(161, 193)))
 
 
 def public_key_pem(private_key):
@@ -74,6 +80,101 @@ def pinned_test_authority_keys(monkeypatch):
             "public_key_pem": public_key_pem(VERTICAL_AUTHORITY_PRIVATE_KEY),
         },
     })
+    monkeypatch.setattr(tool, "TRUSTED_HOLDOUT_REGISTRY_SIGNERS", {
+        HOLDOUT_REGISTRY_KEY_ID: {
+            "registry_id": HOLDOUT_REGISTRY_ID,
+            "producer": "Independent Append-Only Holdout Registry",
+            "source": "external-holdout-registry-test-fixture",
+            "public_key_pem": public_key_pem(HOLDOUT_REGISTRY_PRIVATE_KEY),
+        },
+    })
+    monkeypatch.setattr(tool, "TRUSTED_HOLDOUT_REGISTRY_ENDPOINTS", {
+        HOLDOUT_REGISTRY_ID: {
+            "registry_id": HOLDOUT_REGISTRY_ID,
+            "base_url": "https://holdout-registry.invalid/v1",
+        },
+    })
+
+
+def signed_registry_head(sequence, entry_sha256, prior_head_sha256, *, observed_at=None):
+    head = {
+        "schema": tool.HOLDOUT_REGISTRY_HEAD_SCHEMA,
+        "registry_id": HOLDOUT_REGISTRY_ID,
+        "sequence": sequence,
+        "entry_sha256": entry_sha256,
+        "prior_head_sha256": prior_head_sha256,
+        "observed_at_utc": (observed_at or datetime.now(timezone.utc)).isoformat(),
+        "signing_key_id": HOLDOUT_REGISTRY_KEY_ID,
+        "public_key_sha256": tool.hashlib.sha256(
+            public_key_pem(HOLDOUT_REGISTRY_PRIVATE_KEY)
+        ).hexdigest(),
+        "producer": "Independent Append-Only Holdout Registry",
+        "source": "external-holdout-registry-test-fixture",
+    }
+    return {
+        "head": head,
+        "signature_base64": base64.b64encode(
+            HOLDOUT_REGISTRY_PRIVATE_KEY.sign(tool.canonical_json_bytes(head))
+        ).decode(),
+    }
+
+
+class FakeHoldoutRegistry:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entries = {}
+        self.evaluations = set()
+        self.head_envelope = signed_registry_head(0, "0" * 64, "0" * 64)
+
+    def get_head(self):
+        with self.lock:
+            return copy.deepcopy(self.head_envelope)
+
+    def consume(self, request):
+        with self.lock:
+            current = self.head_envelope["head"]
+            if (
+                request["expected_prior_sequence"] != current["sequence"]
+                or request["expected_prior_head_sha256"]
+                != tool.canonical_hash(current)
+                or request["evaluation_id"] in self.evaluations
+            ):
+                raise tool.RegistrationError("holdout registry atomic consume conflict")
+            entry = {
+                "schema": tool.HOLDOUT_REGISTRY_ENTRY_SCHEMA,
+                "registry_id": HOLDOUT_REGISTRY_ID,
+                "sequence": current["sequence"] + 1,
+                "evaluation_id": request["evaluation_id"],
+                "holdout_ledger_sha256": request["holdout_ledger_sha256"],
+                "annotation_sha256": request["annotation_sha256"],
+                "holdout_set_sha256": request["holdout_set_sha256"],
+                "registration_tool_sha256": request["registration_tool_sha256"],
+                "toolchain_lock_sha256": request["toolchain_lock_sha256"],
+                "annotation_authority_attestation_sha256": request[
+                    "annotation_authority_attestation_sha256"
+                ],
+                "prior_head_sha256": request["expected_prior_head_sha256"],
+                "request_nonce": request["request_nonce"],
+                "consumed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status": "consumed",
+            }
+            self.entries[entry["sequence"]] = copy.deepcopy(entry)
+            self.evaluations.add(entry["evaluation_id"])
+            self.head_envelope = signed_registry_head(
+                entry["sequence"], tool.canonical_hash(entry),
+                request["expected_prior_head_sha256"],
+            )
+            return {
+                "schema": tool.HOLDOUT_REGISTRY_RECEIPT_SCHEMA,
+                "registry_id": HOLDOUT_REGISTRY_ID,
+                "consume_request_sha256": tool.canonical_hash(request),
+                "entry": copy.deepcopy(entry),
+                "head_envelope": copy.deepcopy(self.head_envelope),
+            }
+
+    def get_entry(self, sequence):
+        with self.lock:
+            return {"entry": copy.deepcopy(self.entries[sequence])}
 
 
 def write_detached_attestation(path, value, private_key):
@@ -203,6 +304,8 @@ def test_production_authority_allowlists_default_empty():
     assert fresh.TRUSTED_ANNOTATION_AUTHORITY_SIGNERS == {}
     assert fresh.TRUSTED_LIDAR_VALIDATION_SIGNERS == {}
     assert fresh.TRUSTED_VERTICAL_DATUM_SIGNERS == {}
+    assert fresh.TRUSTED_HOLDOUT_REGISTRY_SIGNERS == {}
+    assert fresh.TRUSTED_HOLDOUT_REGISTRY_ENDPOINTS == {}
 
 
 def test_tracked_deterministic_toolchain_lock_matches_current_runtime():
@@ -225,6 +328,19 @@ def test_toolchain_lock_rejects_different_openblas_kernel(monkeypatch):
     monkeypatch.setenv("OPENBLAS_CORETYPE", "SkylakeX")
     with pytest.raises(tool.RegistrationError, match="deterministic toolchain"):
         tool.validate_toolchain_lock()
+
+
+def write_valid_pdf(path, title, *, encrypted=False):
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_metadata({"/Title": title, "/Subject": "retained-evidence-" * 400})
+    if encrypted:
+        writer.encrypt("test-password")
+    with path.open("wb") as stream:
+        writer.write(stream)
+    assert path.stat().st_size >= tool.MIN_AUTHORITY_PDF_BYTES
 
 
 def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive_hash="opendrive",
@@ -262,13 +378,8 @@ def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive
         writer.writerows(rows)
     survey_license = tmp_path / "surveyor-license.pdf"
     instrument_calibration = tmp_path / "instrument-calibration.pdf"
-    survey_license.write_bytes(
-        b"%PDF-1.7\nlicensed surveyor PLS-12345\n%" + b"L" * 4096 + b"\n%%EOF\n"
-    )
-    instrument_calibration.write_bytes(
-        b"%PDF-1.7\ninstrument TS-9000-001 calibration\n%"
-        + b"C" * 4096 + b"\n%%EOF\n"
-    )
+    write_valid_pdf(survey_license, "Licensed surveyor PLS-12345")
+    write_valid_pdf(instrument_calibration, "Instrument TS-9000-001 calibration")
     deliverables = [observations, survey_license, instrument_calibration]
     roles = {
         observations: "raw_observations", survey_license: "survey_license",
@@ -369,6 +480,22 @@ def rebind_observations(path, observations):
     path.write_text(json.dumps(value))
 
 
+def rebind_survey_deliverable(path, deliverable, role):
+    value = json.loads(path.read_text())
+    digest = tool.sha256(deliverable)
+    declaration = next(
+        item for item in value["raw_deliverables"] if item["role"] == role
+    )
+    declaration.update({"sha256": digest, "bytes": deliverable.stat().st_size})
+    if role == "survey_license":
+        value["licensed_source"]["survey_license_deliverable_sha256"] = digest
+    elif role == "instrument_calibration":
+        value["licensed_source"]["instrument"][
+            "calibration_deliverable_sha256"
+        ] = digest
+    path.write_text(json.dumps(value))
+
+
 def validate_written_survey(path, geometry, deliverables, observations,
                             geometry_hash="geometry", opendrive_hash="opendrive",
                             horizontal_epsg=26910, horizontal_wkt=None,
@@ -415,7 +542,8 @@ def write_crs_authority_attestation(tmp_path, artifact_path):
     )
 
 
-def write_annotation_review_bundle(tmp_path, annotation, features):
+def write_annotation_review_bundle(tmp_path, annotation, features, registry=None):
+    registry = registry or FakeHoldoutRegistry()
     annotation_path = tmp_path / "annotations.json"
     annotation_path.write_text(json.dumps(annotation))
     now = datetime.now(timezone.utc)
@@ -440,6 +568,7 @@ def write_annotation_review_bundle(tmp_path, annotation, features):
     review_path = tmp_path / "annotation-review.json"
     review_path.write_text(json.dumps(review_value))
     review = tool.validate_annotation_review(annotation_path, review_path, features)
+    prior_head = registry.get_head()["head"]
     ledger_value = {
         "schema": tool.HOLDOUT_LEDGER_SCHEMA,
         "annotation_sha256": tool.sha256(annotation_path),
@@ -449,6 +578,9 @@ def write_annotation_review_bundle(tmp_path, annotation, features):
         "prior_evaluation_count": 0,
         "maximum_evaluation_count": 1,
         "prior_evaluation_ids": [],
+        "registry_id": HOLDOUT_REGISTRY_ID,
+        "registry_prior_sequence": prior_head["sequence"],
+        "registry_prior_head_sha256": tool.canonical_hash(prior_head),
         "authorized_at_utc": now.isoformat(),
         "expires_at_utc": (now + timedelta(days=7)).isoformat(),
         "burn_receipt_path": str(
@@ -473,6 +605,9 @@ def write_annotation_review_bundle(tmp_path, annotation, features):
         "holdout_ledger_sha256": ledger["sha256"],
         "holdout_set_sha256": review["holdout_set_sha256"],
         "reviewers": review["reviewers"],
+        "registry_id": HOLDOUT_REGISTRY_ID,
+        "registry_prior_sequence": prior_head["sequence"],
+        "registry_prior_head_sha256": tool.canonical_hash(prior_head),
         "verification_result": {
             "annotation_status": "verified",
             "interreview_status": "independent",
@@ -485,7 +620,7 @@ def write_annotation_review_bundle(tmp_path, annotation, features):
     )
     return (
         annotation_path, review_path, ledger_path,
-        attestation_path, signature_path,
+        attestation_path, signature_path, registry,
     )
 
 
@@ -649,7 +784,7 @@ def test_exact_segment_distance_handles_intersections_and_degenerate_segments():
 def test_annotation_interreview_and_one_time_holdout_burn_are_enforced(tmp_path):
     annotation, geometry, tiles, _, _ = synthetic_evidence()
     features = tool.load_features(annotation, geometry, tiles)
-    annotation_path, review_path, ledger_path, attestation_path, signature_path = (
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, registry = (
         write_annotation_review_bundle(tmp_path, annotation, features)
     )
     review = tool.validate_annotation_review(annotation_path, review_path, features)
@@ -657,10 +792,11 @@ def test_annotation_interreview_and_one_time_holdout_burn_are_enforced(tmp_path)
     authority = tool.validate_annotation_authority(
         annotation_path, review, ledger, attestation_path, signature_path
     )
-    burned = tool.authorize_and_burn_holdout(review, ledger, authority)
+    burned = tool.authorize_and_burn_holdout(review, ledger, authority, registry)
     assert review["repeatability_max_m"] == 0.0
     assert authority["signing_key_id"] == ANNOTATION_AUTHORITY_KEY_ID
     assert burned["burned"] is True
+    assert burned["registry_consumption"]["confirmed"] is True
     with pytest.raises(tool.RegistrationError, match="already burned"):
         tool.validate_holdout_ledger(annotation_path, ledger_path, review)
     copied_dir = tmp_path / "copied-ledger-bypass"
@@ -669,6 +805,235 @@ def test_annotation_interreview_and_one_time_holdout_burn_are_enforced(tmp_path)
     copied_ledger.write_bytes(ledger_path.read_bytes())
     with pytest.raises(tool.RegistrationError, match="ledger is invalid"):
         tool.validate_holdout_ledger(annotation_path, copied_ledger, review)
+
+
+def test_deleted_or_restored_local_receipt_cannot_reuse_external_consumption(tmp_path):
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, registry = (
+        write_annotation_review_bundle(tmp_path, annotation, features)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    burned = tool.authorize_and_burn_holdout(review, ledger, authority, registry)
+    Path(burned["burn_receipt_path"]).unlink()
+    restored_local_ledger = tool.validate_holdout_ledger(
+        annotation_path, ledger_path, review
+    )
+    with pytest.raises(tool.RegistrationError, match="registry head"):
+        tool.authorize_and_burn_holdout(
+            review, restored_local_ledger, authority, registry
+        )
+
+
+def test_offline_local_receipt_never_substitutes_for_allowlisted_registry(
+    tmp_path, monkeypatch
+):
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, registry = (
+        write_annotation_review_bundle(tmp_path, annotation, features)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    monkeypatch.setattr(tool, "TRUSTED_HOLDOUT_REGISTRY_ENDPOINTS", {})
+    with pytest.raises(tool.RegistrationError, match="endpoint is not pinned"):
+        tool.authorize_and_burn_holdout(review, ledger, authority, registry)
+    assert not Path(ledger["burn_receipt_path"]).exists()
+
+
+@pytest.mark.parametrize("mode", ["rollback", "fork"])
+def test_registry_rollback_or_fork_head_is_rejected(tmp_path, mode):
+    registry = FakeHoldoutRegistry()
+    genesis = registry.head_envelope["head"]
+    authorized_head = signed_registry_head(
+        1, "1" * 64, tool.canonical_hash(genesis)
+    )
+    registry.head_envelope = authorized_head
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, _ = (
+        write_annotation_review_bundle(tmp_path, annotation, features, registry)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    if mode == "rollback":
+        registry.head_envelope = signed_registry_head(0, "0" * 64, "0" * 64)
+    else:
+        registry.head_envelope = signed_registry_head(
+            1, "f" * 64, tool.canonical_hash(genesis)
+        )
+    with pytest.raises(tool.RegistrationError, match="signed authorization base"):
+        tool.consume_holdout_registry(ledger, authority, registry)
+
+
+@pytest.mark.parametrize("failure", ["stale", "signature"])
+def test_registry_head_freshness_and_signature_are_fail_closed(tmp_path, failure):
+    registry = FakeHoldoutRegistry()
+    if failure == "stale":
+        registry.head_envelope = signed_registry_head(
+            0, "0" * 64, "0" * 64,
+            observed_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+    else:
+        registry.head_envelope["signature_base64"] = base64.b64encode(
+            b"\x00" * 64
+        ).decode()
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, _ = (
+        write_annotation_review_bundle(tmp_path, annotation, features, registry)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    with pytest.raises(
+        tool.RegistrationError, match="stale|signature is invalid"
+    ):
+        tool.consume_holdout_registry(ledger, authority, registry)
+
+
+@pytest.mark.parametrize("failure", ["head_registry", "signer_registry"])
+def test_registry_head_cannot_cross_registry_or_signer_namespace(
+    monkeypatch, failure
+):
+    other_key_id = "other-registry-key"
+    other_registry_id = "other-registry"
+    other_key = Ed25519PrivateKey.from_private_bytes(bytes(range(193, 225)))
+    signers = copy.deepcopy(tool.TRUSTED_HOLDOUT_REGISTRY_SIGNERS)
+    signers[other_key_id] = {
+        "registry_id": other_registry_id,
+        "producer": "Other Registry",
+        "source": "other-registry-source",
+        "public_key_pem": public_key_pem(other_key),
+    }
+    monkeypatch.setattr(tool, "TRUSTED_HOLDOUT_REGISTRY_SIGNERS", signers)
+    head = copy.deepcopy(signed_registry_head(0, "0" * 64, "0" * 64)["head"])
+    if failure == "head_registry":
+        head["registry_id"] = other_registry_id
+    else:
+        head.update({
+            "signing_key_id": other_key_id,
+            "public_key_sha256": tool.hashlib.sha256(public_key_pem(other_key)).hexdigest(),
+            "producer": "Other Registry",
+            "source": "other-registry-source",
+        })
+    envelope = {
+        "head": head,
+        "signature_base64": base64.b64encode(
+            other_key.sign(tool.canonical_json_bytes(head))
+        ).decode(),
+    }
+    with pytest.raises(
+        tool.RegistrationError, match="binding is invalid|signer is not pinned"
+    ):
+        tool._verify_holdout_registry_head(envelope, HOLDOUT_REGISTRY_ID)
+
+
+def test_registry_producer_must_be_independent_from_annotation_authority(
+    tmp_path, monkeypatch
+):
+    registry = FakeHoldoutRegistry()
+    signers = copy.deepcopy(tool.TRUSTED_HOLDOUT_REGISTRY_SIGNERS)
+    signers[HOLDOUT_REGISTRY_KEY_ID].update({
+        "producer": "Independent Annotation Authority",
+        "source": "annotation-review-registry-test-fixture",
+    })
+    monkeypatch.setattr(tool, "TRUSTED_HOLDOUT_REGISTRY_SIGNERS", signers)
+    head = registry.head_envelope["head"]
+    head.update({
+        "producer": "Independent Annotation Authority",
+        "source": "annotation-review-registry-test-fixture",
+    })
+    registry.head_envelope["signature_base64"] = base64.b64encode(
+        HOLDOUT_REGISTRY_PRIVATE_KEY.sign(tool.canonical_json_bytes(head))
+    ).decode()
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, _ = (
+        write_annotation_review_bundle(tmp_path, annotation, features, registry)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    with pytest.raises(tool.RegistrationError, match="not independent"):
+        tool.consume_holdout_registry(ledger, authority, registry)
+
+
+def test_registry_receipt_fork_and_missing_inclusion_are_rejected(tmp_path):
+    class ForkingRegistry(FakeHoldoutRegistry):
+        def consume(self, request):
+            receipt = super().consume(request)
+            receipt["head_envelope"] = signed_registry_head(
+                receipt["entry"]["sequence"],
+                tool.canonical_hash(receipt["entry"]), "f" * 64,
+            )
+            return receipt
+
+    class MissingEntryRegistry(FakeHoldoutRegistry):
+        def get_entry(self, sequence):
+            return {"entry": {"sequence": sequence, "status": "missing"}}
+
+    for registry, message in (
+        (ForkingRegistry(), "append chain"),
+        (MissingEntryRegistry(), "inclusion"),
+    ):
+        case = tmp_path / message.replace(" ", "-")
+        case.mkdir()
+        annotation, geometry, tiles, _, _ = synthetic_evidence()
+        features = tool.load_features(annotation, geometry, tiles)
+        annotation_path, review_path, ledger_path, attestation_path, signature_path, _ = (
+            write_annotation_review_bundle(case, annotation, features, registry)
+        )
+        review = tool.validate_annotation_review(annotation_path, review_path, features)
+        ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+        authority = tool.validate_annotation_authority(
+            annotation_path, review, ledger, attestation_path, signature_path
+        )
+        with pytest.raises(tool.RegistrationError, match=message):
+            tool.consume_holdout_registry(ledger, authority, registry)
+
+
+def test_registry_atomic_compare_and_append_allows_only_one_concurrent_consumer(tmp_path):
+    annotation, geometry, tiles, _, _ = synthetic_evidence()
+    features = tool.load_features(annotation, geometry, tiles)
+    annotation_path, review_path, ledger_path, attestation_path, signature_path, registry = (
+        write_annotation_review_bundle(tmp_path, annotation, features)
+    )
+    review = tool.validate_annotation_review(annotation_path, review_path, features)
+    ledger = tool.validate_holdout_ledger(annotation_path, ledger_path, review)
+    authority = tool.validate_annotation_authority(
+        annotation_path, review, ledger, attestation_path, signature_path
+    )
+    results = []
+
+    def consume():
+        try:
+            results.append(("ok", tool.consume_holdout_registry(ledger, authority, registry)))
+        except tool.RegistrationError as exc:
+            results.append(("error", str(exc)))
+
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert [item[0] for item in results].count("ok") == 1
+    assert [item[0] for item in results].count("error") == 1
+    assert len(registry.entries) == 1
 
 
 def test_cli_holdout_evaluation_fails_closed_before_any_metric_is_computed(tmp_path):
@@ -694,7 +1059,7 @@ def test_cli_holdout_evaluation_fails_closed_before_any_metric_is_computed(tmp_p
 def test_annotation_interreview_repeatability_above_fixed_limit_fails(tmp_path):
     annotation, geometry, tiles, _, _ = synthetic_evidence()
     features = tool.load_features(annotation, geometry, tiles)
-    annotation_path, review_path, _, _, _ = write_annotation_review_bundle(
+    annotation_path, review_path, _, _, _, _ = write_annotation_review_bundle(
         tmp_path, annotation, features
     )
     review = json.loads(review_path.read_text())
@@ -1123,11 +1488,17 @@ def write_lidar_validation_attestation(tmp_path, lidar_path, validation_path):
 
 def write_vertical_reconciliation_bundle(tmp_path, opendrive, tile):
     now = datetime.now(timezone.utc)
+    source_artifact = tmp_path / "vertical-source-reference.txt"
+    source_artifact.write_bytes(
+        b"Independent retained engineering vertical datum record\n" * 128
+    )
     source_reference = {
         "datum": "Authenticated Richmond engineering datum",
         "coordinate_epoch": 2026.5,
         "linear_units": "metre",
-        "source_artifact_sha256": "a" * 64,
+        "source_artifact_sha256": tool.sha256(source_artifact),
+        "source_artifact_file_name": source_artifact.name,
+        "source_artifact_bytes": source_artifact.stat().st_size,
     }
     target_reference = {
         "epsg": tile["vertical_epsg"], "datum": tile["vertical_datum"],
@@ -1191,7 +1562,7 @@ def write_vertical_reconciliation_bundle(tmp_path, opendrive, tile):
         tmp_path / "vertical-datum-authority.json", attestation_value,
         VERTICAL_AUTHORITY_PRIVATE_KEY,
     )
-    return artifact_path, attestation_path, signature_path
+    return artifact_path, attestation_path, signature_path, source_artifact
 
 
 def test_lidar_validation_requires_independently_signed_authority_for_acceptance(tmp_path):
@@ -1237,11 +1608,12 @@ def test_signed_vertical_datum_reconciliation_recomputes_independent_controls(tm
         "<OpenDRIVE><header><geoReference>EPSG:26910</geoReference></header></OpenDRIVE>"
     )
     opendrive = tool.parse_opendrive(xodr)
-    artifact, attestation, signature = write_vertical_reconciliation_bundle(
+    artifact, attestation, signature, source_artifact = write_vertical_reconciliation_bundle(
         tmp_path, opendrive, tile
     )
     result = tool.validate_vertical_datum_reconciliation(
-        opendrive, tile, {"present": False}, artifact, attestation, signature
+        opendrive, tile, {"present": False}, artifact, attestation, signature,
+        source_artifact,
     )
     assert result["passed"] is True
     assert result["authenticated_offset_m"] == 5.0
@@ -1256,10 +1628,111 @@ def test_self_declared_vertical_offset_without_pinned_signature_fails(tmp_path):
         "<OpenDRIVE><header><geoReference>EPSG:26910</geoReference></header></OpenDRIVE>"
     )
     opendrive = tool.parse_opendrive(xodr)
-    artifact, _, _ = write_vertical_reconciliation_bundle(tmp_path, opendrive, tile)
+    artifact, _, _, source_artifact = write_vertical_reconciliation_bundle(
+        tmp_path, opendrive, tile
+    )
     with pytest.raises(tool.RegistrationError, match="vertical datum authority detached"):
         tool.validate_vertical_datum_reconciliation(
-            opendrive, tile, {"present": False}, artifact
+            opendrive, tile, {"present": False}, artifact,
+            source_artifact_path=source_artifact,
+        )
+
+
+def vertical_reconciliation_fixture(tmp_path):
+    path, validation = write_las_and_validation(tmp_path)
+    tile = tool.load_lidar_tile(path, validation)
+    xodr = tmp_path / "map.xodr"
+    xodr.write_text(
+        "<OpenDRIVE><header><geoReference>EPSG:26910</geoReference></header></OpenDRIVE>"
+    )
+    opendrive = tool.parse_opendrive(xodr)
+    return (
+        opendrive, tile,
+        *write_vertical_reconciliation_bundle(tmp_path, opendrive, tile),
+    )
+
+
+def test_vertical_source_artifact_is_required_and_exactly_hash_bound(tmp_path):
+    opendrive, tile, artifact, attestation, signature, source = (
+        vertical_reconciliation_fixture(tmp_path)
+    )
+    with pytest.raises(tool.RegistrationError, match="source artifact is required"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact, attestation, signature
+        )
+    source.write_bytes(source.read_bytes() + b"tampered")
+    with pytest.raises(tool.RegistrationError, match="does not match signed reference"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact, attestation, signature,
+            source,
+        )
+
+
+def test_vertical_source_artifact_substitution_and_symlink_fail_closed(tmp_path):
+    opendrive, tile, artifact, attestation, signature, source = (
+        vertical_reconciliation_fixture(tmp_path)
+    )
+    substitute_dir = tmp_path / "substitute"
+    substitute_dir.mkdir()
+    substitute = substitute_dir / source.name
+    substitute.write_bytes(b"different retained source" * 128)
+    with pytest.raises(tool.RegistrationError, match="does not match signed reference"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact, attestation, signature,
+            substitute,
+        )
+    symlink = tmp_path / "vertical-source-link.txt"
+    symlink.symlink_to(source)
+    with pytest.raises(tool.RegistrationError, match="safely opened"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact, attestation, signature,
+            symlink,
+        )
+
+
+def test_vertical_source_artifact_hardlink_empty_and_oversize_fail_closed(tmp_path):
+    opendrive, tile, artifact, attestation, signature, source = (
+        vertical_reconciliation_fixture(tmp_path)
+    )
+    hardlink = tmp_path / "hardlink.txt"
+    hardlink.hardlink_to(source)
+    with pytest.raises(tool.RegistrationError, match="single-link regular file"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact, attestation, signature,
+            source,
+        )
+    hardlink.unlink()
+    empty = tmp_path / "empty.txt"
+    empty.touch()
+    with pytest.raises(tool.RegistrationError, match="single-link regular file"):
+        tool.read_retained_vertical_source_artifact(empty)
+    oversize = tmp_path / "oversize.txt"
+    with oversize.open("wb") as stream:
+        stream.truncate(tool.MAX_VERTICAL_SOURCE_ARTIFACT_BYTES + 1)
+    with pytest.raises(tool.RegistrationError, match="single-link regular file"):
+        tool.read_retained_vertical_source_artifact(oversize)
+
+
+def test_vertical_source_artifact_concurrent_path_replacement_is_rejected(
+    tmp_path, monkeypatch
+):
+    opendrive, tile, artifact, attestation, signature, source = (
+        vertical_reconciliation_fixture(tmp_path)
+    )
+    original_reader = tool._read_all_from_fd
+
+    def replace_after_read(file_descriptor, expected_bytes):
+        content = original_reader(file_descriptor, expected_bytes)
+        replacement = source.with_suffix(".replacement")
+        replacement.write_bytes(content)
+        replacement.replace(source)
+        return content
+
+    monkeypatch.setattr(tool, "_read_all_from_fd", replace_after_read)
+    with pytest.raises(tool.RegistrationError, match="changed while being read"):
+        tool.validate_vertical_datum_reconciliation(
+            opendrive, tile, {"present": False}, artifact, attestation, signature,
+            source,
         )
 
 
@@ -1627,6 +2100,84 @@ def test_tiny_fake_pdf_is_rejected_even_when_caller_rebinds_its_hash(tmp_path):
     )
     assert survey["passed"] is False
     assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
+
+
+def test_large_padded_fake_pdf_is_rejected_even_with_rebound_hash(tmp_path):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    license_path = next(item for item in deliverables if item.name == "surveyor-license.pdf")
+    license_path.write_bytes(
+        b"%PDF-1.7\ncaller text without objects or xref\n%"
+        + b"X" * 8192 + b"\n%%EOF\n"
+    )
+    rebind_survey_deliverable(path, license_path, "survey_license")
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
+
+
+def test_oversize_survey_deliverable_is_rejected_before_read(tmp_path, monkeypatch):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    license_path = next(item for item in deliverables if item.name == "surveyor-license.pdf")
+    with license_path.open("r+b") as stream:
+        stream.truncate(tool.MAX_SURVEY_DELIVERABLE_BYTES + 1)
+    actual_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(value):
+        if value.resolve() == license_path.resolve():
+            raise AssertionError("oversize deliverable was read before its bound")
+        return actual_read_bytes(value)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
+
+
+@pytest.mark.parametrize("failure", ["truncated", "encrypted", "polyglot"])
+def test_structurally_unsafe_pdf_variants_fail_closed(tmp_path, failure):
+    _, geometry, _, _, _ = synthetic_evidence()
+    path, deliverables, observations = write_current_survey(tmp_path, geometry)
+    license_path = next(item for item in deliverables if item.name == "surveyor-license.pdf")
+    if failure == "truncated":
+        license_path.write_bytes(license_path.read_bytes()[:-32])
+    elif failure == "encrypted":
+        write_valid_pdf(license_path, "Encrypted license", encrypted=True)
+    else:
+        license_path.write_bytes(
+            license_path.read_bytes() + b"\nPK\x03\x04polyglot-archive-after-eof"
+        )
+    rebind_survey_deliverable(path, license_path, "survey_license")
+    survey = tool.validate_current_survey(
+        path, geometry, "geometry", "opendrive", 26910,
+        deliverables, observations,
+    )
+    assert survey["passed"] is False
+    assert "current_horizontal_survey_licensed_deliverables" in survey["reasons"]
+
+
+def test_strict_pdf_parser_warning_is_rejected(tmp_path, monkeypatch):
+    import pypdf
+
+    pdf = tmp_path / "valid-but-warning.pdf"
+    write_valid_pdf(pdf, "Parser warning coverage")
+    actual_reader = pypdf.PdfReader
+
+    def warning_reader(*args, **kwargs):
+        reader = actual_reader(*args, **kwargs)
+        logging.getLogger("pypdf").warning("synthetic strict-parser warning")
+        return reader
+
+    monkeypatch.setattr(pypdf, "PdfReader", warning_reader)
+    with pytest.raises(tool.RegistrationError, match="parser warnings"):
+        tool._strict_pdf_evidence(pdf.read_bytes(), "warning fixture")
 
 
 def test_survey_authority_detached_signature_tamper_fails(tmp_path):
