@@ -304,9 +304,9 @@ class LiveStreamReaderTests(unittest.TestCase):
                 terminal[0]["evidence"], "exact_fragment_match"
             )
             self.assertEqual(len(clock_sources), 2)
-            self.assertTrue(all(
-                source == "clock-session-1" for source in clock_sources
-            ))
+            self.assertEqual(clock_sources, [
+                "clock-session-1", "signed-session-1"
+            ])
             self.assertFalse(any(
                 event["state"] == "reconnecting" for event in states
             ))

@@ -401,6 +401,10 @@ class _AsyncCaptureRestart:
         clock_resolution = None
         source = self._source
         clock_source = self._clock_source
+        resolution_sources = [source]
+        if clock_source != source:
+            resolution_sources.append(clock_source)
+        resolution_source_index = 0
         try:
             self._set_stage("capture_open")
             capture = _call_with_supported_kwargs(
@@ -538,7 +542,7 @@ class _AsyncCaptureRestart:
                     clock_resolution = _AsyncMediaClockResolution(
                         self._media_clock_factory,
                         (
-                            clock_source,
+                            resolution_sources[resolution_source_index],
                             frame,
                             position,
                             self._media_frame_identity,
@@ -557,6 +561,11 @@ class _AsyncCaptureRestart:
                 if not resolved:
                     continue
                 if media_clock is None:
+                    clock_resolution.discard()
+                    clock_resolution = None
+                    if resolution_source_index + 1 < len(resolution_sources):
+                        resolution_source_index += 1
+                        continue
                     raise RuntimeError("media clock resolution failed")
                 self._set_stage("clock_validation")
                 frame_clock = media_clock.metadata_at(position)
