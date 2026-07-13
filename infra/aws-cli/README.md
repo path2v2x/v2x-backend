@@ -6,6 +6,49 @@ This folder provisions the `v2x-backend` data plane in **`us-west-1`**:
 - Read API: HTTP API -> `v2x-backend-read`
 - Private state bucket for digital twin state + snapshots
 
+## Calibration evidence store
+
+`provision-calibration-evidence-store.sh` plans or creates the separate
+versioned, encrypted, public-blocked S3 bucket for write-once calibration
+manifests and holdout evidence. It defaults to read-only plan mode and prints a
+hash of the exact current state. Applying requires that hash plus the explicit
+irreversible Object Lock confirmation; the script refuses to retrofit the
+normal mutable state bucket. Default retention is 90-day COMPLIANCE mode. Do
+not upload a holdout until split/model/config choices are frozen and the
+authority manifest has passed review.
+
+The writer role and a named CloudTrail trail with S3 object data events for the
+exact bucket prefix must already exist. The bucket policy restricts writes to
+that role and denies object deletion, retention changes, and governance bypass.
+Per-object COMPLIANCE retention is the write-once control; administrators can
+still change bucket policy/defaults for future objects, so organization SCPs
+and CloudTrail monitoring should alert on bucket policy, lifecycle, and Object
+Lock configuration changes. Retention extension and legal holds are
+intentionally blocked for ordinary writers; changing that policy is a separate
+reviewed operation.
+
+```bash
+# Read-only plan: review current + desired state and retain the printed hash.
+AWS_PROFILE=path AWS_REGION=us-west-1 \
+CLOUDTRAIL_TRAIL_NAME=<trail-with-this-bucket-data-events> \
+  ./provision-calibration-evidence-store.sh
+
+# Apply only the exact reviewed state.
+AWS_PROFILE=path AWS_REGION=us-west-1 PLAN_ONLY=false \
+CLOUDTRAIL_TRAIL_NAME=<trail-with-this-bucket-data-events> \
+EVIDENCE_WRITER_ROLE_ARN=arn:aws:iam::<account>:role/V2XCalibrationEvidenceWriter \
+EXPECTED_CURRENT_STATE_HASH=<reviewed-hash> \
+CONFIRM_OBJECT_LOCK_IRREVERSIBLE=CONFIGURE_OBJECT_LOCKED_EVIDENCE_BUCKET \
+  ./provision-calibration-evidence-store.sh
+```
+
+Before the first mutation the script stores mode-0700 rollback evidence. A new
+empty bucket can be removed if provisioning fails. After any COMPLIANCE-locked
+object is uploaded, deletion is impossible until retention expires; this is the
+intended property, not a reversible deployment. A partial apply is recovered by
+running a fresh plan, reviewing its new hash, and reconciling again. The script
+does not upload a canary or holdout object.
+
 ## Security note
 
 Do **not** paste AWS access keys into chat or commit them to git.
