@@ -57,7 +57,7 @@ class HlsMediaClockTests(unittest.TestCase):
             ))
 
         self.assertEqual(results, list(range(6)))
-        self.assertEqual(maximum_active, 2)
+        self.assertEqual(maximum_active, 1)
 
     def test_normal_and_urgent_executors_share_the_same_decoder_cap(self):
         lock = threading.Lock()
@@ -94,20 +94,14 @@ class HlsMediaClockTests(unittest.TestCase):
             [future.result(timeout=2.0) for future in futures],
             list(range(6)),
         )
-        self.assertEqual(maximum_active, 2)
+        self.assertEqual(maximum_active, 1)
 
     def test_nvdec_fragment_admission_cancels_while_waiting(self):
-        start_lock = threading.Lock()
-        started = 0
-        both_started = threading.Event()
+        first_started = threading.Event()
         release_first = threading.Event()
 
         def blocker(value):
-            nonlocal started
-            with start_lock:
-                started += 1
-                if started == 2:
-                    both_started.set()
+            first_started.set()
             release_first.wait(2.0)
             return value
 
@@ -118,15 +112,9 @@ class HlsMediaClockTests(unittest.TestCase):
                 ("one",),
                 {},
             )
-            second = executor.submit(
-                _run_nvdec_fragment_match,
-                blocker,
-                ("two",),
-                {},
-            )
-            self.assertTrue(both_started.wait(1.0))
+            self.assertTrue(first_started.wait(1.0))
             cancelled = threading.Event()
-            third = executor.submit(
+            second = executor.submit(
                 _run_nvdec_fragment_match,
                 lambda: self.fail("cancelled matcher ran"),
                 (),
@@ -135,10 +123,9 @@ class HlsMediaClockTests(unittest.TestCase):
             )
             cancelled.set()
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
-                third.result(timeout=1.0)
+                second.result(timeout=1.0)
             release_first.set()
             self.assertEqual(first.result(timeout=1.0), "one")
-            self.assertEqual(second.result(timeout=1.0), "two")
 
     def test_executor_shutdown_completes_in_fresh_subprocess(self):
         code = """

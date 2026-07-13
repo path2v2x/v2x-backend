@@ -35,10 +35,12 @@ _NVDEC_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 # Normal and urgent pools keep terminal work from queueing behind proactive
 # work, but both must share one hard decoder envelope. This prevents a normal
-# exact-clock match and an urgent terminal match from creating four additional
-# NVDEC sessions beside the four live readers. Acquisition remains cancellable
-# so discarded preparations cannot wait indefinitely for a slot.
-_NVDEC_FRAGMENT_MATCH_SLOTS = threading.BoundedSemaphore(value=2)
+# exact-clock match and an urgent terminal match from creating concurrent
+# fragment decoders beside the four live readers. One additional decoder keeps
+# the measured production GPU floor above the fixed rollback threshold while
+# preserving priority through the separate urgent executor. Acquisition remains
+# cancellable so discarded preparations cannot wait indefinitely for a slot.
+_NVDEC_FRAGMENT_MATCH_SLOTS = threading.BoundedSemaphore(value=1)
 
 
 def shutdown_media_clock_executors():
