@@ -9,9 +9,39 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-12 23:23 UTC; verify rather than assume. These items
+Observed through 2026-07-13 00:26 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
+- PR 37 merged as canonical
+  `80db3de34870379ddaa6984497607726a563a17d`. Its terminal-FIFO
+  hot failover preserves the last trusted frame for at most five seconds while
+  one fresh signed session decodes and obtains an exact trusted media clock;
+  otherwise the unchanged reconnect/staleness path fails closed. Fast failures
+  cannot spin session minting, and discarded preparations cannot retain hidden
+  FFmpeg captures. The 15-second freshness, ten-second capture/inference
+  progress, -1/+10-second clock, duplicate-frame, and zero-reconnect gates are
+  unchanged. Verification passed 139 perception, 241 Python-3.10 bridge, and 23
+  generated read-API tests.
+- Controlled upload-disabled and upload-enabled startup passed twice on that
+  exact target, most recently at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T002100Z-pr37-canonical-startup/`,
+  using verified rollback bundle
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T002100Z-pr37-hot-failover`.
+  Its independent ten-minute gate passed 600/600 strict samples and 10/10 feed
+  rounds at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T233414Z-pr37-live-watch-10m/`.
+  The unattended 30-minute product portion passed 1,800/1,800 strict samples and
+  30/30 feed rounds, including the prior ch3 minute-24 failure point, at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260712T234651Z-pr37-live-watch-30m/`.
+  Its post-hold harness probed phase 4 about one second before the Drive
+  WebSocket finished opening, conservatively rolled perception back, and must
+  not be called a complete release-gate pass. The same canonical fingerprint
+  was then redeployed through the fresh startup above. A supervised 24-hour
+  service `v2x-pr37-24h-monitor.service` is active with minute heartbeats,
+  five-minute feed/phase-4 checks, explicit hourly Richmond recovery, and
+  perception-only rollback at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T002445Z-pr37-live-monitor-24h/`.
+  Do not call PR 37 accepted until that monitor reaches its terminal pass.
 - PR 36 merged as canonical
   `edaae29e9c00b411137ba40b0fd546f4b7d3c33d`. It contains the
   fail-closed vehicle identity behavior described below. Controlled startup
@@ -29,22 +59,6 @@ override every older PR 32/candidate statement below.
   zero sessions, perception, and all three safety timers healthy. Do not call
   PR 36 deployed or accepted, and do not attribute the reader failure to the
   identity-only change without stronger evidence.
-- Candidate `77a6dcac428c3d7f331ae98ca143f5be7a17eae1` preserves the last
-  trusted frame while a terminal FIFO read triggers a bounded five-second
-  off-thread replacement. The replacement must obtain a fresh signed session,
-  decode a real frame, and validate its exact media-clock mapping before atomic
-  handoff; otherwise the existing reconnect/staleness path still fails closed.
-  The 15-second freshness, ten-second capture/inference progress, -1/+10-second
-  clock, duplicate-frame, and zero-reconnect gates are unchanged. It also makes
-  abandoned asynchronous preparations cancellation-safe so they cannot retain
-  a hidden FFmpeg capture. Fast preparation failures are limited to one fresh
-  attempt so an outage cannot spin on session minting. Verification passed 139
-  perception tests, 241 bridge
-  tests in the intended Python 3.10 environment, and 23 generated read-API
-  tests. This is source evidence only: require canonical merge, a fresh verified
-  rollback bundle, upload-disabled and upload-enabled startup, uninterrupted
-  ten-minute and 30-minute gates, and the automated 24-hour monitor before
-  acceptance.
 - PR 35 merged as canonical
   `76e561cd41d070a6402c39c98847e646bd81cc9a`. Controlled startup
   passed both upload modes. Its new ten-minute watch passed 600/600 strict
