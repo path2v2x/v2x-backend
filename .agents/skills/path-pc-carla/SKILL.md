@@ -9,15 +9,16 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 16:31 UTC; verify rather than assume. These items
+Observed through 2026-07-13 16:47 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
-- Canonical `origin/main` is now PR 51 merge
-  `be7de18dedf2b9c55fb45250236702bef3070197`. PR 51 is not deployed. Live
-  production remains the exact, detached, clean PR 35 rollback
-  `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
-  environment and timers restored. Do not describe PR 42-51 or the eager-
-  cleanup follow-ups below as production.
+- Canonical `origin/main` and the exact, detached, clean live production tree
+  are now PR 52 merge `0181c83c1d173681089e394b49b6259d324700cf`.
+  Perception is active with `KillMode=mixed`, the 60-second whole-cgroup
+  fail-safe retained, exactly four FFmpeg readers, and no environment override
+  file. CARLA, Drive, and web retained their pre-canary PIDs and zero restart
+  counts; all three intended timers are active. Do not describe PR 42-51 as
+  production.
 - PR 51's diagnostic five-child canary is rejected. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T160437Z-pr51-shutdown-diagnostics-canary/`,
   its bounded diagnostic is
@@ -42,8 +43,7 @@ override every older PR 32/candidate statement below.
   SIGTERM to every FFmpeg child at service stop before Python can own the
   cooperative teardown. Moving the Python cancellation watcher alone cannot
   fix that boundary. Never use `KillMode=process`; it can orphan children.
-- Current source-only branch `codex/v2x-open-cancel-boundary` starts from exact
-  PR 51. It keeps an `O_RDWR|O_NONBLOCK` FIFO owner guard while OpenCV enters
+- PR 52 keeps an `O_RDWR|O_NONBLOCK` FIFO owner guard while OpenCV enters
   its native constructor and runs a bounded monitor that owns deadline/cancel,
   serialized FFmpeg TERM/KILL/reap, guard close, and the EOF wake needed when a
   producer dies before the native reader exists. Normal constructor return
@@ -56,13 +56,26 @@ override every older PR 32/candidate statement below.
   seconds, an alive/no-output producer in 0.109 seconds, and partial-writer
   cancellation in 0.054 seconds. All 87 focused and 251 full perception tests
   pass with warnings as errors; compilation, diff, and systemd verification
-  pass; independent source review is clear. This branch is not committed,
-  merged, or deployed yet. Require canonical merge and one upload-disabled,
-  zero-session live canary: catch a real five-child helper, require a clean
-  stop below 45 seconds with `Result=success`, no SIGKILL and an empty cgroup,
-  then require exact restart, forced-reader recovery, at least 700 newly
-  published frames per camera, unchanged CARLA/Drive/web fingerprints, and
-  verified rollback/timer state. Fable still fails authentication before file
+  pass; independent source review is clear. Its upload-disabled, zero-session
+  canary passed at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T163629Z-pr52-open-boundary-canary/`;
+  the verified rollback bundle is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T163629Z-pr52-open-boundary/`.
+  The gate caught a real five-child helper at sample 44, stopped in four seconds
+  with `Result=success`, an empty cgroup, and no timeout/SIGKILL signature, then
+  restarted exact all-four health in five seconds. Killing one live reader
+  reached exact successful terminal recovery by sample three. The 90-by-five-
+  second soak kept every feed fresh, inference-fresh, and
+  `exact_same_session_pts`; ch1-ch4 published 764/756/768/775 new frames, all
+  above the unchanged 700 floor. Natural helpers around samples 44-46 and
+  87-90 quiesced back to exactly four readers in zero to seven seconds with no
+  cleanup failure. Pre/post phase-4 checks retained Richmond live mode, four
+  rig cameras, zero sessions/actors/tracks, unchanged CARLA/Drive/web
+  fingerprints, and all intended timers. A prior 16:35 UTC harness attempt
+  rejected before candidate start because this systemd reports equivalent
+  signals as `15`/`9`; it rolled exact PR 35 back cleanly and is not runtime
+  evidence. The next perception gate is controlled V2 upload/history proof,
+  not another lifecycle retry. Fable still fails authentication before file
   access; never claim a Fable pass.
 - PR 50's first complete five-child stop canary is rejected. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T153621Z-pr50-claimed-handover-shutdown-canary/`
