@@ -119,6 +119,11 @@ def measured_camera(tmp_path, camera_id):
     })
     return {
         "id": camera_id,
+        "pitch_deg": 0.0,
+        "yaw_deg": 0.0,
+        "heading_deg": 90.0,
+        "roll_deg": 0.0,
+        "twin_pose": {},
         "intrinsics": {
             "width": 1280,
             "height": 960,

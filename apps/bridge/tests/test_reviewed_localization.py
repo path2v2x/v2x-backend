@@ -16,6 +16,7 @@ from digital_twin_bridge.reviewed_localization import (
     ReviewedLocalizationError,
     ReviewedPlacementContext,
     _heldout_reprojection_metrics,
+    _project_surveyed_world_pixel,
     authority_signature,
     build_runtime_context,
     canonical_json_bytes,
@@ -308,6 +309,11 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
     manifest_hash = HASHES["d"]
     camera = {
         "id": "ch1",
+        "pitch_deg": 0.0,
+        "yaw_deg": 0.0,
+        "heading_deg": 90.0,
+        "roll_deg": 0.0,
+        "twin_pose": {},
         "intrinsics": {
             "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
             "width": 1280, "height": 960,
@@ -358,6 +364,7 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
             "anchor_location": [0.0, 0.0, 0.0],
             "base": {
                 "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
+                "fov_deg": 65.0,
             },
         },
         "intrinsics_calibration": {
@@ -421,6 +428,65 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
         )
 
 
+def test_static_reprojection_round_trips_nonzero_active_twin_pose():
+    camera = {
+        "pitch_deg": 0.0,
+        "yaw_deg": 0.0,
+        "heading_deg": 90.0,
+        "roll_deg": 0.0,
+        "twin_pose": {
+            "forward_offset_m": 1.5,
+            "right_offset_m": -0.4,
+            "height_offset_m": 0.7,
+            "pitch_offset_deg": 2.0,
+            "yaw_offset_deg": 3.0,
+            "roll_offset_deg": 1.0,
+        },
+        "intrinsics": {
+            "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
+            "width": 1280, "height": 960,
+        },
+        "intrinsics_calibration": {
+            "distortion": {
+                "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            },
+        },
+    }
+    anchor = [10.0, 20.0, 8.0]
+    base = {
+        "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
+        "fov_deg": 65.0,
+    }
+    from digital_twin_bridge.twin_camera_rig import absolute_twin_model
+
+    baseline = absolute_twin_model(anchor, base, camera["twin_pose"])
+    pitch = math.radians(baseline["pitch_deg"])
+    yaw = math.radians(baseline["yaw_deg"])
+    forward = [
+        math.cos(pitch) * math.cos(yaw),
+        math.cos(pitch) * math.sin(yaw),
+        math.sin(pitch),
+    ]
+    world = [
+        baseline["location"][index] + 20.0 * forward[index]
+        for index in range(3)
+    ]
+    manifest = {
+        "baseline": baseline,
+        "deployment_model": {"anchor_location": anchor, "base": base},
+    }
+
+    assert _project_surveyed_world_pixel(world, manifest, camera) == pytest.approx(
+        [640.0, 480.0]
+    )
+
+    manifest["deployment_model"]["base"]["yaw_deg"] = 1.0
+    with pytest.raises(
+        ReviewedLocalizationError, match="static_reprojection_extrinsics_invalid"
+    ):
+        _project_surveyed_world_pixel(world, manifest, camera)
+
+
 def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_world):
     matrix = [[1000.0, 0, 640.0], [0, 1000.0, 480.0], [0, 0, 1]]
     distortion = {key: 0.0 for key in ("k1", "k2", "p1", "p2", "k3")}
@@ -465,6 +531,11 @@ def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_w
     for camera_id in ("ch1", "ch2", "ch3", "ch4"):
         camera_values.append({
             "id": camera_id,
+            "pitch_deg": 0.0,
+            "yaw_deg": 0.0,
+            "heading_deg": 90.0,
+            "roll_deg": 0.0,
+            "twin_pose": {},
             "intrinsics": {
                 "width": 1280, "height": 960,
                 "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
@@ -984,6 +1055,34 @@ def test_spawn_and_tick_require_exact_selected_blueprint_type(mock_world):
     assert drifted.status()["objects"][0]["actor_present"] is False
 
 
+def test_update_reverifies_selected_blueprint_after_pose_mutation(mock_world):
+    sync = strict_sync(mock_world)
+    first = detection()
+    sync._apply([first])
+    actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+    original_set_transform = actor.set_transform
+
+    def replace_type_during_update(transform):
+        original_set_transform(transform)
+        if abs(transform.location.x - 11.0) < 1e-9:
+            actor.type_id = "vehicle.replaced-during-update"
+
+    actor.set_transform = replace_type_during_update
+    sync._apply([detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )])
+
+    status = sync.status()["objects"][0]
+    assert status["event_id"] == first["event_id"]
+    assert status["trajectory_sample_index"] == 0
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert sync.status()["strict_rejections"][
+        "active_blueprint_type_mismatch"
+    ] == 1
+
+
 def test_failed_provisional_destroy_is_quarantined_not_present(mock_world):
     original_spawn = mock_world.try_spawn_actor
     leaked = []
@@ -1037,7 +1136,8 @@ def test_unexpected_metadata_commit_failure_compensates_actor_and_track(
     prior_transform = actor.get_transform()
     original_commit = sync._commit_detection_metadata
 
-    def fail_commit(*_args, **_kwargs):
+    def fail_commit(track, *_args, **_kwargs):
+        track.event_id = "partially-written-event"
         raise RuntimeError("injected metadata commit failure")
 
     sync._commit_detection_metadata = fail_commit
@@ -1053,6 +1153,24 @@ def test_unexpected_metadata_commit_failure_compensates_actor_and_track(
     assert status["event_id"] == first["event_id"]
     assert status["trajectory_sample_index"] == 0
     assert status["actor_present"] is True
+    assert sync.status()["strict_rejections"]["strict_actor_commit_failed"] == 1
+
+
+def test_spawn_metadata_commit_failure_removes_actor_and_restores_track(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+
+    def fail_commit(track, *_args, **_kwargs):
+        track.event_id = "partially-written-event"
+        raise RuntimeError("injected spawn metadata commit failure")
+
+    sync._commit_detection_metadata = fail_commit
+    sync._apply([detection()])
+
+    assert sync.actor_ids() == set()
+    assert sync.status()["objects"] == []
+    assert all(actor.is_destroyed for actor in mock_world.get_actors())
     assert sync.status()["strict_rejections"]["strict_actor_commit_failed"] == 1
 
 
@@ -1076,6 +1194,9 @@ def test_cleanup_failure_retains_ownership_and_surfaces_status(mock_world, failu
         "track_cleanup:destroy_"
     )
     assert status["objects"][0]["tracked_actor_id"] == actor_id
+    assert status["objects"][0]["actor_present"] is False
+    assert status["objects"][0]["actor_quarantined"] is True
+    assert status["objects"][0]["quarantined_reason"] == "track_cleanup"
 
 
 def test_blueprint_digest_is_stable_and_cleanup_is_unchanged(mock_world):

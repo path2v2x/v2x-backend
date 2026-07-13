@@ -633,6 +633,8 @@ class TwinSync:
         try:
             destroyed = actor.destroy()
         except Exception:
+            if track.quarantined_reason is None:
+                track.quarantined_reason = failure_reason
             track.cleanup_failure = f"{failure_reason}:destroy_exception"
             logger.error(
                 "Twin actor cleanup raised for %s actor=%s",
@@ -642,6 +644,8 @@ class TwinSync:
             )
             return False
         if destroyed is not True:
+            if track.quarantined_reason is None:
+                track.quarantined_reason = failure_reason
             track.cleanup_failure = f"{failure_reason}:destroy_false"
             logger.error(
                 "Twin actor cleanup returned false for %s actor=%s",
@@ -966,6 +970,15 @@ class TwinSync:
                             "Strict twin transform transaction failed for %s: %s",
                             object_id,
                             transform_error,
+                        )
+                        continue
+                    integrity_reason = self._strict_actor_integrity_reason(
+                        actor, reviewed
+                    )
+                    if integrity_reason is not None:
+                        self._reject_strict(det, integrity_reason)
+                        self._quarantine_actor(
+                            track, actor, integrity_reason
                         )
                         continue
                     try:

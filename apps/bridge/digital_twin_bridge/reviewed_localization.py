@@ -18,6 +18,11 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Optional
 
+from digital_twin_bridge.twin_camera_rig import (
+    absolute_twin_model,
+    heading_to_carla_yaw,
+)
+
 try:
     from tools.aggregate_twin_calibration_manifests import (
         SiteManifestError,
@@ -603,12 +608,65 @@ def _project_surveyed_world_pixel(
     ]
     if any(not _finite(value) for value in rotation):
         raise ReviewedLocalizationError("static_reprojection_extrinsics_invalid")
-    if (
-        deployment.get("anchor_location") != location
-        or any(
-            deployment_base.get(key) != baseline.get(key)
-            for key in ("pitch_deg", "yaw_deg", "roll_deg")
+    try:
+        expected_base = {
+            "pitch_deg": float(camera["pitch_deg"]),
+            "yaw_deg": heading_to_carla_yaw(
+                float(camera["heading_deg"]), float(camera["yaw_deg"])
+            ),
+            "roll_deg": float(camera.get("roll_deg", 0.0)),
+        }
+        deployed = absolute_twin_model(
+            deployment.get("anchor_location"),
+            deployment_base,
+            camera.get("twin_pose") or {},
         )
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ReviewedLocalizationError(
+            "static_reprojection_extrinsics_invalid"
+        ) from exc
+    deployed_location = deployed.get("location")
+    deployed_rotation = [
+        deployed.get("pitch_deg"),
+        deployed.get("yaw_deg"),
+        deployed.get("roll_deg"),
+    ]
+    yaw_error = abs(
+        (float(deployed_rotation[1]) - float(rotation[1]) + 180.0)
+        % 360.0
+        - 180.0
+    ) if all(_finite(value) for value in deployed_rotation) else math.inf
+    base_yaw_error = abs(
+        (
+            float(deployment_base.get("yaw_deg"))
+            - expected_base["yaw_deg"]
+            + 180.0
+        )
+        % 360.0
+        - 180.0
+    ) if _finite(deployment_base.get("yaw_deg")) else math.inf
+    if (
+        not isinstance(deployed_location, list)
+        or len(deployed_location) != 3
+        or any(not _finite(value) for value in deployed_location)
+        or any(
+            abs(float(deployed_location[index]) - location[index]) > 1e-6
+            for index in range(3)
+        )
+        or abs(float(deployed_rotation[0]) - float(rotation[0])) > 1e-6
+        or yaw_error > 1e-6
+        or abs(float(deployed_rotation[2]) - float(rotation[2])) > 1e-6
+        or not _finite(deployment_base.get("pitch_deg"))
+        or abs(
+            float(deployment_base["pitch_deg"])
+            - expected_base["pitch_deg"]
+        ) > 1e-6
+        or base_yaw_error > 1e-6
+        or not _finite(deployment_base.get("roll_deg"))
+        or abs(
+            float(deployment_base["roll_deg"])
+            - expected_base["roll_deg"]
+        ) > 1e-6
     ):
         raise ReviewedLocalizationError("static_reprojection_extrinsics_invalid")
     intrinsics = _object(
