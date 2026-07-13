@@ -6,9 +6,19 @@ geometry truth.  A pinned segmentation model is tracked over every retained
 frame.  Exact-frame, cross-model segmentation consensus anchors select the
 target tracker ID.  Any anchor disagreement, missing frame binding, hash drift,
 or tracker-ID switch is retained as a rejection rather than hidden.
+
+Resource admission: do not run CPU model jobs while live perception is active
+unless the job is isolated below a previously proven non-impact CPU and memory
+cap.  This proposal tool does not establish that cap.
+
+SIGINT and SIGTERM remove only this invocation's exact staging directory.
+SIGKILL cannot be handled and can leave that directory behind.  Later runs do
+not sweep similarly named directories: an operator must prove the owning
+process is gone and the final output is absent before removing an orphan.
 """
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -16,6 +26,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import signal
 import shutil
 import sys
 import tempfile
@@ -69,9 +80,15 @@ REFERENCE_HEIGHT = 960.0
 MAXIMUM_CONTACT_RESIDUAL_JUMP_AT_REFERENCE_PX = 24.0
 MAXIMUM_CONTACT_RESIDUAL_SPEED_AT_REFERENCE_PX_PER_SECOND = 160.0
 MAXIMUM_CONTACT_RESIDUAL_ACCELERATION_AT_REFERENCE_PX_PER_SECOND2 = 1000.0
+STAGING_OWNER_MARKER = ".v2x-dense-track-staging-owner.json"
+HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class DenseTrackError(RuntimeError):
+    pass
+
+
+class DenseTrackInterrupted(DenseTrackError):
     pass
 
 
@@ -145,6 +162,79 @@ def fsync_directory_tree(root):
     directories.extend(path for path in root.rglob("*") if path.is_dir())
     for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
         fsync_directory(directory)
+
+
+@contextmanager
+def invocation_staging_directory(output):
+    """Yield one owned staging directory with scoped, cleanup-safe signals."""
+    if not hasattr(signal, "pthread_sigmask"):
+        raise DenseTrackError("scoped staging requires POSIX signal masking")
+    output = Path(output).resolve()
+    handled = set(HANDLED_TERMINATION_SIGNALS)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+    previous_handlers = {}
+    staged = None
+    marker = None
+    state = {"cleanup_started": False, "received": None}
+
+    def interrupt(signum, _frame):
+        # A repeated signal must not interrupt the exact-directory cleanup.
+        if state["cleanup_started"] or state["received"] is not None:
+            return
+        state["received"] = signum
+        raise DenseTrackInterrupted(
+            f"dense vehicle tracking interrupted by {signal.Signals(signum).name}"
+        )
+
+    cleanup_error = None
+    try:
+        try:
+            for handled_signal in HANDLED_TERMINATION_SIGNALS:
+                previous_handler = signal.getsignal(handled_signal)
+                signal.signal(handled_signal, interrupt)
+                previous_handlers[handled_signal] = previous_handler
+        except ValueError as exc:
+            raise DenseTrackError(
+                "scoped staging signal handlers require the Python main thread"
+            ) from exc
+        staged = Path(tempfile.mkdtemp(
+            prefix=f".{output.name}.tmp-", dir=output.parent
+        ))
+        marker = staged / STAGING_OWNER_MARKER
+        write_text_exclusive(
+            marker,
+            json.dumps({
+                "schema": "v2x-dense-track-staging-owner/v1",
+                "pid": os.getpid(),
+                "created_at_utc": utc_now(),
+                "nonce": os.urandom(16).hex(),
+                "staging_directory": str(staged.resolve()),
+                "final_output_directory": str(output),
+            }, indent=2, sort_keys=True) + "\n",
+            "dense track staging owner marker",
+        )
+        fsync_directory(staged)
+        # The try/finally is active before pending signals are deliverable.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        yield staged, marker
+    finally:
+        state["cleanup_started"] = True
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        if staged is not None and staged.exists():
+            try:
+                # Never search for or sweep other similarly named directories.
+                shutil.rmtree(staged)
+            except OSError as exc:
+                cleanup_error = exc
+        try:
+            for handled_signal, previous_handler in previous_handlers.items():
+                signal.signal(handled_signal, previous_handler)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if cleanup_error is not None:
+            raise DenseTrackError(
+                f"failed to remove invocation staging directory {staged}"
+            ) from cleanup_error
 
 
 def parse_utc(value, label):
@@ -1050,96 +1140,103 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
     if output.exists():
         raise DenseTrackError("dense track output already exists")
     output.parent.mkdir(parents=True, exist_ok=True)
-    staged = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
-    try:
-        model_snapshot_relative = Path("inputs") / f"tracking-model-{model_hash}.pt"
-        model_snapshot = staged / model_snapshot_relative
-        copy_file_exclusive(model_path, model_snapshot, "tracking model snapshot")
-        if sha256_file(model_snapshot) != model_hash:
-            raise DenseTrackError("tracking model changed while it was snapshotted")
-        sequences = [
-            process_window(
-                report, consensus_index, model_snapshot, staged, model_factory,
-                confidence, iou_threshold, image_size, device,
-                expected_source_report_sha256=source_report_sha256,
-                model_sha256=model_hash,
-                consensus_sha256=consensus_hash,
-            )
-            for report in capture_reports
-        ]
-        sequence_ids = [sequence["sequence_id"] for sequence in sequences]
-        if len(sequence_ids) != len(set(sequence_ids)):
-            raise DenseTrackError("dense capture reports resolve to duplicate sequence IDs")
-        verify_output_artifacts(staged, sequences)
-        if sha256_file(model_snapshot) != model_hash:
-            raise DenseTrackError("tracking model snapshot changed during inference")
-        payload = {
-            "schema": SCHEMA,
-            "generated_at_utc": utc_now(),
-            "acceptance_eligible": False,
-            "acceptance_failures": [
-                "tracker_identity_is_a_model_proposal_not_independent_same_car_truth",
-                "ground_contacts_are_unreviewed_segmentation_midpoints",
-                "static_camera_and_map_calibration_must_pass_before_backprojection",
-                "development_sequences_are_not_untouched_holdouts",
-            ],
-            "consensus": {
-                "path": str(consensus_file),
-                "sha256": consensus_hash,
-                "selected_model_side": side,
-                "capture_report_sha256": source_report_sha256,
-            },
-            "model": {
-                "path": str(model_path),
-                "sha256": model_hash,
-                "execution_snapshot": {
-                    "path": model_snapshot_relative.as_posix(),
-                    "sha256": model_hash,
+    with invocation_staging_directory(output) as (staged, owner_marker):
+        try:
+            model_snapshot_relative = Path("inputs") / f"tracking-model-{model_hash}.pt"
+            model_snapshot = staged / model_snapshot_relative
+            copy_file_exclusive(model_path, model_snapshot, "tracking model snapshot")
+            if sha256_file(model_snapshot) != model_hash:
+                raise DenseTrackError("tracking model changed while it was snapshotted")
+            sequences = [
+                process_window(
+                    report, consensus_index, model_snapshot, staged, model_factory,
+                    confidence, iou_threshold, image_size, device,
+                    expected_source_report_sha256=source_report_sha256,
+                    model_sha256=model_hash,
+                    consensus_sha256=consensus_hash,
+                )
+                for report in capture_reports
+            ]
+            sequence_ids = [sequence["sequence_id"] for sequence in sequences]
+            if len(sequence_ids) != len(set(sequence_ids)):
+                raise DenseTrackError(
+                    "dense capture reports resolve to duplicate sequence IDs"
+                )
+            verify_output_artifacts(staged, sequences)
+            if sha256_file(model_snapshot) != model_hash:
+                raise DenseTrackError("tracking model snapshot changed during inference")
+            payload = {
+                "schema": SCHEMA,
+                "generated_at_utc": utc_now(),
+                "acceptance_eligible": False,
+                "acceptance_failures": [
+                    "tracker_identity_is_a_model_proposal_not_independent_same_car_truth",
+                    "ground_contacts_are_unreviewed_segmentation_midpoints",
+                    "static_camera_and_map_calibration_must_pass_before_backprojection",
+                    "development_sequences_are_not_untouched_holdouts",
+                ],
+                "consensus": {
+                    "path": str(consensus_file),
+                    "sha256": consensus_hash,
+                    "selected_model_side": side,
+                    "capture_report_sha256": source_report_sha256,
                 },
-            },
-            "runtime": {
-                **runtime,
-                "python_version": platform.python_version(),
-                "opencv_version": cv2.__version__,
-                "device": device,
-                "image_size": image_size,
-                "confidence": confidence,
-                "nms_iou": iou_threshold,
-                "tracker": "bytetrack.yaml",
-            },
-            "sequences": sequences,
-            "summary": {
-                "sequence_count": len(sequences),
-                "ready_for_independent_review_count": sum(
-                    row["proposal_status"] == "ready_for_independent_review"
-                    for row in sequences
-                ),
-                "rejected_count": sum(row["proposal_status"] == "rejected" for row in sequences),
-                "input_frame_count": sum(row["summary"]["input_frame_count"] for row in sequences),
-                "tracked_frame_count": sum(row["summary"]["tracked_frame_count"] for row in sequences),
-                "contact_proposal_count": sum(
-                    row["summary"]["contact_proposal_count"] for row in sequences
-                ),
-            },
-        }
-        report_path = staged / "report.json"
-        write_text_exclusive(
-            report_path,
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            "dense track report",
-        )
-        write_text_exclusive(staged / "SHA256SUMS", "".join(
-            f"{sha256_file(path)}  {path.relative_to(staged).as_posix()}\n"
-            for path in sorted(item for item in staged.rglob("*") if item.is_file())
-        ), "dense track checksum manifest")
-        fsync_directory_tree(staged)
-        atomic_publish_directory(staged, output)
-        fsync_directory(output.parent)
-    except StaticCaptureError as exc:
-        raise DenseTrackError("atomic dense-track publication failed") from exc
-    finally:
-        if staged.exists():
-            shutil.rmtree(staged, ignore_errors=True)
+                "model": {
+                    "path": str(model_path),
+                    "sha256": model_hash,
+                    "execution_snapshot": {
+                        "path": model_snapshot_relative.as_posix(),
+                        "sha256": model_hash,
+                    },
+                },
+                "runtime": {
+                    **runtime,
+                    "python_version": platform.python_version(),
+                    "opencv_version": cv2.__version__,
+                    "device": device,
+                    "image_size": image_size,
+                    "confidence": confidence,
+                    "nms_iou": iou_threshold,
+                    "tracker": "bytetrack.yaml",
+                },
+                "sequences": sequences,
+                "summary": {
+                    "sequence_count": len(sequences),
+                    "ready_for_independent_review_count": sum(
+                        row["proposal_status"] == "ready_for_independent_review"
+                        for row in sequences
+                    ),
+                    "rejected_count": sum(
+                        row["proposal_status"] == "rejected" for row in sequences
+                    ),
+                    "input_frame_count": sum(
+                        row["summary"]["input_frame_count"] for row in sequences
+                    ),
+                    "tracked_frame_count": sum(
+                        row["summary"]["tracked_frame_count"] for row in sequences
+                    ),
+                    "contact_proposal_count": sum(
+                        row["summary"]["contact_proposal_count"] for row in sequences
+                    ),
+                },
+            }
+            report_path = staged / "report.json"
+            write_text_exclusive(
+                report_path,
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                "dense track report",
+            )
+            owner_marker.unlink()
+            fsync_directory(staged)
+            write_text_exclusive(staged / "SHA256SUMS", "".join(
+                f"{sha256_file(path)}  {path.relative_to(staged).as_posix()}\n"
+                for path in sorted(item for item in staged.rglob("*") if item.is_file())
+            ), "dense track checksum manifest")
+            fsync_directory_tree(staged)
+            atomic_publish_directory(staged, output)
+            fsync_directory(output.parent)
+        except StaticCaptureError as exc:
+            raise DenseTrackError("atomic dense-track publication failed") from exc
     return output
 
 

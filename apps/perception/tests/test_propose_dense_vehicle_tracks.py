@@ -1,7 +1,10 @@
 import hashlib
 import json
 from pathlib import Path
+import signal
+import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -543,3 +546,115 @@ def test_propose_publishes_one_verified_model_snapshot_and_bound_artifact_tree(
     for line in (output / "SHA256SUMS").read_text().splitlines():
         expected, relative = line.split("  ", 1)
         assert _sha((output / relative).read_bytes()) == expected
+    assert not (output / tracks.STAGING_OWNER_MARKER).exists()
+
+
+@pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
+def test_subprocess_interrupt_removes_only_its_owned_staging_directory(
+    tmp_path, termination_signal
+):
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"model")
+    consensus = tmp_path / "consensus.json"
+    consensus.write_text("{}\n")
+    output = tmp_path / "interrupted-output"
+    sentinel = tmp_path / f".{output.name}.tmp-concurrent-sentinel"
+    sentinel.mkdir()
+    sentinel_file = sentinel / "foreign-owner.txt"
+    sentinel_file.write_text("must remain unchanged\n")
+    child_source = r'''
+import signal
+import sys
+import time
+from pathlib import Path
+
+tools, model_text, consensus_text, output_text = sys.argv[1:]
+sys.path.insert(0, tools)
+import propose_dense_vehicle_tracks as tracks
+
+model = Path(model_text)
+consensus = Path(consensus_text)
+output = Path(output_text)
+previous_handlers = {
+    handled: signal.getsignal(handled)
+    for handled in tracks.HANDLED_TERMINATION_SIGNALS
+}
+previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+tracks.load_consensus = lambda _path, _hash: (
+    consensus.resolve(),
+    consensus.read_bytes(),
+    {"capture_report_sha256": "a" * 64},
+    {},
+    "left",
+)
+
+def stall_after_owner_marker(*_args, **_kwargs):
+    while True:
+        time.sleep(0.05)
+
+tracks.copy_file_exclusive = stall_after_owner_marker
+try:
+    tracks.propose(
+        ["unused"], consensus, model, output,
+        model_factory=lambda _path: object(),
+    )
+except tracks.DenseTrackInterrupted:
+    handlers_restored = all(
+        signal.getsignal(handled) == previous
+        for handled, previous in previous_handlers.items()
+    )
+    mask_restored = signal.pthread_sigmask(signal.SIG_BLOCK, set()) == previous_mask
+    raise SystemExit(23 if handlers_restored and mask_restored else 24)
+raise SystemExit(25)
+'''
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_source,
+            str(TOOLS),
+            str(model),
+            str(consensus),
+            str(output),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    owner_marker = None
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            candidates = list(
+                tmp_path.glob(
+                    f".{output.name}.tmp-*/{tracks.STAGING_OWNER_MARKER}"
+                )
+            )
+            if candidates:
+                assert len(candidates) == 1
+                owner_marker = candidates[0]
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert owner_marker is not None
+        owner = json.loads(owner_marker.read_text())
+        owned_stage = Path(owner["staging_directory"])
+        assert owned_stage == owner_marker.parent.resolve()
+        assert owner["final_output_directory"] == str(output.resolve())
+        assert owner["pid"] == process.pid
+        assert len(owner["nonce"]) == 32
+        process.send_signal(termination_signal)
+        stdout, stderr = process.communicate(timeout=10.0)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10.0)
+
+    assert process.returncode == 23, (stdout, stderr)
+    assert not output.exists()
+    assert not owned_stage.exists()
+    assert sentinel.is_dir()
+    assert sentinel_file.read_text() == "must remain unchanged\n"
