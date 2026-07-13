@@ -9,7 +9,7 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 03:29 UTC; verify rather than assume. These items
+Observed through 2026-07-13 04:02 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
 - Live production remains the verified PR 35 rollback
@@ -28,8 +28,23 @@ override every older PR 32/candidate statement below.
   The only allowed next gate is an in-place, zero-overlap perception replacement
   with a pre/post CARLA fingerprint; abort on any additional restart,
   Vulkan/OOM signature, or less than 3 GiB free.
+- PR 39 merged as canonical
+  `56199fedae0ffe8ad832f5381840fc26e7b3c495`. Its zero-overlap controlled
+  startup passed upload-disabled and upload-enabled readiness, two four-feed
+  rounds in each mode, fresh trusted schema-v2 persistence, Richmond/LIVE/zero
+  sessions, and a deliberate clean perception stop in two seconds. The first
+  post-start rotation probe later exited its decoder/headroom safety gate before
+  producing a pass artifact. The exact subcondition was not durably retained,
+  so do not overstate it as a measured outage; the topology could still own four
+  active readers, one proactive replacement reader, and two exact fragment
+  decoders. PR 39 was immediately rolled back to PR 35 with four trusted feeds
+  and all timers restored. Evidence and rollback are at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T034307Z-pr39-controlled-startup/`
+  and
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T034307Z-pr39-terminal-recovery/`.
+  Do not redeploy `56199fe` unchanged.
 - The newest isolated terminal-recovery candidate is
-  `90b40441bbb7d0f6cb27d615cca1eefab8fd587b`. It retains signed capture and
+  `6d2d8f68eecd6312b5e873c2740ec848abe0a674`. It retains signed capture and
   clock URLs only inside one reader, exposes secret-safe stage/evidence
   telemetry, and never accepts a prior decoder cursor or prior clock as a new
   anchor. A same-session restart must match a unique contiguous sequence of
@@ -39,11 +54,11 @@ override every older PR 32/candidate statement below.
   fails closed. Discard propagates through HTTP, fragment matching, and FFmpeg;
   SIGTERM stops readers cooperatively; HTTP worker threads are daemonized; and
   the URL-free fragment executors are explicitly quiesced on shutdown. Normal
-  and urgent exact-match pools share one cancellable two-decoder admission cap,
-  so overlapping clock work cannot add more than two fragment decoders beside
-  the four live readers. The tracked capture/clock fragment defaults are
-  two/four. No freshness, clock, inference, duplicate-frame, or zero-reconnect
-  threshold is weakened.
+  and urgent exact-match pools share one cancellable one-decoder admission cap,
+  so overlapping clock work cannot add more than one fragment decoder beside
+  the active and proactive readers. The tracked capture/clock fragment defaults
+  are two/four. No freshness, clock, inference, duplicate-frame, or zero-
+  reconnect threshold is weakened.
 - The last four-camera NVDEC recovery proof ran on functional failover commit
   `791676c`: two sequential forced-reader cycles recovered ch1-ch4 eight times
   with zero not-ready samples. Six recoveries used the exact three-frame
@@ -52,9 +67,10 @@ override every older PR 32/candidate statement below.
   inference advanced, and final readiness/media-clock readiness were true.
   That transient service did not stop cleanly because it predates the final
   cooperative shutdown changes, so it is recovery evidence only. Candidate
-  `90b4044` passes 154 perception, 241 Python-3.10 bridge, 23 recovery-
-  infrastructure, and 132 web tests plus zero Svelte diagnostics and the web
-  production build. A one-camera runtime attempt correctly exited because the
+  `6d2d8f6` passes 154 perception; its inherited base passes 241 Python-3.10
+  bridge, 23 recovery-infrastructure, and 132 web tests plus zero Svelte
+  diagnostics and the web production build. A one-camera runtime attempt
+  correctly exited because the
   production pipeline requires one detector per configured source; do not
   weaken that invariant or count the attempt as canary proof.
 - Candidate `49ac21b` and its PR49 single-frame ring proof are superseded and
