@@ -10,14 +10,16 @@ endpoints or credentials.
 import argparse
 import base64
 import binascii
+import ctypes
 from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
-import uuid
+import tempfile
 
 import cv2
 import numpy as np
@@ -30,8 +32,11 @@ INPUT_SCHEMAS = {
 OUTPUT_SCHEMA = "v2x-dense-kvs-window/v1"
 CAMERAS = {"ch1", "ch2", "ch3", "ch4"}
 MAX_IMAGES_PER_RESPONSE = 25
-MAX_REQUEST_SPAN_SECONDS = 240
-MAX_REQUEST_COUNT = 10
+MAX_REQUEST_SPAN_SECONDS = 4
+MAX_REQUEST_COUNT = 100
+FETCH_SAMPLING_MS = 200
+MAX_TARGET_OFFSET_MS = 200
+RENAME_NOREPLACE = 1
 
 
 class DenseCaptureError(RuntimeError):
@@ -132,45 +137,172 @@ def validate_parameters(camera_id, object_id, padding_seconds, sampling_ms):
         raise DenseCaptureError("sampling interval must be 200 through 20000 ms")
 
 
+def sampling_targets(start, end, sampling_ms):
+    """Return one whole-request sampling grid clipped to the exact window."""
+    if end <= start:
+        raise DenseCaptureError("dense KVS request has no positive time range")
+    origin = start.replace(microsecond=0)
+    step_us = sampling_ms * 1000
+    offset_us = start.microsecond
+    first_step = (offset_us + step_us - 1) // step_us
+    target = origin + timedelta(microseconds=first_step * step_us)
+    targets = []
+    while target <= end:
+        targets.append(target)
+        target += timedelta(microseconds=step_us)
+    if not targets:
+        raise DenseCaptureError("dense KVS request contains no sampling target")
+    if len(targets) > 100:
+        raise DenseCaptureError(
+            "requested dense window exceeds the 100-image API bound"
+        )
+    return origin, targets
+
+
 def request_windows(start, end, sampling_ms):
-    """Split one inclusive sample grid into deterministic service-sized chunks.
+    """Cover one sampling grid with deterministic whole-second fetch windows.
 
     GetImages currently returns at most 25 images per response even when a
     larger MaxResults value is requested.  Continuation-token requests have
     also produced intermittent timestamp-validation failures in the service.
-    Keeping every request at or below the documented effective page size makes
-    each time range self-contained and prevents an opaque token from becoming
-    part of the evidence acquisition contract.
+    Fetching at 200 ms in at-most-four-second, whole-second windows keeps every
+    request below that effective page size.  The response candidates are then
+    matched to one declared whole-request target grid, so a chunk boundary
+    never resets the sampling phase.
     """
-    if end <= start:
-        raise DenseCaptureError("dense KVS request has no positive time range")
-    aligned_start = start.replace(microsecond=0)
-    aligned_end = end.replace(microsecond=0)
-    if aligned_end < end:
-        aligned_end += timedelta(seconds=1)
-    # The service aligns producer-time image grids to whole seconds.  Fractional
-    # subranges can therefore return samples before StartTimestamp, and a range
-    # whose endpoints fall in one second can be rejected as equal.  Whole-second
-    # requests plus post-filtering preserve the caller's exact requested range.
-    maximum_grid_span = math.floor(
-        (MAX_IMAGES_PER_RESPONSE - 2) * sampling_ms / 1000.0
-    )
-    span_seconds = max(1, min(MAX_REQUEST_SPAN_SECONDS, maximum_grid_span))
-    span = timedelta(seconds=span_seconds)
-    cursor = aligned_start
+    _origin, targets = sampling_targets(start, end, sampling_ms)
     windows = []
-    while cursor < aligned_end:
-        chunk_end = min(aligned_end, cursor + span)
-        windows.append((cursor, chunk_end))
-        # Boundary overlap is intentional.  KVS uses inclusive timestamps; the
-        # duplicate is content-checked and removed after decoding.
-        cursor = chunk_end
+    for target in targets:
+        bucket_start = target.replace(microsecond=0)
+        bucket_end = bucket_start + timedelta(seconds=1)
+        if not windows:
+            windows.append((bucket_start, bucket_end))
+            continue
+        left, right = windows[-1]
+        merged_right = max(right, bucket_end)
+        if (
+            bucket_start <= right
+            and (merged_right - left).total_seconds()
+            <= MAX_REQUEST_SPAN_SECONDS
+        ):
+            windows[-1] = (left, merged_right)
+        else:
+            windows.append((bucket_start, bucket_end))
     if len(windows) > MAX_REQUEST_COUNT:
-        raise DenseCaptureError("dense KVS capture exceeds ten bounded requests")
+        raise DenseCaptureError("dense KVS capture exceeds 100 bounded requests")
     return windows
 
 
+def match_sampling_targets(targets, candidates):
+    """Maximize ordered target coverage, then minimize total timing error."""
+    tolerance = timedelta(milliseconds=MAX_TARGET_OFFSET_MS)
+    row_count = len(targets) + 1
+    column_count = len(candidates) + 1
+    scores = [[(0, 0)] * column_count for _ in range(row_count)]
+    decisions = [[None] * column_count for _ in range(row_count)]
+
+    def better(left, right):
+        return (left[0], -left[1]) > (right[0], -right[1])
+
+    for target_index in range(1, row_count):
+        decisions[target_index][0] = "skip_target"
+    for candidate_index in range(1, column_count):
+        decisions[0][candidate_index] = "skip_candidate"
+    for target_index in range(1, row_count):
+        target = targets[target_index - 1]
+        for candidate_index in range(1, column_count):
+            candidate_timestamp = candidates[candidate_index - 1][0]
+            best_score = scores[target_index - 1][candidate_index]
+            best_decision = "skip_target"
+            skip_candidate = scores[target_index][candidate_index - 1]
+            if better(skip_candidate, best_score):
+                best_score = skip_candidate
+                best_decision = "skip_candidate"
+            offset = abs(candidate_timestamp - target)
+            if offset <= tolerance:
+                previous = scores[target_index - 1][candidate_index - 1]
+                matched_score = (
+                    previous[0] + 1,
+                    previous[1] + offset // timedelta(microseconds=1),
+                )
+                if better(matched_score, best_score) or matched_score == best_score:
+                    best_score = matched_score
+                    best_decision = "match"
+            scores[target_index][candidate_index] = best_score
+            decisions[target_index][candidate_index] = best_decision
+
+    matched = []
+    target_index = len(targets)
+    candidate_index = len(candidates)
+    while target_index > 0 or candidate_index > 0:
+        decision = decisions[target_index][candidate_index]
+        if decision == "match":
+            target = targets[target_index - 1]
+            timestamp, content, image = candidates[candidate_index - 1]
+            matched.append((target, timestamp, content, image))
+            target_index -= 1
+            candidate_index -= 1
+        elif decision == "skip_target":
+            target_index -= 1
+        elif decision == "skip_candidate":
+            candidate_index -= 1
+        else:
+            break
+    matched.reverse()
+    return matched
+
+
+def publish_directory_no_replace(source, destination):
+    """Atomically publish one staged directory without replacing any entry."""
+    source = Path(source)
+    destination = Path(destination)
+    if source.parent != destination.parent:
+        raise DenseCaptureError("staging and output directories must share a parent")
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise DenseCaptureError(
+            "atomic no-replace publication is unavailable"
+        ) from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        ctypes.set_errno(0)
+        result = renameat2(
+            parent_fd,
+            os.fsencode(source.name),
+            parent_fd,
+            os.fsencode(destination.name),
+            RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(
+                error_number,
+                "dense capture output already exists",
+                str(destination),
+            )
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+    finally:
+        os.close(parent_fd)
+
+
 def decode_image(item):
+    if not isinstance(item, dict):
+        return None
     timestamp = item.get("TimeStamp") if isinstance(item, dict) else None
     content = item.get("ImageContent") if isinstance(item, dict) else None
     if isinstance(content, str):
@@ -213,13 +345,12 @@ def capture(
     )
     start = first - timedelta(seconds=float(padding_seconds))
     end = last + timedelta(seconds=float(padding_seconds))
-    expected_count = (
-        int(math.floor((end - start).total_seconds() * 1000 / sampling_ms)) + 1
-    )
-    if expected_count > 100:
-        raise DenseCaptureError(
-            "requested dense window exceeds the 100-image API bound"
-        )
+    target_origin, targets = sampling_targets(start, end, sampling_ms)
+
+    output_dir = Path(output_dir).expanduser().resolve()
+    if output_dir.exists():
+        raise DenseCaptureError("dense capture output already exists")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if session_factory is None:
         import boto3
@@ -242,7 +373,7 @@ def capture(
             "ImageSelectorType": "PRODUCER_TIMESTAMP",
             "StartTimestamp": chunk_start,
             "EndTimestamp": chunk_end,
-            "SamplingInterval": sampling_ms,
+            "SamplingInterval": FETCH_SAMPLING_MS,
             "Format": "JPEG",
             # The aligned request span is sized below the service's effective
             # 25-image response page, so any token is a fail-closed anomaly.
@@ -285,33 +416,38 @@ def capture(
             continue
         by_timestamp[timestamp] = value
     decoded = list(by_timestamp.values())
-    if len(decoded) < 3:
-        raise DenseCaptureError("KVS returned fewer than three usable dense frames")
-    if len(decoded) > expected_count:
-        raise DenseCaptureError("KVS returned more images than the requested grid")
     decoded.sort(key=lambda value: value[0])
-    timestamps = [value[0] for value in decoded]
+    matched = match_sampling_targets(targets, decoded)
+    if len(matched) < 3:
+        raise DenseCaptureError("KVS returned fewer than three usable dense frames")
+    timestamps = [value[1] for value in matched]
     if len(set(timestamps)) != len(timestamps):
         raise DenseCaptureError("KVS returned duplicate producer timestamps")
-    dimensions = {(image.shape[1], image.shape[0]) for _, _, image in decoded}
+    dimensions = {
+        (image.shape[1], image.shape[0]) for _, _, _, image in matched
+    }
     if len(dimensions) != 1:
         raise DenseCaptureError("dense KVS frames have mixed resolutions")
     width, height = next(iter(dimensions))
 
-    output_dir = Path(output_dir).expanduser().resolve()
-    if output_dir.exists():
-        raise DenseCaptureError("dense capture output already exists")
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_dir.parent / f".{output_dir.name}.tmp-{uuid.uuid4().hex}"
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent
+        )
+    )
     rows = []
     try:
-        (temporary / "frames").mkdir(parents=True)
-        for index, (timestamp, content, _image) in enumerate(decoded):
+        (temporary / "frames").mkdir()
+        for index, (target, timestamp, content, _image) in enumerate(matched):
             name = f"frame-{index:03d}.jpg"
             path = temporary / "frames" / name
             path.write_bytes(content)
             rows.append({
                 "index": index,
+                "target_timestamp_utc": canonical_utc(target),
+                "target_offset_ms": (
+                    (timestamp - target).total_seconds() * 1000.0
+                ),
                 "producer_timestamp_utc": canonical_utc(timestamp),
                 "path": f"frames/{name}",
                 "sha256": sha256_bytes(content),
@@ -353,10 +489,13 @@ def capture(
             "resolution": [width, height],
             "frames": rows,
             "frame_count": len(rows),
+            "target_count": len(targets),
+            "missing_target_count": len(targets) - len(rows),
             "response_page_count": page_count,
             "discarded_error_count": discarded_error_count,
             "discarded_out_of_window_count": discarded_out_of_window_count,
             "duplicate_timestamp_count": duplicate_timestamp_count,
+            "unused_in_window_count": len(decoded) - len(rows),
             "request_strategy": {
                 "whole_second_aligned": True,
                 "maximum_images_per_response": MAX_IMAGES_PER_RESPONSE,
@@ -365,6 +504,11 @@ def capture(
                 ),
                 "continuation_tokens_accepted": False,
                 "exact_requested_window_post_filter": True,
+                "fetch_sampling_interval_ms": FETCH_SAMPLING_MS,
+                "target_grid_origin_utc": canonical_utc(target_origin),
+                "target_sampling_interval_ms": sampling_ms,
+                "maximum_target_offset_ms": MAX_TARGET_OFFSET_MS,
+                "single_target_phase_across_requests": True,
             },
             "maximum_interframe_gap_ms": max(gaps_ms) if gaps_ms else None,
             "acceptance_failures": [
@@ -381,10 +525,21 @@ def capture(
         (temporary / "capture-report.json").write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        os.rename(temporary, output_dir)
-    except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
+        try:
+            publish_directory_no_replace(temporary, output_dir)
+        except FileExistsError as exc:
+            raise DenseCaptureError("dense capture output already exists") from exc
+        except OSError as exc:
+            raise DenseCaptureError("atomic dense capture publication failed") from exc
+    except DenseCaptureError:
         raise
+    except OSError as exc:
+        raise DenseCaptureError("dense capture staging failed") from exc
+    finally:
+        try:
+            shutil.rmtree(temporary)
+        except FileNotFoundError:
+            pass
     return output_dir / "capture-report.json"
 
 
