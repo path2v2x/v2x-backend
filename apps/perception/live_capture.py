@@ -218,6 +218,25 @@ def _call_with_supported_kwargs(factory, *args, **kwargs):
     return factory(*args, **supported)
 
 
+def _capture_transport_media_clock(capture):
+    """Return same-session transport evidence exposed by a capture adapter.
+
+    The method is intentionally optional so the existing OpenCV and exact
+    decoded-pixel paths remain unchanged.  Capture-layer failures are additive:
+    they provide no clock and the established exact matcher may still recover.
+    """
+    accessor = getattr(capture, "transport_media_clock", None)
+    if accessor is None:
+        return None
+    try:
+        clock = accessor()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if getattr(clock, "evidence_method", None) != "exact_same_session_pts":
+        return None
+    return clock
+
+
 class _ProactiveRenewal(Exception):
     """Internal control flow for rotating a signed source before expiry."""
 
@@ -413,9 +432,7 @@ class _AsyncCapturePreparation:
             capture_source = source
             self._set_stage("clock_source")
             clock_source = (
-                self._clock_source_factory()
-                if self._clock_source_factory is not None
-                else source
+                source if self._clock_source_factory is None else None
             )
             # Until an exact clock succeeds, the only source known to belong
             # to this capture connection is the capture URL itself. Never
@@ -458,6 +475,34 @@ class _AsyncCapturePreparation:
                     except (AttributeError, TypeError, ValueError):
                         position = None
                 latest = (frame, source_epoch, source_monotonic, position)
+
+                transport_clock = _capture_transport_media_clock(capture)
+                if transport_clock is not None and position is not None:
+                    self._set_stage("transport_clock_validation")
+                    frame_clock = transport_clock.metadata_at(position)
+                    if (
+                        frame_clock is not None
+                        and (
+                            self._media_clock_validator is None
+                            or self._media_clock_validator(
+                                frame_clock, source_epoch
+                            )
+                        )
+                    ):
+                        with self._result_lock:
+                            if self._discarded.is_set():
+                                return
+                            self._result = (
+                                capture,
+                                *latest,
+                                transport_clock,
+                                capture_source,
+                                capture_source,
+                            )
+                            capture = None
+                        self._set_stage("ready")
+                        self._success_evidence = "exact_same_session_pts"
+                        return
 
                 if self._media_clock_factory is None:
                     with self._result_lock:
@@ -789,6 +834,36 @@ class _AsyncCaptureRestart:
                 if position is None:
                     self._set_stage("capture_position")
                     continue
+                transport_clock = _capture_transport_media_clock(capture)
+                if transport_clock is not None:
+                    self._set_stage("transport_clock_validation")
+                    frame_clock = transport_clock.metadata_at(position)
+                    if (
+                        frame_clock is not None
+                        and (
+                            self._media_clock_validator is None
+                            or self._media_clock_validator(
+                                frame_clock, source_epoch
+                            )
+                        )
+                    ):
+                        with self._result_lock:
+                            if self._discarded.is_set():
+                                return
+                            self._result = (
+                                capture,
+                                frame,
+                                source_epoch,
+                                source_monotonic,
+                                position,
+                                transport_clock,
+                                source,
+                                source,
+                            )
+                            capture = None
+                        self._set_stage("ready")
+                        self._success_evidence = "exact_same_session_pts"
+                        return
                 self._restart_fragment_frames.append((frame, position))
                 if (
                     self._recent_exact_media_anchors
@@ -1664,12 +1739,13 @@ class LiveStreamReader:
                 source = self.source_factory()
                 capture_source = source
                 clock_source = (
-                    self.media_clock_source_factory()
-                    if self.media_clock_source_factory is not None
-                    else source
+                    source
+                    if self.media_clock_source_factory is None
+                    else None
                 )
                 capture_clock_source = capture_source
                 media_clock = None
+                transport_recovery_active = False
                 clock_resolution = None
                 next_media_clock_retry = 0.0
                 last_capture_position = None
@@ -1790,6 +1866,7 @@ class LiveStreamReader:
                             clock_resolution = None
                             pending_clock_source = None
                         media_clock = prepared_media_clock
+                        transport_recovery_active = False
                         capture_source = prepared_source
                         capture_clock_source = prepared_clock_source
                         has_trusted_media_clock = (
@@ -1830,6 +1907,46 @@ class LiveStreamReader:
                             )
                         except (AttributeError, TypeError, ValueError):
                             capture_position = None
+                    transport_clock = _capture_transport_media_clock(cap)
+                    transport_clock_lost = False
+                    if transport_clock is not None:
+                        if clock_resolution is not None:
+                            cleanup = _start_candidate_cleanup(
+                                clock_resolution
+                            )
+                            self._track_terminal_cleanup(cleanup)
+                        clock_resolution = None
+                        pending_clock_source = None
+                        media_clock = transport_clock
+                        transport_recovery_active = False
+                        capture_clock_source = capture_source
+                        unclocked_frame_sequence.clear()
+                        media_clock_attempted = True
+                    elif (
+                        getattr(media_clock, "evidence_method", None)
+                        == "exact_same_session_pts"
+                    ):
+                        # Transport evidence is per decoded frame. Never carry
+                        # yesterday's exact PTS mapping across a missing,
+                        # delayed, or malformed current sidecar record. Drop
+                        # it immediately so this very frame can enter the
+                        # established exact-pixel fallback/recovery path.
+                        media_clock = None
+                        capture_clock_source = capture_source
+                        unclocked_frame_sequence.clear()
+                        media_clock_attempted = False
+                        next_media_clock_retry = 0.0
+                        transport_clock_lost = True
+                        transport_recovery_active = True
+                        if proactive_preparation is None:
+                            # A failed sidecar is connection-scoped and cannot
+                            # repair itself. Start one bounded fresh capture in
+                            # parallel with the additive pixel fallback instead
+                            # of freezing trusted publication until the normal
+                            # multi-minute proactive-renewal deadline.
+                            proactive_preparation = (
+                                self._prepare_replacement_capture()
+                            )
                     if (
                         media_clock is not None
                         and capture_position is not None
@@ -1860,7 +1977,12 @@ class LiveStreamReader:
                             )
 
                     identity = self.frame_identity(frame)
-                    if identity in self._recent_frame_identity_set:
+                    if (
+                        identity in self._recent_frame_identity_set
+                        and transport_clock is None
+                        and not transport_clock_lost
+                        and not transport_recovery_active
+                    ):
                         self._consecutive_duplicate_frames += 1
                         if (
                             self._consecutive_duplicate_frames
@@ -1881,6 +2003,7 @@ class LiveStreamReader:
                             clock_resolution = None
                             media_clock = candidate
                             if media_clock is not None:
+                                transport_recovery_active = False
                                 capture_clock_source = (
                                     pending_clock_source or capture_source
                                 )
@@ -1894,7 +2017,10 @@ class LiveStreamReader:
                     if (
                         media_clock is None
                         and clock_resolution is None
-                        and proactive_preparation is None
+                        and (
+                            proactive_preparation is None
+                            or transport_recovery_active
+                        )
                         and self.media_clock_factory is not None
                         and capture_position is not None
                         and source_monotonic >= next_media_clock_retry
@@ -1938,6 +2064,7 @@ class LiveStreamReader:
                             clock_resolution = None
                             media_clock = candidate
                             if media_clock is not None:
+                                transport_recovery_active = False
                                 capture_clock_source = (
                                     pending_clock_source or capture_source
                                 )
@@ -2044,6 +2171,9 @@ class LiveStreamReader:
                         frame_media_clock is not None
                         and media_clock is not None
                         and capture_position is not None
+                        and getattr(
+                            media_clock, "evidence_method", None
+                        ) != "exact_same_session_pts"
                     ):
                         self._recent_exact_media_anchors.append(
                             (
@@ -2052,7 +2182,8 @@ class LiveStreamReader:
                                 capture_position,
                             )
                         )
-                    self._remember_frame_identity(identity)
+                    if identity not in self._recent_frame_identity_set:
+                        self._remember_frame_identity(identity)
                     self._consecutive_duplicate_frames = 0
                     self.recovery.record_success()
                     if not connected:

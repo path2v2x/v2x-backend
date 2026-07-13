@@ -160,6 +160,16 @@ class FrameBroadcasterTests(unittest.TestCase):
             "exact_fragment_sequence",
         )
         self.broadcaster.mark_terminal_failover(
+            "ch1", "succeeded", 0.4, "same_session_restart", "ready",
+            "exact_same_session_pts",
+        )
+        self.assertEqual(
+            self.broadcaster.snapshot_health()["cameras"]["ch1"][
+                "terminal_failover_last_evidence"
+            ],
+            "exact_same_session_pts",
+        )
+        self.broadcaster.mark_terminal_failover(
             "ch2", "failed", 8.0, "same_session_restart",
             "active_clock_cleanup",
         )
@@ -236,6 +246,28 @@ class FrameBroadcasterTests(unittest.TestCase):
             ]
         )
 
+        self.broadcaster.publish(
+            "ch2",
+            self.frame,
+            media_clock_health={
+                "status": "matched",
+                "trusted": True,
+                "media_clock": {
+                    "evidence_method": "exact_same_session_pts",
+                    "signed_url": "https://invalid/?token=literal-secret",
+                },
+            },
+        )
+        transport_camera = self.broadcaster.snapshot_health()["cameras"][
+            "ch2"
+        ]
+        self.assertEqual(
+            transport_camera["media_clock_evidence_method"],
+            "exact_same_session_pts",
+        )
+        self.assertIsNone(transport_camera["anchor_match_frame_count"])
+        self.assertNotIn("literal-secret", repr(transport_camera))
+
     def test_terminal_failover_stage_allowlist_is_finite(self):
         base_stages = (
             None,
@@ -246,6 +278,7 @@ class FrameBroadcasterTests(unittest.TestCase):
             "capture_open",
             "first_frame",
             "capture_position",
+            "transport_clock_validation",
             "recent_exact_anchor",
             "clock_resolution",
             "clock_validation",
@@ -351,6 +384,85 @@ class FrameBroadcasterTests(unittest.TestCase):
 
 
 class MediaClockPersistenceTests(unittest.TestCase):
+    def test_same_session_pts_evidence_is_preserved_without_match_count(self):
+        record = {
+            "event_id": "transport-1",
+            "timestamp_utc": "2026-07-10T03:57:27.000Z",
+            "ingested_at_epoch": 1_783_655_847.0,
+        }
+        attach_media_clock_metadata(
+            [record],
+            {
+                "media_timestamp_utc": "2026-07-10T03:57:23.388Z",
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                    "anchor_program_date_time_utc": (
+                        "2026-07-10T03:57:23.138Z"
+                    ),
+                    "position_milliseconds": 250.0,
+                    "capture_position_milliseconds": 2454.0,
+                    "anchor_capture_position_milliseconds": 2454.0,
+                    "anchor_fragment_frame_offset_milliseconds": 250.0,
+                    "anchor_fragment_id": "frag-transport-1",
+                    "anchor_media_sequence": 7,
+                    "segment_duration_seconds": 2.0,
+                    "evidence_method": "exact_same_session_pts",
+                    "source_pts": 220860,
+                    "source_time_base_numerator": 1,
+                    "source_time_base_denominator": 90000,
+                    "fragment_sample_index": 8,
+                    "anchor_match_frame_count": 99,
+                    "signed_url": "https://example.invalid/?token=secret",
+                },
+            },
+        )
+
+        clock = record["media_clock"]
+        self.assertEqual(clock["evidence_method"], "exact_same_session_pts")
+        self.assertEqual(clock["source_pts"], 220860)
+        self.assertEqual(clock["source_time_base_denominator"], 90000)
+        self.assertNotIn("anchor_match_frame_count", clock)
+        self.assertNotIn("signed_url", clock)
+
+        invalid = assess_media_clock(
+            {
+                "media_timestamp_utc": "2026-07-10T03:57:23.388Z",
+                "media_clock": {
+                    "source": "hls_ext_x_program_date_time",
+                    "schema_version": 1,
+                    "anchor_program_date_time_utc": (
+                        "2026-07-10T03:57:23.138Z"
+                    ),
+                    "position_milliseconds": 250.0,
+                    "evidence_method": "exact_same_session_pts",
+                    "source_pts": 220860,
+                    "source_time_base_numerator": 1,
+                    # Denominator and sample index are deliberately missing.
+                },
+            },
+            1_783_655_847.0,
+        )
+        self.assertFalse(invalid["trusted"])
+        self.assertEqual(
+            invalid["status"], "invalid_transport_provenance"
+        )
+
+        inconsistent = copy.deepcopy(record["media_clock"])
+        inconsistent["source_pts"] = 999_999_999
+        inconsistent_assessment = assess_media_clock(
+            {
+                "media_timestamp_utc": record["media_timestamp_utc"],
+                "media_clock": inconsistent,
+            },
+            1_783_655_847.0,
+        )
+        self.assertFalse(inconsistent_assessment["trusted"])
+        self.assertEqual(
+            inconsistent_assessment["status"],
+            "inconsistent_transport_provenance",
+        )
+
     def test_media_time_becomes_replay_index_and_receipt_is_preserved(self):
         record = {
             "event_id": "event-1",

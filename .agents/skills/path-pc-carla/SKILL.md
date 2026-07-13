@@ -9,8 +9,68 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 06:16 UTC; verify rather than assume. These items
+Observed through 2026-07-13 08:04 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
+
+- Canonical `origin/main` is now PR 43 merge
+  `ea4cc270ba9c0e5e2b88b99712f6caf4856b864a`. PR 43 is not deployed. Live
+  production remains the exact, detached, clean PR 35 rollback
+  `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
+  environment and timers restored. Do not describe PR 42, PR 43, or the
+  same-session PTS follow-up below as production.
+- PR 43's first zero-overlap, upload-disabled startup at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T062453Z-pr43-evidence-controlled-startup/`
+  reached all-four trusted clocks and clean topology in 35 seconds: ch1 used
+  `anchor_match_frame_count=3`, while ch2-ch4 used a one-frame exact match.
+  Two strict feed rounds and a two-second clean stop passed. A required clean
+  restart then failed the unchanged 150-second gate: ch1 remained untrusted
+  until after the deadline while ch2/ch3 used three-frame matches and ch4 used
+  one frame. No forced reader was killed, uploads were never enabled, and the
+  exact rollback bundle
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T062453Z-pr43-evidence/`
+  restored PR 35, its unit/environment, and every timer. CARLA, Drive, and web
+  fingerprints/restart counts were unchanged. Treat this as a rejected release
+  gate that proves decoded-pixel uniqueness is not deterministic for an empty
+  or visually static road; do not retry PR 43 for luck and do not widen the
+  150-second threshold.
+- The current source-only follow-up branch is `codex/v2x-same-session-pts` on
+  PR 43 main. It mediates the exact capture HLS session through a capability-
+  scoped loopback server, observes the exact init/fragment bytes actually
+  served to FFmpeg, and pairs every OpenCV frame with the same FFmpeg graph's
+  source PTS from a bounded `framecrc` sidecar. Exact UTC is
+  `fragment PDT + source PTS - first fragment video PTS`; evidence is named
+  `exact_same_session_pts` and never carries `anchor_match_frame_count`.
+  Signed upstream URLs/config enter only memory or inherited memfds, never
+  argv, stderr, disk, health, or persisted records. The mediated FFmpeg child
+  protocol set is only `file,http,tcp`; any master URI-bearing tag is rejected.
+- The transport path is additive and fail-closed. Unknown URI tags, redirects,
+  discontinuities, non-video companion tracks, duplicate/colliding PTS,
+  malformed or reordered sidecar records, bounded-fetch/probe failures, and
+  PTS/provenance inconsistencies disable and clear transport evidence. The
+  exact already-fetched media bytes still reach FFmpeg so the existing exact
+  pixel/sequence resolver remains available. A missing current sidecar record
+  immediately drops the prior transport clock and starts fallback rather than
+  carrying stale evidence. Production network fetches run in a killable helper
+  with signed input through memfd, bounded stdout, no redirects, and a hard
+  deadline; cleanup scrubs retained state even on failure.
+- Read-only ch1 transport observation across three consecutive fragments found
+  non-overlapping presentation ranges `0.000-1.967`, `5.536-7.501`, and
+  `7.707-9.678` seconds. Their advances matched each playlist PDT, supporting
+  the same-session piecewise mapping without pixel change. This is transport
+  evidence only, not a four-camera decoder canary or deployment pass. The
+  current root suite passes 211 perception tests plus syntax/diff checks; an
+  earlier independent adversarial review correctly blocked the first draft and
+  the fixed draft still requires a fresh independent re-review, full repository
+  regression, canonical merge, and an actual zero-overlap four-camera NVDEC
+  canary before release. Fable remains unavailable because Claude CLI OAuth
+  expires before file access; never claim a Fable pass.
+- The next live gate remains perception-only and rollback-first: require exact
+  source/rollback fingerprints, Richmond LIVE, zero Drive sessions/actors/
+  tracks, exactly four baseline FFmpeg readers, at least 3 GiB GPU headroom,
+  unchanged CARLA/Drive/web fingerprints, uploads disabled, all four cameras
+  trusted via `exact_same_session_pts` well inside 150 seconds, clean topology,
+  two changing feed rounds, and trust across a playlist roll. Any partial result
+  or cleanup failure restores PR 35 before uploads or forced-reader testing.
 
 - Canonical source `origin/main` is now
   `7b74103c2811a22464755db40fdaf6d18be58333`, merged PR 42; it is not the

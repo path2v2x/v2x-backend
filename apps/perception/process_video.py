@@ -135,6 +135,80 @@ def assess_media_clock(
         and match_frame_count in (1, 3)
     ):
         safe_clock["anchor_match_frame_count"] = match_frame_count
+    evidence_method = raw_clock.get("evidence_method")
+    if evidence_method == "exact_same_session_pts":
+        required_transport_fields = (
+            "source_pts",
+            "source_time_base_numerator",
+            "source_time_base_denominator",
+            "fragment_sample_index",
+        )
+        for key in required_transport_fields:
+            value = raw_clock.get(key)
+            minimum = 1 if key.startswith("source_time_base_") else 0
+            if not (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= minimum
+            ):
+                result["status"] = "invalid_transport_provenance"
+                return result
+            safe_clock[key] = value
+        try:
+            capture_position = float(
+                safe_clock["capture_position_milliseconds"]
+            )
+            anchor_capture_position = float(
+                safe_clock["anchor_capture_position_milliseconds"]
+            )
+            fragment_offset = float(safe_clock["position_milliseconds"])
+            anchor_fragment_offset = float(
+                safe_clock[
+                    "anchor_fragment_frame_offset_milliseconds"
+                ]
+            )
+            segment_duration_milliseconds = (
+                float(safe_clock["segment_duration_seconds"]) * 1000.0
+            )
+            source_position = (
+                safe_clock["source_pts"]
+                * safe_clock["source_time_base_numerator"]
+                * 1000.0
+                / safe_clock["source_time_base_denominator"]
+            )
+            media_sequence = safe_clock["anchor_media_sequence"]
+            fragment_id = safe_clock["anchor_fragment_id"]
+        except (KeyError, TypeError, ValueError, OverflowError):
+            result["status"] = "incomplete_transport_provenance"
+            return result
+        if (
+            not all(math.isfinite(value) for value in (
+                capture_position,
+                anchor_capture_position,
+                fragment_offset,
+                anchor_fragment_offset,
+                segment_duration_milliseconds,
+                source_position,
+            ))
+            or not isinstance(media_sequence, int)
+            or isinstance(media_sequence, bool)
+            or media_sequence < 0
+            or not isinstance(fragment_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9._~-]{1,256}", fragment_id)
+            or abs(source_position - capture_position) > 0.001
+            or abs(anchor_capture_position - capture_position) > 0.001
+            or abs(anchor_fragment_offset - fragment_offset) > 0.001
+            or fragment_offset < 0.0
+            or segment_duration_milliseconds <= 0.0
+            or fragment_offset > segment_duration_milliseconds + 1.0
+        ):
+            result["status"] = "inconsistent_transport_provenance"
+            return result
+        safe_clock["evidence_method"] = evidence_method
+        # Transport evidence is independently established by the exact HLS
+        # objects and PTS from the capture FFmpeg graph.  It must never
+        # masquerade as decoded-pixel match evidence.
+        safe_clock.pop("anchor_match_frame_count", None)
 
     try:
         anchor_epoch = datetime.fromisoformat(
@@ -307,6 +381,7 @@ class FrameBroadcaster:
                 "media_time_trusted": False,
                 "decode_latency_ms": None,
                 "anchor_match_frame_count": None,
+                "media_clock_evidence_method": None,
             }
             for camera_id in self.camera_ids
         }
@@ -377,6 +452,13 @@ class FrameBroadcaster:
                         if isinstance(match_frame_count, int)
                         and not isinstance(match_frame_count, bool)
                         and match_frame_count in (1, 3)
+                        else None
+                    ),
+                    "media_clock_evidence_method": (
+                        safe_clock.get("evidence_method")
+                        if isinstance(safe_clock, dict)
+                        and safe_clock.get("evidence_method")
+                        == "exact_same_session_pts"
                         else None
                     ),
                 })
@@ -480,6 +562,7 @@ class FrameBroadcaster:
             "capture_open",
             "first_frame",
             "capture_position",
+            "transport_clock_validation",
             "recent_exact_anchor",
             "clock_resolution",
             "clock_validation",
@@ -510,6 +593,7 @@ class FrameBroadcaster:
             "recent_exact_sequence",
             "exact_fragment_match",
             "exact_fragment_sequence",
+            "exact_same_session_pts",
             "no_media_clock",
         }:
             raise ValueError("terminal failover evidence is invalid")
@@ -611,6 +695,9 @@ class FrameBroadcaster:
                     "decode_latency_ms": entry["decode_latency_ms"],
                     "anchor_match_frame_count": entry[
                         "anchor_match_frame_count"
+                    ],
+                    "media_clock_evidence_method": entry[
+                        "media_clock_evidence_method"
                     ],
                 }
             decoder_topology = AUXILIARY_DECODER_ADMISSION.snapshot()

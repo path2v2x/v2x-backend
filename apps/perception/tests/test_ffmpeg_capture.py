@@ -1,9 +1,17 @@
 import sys
+from fractions import Fraction
+import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import threading
+import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
+
+import requests
 
 import numpy as np
 
@@ -15,11 +23,38 @@ from ffmpeg_capture import (  # noqa: E402
     FfmpegNvdecCapture,
     FragmentFrameSequenceMatch,
     NvdecCaptureError,
+    SameSessionTransportClock,
+    _FramePtsSidecar,
+    _fetch_bounded,
+    _LoopbackHlsMediator,
+    _MediatedFragment,
+    _PacketSample,
+    _parse_media_playlist,
+    _probe_fragment_packets,
+    _run_bounded_command,
     build_nvdec_frame_identity,
     build_nvdec_command,
     match_fragment_frame_nvdec,
     rewrite_hls_master,
 )
+
+
+class Response:
+    def __init__(self, *, content=b"", text=None, url=None, status=200):
+        self.content = (
+            text.encode("utf-8") if text is not None else bytes(content)
+        )
+        self.text = (
+            text if text is not None else self.content.decode("utf-8")
+        )
+        self.url = url
+        self.status = status
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(
+                "failed https://example.test/?SessionToken=secret-value"
+            )
 
 
 class FakeCapture:
@@ -146,6 +181,8 @@ class FfmpegCaptureTests(unittest.TestCase):
             "/usr/bin/ffmpeg", "/proc/self/fd/9", "/tmp/frames.nut", hls=True
         )
         rendered = " ".join(command)
+        protocol_index = command.index("-protocol_whitelist")
+        self.assertEqual(command[protocol_index + 1], "file,http,tcp")
         self.assertNotIn("secret", rendered)
         self.assertNotIn("example.test", rendered)
         self.assertIn("/proc/self/fd/9", rendered)
@@ -159,6 +196,261 @@ class FfmpegCaptureTests(unittest.TestCase):
         self.assertNotIn("-rw_timeout", file_rendered)
         self.assertNotIn("-m3u8_hold_counters", file_rendered)
 
+    def test_sidecar_command_preserves_pts_without_exposing_source(self):
+        command = build_nvdec_command(
+            "/usr/bin/ffmpeg",
+            "/proc/self/fd/9",
+            "/tmp/frames.nut",
+            hls=True,
+            pts_fd=11,
+        )
+        rendered = " ".join(command)
+        self.assertIn("-copyts", command)
+        self.assertIn("-copytb 1", rendered)
+        self.assertEqual(rendered.count("-enc_time_base -1"), 2)
+        self.assertIn("split=2", rendered)
+        self.assertIn("scale=2:2", rendered)
+        self.assertIn("-f framecrc pipe:11", rendered)
+        self.assertIn("-fps_mode passthrough", rendered)
+        self.assertNotIn("https://", rendered)
+        self.assertNotIn("SessionToken", rendered)
+        with self.assertRaisesRegex(ValueError, "descriptor"):
+            build_nvdec_command(
+                "/usr/bin/ffmpeg", "/proc/self/fd/9", "/tmp/frames.nut",
+                hls=True, pts_fd=True,
+            )
+
+    def test_framecrc_sidecar_pairs_static_frames_by_source_pts(self):
+        read_fd, write_fd = __import__("os").pipe()
+        sidecar = _FramePtsSidecar(read_fd)
+        try:
+            __import__("os").write(write_fd, (
+                b"#software: Lavf\n"
+                b"#tb 0: 1/20\n"
+                b"0, 2, 2, 1, 4, 0x00000000\n"
+                b"0, 3, 3, 1, 4, 0x00000000\n"
+            ))
+            __import__("os").close(write_fd)
+            self.assertEqual(sidecar.take(1.0), Fraction(1, 10))
+            self.assertEqual(sidecar.take(1.0), Fraction(3, 20))
+        finally:
+            try:
+                __import__("os").close(write_fd)
+            except OSError:
+                pass
+            sidecar.close()
+
+    def test_malformed_or_overflowed_sidecar_fails_closed(self):
+        for body in (
+            b"0, 0, 0, 1, 4, 0x0\n",
+            b"#tb 0: 1/20\nnot,a,frame\n",
+            (
+                b"#tb 0: 1/20\n"
+                b"0, 2, 2, 1, 4, 0x0\n"
+                b"0, 2, 2, 1, 4, 0x0\n"
+            ),
+        ):
+            with self.subTest(body=body):
+                read_fd, write_fd = __import__("os").pipe()
+                sidecar = _FramePtsSidecar(read_fd, queue_limit=4)
+                try:
+                    __import__("os").write(write_fd, body)
+                    __import__("os").close(write_fd)
+                    self.assertIsNone(sidecar.take(1.0))
+                finally:
+                    try:
+                        __import__("os").close(write_fd)
+                    except OSError:
+                        pass
+                    sidecar.close()
+
+    def test_sidecar_thread_is_the_only_descriptor_owner(self):
+        read_fd, write_fd = os.pipe()
+        sidecar = _FramePtsSidecar(read_fd)
+        os.close(write_fd)
+        sidecar.close()
+        self.assertIsNone(sidecar._descriptor)
+
+        # Linux normally reuses the just-closed descriptor. A second sidecar
+        # close must never close whichever unrelated resource now owns it.
+        replacement = os.open("/dev/null", os.O_RDONLY)
+        try:
+            sidecar.close()
+            os.fstat(replacement)
+        finally:
+            os.close(replacement)
+
+    def test_transport_clock_is_piecewise_exact_and_rejects_collisions(self):
+        fragment = _MediatedFragment(
+            program_date_time_epoch=1_783_655_843.0,
+            program_date_time_utc="2026-07-10T03:57:23.000Z",
+            duration_seconds=2.0,
+            media_sequence=17,
+            fragment_id="frag-123",
+            init_url="https://example.test/init.mp4?SessionToken=secret",
+            segment_url=(
+                "https://example.test/media.mp4?FragmentNumber=frag-123&"
+                "SessionToken=secret"
+            ),
+        )
+        samples = (
+            _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
+            _PacketSample(1, Fraction(3, 20), Fraction(1, 20)),
+        )
+        clock = SameSessionTransportClock()
+        clock.add_fragment(fragment, samples)
+        self.assertEqual(clock.evidence_method, "exact_same_session_pts")
+        metadata = clock.metadata_at(150.0)
+        self.assertEqual(
+            metadata["media_timestamp_utc"], "2026-07-10T03:57:23.050Z"
+        )
+        safe = metadata["media_clock"]
+        self.assertEqual(safe["evidence_method"], "exact_same_session_pts")
+        self.assertEqual(safe["anchor_fragment_id"], "frag-123")
+        self.assertEqual(safe["fragment_sample_index"], 1)
+        self.assertEqual(safe["source_pts"], 3)
+        self.assertEqual(safe["source_time_base_numerator"], 1)
+        self.assertEqual(safe["source_time_base_denominator"], 20)
+        rendered = repr(metadata)
+        self.assertNotIn("SessionToken", rendered)
+        self.assertNotIn("example.test", rendered)
+        self.assertIsNone(clock.metadata_at(200.0))
+
+        collision = _MediatedFragment(
+            program_date_time_epoch=1_783_655_845.0,
+            program_date_time_utc="2026-07-10T03:57:25.000Z",
+            duration_seconds=2.0,
+            media_sequence=18,
+            fragment_id="frag-124",
+            init_url=fragment.init_url,
+            segment_url=fragment.segment_url.replace("frag-123", "frag-124"),
+        )
+        with self.assertRaisesRegex(NvdecCaptureError, "timeline"):
+            clock.add_fragment(collision, samples)
+
+    def test_transport_clock_rejects_duplicates_and_sorts_b_frame_pts(self):
+        fragment = _MediatedFragment(
+            0.0, "1970-01-01T00:00:00.000Z", 1.0, 1, "fragment",
+            "https://example.test/init", (
+                "https://example.test/segment?FragmentNumber=fragment"
+            ),
+        )
+        clock = SameSessionTransportClock()
+        with self.assertRaisesRegex(NvdecCaptureError, "ambiguous"):
+            clock.add_fragment(fragment, (
+                _PacketSample(0, Fraction(1), Fraction(1, 20)),
+                _PacketSample(1, Fraction(1), Fraction(1, 20)),
+            ))
+        with self.assertRaisesRegex(NvdecCaptureError, "not integral"):
+            clock.add_fragment(fragment, (
+                _PacketSample(0, Fraction(1, 3), Fraction(1, 20)),
+            ))
+        clock.add_fragment(fragment, (
+            _PacketSample(0, Fraction(1), Fraction(1, 20)),
+            _PacketSample(1, Fraction(1, 2), Fraction(1, 20)),
+        ))
+        self.assertEqual(
+            clock.metadata_at(500.0)["media_timestamp_utc"],
+            "1970-01-01T00:00:00.000Z",
+        )
+        self.assertEqual(
+            clock.metadata_at(500.0)["media_clock"]["fragment_sample_index"],
+            0,
+        )
+        self.assertEqual(
+            clock.metadata_at(1000.0)["media_timestamp_utc"],
+            "1970-01-01T00:00:00.500Z",
+        )
+
+    def test_transport_clock_requires_continuous_multi_fragment_pdt(self):
+        def fragment(sequence, fragment_id, epoch):
+            return _MediatedFragment(
+                epoch,
+                "1970-01-01T00:00:00.000Z",
+                2.0,
+                sequence,
+                fragment_id,
+                "https://example.test/init",
+                "https://example.test/segment?FragmentNumber=" + fragment_id,
+            )
+
+        clock = SameSessionTransportClock()
+        clock.add_fragment(fragment(1, "f1", 1000.0), (
+            _PacketSample(0, Fraction(0), Fraction(1, 1000)),
+            _PacketSample(1, Fraction(1), Fraction(1, 1000)),
+        ))
+        clock.add_fragment(fragment(2, "f2", 1002.0), (
+            _PacketSample(0, Fraction(2), Fraction(1, 1000)),
+            _PacketSample(1, Fraction(3), Fraction(1, 1000)),
+        ))
+        self.assertIsNotNone(clock.metadata_at(2000.0))
+
+        with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
+            clock.add_fragment(fragment(3, "overlap", 1003.0), (
+                _PacketSample(0, Fraction(3), Fraction(1, 1000)),
+            ))
+        with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
+            clock.add_fragment(fragment(3, "backward", 999.0), (
+                _PacketSample(0, Fraction(4), Fraction(1, 1000)),
+            ))
+        with self.assertRaisesRegex(NvdecCaptureError, "PDT timeline"):
+            clock.add_fragment(fragment(3, "misaligned", 1005.0), (
+                _PacketSample(0, Fraction(4), Fraction(1, 1000)),
+            ))
+
+    def test_transport_clock_prunes_fifo_and_clear_drops_retained_evidence(self):
+        fragment = _MediatedFragment(
+            0.0, "1970-01-01T00:00:00.000Z", 4.0, 1, "fragment",
+            "https://example.test/init", (
+                "https://example.test/segment?FragmentNumber=fragment"
+            ),
+        )
+        clock = SameSessionTransportClock(max_positions=2)
+        clock.add_fragment(fragment, (
+            _PacketSample(0, Fraction(0), Fraction(1)),
+            _PacketSample(1, Fraction(1), Fraction(1)),
+            _PacketSample(2, Fraction(2), Fraction(1)),
+        ))
+        self.assertIsNone(clock.metadata_at(0.0))
+        self.assertIsNotNone(clock.metadata_at(1000.0))
+        self.assertIsNotNone(clock.metadata_at(2000.0))
+        clock.clear()
+        self.assertIsNone(clock.metadata_at(1000.0))
+        self.assertIsNone(clock.metadata_at(2000.0))
+
+    def test_capture_exposes_source_pts_and_only_an_exact_current_clock(self):
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        capture = object.__new__(FfmpegNvdecCapture)
+        capture._opened = True
+        capture._capture = FakeCapture([frame, frame], [0.0, 50.0])
+        capture._process = SimpleNamespace(poll=lambda: None)
+        capture._source_pts_timeout_seconds = 0.1
+        capture._last_source_position_ms = None
+        capture._last_transport_exact = False
+
+        fragment = _MediatedFragment(
+            0.0, "1970-01-01T00:00:00.000Z", 1.0, 1, "fragment",
+            "https://example.test/init", (
+                "https://example.test/segment?FragmentNumber=fragment"
+            ),
+        )
+        clock = SameSessionTransportClock()
+        clock.add_fragment(fragment, (
+            _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
+        ))
+        capture._mediator = SimpleNamespace(clock=clock)
+        positions = iter((Fraction(1, 10), Fraction(1, 5)))
+        capture._pts_sidecar = SimpleNamespace(
+            take=lambda _timeout: next(positions)
+        )
+
+        self.assertTrue(capture.read()[0])
+        self.assertEqual(capture.get(0), 100.0)
+        self.assertIs(capture.transport_media_clock(), clock)
+        self.assertTrue(capture.read()[0])
+        self.assertEqual(capture.get(0), 200.0)
+        self.assertIsNone(capture.transport_media_clock())
+
     def test_rejects_media_playlist_and_cross_origin_variant(self):
         with self.assertRaisesRegex(NvdecCaptureError, "variant playlist"):
             rewrite_hls_master(
@@ -171,6 +463,572 @@ class FfmpegCaptureTests(unittest.TestCase):
                 "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
                 "https://other.test/media.m3u8\n",
             )
+
+    def test_master_rejects_every_uri_bearing_tag(self):
+        source = "https://example.test/master.m3u8?SessionToken=secret"
+        base = (
+            "#EXTM3U\n{tag}\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child\n"
+        )
+        for tag in (
+            '#EXT-X-MEDIA:TYPE=AUDIO,URI="audio.m3u8"',
+            '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI="iframe.m3u8"',
+            '#EXT-X-SESSION-DATA:DATA-ID="x",URI = "data.json"',
+            '#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=1,uri="images.m3u8"',
+            '#EXT-X-CONTENT-STEERING:SERVER-URI="steering.json"',
+        ):
+            with self.subTest(tag=tag):
+                playlist = base.format(tag=tag)
+                with self.assertRaisesRegex(
+                    NvdecCaptureError, "URI-bearing"
+                ):
+                    rewrite_hls_master(source, playlist)
+                with self.assertRaisesRegex(
+                    NvdecCaptureError, "URI-bearing"
+                ):
+                    _LoopbackHlsMediator(
+                        source,
+                        playlist,
+                        http_get=lambda *_args, **_kwargs: None,
+                    )
+
+    def test_media_playlist_requires_exact_safe_fmp4_provenance(self):
+        media_url = (
+            "https://example.test/media.m3u8?SessionToken=playlist-secret"
+        )
+        valid = (
+            "#EXTM3U\n"
+            "#EXT-X-MEDIA-SEQUENCE:17\n"
+            "#EXT-X-MAP:URI=\"init.mp4?SessionToken=init-secret\"\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23.000Z\n"
+            "#EXTINF:2.0,\n"
+            "segment.mp4?FragmentNumber=frag-123&SessionToken=media-secret\n"
+        )
+        fragment = _parse_media_playlist(media_url, valid)[0]
+        self.assertEqual(fragment.fragment_id, "frag-123")
+        self.assertEqual(fragment.media_sequence, 17)
+        for text, expected in (
+            (valid.replace("#EXT-X-PROGRAM-DATE-TIME", "#MISSING"),
+             "provenance"),
+            (valid.replace("#EXTINF:2.0,", "#EXT-X-BYTERANGE:10@0\n#EXTINF:2.0,"),
+             "byte ranges"),
+            (valid.replace("segment.mp4?", "https://other.test/segment.mp4?"),
+             "same-origin"),
+            (valid.replace("FragmentNumber=frag-123&", ""), "identity"),
+            (valid.replace(
+                "#EXT-X-MEDIA-SEQUENCE:17",
+                '#EXT-X-SESSION-DATA:URI="https://example.test/data"',
+            ), "URI-bearing"),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(NvdecCaptureError, expected):
+                    _parse_media_playlist(media_url, text)
+
+    def test_ffprobe_packet_parser_is_bounded_url_free_and_exact(self):
+        payload = (
+            b'{"streams":[{"index":0,"codec_type":"video",'
+            b'"time_base":"1/20"}],"packets":['
+            b'{"stream_index":0,"pts":2,"dts":0,"duration":1,"flags":"K_"},'
+            b'{"stream_index":0,"pts":3,"dts":1,"duration":1,"flags":"__"}]}'
+        )
+        with patch(
+            "ffmpeg_capture._run_bounded_command", return_value=payload
+        ) as run:
+            samples = _probe_fragment_packets(b"init", b"segment")
+        self.assertEqual([sample.pts for sample in samples], [
+            Fraction(1, 10), Fraction(3, 20)
+        ])
+        command = " ".join(run.call_args.args[0])
+        self.assertIn("/proc/self/fd/", command)
+        self.assertNotIn("https://", command)
+        self.assertNotIn("SessionToken", command)
+        self.assertEqual(
+            run.call_args.kwargs["output_limit"], 2 * 1024 * 1024
+        )
+
+        bad = b'{"streams":[],"packets":[]}'
+        with patch("ffmpeg_capture._run_bounded_command", return_value=bad):
+            with self.assertRaisesRegex(NvdecCaptureError, "track") as error:
+                _probe_fragment_packets(b"init", b"segment")
+        self.assertNotIn("secret", str(error.exception))
+
+        multiple = (
+            b'{"streams":['
+            b'{"index":0,"codec_type":"video","time_base":"1/20"},'
+            b'{"index":1,"codec_type":"video","time_base":"1/20"}],'
+            b'"packets":[{"stream_index":0,"pts":1}]}'
+        )
+        with patch(
+            "ffmpeg_capture._run_bounded_command", return_value=multiple
+        ):
+            with self.assertRaisesRegex(NvdecCaptureError, "ambiguous"):
+                _probe_fragment_packets(b"init", b"segment")
+
+        for codec_type in ("audio", "subtitle", "data", "attachment"):
+            auxiliary = (
+                '{"streams":['
+                '{"index":0,"codec_type":"video","time_base":"1/20"},'
+                f'{{"index":1,"codec_type":"{codec_type}",'
+                '"time_base":"1/20"}],'
+                '"packets":[{"stream_index":0,"pts":1}]}'
+            ).encode()
+            with self.subTest(codec_type=codec_type), patch(
+                "ffmpeg_capture._run_bounded_command",
+                return_value=auxiliary,
+            ):
+                with self.assertRaisesRegex(NvdecCaptureError, "ambiguous"):
+                    _probe_fragment_packets(b"init", b"segment")
+
+    def test_bounded_probe_runner_rejects_output_overflow(self):
+        with self.assertRaisesRegex(NvdecCaptureError, "inspection failed"):
+            _run_bounded_command(
+                ["/bin/sh", "-c", "head -c 4096 /dev/zero"],
+                pass_fds=(),
+                timeout=1.0,
+                output_limit=64,
+            )
+
+    def test_fetch_has_one_monotonic_deadline_and_disables_redirects(self):
+        requested = {}
+
+        def redirecting_get(url, **kwargs):
+            requested.update(kwargs)
+            return Response(content=b"redirect", url=url, status=302)
+
+        with self.assertRaisesRegex(NvdecCaptureError, "redirect"):
+            _fetch_bounded(
+                redirecting_get,
+                "https://example.test/master.m3u8?SessionToken=secret",
+                timeout=1.0,
+                origin_url="https://example.test/master.m3u8",
+                limit=1024,
+                label="HLS test",
+            )
+        self.assertIs(requested["allow_redirects"], False)
+        self.assertIs(requested["stream"], True)
+
+        class SlowResponse:
+            url = "https://example.test/media.m3u8"
+            headers = {}
+
+            def __init__(self):
+                self.closed = False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                self.chunk_size = chunk_size
+                time.sleep(0.03)
+                yield b"late"
+
+            def close(self):
+                self.closed = True
+
+        slow = SlowResponse()
+        with self.assertRaisesRegex(NvdecCaptureError, "deadline"):
+            _fetch_bounded(
+                lambda _url, **_kwargs: slow,
+                slow.url,
+                timeout=0.01,
+                origin_url=slow.url,
+                limit=1024,
+                label="HLS slow test",
+            )
+        self.assertTrue(slow.closed)
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(NvdecCaptureError, "cancelled"):
+            _fetch_bounded(
+                lambda *_args, **_kwargs: self.fail("cancelled fetch ran"),
+                slow.url,
+                timeout=1.0,
+                origin_url=slow.url,
+                limit=1024,
+                label="HLS cancelled test",
+                cancel_event=cancelled,
+            )
+
+    def test_production_fetch_is_killable_and_keeps_url_in_memfd(self):
+        source = (
+            "https://example.test/master.m3u8?SessionToken=top-secret"
+        )
+        observed = {}
+
+        def inspect_helper(command, **kwargs):
+            rendered = " ".join(command)
+            self.assertNotIn("top-secret", rendered)
+            self.assertNotIn("example.test", rendered)
+            descriptor = kwargs["pass_fds"][0]
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            observed.update(json.loads(os.read(descriptor, 256 * 1024)))
+            self.assertLessEqual(kwargs["absolute_deadline"], time.monotonic() + 1.0)
+            return b"playlist"
+
+        with patch(
+            "ffmpeg_capture._run_bounded_command", side_effect=inspect_helper
+        ):
+            body = _fetch_bounded(
+                requests.get,
+                source,
+                timeout=1.0,
+                origin_url=source,
+                limit=1024,
+                label="HLS production test",
+            )
+        self.assertEqual(body, b"playlist")
+        self.assertEqual(observed["url"], source)
+        self.assertEqual(observed["limit"], 1024)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(NvdecCaptureError, "bounded fetch"):
+            _run_bounded_command(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                pass_fds=(),
+                timeout=0.05,
+                output_limit=64,
+                error_message="bounded fetch",
+            )
+        self.assertLess(time.monotonic() - started, 0.75)
+
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.05, cancel_event.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(NvdecCaptureError, "cancelled fetch"):
+                _run_bounded_command(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    pass_fds=(),
+                    timeout=5.0,
+                    output_limit=64,
+                    error_message="cancelled fetch",
+                    cancel_event=cancel_event,
+                )
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 0.75)
+
+    def test_loopback_mediator_binds_actual_served_fragment_and_hides_tokens(self):
+        source = (
+            "https://example.test/master.m3u8?SessionToken=master-secret"
+        )
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child-secret\n"
+        )
+        media = (
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:17\n"
+            "#EXT-X-MAP:URI=\"init.mp4?SessionToken=init-secret\"\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23.000Z\n"
+            "#EXTINF:2.0,\n"
+            "segment.mp4?FragmentNumber=frag-123&SessionToken=media-secret\n"
+        )
+        upstream_calls = []
+
+        def get(url, timeout):
+            upstream_calls.append((url, timeout))
+            if "media.m3u8" in url:
+                return Response(text=media, url=url)
+            if "init.mp4" in url:
+                return Response(content=b"exact-init", url=url)
+            if "segment.mp4" in url:
+                return Response(content=b"exact-segment", url=url)
+            raise AssertionError("unexpected upstream URL")
+
+        def probe(init, segment):
+            self.assertEqual((init, segment), (b"exact-init", b"exact-segment"))
+            return (
+                _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
+                _PacketSample(1, Fraction(3, 20), Fraction(1, 20)),
+            )
+
+        mediator = _LoopbackHlsMediator(
+            source, master, http_get=get, packet_probe=probe
+        )
+        retained_clock = mediator.clock
+        try:
+            rendered_master = mediator.master.decode("utf-8")
+            self.assertIn("http://127.0.0.1:", rendered_master)
+            for secret in (
+                "master-secret", "child-secret", "init-secret",
+                "media-secret", "example.test", "SessionToken",
+            ):
+                self.assertNotIn(secret, rendered_master)
+            local_media = next(
+                line for line in rendered_master.splitlines()
+                if line.startswith("http://")
+            )
+            media_response = requests.get(local_media, timeout=2)
+            self.assertEqual(media_response.status_code, 200)
+            rewritten = media_response.text
+            self.assertNotIn("SessionToken", rewritten)
+            self.assertNotIn("example.test", rewritten)
+            init_url = re.search(r'URI="([^"]+)"', rewritten).group(1)
+            segment_url = next(
+                line for line in rewritten.splitlines()
+                if line.startswith("http://") and line != init_url
+            )
+            self.assertEqual(requests.get(init_url, timeout=2).content, b"exact-init")
+            self.assertEqual(
+                requests.get(segment_url, timeout=2).content, b"exact-segment"
+            )
+            metadata = mediator.clock.metadata_at(150.0)
+            self.assertEqual(
+                metadata["media_timestamp_utc"],
+                "2026-07-10T03:57:23.050Z",
+            )
+            rendered = repr(metadata)
+            self.assertNotIn("secret", rendered.lower())
+            self.assertEqual(len(upstream_calls), 3)
+        finally:
+            mediator.close()
+        self.assertFalse(mediator.is_alive())
+        self.assertIsNone(retained_clock.metadata_at(150.0))
+        self.assertIsNone(mediator._media_url)
+        self.assertIsNone(mediator._origin_url)
+        self.assertIsNone(mediator._http_get)
+        self.assertIsNone(mediator._packet_probe)
+        self.assertIsNone(mediator._token)
+        self.assertEqual(mediator.master, b"")
+
+    def test_packet_or_clock_failure_keeps_exact_segment_pixel_fallback(self):
+        source = "https://example.test/master.m3u8?SessionToken=master"
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child\n"
+        )
+        media = (
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:17\n"
+            "#EXT-X-MAP:URI=\"init.mp4?SessionToken=init\"\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23.000Z\n"
+            "#EXTINF:2.0,\n"
+            "segment.mp4?FragmentNumber=frag-123&SessionToken=segment\n"
+        )
+
+        def get(url, timeout):
+            if "media.m3u8" in url:
+                return Response(text=media, url=url)
+            if "init.mp4" in url:
+                return Response(content=b"exact-init", url=url)
+            if "segment.mp4" in url:
+                return Response(content=b"exact-segment", url=url)
+            raise AssertionError("unexpected URL")
+
+        probes = (
+            lambda *_args: (_ for _ in ()).throw(
+                NvdecCaptureError("synthetic probe failure")
+            ),
+            lambda *_args: (
+                _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
+                _PacketSample(1, Fraction(1, 10), Fraction(1, 20)),
+            ),
+        )
+        for probe in probes:
+            with self.subTest(probe=probe):
+                mediator = _LoopbackHlsMediator(
+                    source, master, http_get=get, packet_probe=probe
+                )
+                try:
+                    local_media = next(
+                        line for line in mediator.master.decode().splitlines()
+                        if line.startswith("http://")
+                    )
+                    rewritten = requests.get(local_media, timeout=2).text
+                    init_url = re.search(
+                        r'URI="([^"]+)"', rewritten
+                    ).group(1)
+                    segment_url = next(
+                        line for line in rewritten.splitlines()
+                        if line.startswith("http://") and line != init_url
+                    )
+                    self.assertEqual(
+                        requests.get(init_url, timeout=2).content,
+                        b"exact-init",
+                    )
+                    segment = requests.get(segment_url, timeout=2)
+                    self.assertEqual(segment.status_code, 200)
+                    self.assertEqual(segment.content, b"exact-segment")
+                    self.assertFalse(mediator._transport_evidence_enabled)
+                    self.assertIsNone(mediator.clock.metadata_at(100.0))
+                finally:
+                    mediator.close()
+
+    def test_discontinuity_disables_evidence_without_blocking_decode(self):
+        source = "https://example.test/master.m3u8?SessionToken=master"
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child\n"
+        )
+        media = (
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:17\n"
+            "#EXT-X-MAP:URI=\"init.mp4?SessionToken=init\"\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23.000Z\n"
+            "#EXTINF:2.0,\n"
+            "segment.mp4?FragmentNumber=frag-123&SessionToken=segment\n"
+        )
+
+        def get(url, timeout):
+            if "media.m3u8" in url:
+                return Response(text=media, url=url)
+            if "init.mp4" in url:
+                return Response(content=b"exact-init", url=url)
+            if "segment.mp4" in url:
+                return Response(content=b"exact-segment", url=url)
+            raise AssertionError("unexpected URL")
+
+        def forbidden_probe(*_args):
+            raise AssertionError("discontinuous transport was probed")
+
+        mediator = _LoopbackHlsMediator(
+            source, master, http_get=get, packet_probe=forbidden_probe
+        )
+        try:
+            local_media = next(
+                line for line in mediator.master.decode().splitlines()
+                if line.startswith("http://")
+            )
+            rewritten = requests.get(local_media, timeout=2).text
+            self.assertIn("#EXT-X-DISCONTINUITY", rewritten)
+            init_url = re.search(r'URI="([^"]+)"', rewritten).group(1)
+            segment_url = next(
+                line for line in rewritten.splitlines()
+                if line.startswith("http://") and line != init_url
+            )
+            self.assertEqual(requests.get(init_url, timeout=2).status_code, 200)
+            segment = requests.get(segment_url, timeout=2)
+            self.assertEqual(segment.status_code, 200)
+            self.assertEqual(segment.content, b"exact-segment")
+            self.assertFalse(mediator._transport_evidence_enabled)
+            self.assertIsNone(mediator.clock.metadata_at(100.0))
+        finally:
+            mediator.close()
+
+    def test_loopback_mediator_returns_only_fixed_secret_free_errors(self):
+        source = "https://example.test/master.m3u8?SessionToken=secret"
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child-secret\n"
+        )
+        mediator = _LoopbackHlsMediator(
+            source,
+            master,
+            http_get=lambda url, timeout: Response(
+                text="secret", url=url, status=500
+            ),
+            packet_probe=lambda *_args: (),
+        )
+        try:
+            local_media = next(
+                line for line in mediator.master.decode().splitlines()
+                if line.startswith("http://")
+            )
+            response = requests.get(local_media, timeout=2)
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.text, "HLS mediation failed")
+            self.assertNotIn("secret", response.text.lower())
+        finally:
+            close_started = time.monotonic()
+            mediator.close()
+            self.assertLess(time.monotonic() - close_started, 0.5)
+
+    def test_failed_close_still_scrubs_every_signed_reference(self):
+        source = "https://example.test/master.m3u8?SessionToken=secret"
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child-secret\n"
+        )
+        mediator = _LoopbackHlsMediator(
+            source,
+            master,
+            http_get=lambda *_args, **_kwargs: Response(content=b"unused"),
+        )
+        with mediator._active_condition:
+            mediator._active_requests = 1
+        with self.assertRaisesRegex(NvdecCaptureError, "quiesce"):
+            mediator.close(timeout=0.0)
+        self.assertIsNone(mediator._media_url)
+        self.assertIsNone(mediator._origin_url)
+        self.assertIsNone(mediator._http_get)
+        self.assertIsNone(mediator._packet_probe)
+        self.assertIsNone(mediator._token)
+        self.assertEqual(mediator.master, b"")
+        with mediator._routes_lock:
+            self.assertEqual(mediator._routes, {})
+            self.assertEqual(mediator._init_bytes, {})
+
+    def test_capture_cancellation_closes_the_mediator(self):
+        class Process:
+            pid = 12345
+
+            @staticmethod
+            def poll():
+                return None
+
+        class Mediator:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        capture = object.__new__(FfmpegNvdecCapture)
+        capture._cancel_watcher_stop = threading.Event()
+        capture._cancel_event = threading.Event()
+        capture._cancel_event.set()
+        capture._process_lock = threading.RLock()
+        capture._process = Process()
+        capture._mediator = Mediator()
+        with patch("ffmpeg_capture.os.killpg") as killpg:
+            capture._watch_for_cancel()
+        killpg.assert_called_once_with(12345, __import__("signal").SIGTERM)
+        self.assertTrue(capture._mediator.closed)
+
+    def test_loopback_mediator_keeps_four_bounded_playlist_generations(self):
+        source = "https://example.test/master.m3u8?SessionToken=secret"
+        master = (
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "media.m3u8?SessionToken=child\n"
+        )
+        media = (
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:17\n"
+            "#EXT-X-MAP:URI=\"init.mp4?SessionToken=init\"\n"
+            "#EXT-X-PROGRAM-DATE-TIME:2026-07-10T03:57:23.000Z\n"
+            "#EXTINF:2.0,\n"
+            "segment.mp4?FragmentNumber=frag-123&SessionToken=media\n"
+        )
+
+        def get(url, timeout):
+            if "media.m3u8" in url:
+                return Response(text=media, url=url)
+            if "init.mp4" in url:
+                return Response(content=b"init", url=url)
+            raise AssertionError("unexpected fetch")
+
+        mediator = _LoopbackHlsMediator(
+            source, master, http_get=get, packet_probe=lambda *_args: ()
+        )
+        try:
+            local_media = next(
+                line for line in mediator.master.decode().splitlines()
+                if line.startswith("http://")
+            )
+            generations = [requests.get(local_media, timeout=2).text for _ in range(4)]
+            first_init = re.search(r'URI="([^"]+)"', generations[0]).group(1)
+            first_segment = next(
+                line for line in generations[0].splitlines()
+                if line.startswith("http://") and line != first_init
+            )
+            self.assertEqual(requests.get(first_init, timeout=2).status_code, 200)
+            requests.get(local_media, timeout=2)
+            self.assertEqual(requests.get(first_segment, timeout=2).status_code, 404)
+            with mediator._routes_lock:
+                self.assertLessEqual(len(mediator._route_generations), 4)
+                self.assertLessEqual(len(mediator._routes), 24)
+        finally:
+            mediator.close()
 
     def test_fragment_match_requires_one_exact_frame_and_releases(self):
         captures = []

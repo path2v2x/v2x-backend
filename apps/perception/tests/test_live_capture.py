@@ -61,6 +61,42 @@ class FakeMediaClock:
         }
 
 
+class FakeTransportMediaClock(FakeMediaClock):
+    evidence_method = "exact_same_session_pts"
+
+
+class TransportClockCapture:
+    """Capture fixture exposing same-session transport evidence per read."""
+
+    def __init__(self, frames, positions, next_frame_gate=None):
+        self.frames = list(frames)
+        self.positions = list(positions)
+        self.current_position = None
+        self.next_frame_gate = next_frame_gate
+        self.released = False
+        self.clock = FakeTransportMediaClock()
+
+    def isOpened(self):
+        return not self.released
+
+    def read(self):
+        if self.released or not self.frames:
+            return False, None
+        if self.current_position is not None and self.next_frame_gate is not None:
+            self.next_frame_gate.wait(1.0)
+        self.current_position = self.positions.pop(0)
+        return True, self.frames.pop(0)
+
+    def get(self, _property):
+        return self.current_position
+
+    def transport_media_clock(self):
+        return None if self.current_position is None else self.clock
+
+    def release(self):
+        self.released = True
+
+
 class SequencedMediaClock:
     def __init__(self, timestamps):
         self.timestamps = list(timestamps)
@@ -165,6 +201,222 @@ class LiveStreamReaderTests(unittest.TestCase):
                 return True
             time.sleep(0.01)
         return bool(predicate())
+
+    def test_preparation_prefers_same_session_pts_without_clock_session(self):
+        capture = TransportClockCapture(["static-frame"], [2204.0])
+        clock_source_calls = []
+        fallback_calls = []
+        preparation = _AsyncCapturePreparation(
+            source_factory=lambda: "capture-source",
+            clock_source_factory=lambda: clock_source_calls.append(True),
+            capture_factory=lambda _source: capture,
+            media_clock_factory=lambda *_args, **_kwargs: (
+                fallback_calls.append(True)
+            ),
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=time.monotonic,
+            serialize_preparation=False,
+        )
+        try:
+            self.assertTrue(self.wait_until(lambda: preparation.poll()[0]))
+            result = preparation.take()
+            self.assertIsNotNone(result)
+            self.assertIs(result[5], capture.clock)
+            self.assertEqual(result[7], "capture-source")
+            self.assertEqual(preparation.evidence(), "exact_same_session_pts")
+            self.assertEqual(clock_source_calls, [])
+            self.assertEqual(fallback_calls, [])
+            result[0].release()
+        finally:
+            preparation.discard()
+
+    def test_active_reader_publishes_same_session_pts_without_pixel_match(self):
+        next_frame_gate = threading.Event()
+        capture = TransportClockCapture(
+            ["identical", "identical"], [2204.0, 2237.333], next_frame_gate
+        )
+        clock_source_calls = []
+        fallback_calls = []
+        reader = LiveStreamReader(
+            source_factory=lambda: "capture-source",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=lambda *_args, **_kwargs: (
+                fallback_calls.append(True)
+            ),
+            media_clock_source_factory=lambda: clock_source_calls.append(True),
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            duplicate_frame_limit=10,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(first["media_clock"])
+            next_frame_gate.set()
+            second = reader.wait_for_frame(first["sequence"], timeout=1.0)
+            self.assertIsNotNone(second)
+            self.assertEqual(second["frame"], "identical")
+            self.assertGreater(second["sequence"], first["sequence"])
+            self.assertEqual(clock_source_calls, [])
+            self.assertEqual(fallback_calls, [])
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_missing_current_transport_pts_immediately_starts_fallback(self):
+        class LosingTransportCapture(TransportClockCapture):
+            def transport_media_clock(self):
+                if self.current_position == 2204.0:
+                    return self.clock
+                return None
+
+        next_frame_gate = threading.Event()
+        capture = LosingTransportCapture(
+            ["identical", "identical"],
+            [2204.0, 2237.333],
+            next_frame_gate,
+        )
+        fallback_started = threading.Event()
+        clock_sources = []
+
+        def fallback(*_args, **_kwargs):
+            fallback_started.set()
+            return FakeMediaClock()
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "capture-source",
+            capture_factory=lambda _source: capture,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=fallback,
+            media_clock_source_factory=lambda: (
+                clock_sources.append("clock-fallback") or "clock-fallback"
+            ),
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            duplicate_frame_limit=10,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            next_frame_gate.set()
+            self.assertTrue(fallback_started.wait(1.0))
+            second = reader.wait_for_frame(first["sequence"], timeout=1.0)
+            self.assertIsNotNone(second)
+            self.assertEqual(clock_sources, ["clock-fallback"])
+        finally:
+            reader.stop(timeout=2.0)
+
+    def test_static_transport_loss_hands_over_to_fresh_trusted_session(self):
+        class PersistentLosingCapture:
+            def __init__(self):
+                self.count = 0
+                self.position = None
+                self.released = False
+                self.clock = FakeTransportMediaClock()
+
+            def isOpened(self):
+                return not self.released
+
+            def read(self):
+                if self.released:
+                    return False, None
+                time.sleep(0.002)
+                self.count += 1
+                self.position = 2204.0 + (self.count - 1) * 33.333
+                return True, "identical-static-frame"
+
+            def get(self, _property):
+                return self.position
+
+            def transport_media_clock(self):
+                return self.clock if self.count == 1 else None
+
+            def release(self):
+                self.released = True
+
+        class ContinuousTransportCapture:
+            def __init__(self):
+                self.count = 0
+                self.position = None
+                self.released = False
+                self.clock = FakeTransportMediaClock()
+
+            def isOpened(self):
+                return not self.released
+
+            def read(self):
+                if self.released:
+                    return False, None
+                time.sleep(0.002)
+                self.count += 1
+                self.position = 5000.0 + self.count * 33.333
+                return True, f"replacement-{self.count}"
+
+            def get(self, _property):
+                return self.position
+
+            def transport_media_clock(self):
+                return self.clock
+
+            def release(self):
+                self.released = True
+
+        primary = PersistentLosingCapture()
+        replacement = ContinuousTransportCapture()
+        source_calls = []
+        fallback_calls = []
+
+        def source_factory():
+            source = f"capture-session-{len(source_calls) + 1}"
+            source_calls.append(source)
+            return source
+
+        def capture_factory(source):
+            return primary if source.endswith("-1") else replacement
+
+        reader = LiveStreamReader(
+            source_factory=source_factory,
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            media_clock_factory=lambda *_args, **_kwargs: (
+                fallback_calls.append(True) and None
+            ),
+            media_clock_source_factory=lambda: "fallback-clock-session",
+            media_clock_validator=lambda *_args: True,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            duplicate_frame_limit=10,
+            connection_max_age_seconds=300.0,
+            connection_renewal_lead_seconds=15.0,
+        )
+        reader.start()
+        try:
+            first = reader.wait_for_frame(0, timeout=1.0)
+            self.assertIsNotNone(first)
+            replacement_frame = reader.wait_for_frame(
+                first["sequence"], timeout=2.0
+            )
+            self.assertIsNotNone(replacement_frame)
+            self.assertTrue(
+                str(replacement_frame["frame"]).startswith("replacement-")
+            )
+            self.assertGreaterEqual(len(source_calls), 2)
+            self.assertTrue(fallback_calls)
+            self.assertTrue(primary.released)
+            self.assertIsNotNone(replacement_frame["media_clock"])
+        finally:
+            reader.stop(timeout=2.0)
+        self.assertTrue(self.wait_until(
+            lambda: (
+                capture_preparation_topology()["proactive_preparations"] == 0
+                and capture_preparation_topology()["terminal_cleanups"] == 0
+            )
+        ))
 
     def test_discarded_media_clock_resolution_cancels_and_quiesces(self):
         entered = threading.Event()
