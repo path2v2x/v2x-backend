@@ -113,10 +113,10 @@ class FrameBroadcasterTests(unittest.TestCase):
 
     def test_terminal_failover_telemetry_is_explicit_and_cumulative(self):
         self.broadcaster.mark_terminal_failover(
-            "ch1", "succeeded", 4.25, "same_session_restart"
+            "ch1", "succeeded", 4.25, "same_session_restart", "ready"
         )
         self.broadcaster.mark_terminal_failover(
-            "ch1", "failed", 8.0, "fresh_session_replacement"
+            "ch1", "failed", 8.0, "fresh_session_replacement", "capture_open"
         )
         health = self.broadcaster.snapshot_health()["cameras"]["ch1"]
         self.assertEqual(health["terminal_failover_attempts"], 2)
@@ -130,6 +130,9 @@ class FrameBroadcasterTests(unittest.TestCase):
         self.assertEqual(
             health["terminal_failover_last_duration_seconds"], 8.0
         )
+        self.assertEqual(
+            health["terminal_failover_last_stage"], "capture_open"
+        )
 
         with self.assertRaisesRegex(ValueError, "outcome"):
             self.broadcaster.mark_terminal_failover(
@@ -142,6 +145,10 @@ class FrameBroadcasterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "method"):
             self.broadcaster.mark_terminal_failover(
                 "ch1", "failed", 1.0, "unknown"
+            )
+        with self.assertRaisesRegex(ValueError, "stage"):
+            self.broadcaster.mark_terminal_failover(
+                "ch1", "failed", 1.0, "same_session_restart", "signed-url"
             )
 
     def test_health_age_uses_capture_time_not_inference_completion_time(self):

@@ -288,6 +288,7 @@ class FrameBroadcaster:
                 "terminal_failover_last_outcome": None,
                 "terminal_failover_last_duration_seconds": None,
                 "terminal_failover_last_method": None,
+                "terminal_failover_last_stage": None,
                 "media_clock_status": "unavailable",
                 "media_time_trusted": False,
                 "decode_latency_ms": None,
@@ -428,7 +429,7 @@ class FrameBroadcaster:
             self.condition.notify_all()
 
     def mark_terminal_failover(
-        self, camera_id, outcome, duration_seconds, method
+        self, camera_id, outcome, duration_seconds, method, stage=None
     ):
         if outcome not in {"succeeded", "failed", "stopped"}:
             raise ValueError("terminal failover outcome is invalid")
@@ -441,6 +442,19 @@ class FrameBroadcaster:
             "fresh_session_replacement",
         }:
             raise ValueError("terminal failover method is invalid")
+        if stage not in {
+            None,
+            "source",
+            "clock_source",
+            "capture_open",
+            "first_frame",
+            "capture_position",
+            "clock_resolution",
+            "clock_validation",
+            "ready",
+            "failed",
+        }:
+            raise ValueError("terminal failover stage is invalid")
         with self.condition:
             health = self.camera_health[camera_id]
             health["terminal_failover_attempts"] += 1
@@ -450,6 +464,7 @@ class FrameBroadcaster:
                 health["terminal_failover_failures"] += 1
             health["terminal_failover_last_outcome"] = outcome
             health["terminal_failover_last_method"] = method
+            health["terminal_failover_last_stage"] = stage
             health["terminal_failover_last_duration_seconds"] = round(
                 duration, 3
             )
@@ -525,6 +540,9 @@ class FrameBroadcaster:
                     ],
                     "terminal_failover_last_method": entry[
                         "terminal_failover_last_method"
+                    ],
+                    "terminal_failover_last_stage": entry[
+                        "terminal_failover_last_stage"
                     ],
                     "media_clock_status": entry["media_clock_status"],
                     "media_time_trusted": entry["media_time_trusted"],
@@ -1148,7 +1166,7 @@ class MultiCameraPipeline:
 
             def _state_callback(index):
                 def callback(
-                    state, error, failures, delay_seconds, method=None
+                    state, error, failures, delay_seconds, method=None, stage=None
                 ):
                     if state == "connected":
                         if stream_broadcaster:
@@ -1160,11 +1178,13 @@ class MultiCameraPipeline:
                         outcome = state.removeprefix("terminal_failover_")
                         if stream_broadcaster:
                             stream_broadcaster.mark_terminal_failover(
-                                camera_ids[index], outcome, delay_seconds, method
+                                camera_ids[index], outcome, delay_seconds, method,
+                                stage,
                             )
                         print(
                             f"Camera {camera_ids[index]} terminal failover "
-                            f"{outcome} after {delay_seconds:.3f}s."
+                            f"{outcome} at {stage or 'unknown'} after "
+                            f"{delay_seconds:.3f}s."
                         )
                         return
                     if stream_broadcaster:

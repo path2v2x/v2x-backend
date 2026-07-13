@@ -81,21 +81,34 @@ class _AsyncCapturePreparation:
         self._result_lock = threading.Lock()
         self._result = None
         self._failed = False
+        self._stage_lock = threading.Lock()
+        self._stage = "source"
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _set_stage(self, stage):
+        with self._stage_lock:
+            self._stage = str(stage)
+
+    def stage(self):
+        with self._stage_lock:
+            return self._stage
 
     def _run(self):
         capture = None
         clock_resolution = None
         try:
+            self._set_stage("source")
             source = self._source_factory()
             capture_source = source
+            self._set_stage("clock_source")
             clock_source = (
                 self._clock_source_factory()
                 if self._clock_source_factory is not None
                 else source
             )
             prepared_clock_source = clock_source
+            self._set_stage("capture_open")
             capture = self._capture_factory(source)
             if self._clock_source_factory is not None:
                 source = None
@@ -103,6 +116,7 @@ class _AsyncCapturePreparation:
                 raise RuntimeError("capture open failed")
 
             latest = None
+            self._set_stage("first_frame")
             while not (
                 self._stop_event.is_set() or self._discarded.is_set()
             ):
@@ -133,6 +147,7 @@ class _AsyncCapturePreparation:
                         capture = None
                     return
                 if position is None:
+                    self._set_stage("capture_position")
                     continue
                 if clock_resolution is None:
                     if clock_source is None:
@@ -151,6 +166,7 @@ class _AsyncCapturePreparation:
                         ),
                     )
                     clock_source = None
+                    self._set_stage("clock_resolution")
                 resolved, media_clock = clock_resolution.poll()
                 if not resolved:
                     # Keep draining the replacement FIFO while its first exact
@@ -159,6 +175,7 @@ class _AsyncCapturePreparation:
                     continue
                 if media_clock is None:
                     raise RuntimeError("media clock resolution failed")
+                self._set_stage("clock_validation")
                 frame, source_epoch, source_monotonic, position = latest
                 frame_clock = media_clock.metadata_at(position)
                 if frame_clock is None:
@@ -189,10 +206,12 @@ class _AsyncCapturePreparation:
                         prepared_clock_source,
                     )
                     capture = None
+                self._set_stage("ready")
                 return
             raise RuntimeError("capture preparation stopped")
         except Exception:
             self._failed = True
+            self._set_stage("failed")
         finally:
             self._source_factory = None
             self._clock_source_factory = None
@@ -266,8 +285,18 @@ class _AsyncCaptureRestart:
         self._result_lock = threading.Lock()
         self._result = None
         self._failed = False
+        self._stage_lock = threading.Lock()
+        self._stage = "capture_open"
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _set_stage(self, stage):
+        with self._stage_lock:
+            self._stage = str(stage)
+
+    def stage(self):
+        with self._stage_lock:
+            return self._stage
 
     def _run(self):
         capture = None
@@ -275,9 +304,11 @@ class _AsyncCaptureRestart:
         source = self._source
         clock_source = self._clock_source
         try:
+            self._set_stage("capture_open")
             capture = self._capture_factory(source)
             if capture is None or not capture.isOpened():
                 raise RuntimeError("capture open failed")
+            self._set_stage("first_frame")
             while not (
                 self._stop_event.is_set() or self._discarded.is_set()
             ):
@@ -293,6 +324,7 @@ class _AsyncCaptureRestart:
                     except (AttributeError, TypeError, ValueError):
                         position = None
                 if position is None:
+                    self._set_stage("capture_position")
                     continue
                 if self._media_clock_factory is None:
                     with self._result_lock:
@@ -320,11 +352,13 @@ class _AsyncCaptureRestart:
                             self._media_frame_identity,
                         ),
                     )
+                    self._set_stage("clock_resolution")
                 resolved, media_clock = clock_resolution.poll()
                 if not resolved:
                     continue
                 if media_clock is None:
                     raise RuntimeError("media clock resolution failed")
+                self._set_stage("clock_validation")
                 frame_clock = media_clock.metadata_at(position)
                 if frame_clock is None:
                     raise RuntimeError("media clock metadata failed")
@@ -347,10 +381,12 @@ class _AsyncCaptureRestart:
                         clock_source,
                     )
                     capture = None
+                self._set_stage("ready")
                 return
             raise RuntimeError("capture restart stopped")
         except Exception:
             self._failed = True
+            self._set_stage("failed")
         finally:
             self._source = None
             self._clock_source = None
@@ -617,7 +653,9 @@ class LiveStreamReader:
             )
         return self.snapshot(after_sequence)
 
-    def _notify(self, state, error=None, delay_seconds=0.0, method=None):
+    def _notify(
+        self, state, error=None, delay_seconds=0.0, method=None, stage=None
+    ):
         if self.state_callback:
             self.state_callback(
                 state=state,
@@ -625,6 +663,7 @@ class LiveStreamReader:
                 failures=self.recovery.failures,
                 delay_seconds=float(delay_seconds),
                 method=method,
+                stage=stage,
             )
 
     def _remember_frame_identity(self, identity):
@@ -679,12 +718,13 @@ class LiveStreamReader:
         started = self.monotonic()
         deadline = started + self.terminal_read_failover_seconds
 
-        def finish(result, outcome, method):
+        def finish(result, outcome, method, stage):
             elapsed = max(0.0, self.monotonic() - started)
             self._notify(
                 f"terminal_failover_{outcome}",
                 delay_seconds=elapsed,
                 method=method,
+                stage=stage,
             )
             return result
 
@@ -712,13 +752,16 @@ class LiveStreamReader:
             done, result, failed = candidate.poll()
             if done:
                 if not failed and result is not None:
-                    return finish(candidate.take(), "succeeded", method)
+                    return finish(
+                        candidate.take(), "succeeded", method, candidate.stage()
+                    )
+                failed_stage = candidate.stage()
                 candidate.discard()
                 if (
                     not may_start_fresh_attempt
                     or self.monotonic() >= deadline
                 ):
-                    return finish(None, "failed", method)
+                    return finish(None, "failed", method, failed_stage)
                 may_start_fresh_attempt = False
                 candidate = self._prepare_replacement_capture()
                 method = "fresh_session_replacement"
@@ -726,12 +769,13 @@ class LiveStreamReader:
 
             remaining = deadline - self.monotonic()
             if remaining <= 0.0:
+                timed_out_stage = candidate.stage()
                 candidate.discard()
-                return finish(None, "failed", method)
+                return finish(None, "failed", method, timed_out_stage)
             self._stop_event.wait(min(0.01, remaining))
 
         candidate.discard()
-        return finish(None, "stopped", method)
+        return finish(None, "stopped", method, candidate.stage())
 
     def _run(self):
         while not self._stop_event.is_set():

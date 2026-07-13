@@ -212,6 +212,7 @@ class LiveStreamReaderTests(unittest.TestCase):
             self.assertEqual(
                 terminal[0]["method"], "same_session_restart"
             )
+            self.assertEqual(terminal[0]["stage"], "ready")
             self.assertGreaterEqual(len(clock_sources), 2)
             self.assertTrue(all(
                 source == "clock-session-1" for source in clock_sources
@@ -276,6 +277,14 @@ class LiveStreamReaderTests(unittest.TestCase):
                     for event in states
                 ),
                 1,
+            )
+            failure = next(
+                event for event in states
+                if event["state"] == "terminal_failover_failed"
+            )
+            self.assertIn(
+                failure["stage"],
+                {"capture_open", "first_frame", "failed"},
             )
         finally:
             reader.stop(timeout=2.0)
