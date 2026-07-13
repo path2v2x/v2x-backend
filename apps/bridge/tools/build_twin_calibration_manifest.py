@@ -164,9 +164,25 @@ def managed_sensor_actor(spawn):
         except BaseException as exc:  # cleanup must continue through destroy
             failures.append(("stop", exc))
         try:
-            actor.destroy()
+            destroy_result = actor.destroy()
+            if destroy_result is False:
+                failures.append(("destroy", RuntimeError("returned False")))
         except BaseException as exc:
             failures.append(("destroy", exc))
+        try:
+            is_alive = actor.is_alive
+        except AttributeError:
+            # Test doubles and older compatible clients may not expose the
+            # property.  A readable runtime property, however, is authoritative.
+            pass
+        except BaseException as exc:
+            failures.append(("is_alive", exc))
+        else:
+            if is_alive is not False:
+                failures.append((
+                    "is_alive",
+                    RuntimeError(f"remained {is_alive!r} after destroy"),
+                ))
         if failures:
             details = "; ".join(
                 f"{operation} failed: {error}" for operation, error in failures

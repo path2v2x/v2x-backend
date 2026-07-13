@@ -252,6 +252,63 @@ def test_cleanup_failure_attempts_both_sensor_operations(failed_operations):
         assert f"{operation} failed" in str(error.value)
 
 
+def test_destroy_false_fails_closed_after_attempting_stop_and_destroy():
+    calls = []
+
+    class Actor:
+        def stop(self):
+            calls.append("stop")
+
+        def destroy(self):
+            calls.append("destroy")
+            return False
+
+    with pytest.raises(RuntimeError, match="destroy failed: returned False"):
+        with manifest_builder.managed_sensor_actor(Actor):
+            pass
+
+    assert calls == ["stop", "destroy"]
+
+
+def test_destroyed_actor_that_remains_alive_fails_closed():
+    calls = []
+
+    class Actor:
+        is_alive = True
+
+        def stop(self):
+            calls.append("stop")
+
+        def destroy(self):
+            calls.append("destroy")
+            return True
+
+    with pytest.raises(RuntimeError, match="is_alive failed: remained True"):
+        with manifest_builder.managed_sensor_actor(Actor):
+            pass
+
+    assert calls == ["stop", "destroy"]
+
+
+def test_destroyed_actor_with_false_is_alive_state_can_publish():
+    calls = []
+
+    class Actor:
+        is_alive = False
+
+        def stop(self):
+            calls.append("stop")
+
+        def destroy(self):
+            calls.append("destroy")
+            return True
+
+    with manifest_builder.managed_sensor_actor(Actor):
+        pass
+
+    assert calls == ["stop", "destroy"]
+
+
 @pytest.mark.parametrize("kind", ["payload", "point", "road"])
 def test_malformed_annotation_objects_fail_controlled(kind):
     payload = copy.deepcopy(annotation_payload())
