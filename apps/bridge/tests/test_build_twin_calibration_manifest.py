@@ -138,6 +138,120 @@ def test_retained_artifact_identity_rejects_nonexistent_and_tampered_hash(tmp_pa
         )
 
 
+def test_staged_artifact_pair_publishes_durably_without_partial_files(tmp_path):
+    depth_output = tmp_path / "depth.bgra"
+    manifest_output = tmp_path / "manifest.json"
+    depth_stage = manifest_builder.stage_artifact_bytes(
+        depth_output, b"depth", "depth"
+    )
+    manifest_stage = manifest_builder.stage_artifact_bytes(
+        manifest_output, b'{"manifest": true}\n', "manifest"
+    )
+
+    manifest_builder.publish_staged_artifacts_no_replace((
+        (depth_stage, depth_output),
+        (manifest_stage, manifest_output),
+    ))
+
+    assert depth_output.read_bytes() == b"depth"
+    assert manifest_output.read_bytes() == b'{"manifest": true}\n'
+    assert not depth_stage.exists()
+    assert not manifest_stage.exists()
+
+
+def test_staged_artifact_pair_rolls_back_if_no_replace_publish_fails(tmp_path):
+    depth_output = tmp_path / "depth.bgra"
+    manifest_output = tmp_path / "manifest.json"
+    manifest_output.write_bytes(b"preexisting")
+    depth_stage = manifest_builder.stage_artifact_bytes(
+        depth_output, b"depth", "depth"
+    )
+    manifest_stage = manifest_builder.stage_artifact_bytes(
+        tmp_path / "unused-manifest.json", b"new manifest", "manifest"
+    )
+
+    with pytest.raises(FileExistsError):
+        manifest_builder.publish_staged_artifacts_no_replace((
+            (depth_stage, depth_output),
+            (manifest_stage, manifest_output),
+        ))
+
+    assert not depth_output.exists()
+    assert manifest_output.read_bytes() == b"preexisting"
+    assert not depth_stage.exists()
+    assert not manifest_stage.exists()
+
+
+def test_staging_fsync_failure_removes_temporary_file(tmp_path, monkeypatch):
+    output = tmp_path / "manifest.json"
+
+    def fail_fsync(_descriptor):
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(manifest_builder.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        manifest_builder.stage_artifact_bytes(output, b"partial", "manifest")
+
+    assert not output.exists()
+    assert list(tmp_path.glob("*.staged")) == []
+
+
+def test_offline_depth_projection_uses_carla_forward_right_up_axes():
+    baseline = {
+        "location": [1.2, -3.4, 8.5],
+        "pitch_deg": 0.0,
+        "yaw_deg": 90.0,
+        "roll_deg": 0.0,
+    }
+    offline = manifest_builder.offline_depth_pixel_to_world(
+        baseline, 640.0, 480.0, 23.4, 90.0, 1280, 960
+    )
+
+    assert offline == pytest.approx([1.2, 20.0, 8.5], abs=1e-12)
+
+
+@pytest.mark.parametrize("failure_site", ["identity", "resolve"])
+def test_post_spawn_body_failure_still_stops_and_destroys_sensor(failure_site):
+    calls = []
+
+    class Actor:
+        def stop(self):
+            calls.append("stop")
+
+        def destroy(self):
+            calls.append("destroy")
+
+    with pytest.raises(ValueError, match=failure_site):
+        with manifest_builder.managed_sensor_actor(Actor) as _actor:
+            raise ValueError(f"injected {failure_site} failure")
+
+    assert calls == ["stop", "destroy"]
+
+
+@pytest.mark.parametrize("failed_operations", [("stop",), ("destroy",), ("stop", "destroy")])
+def test_cleanup_failure_attempts_both_sensor_operations(failed_operations):
+    calls = []
+
+    class Actor:
+        def stop(self):
+            calls.append("stop")
+            if "stop" in failed_operations:
+                raise RuntimeError("injected stop failure")
+
+        def destroy(self):
+            calls.append("destroy")
+            if "destroy" in failed_operations:
+                raise RuntimeError("injected destroy failure")
+
+    with pytest.raises(RuntimeError, match="sensor cleanup failed") as error:
+        with manifest_builder.managed_sensor_actor(Actor):
+            pass
+
+    assert calls == ["stop", "destroy"]
+    for operation in failed_operations:
+        assert f"{operation} failed" in str(error.value)
+
+
 @pytest.mark.parametrize("kind", ["payload", "point", "road"])
 def test_malformed_annotation_objects_fail_controlled(kind):
     payload = copy.deepcopy(annotation_payload())
@@ -347,7 +461,7 @@ def test_intrinsics_sources_are_bound_to_retained_images(tmp_path):
     hashes = []
     for index in range(10):
         path = tmp_path / f"source-{index}.png"
-        image = Image.new("RGB", (16, 12), (index, 0, 0))
+        image = Image.new("RGB", (1280, 960), (index, 0, 0))
         image.save(path)
         images.append(path)
         hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())

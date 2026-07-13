@@ -8,12 +8,16 @@ sensor at the baseline rig pose. The output is accepted directly by
 """
 
 import argparse
+from contextlib import contextmanager
 from io import BytesIO
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 
 from PIL import Image, UnidentifiedImageError
 
@@ -45,6 +49,7 @@ DISTORTION_KEYS = ("k1", "k2", "p1", "p2", "k3")
 MIN_TRAIN_HOLDOUT_WORLD_SEPARATION_M = 0.25
 MIN_TRAIN_HOLDOUT_IMAGE_SEPARATION_PX = 4.0
 MIN_TRAIN_HOLDOUT_TWIN_SEPARATION_PX = 2.0
+OFFLINE_CARLA_TRANSFORM_TOLERANCE_M = 1e-5
 
 
 def _valid_sha256(value):
@@ -72,6 +77,101 @@ def retained_artifact_identity(path, label, *, expected_sha256=None):
     if expected_sha256 is not None and identity["sha256"] != expected_sha256:
         raise ValueError(f"{label} artifact hash does not match its declaration")
     return identity
+
+
+def stage_artifact_bytes(destination, payload, label):
+    """Durably stage bytes beside a destination without exposing partial output."""
+    destination = Path(destination).expanduser().resolve()
+    if destination.exists():
+        raise FileExistsError(f"{label} destination already exists: {destination}")
+    if not destination.parent.is_dir():
+        raise FileNotFoundError(
+            f"{label} destination directory is missing: {destination.parent}"
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".staged", dir=destination.parent
+    )
+    staged = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def staged_artifact_identity(staged, destination, label, *, expected_sha256=None):
+    """Hash staged bytes while binding their identity to the final destination."""
+    identity = retained_artifact_identity(
+        staged, label, expected_sha256=expected_sha256
+    )
+    identity["path"] = str(Path(destination).expanduser().resolve())
+    return identity
+
+
+def _fsync_directory(directory):
+    descriptor = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_staged_artifacts_no_replace(staged_destinations):
+    """Publish a staged artifact set, rolling all outputs back on any failure."""
+    pairs = [
+        (Path(staged), Path(destination).expanduser().resolve())
+        for staged, destination in staged_destinations
+    ]
+    published = []
+    directories = {destination.parent for _staged, destination in pairs}
+    try:
+        for staged, destination in pairs:
+            # A same-directory hard link is atomic and fails with EEXIST.  It
+            # therefore supplies the no-replace guarantee that Path.rename lacks.
+            os.link(staged, destination)
+            published.append(destination)
+        for directory in directories:
+            _fsync_directory(directory)
+    except BaseException:
+        for destination in reversed(published):
+            destination.unlink(missing_ok=True)
+        for directory in directories:
+            _fsync_directory(directory)
+        raise
+    finally:
+        for staged, _destination in pairs:
+            staged.unlink(missing_ok=True)
+
+
+@contextmanager
+def managed_sensor_actor(spawn):
+    """Always attempt both sensor stop and destroy before evidence publication."""
+    actor = spawn()
+    try:
+        yield actor
+    finally:
+        failures = []
+        try:
+            actor.stop()
+        except BaseException as exc:  # cleanup must continue through destroy
+            failures.append(("stop", exc))
+        try:
+            actor.destroy()
+        except BaseException as exc:
+            failures.append(("destroy", exc))
+        if failures:
+            details = "; ".join(
+                f"{operation} failed: {error}" for operation, error in failures
+            )
+            raise RuntimeError(f"UE5 depth sensor cleanup failed ({details})")
 
 
 def bind_survey_record_artifacts(features):
@@ -265,15 +365,253 @@ def validate_intrinsics_source_images(camera, source_paths):
     """Bind the declared calibration source hashes to retained image files."""
     expected = set(validate_intrinsics_calibration(camera)["source_images_sha256"])
     actual = []
+    expected_size = (
+        int(camera["intrinsics"]["width"]),
+        int(camera["intrinsics"]["height"]),
+    )
     for path in source_paths:
         payload = Path(path).read_bytes()
-        decoded_image_size(payload, f"intrinsics source {path}")
+        if decoded_image_size(payload, f"intrinsics source {path}") != expected_size:
+            raise ValueError(
+                "intrinsics source image dimensions do not match camera resolution"
+            )
         actual.append(hashlib.sha256(payload).hexdigest())
     if len(actual) != len(expected) or len(set(actual)) != len(actual):
         raise ValueError("intrinsics source image count or uniqueness does not match")
     if set(actual) != expected:
         raise ValueError("intrinsics source image hashes do not match calibration artifact")
     return sorted(actual)
+
+
+def canonical_camera_sha256(camera):
+    return hashlib.sha256(json.dumps(
+        camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")).hexdigest()
+
+
+def offline_depth_pixel_to_world(baseline, u, v, depth_m, fov_deg, width, height):
+    """Reproduce CARLA Transform.transform without importing a runtime client."""
+    focal = (float(width) / 2.0) / math.tan(math.radians(float(fov_deg)) / 2.0)
+    local = (
+        float(depth_m),
+        (float(u) - float(width) / 2.0) * float(depth_m) / focal,
+        -(float(v) - float(height) / 2.0) * float(depth_m) / focal,
+    )
+    pitch = math.radians(float(baseline["pitch_deg"]))
+    yaw = math.radians(float(baseline["yaw_deg"]))
+    roll = math.radians(float(baseline["roll_deg"]))
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cr, sr = math.cos(roll), math.sin(roll)
+    matrix = (
+        (cp * cy, cy * sp * sr - sy * cr, -cy * sp * cr - sy * sr),
+        (cp * sy, sy * sp * sr + cy * cr, -sy * sp * cr + cy * sr),
+        (sp, -cp * sr, cp * cr),
+    )
+    return [
+        float(baseline["location"][axis])
+        + sum(matrix[axis][index] * local[index] for index in range(3))
+        for axis in range(3)
+    ]
+
+
+def validate_manifest_semantic_bindings(manifest):
+    """Recompute one complete builder manifest from its retained source bytes."""
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be an object")
+    sources = manifest.get("source_artifacts")
+    depth_identity = manifest.get("depth_frame")
+    if not isinstance(sources, dict) or not isinstance(depth_identity, dict):
+        raise ValueError("manifest retained artifacts are incomplete")
+
+    def payload(key):
+        identity = sources.get(key)
+        if not isinstance(identity, dict):
+            raise ValueError(f"manifest {key} identity is missing")
+        return Path(identity["path"]).read_bytes()
+
+    try:
+        annotation_bytes = payload("annotations")
+        annotation_payload = json.loads(annotation_bytes)
+        cameras_bytes = payload("cameras_file")
+        cameras_payload = json.loads(cameras_bytes)
+        intrinsics_bytes = payload("intrinsics_artifact")
+    except (OSError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("retained semantic JSON artifacts are invalid") from exc
+    if not isinstance(annotation_payload, dict) or not isinstance(cameras_payload, dict):
+        raise ValueError("retained semantic JSON artifacts must be objects")
+    cameras = cameras_payload.get("cameras")
+    matches = [
+        camera for camera in cameras or []
+        if isinstance(camera, dict) and camera.get("id") == manifest.get("camera_id")
+    ]
+    if len(matches) != 1:
+        raise ValueError("cameras file must contain exactly one selected camera")
+    camera = matches[0]
+    if canonical_camera_sha256(camera) != manifest.get("camera_config_sha256"):
+        raise ValueError("selected camera canonical SHA-256 mismatches manifest")
+    if hashlib.sha256(annotation_bytes).hexdigest() != manifest.get("annotation_sha256"):
+        raise ValueError("annotation semantic bytes mismatch manifest")
+    if hashlib.sha256(cameras_bytes).hexdigest() != manifest.get("cameras_file_sha256"):
+        raise ValueError("cameras semantic bytes mismatch manifest")
+
+    real_bytes = payload("real_frame")
+    twin_bytes = payload("twin_frame")
+    real_size = decoded_image_size(real_bytes, "retained real")
+    twin_size = decoded_image_size(twin_bytes, "retained twin")
+    expected_real_size = (
+        int(camera["intrinsics"]["width"]),
+        int(camera["intrinsics"]["height"]),
+    )
+    if (
+        real_size != expected_real_size
+        or real_size != (manifest.get("width"), manifest.get("height"))
+        or twin_size != (depth_identity.get("width"), depth_identity.get("height"))
+    ):
+        raise ValueError("retained real/twin image dimensions mismatch manifest")
+    if annotation_payload.get("real_frame_sha256") != hashlib.sha256(real_bytes).hexdigest():
+        raise ValueError("annotation real frame binding mismatches retained image")
+    if annotation_payload.get("twin_frame_sha256") != hashlib.sha256(twin_bytes).hexdigest():
+        raise ValueError("annotation twin frame binding mismatches retained image")
+    if annotation_payload.get("cameras_file_sha256") != hashlib.sha256(cameras_bytes).hexdigest():
+        raise ValueError("annotation cameras binding mismatches retained config")
+
+    normalized_calibration = validate_intrinsics_artifact(camera, intrinsics_bytes)
+    if normalized_calibration != manifest.get("intrinsics_calibration"):
+        raise ValueError("manifest intrinsics calibration mismatches retained evidence")
+    source_images = sources.get("intrinsics_source_images")
+    if not isinstance(source_images, list):
+        raise ValueError("manifest intrinsics source image identities are missing")
+    validate_intrinsics_source_images(
+        camera,
+        [identity["path"] for identity in source_images if isinstance(identity, dict)],
+    )
+
+    annotations = bind_survey_record_artifacts(validate_annotations(
+        annotation_payload,
+        manifest["camera_id"],
+        real_size,
+        twin_size,
+    ))
+    try:
+        depth_raw = Path(depth_identity["path"]).read_bytes()
+    except (OSError, KeyError, TypeError) as exc:
+        raise ValueError("retained depth artifact is unreadable") from exc
+    if (
+        len(depth_raw) != depth_identity.get("raw_data_size")
+        or hashlib.sha256(depth_raw).hexdigest()
+        != depth_identity.get("raw_data_sha256")
+    ):
+        raise ValueError("retained depth artifact mismatches manifest")
+    baseline = manifest.get("baseline")
+    if not isinstance(baseline, dict):
+        raise ValueError("manifest baseline is missing")
+    expected_fov = twin_horizontal_fov_deg(camera)
+    expected_rotation = {
+        "pitch_deg": float(camera["pitch_deg"])
+        + float((camera.get("twin_pose") or {}).get("pitch_offset_deg", 0.0)),
+        "yaw_deg": heading_to_carla_yaw(
+            float(camera["heading_deg"]), float(camera["yaw_deg"])
+        ) + float((camera.get("twin_pose") or {}).get("yaw_offset_deg", 0.0)),
+        "roll_deg": float(camera.get("roll_deg", 0.0))
+        + float((camera.get("twin_pose") or {}).get("roll_offset_deg", 0.0)),
+        "fov_deg": expected_fov,
+        "cx": float(camera["intrinsics"]["cx"]),
+        "cy": float(camera["intrinsics"]["cy"]),
+        "k1": 0.0,
+    }
+    if any(
+        not math.isclose(
+            float(baseline.get(key, math.nan)), value, rel_tol=0.0, abs_tol=1e-9
+        )
+        for key, value in expected_rotation.items()
+    ):
+        raise ValueError("manifest baseline mismatches selected camera config")
+    transform = SimpleNamespace(
+        location=SimpleNamespace(
+            x=float(baseline["location"][0]),
+            y=float(baseline["location"][1]),
+            z=float(baseline["location"][2]),
+        ),
+        rotation=SimpleNamespace(
+            pitch=float(baseline["pitch_deg"]),
+            yaw=float(baseline["yaw_deg"]),
+            roll=float(baseline["roll_deg"]),
+        ),
+    )
+    if build_deployment_model(camera, transform) != manifest.get("deployment_model"):
+        raise ValueError("deployment model mismatches selected camera config")
+
+    features = manifest.get("features")
+    if not isinstance(features, list) or len(features) != len(annotations):
+        raise ValueError("manifest features mismatch annotation count")
+    for feature, annotation in zip(features, annotations):
+        annotation_keys = (
+            (
+                "id", "global_landmark_id", "surveyed_world",
+                "survey_record_sha256", "survey_record_path", "type", "split",
+                "provenance", "category", "description", "twin", "image",
+            )
+            if annotation["type"] == "point"
+            else (
+                "id", "type", "split", "provenance", "category", "description",
+                "twin_polyline", "image_polyline",
+            )
+        )
+        if any(feature.get(key) != annotation.get(key) for key in annotation_keys):
+            raise ValueError("manifest feature semantics mismatch annotations")
+        if annotation["type"] == "point":
+            if feature.get("survey_record") != annotation.get("survey_record"):
+                raise ValueError("manifest survey record identity mismatch annotations")
+            pixels = [annotation["twin"]]
+            stored_worlds = [feature.get("world")]
+            stored_depths = [feature.get("depth_neighborhood")]
+        else:
+            pixels = annotation["twin_polyline"]
+            stored_worlds = feature.get("world")
+            stored_depths = feature.get("depth_neighborhoods")
+        if (
+            not isinstance(stored_worlds, list)
+            or len(stored_worlds) != len(pixels)
+            or not isinstance(stored_depths, list)
+            or len(stored_depths) != len(pixels)
+        ):
+            raise ValueError("manifest resolved geometry cardinality mismatches annotations")
+        for pixel, stored_world, stored_depth in zip(
+            pixels, stored_worlds, stored_depths
+        ):
+            expected_depth = depth_neighborhood_evidence(
+                depth_raw,
+                int(depth_identity["width"]),
+                int(depth_identity["height"]),
+                pixel[0],
+                pixel[1],
+            )
+            if stored_depth != expected_depth:
+                raise ValueError("manifest depth neighborhood mismatches raw depth")
+            expected_world = offline_depth_pixel_to_world(
+                baseline,
+                pixel[0],
+                pixel[1],
+                expected_depth["center_depth_m"],
+                expected_fov,
+                int(depth_identity["width"]),
+                int(depth_identity["height"]),
+            )
+            if (
+                not isinstance(stored_world, list)
+                or len(stored_world) != 3
+                or math.dist([float(value) for value in stored_world], expected_world)
+                > OFFLINE_CARLA_TRANSFORM_TOLERANCE_M
+            ):
+                raise ValueError("manifest world geometry mismatches retained depth")
+    validate_resolved_point_independence(features)
+    return {
+        "camera_id": manifest["camera_id"],
+        "feature_count": len(features),
+        "real_size": list(real_size),
+        "twin_size": list(twin_size),
+    }
 
 
 def build_deployment_model(camera, transform):
@@ -936,20 +1274,27 @@ def main():
         blueprint, camera, args.twin_width, args.twin_height
     )
     frames = []
-    actor = world.spawn_actor(blueprint, transform)
+    depth_stage = None
+    manifest_stage = None
     try:
-        actor.listen(frames.append)
-        depth_image = wait_for_frame(world, frames)
-        if depth_image is None:
-            raise RuntimeError("no UE5 depth frame received")
-        depth_raw = bytes(depth_image.raw_data)
-        depth_output_path.write_bytes(depth_raw)
-        depth_frame_artifact = retained_artifact_identity(
-            depth_output_path,
-            "depth frame",
-            expected_sha256=hashlib.sha256(depth_raw).hexdigest(),
-        )
-        try:
+        with managed_sensor_actor(
+            lambda: world.spawn_actor(blueprint, transform)
+        ) as actor:
+            actor.listen(frames.append)
+            depth_image = wait_for_frame(world, frames)
+            if depth_image is None:
+                raise RuntimeError("no UE5 depth frame received")
+            depth_raw = bytes(depth_image.raw_data)
+            depth_sha256 = hashlib.sha256(depth_raw).hexdigest()
+            depth_stage = stage_artifact_bytes(
+                depth_output_path, depth_raw, "depth frame"
+            )
+            depth_frame_artifact = staged_artifact_identity(
+                depth_stage,
+                depth_output_path,
+                "depth frame",
+                expected_sha256=depth_sha256,
+            )
             manifest = resolve_manifest(
                 annotations,
                 camera_id=args.camera,
@@ -962,30 +1307,30 @@ def main():
                 twin_frame_sha256=twin_hash,
                 annotation_sha256=hashlib.sha256(annotation_bytes).hexdigest(),
                 cameras_file_sha256=cameras_hash,
-                camera_config_sha256=hashlib.sha256(json.dumps(
-                    camera, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-                ).encode("utf-8")).hexdigest(),
-                depth_raw_sha256=hashlib.sha256(depth_raw).hexdigest(),
+                camera_config_sha256=canonical_camera_sha256(camera),
+                depth_raw_sha256=depth_sha256,
                 depth_frame_artifact=depth_frame_artifact,
                 source_artifacts=source_artifacts,
                 projection_provenance=projection_provenance,
                 ue5_map=map_name,
                 ue5_map_opendrive_sha256=opendrive_sha256,
             )
-        except Exception:
-            depth_output_path.unlink(missing_ok=True)
-            raise
+            manifest_stage = stage_artifact_bytes(
+                manifest_output_path,
+                (json.dumps(manifest, indent=2) + "\n").encode("utf-8"),
+                "calibration manifest",
+            )
+        publish_staged_artifacts_no_replace((
+            (depth_stage, depth_output_path),
+            (manifest_stage, manifest_output_path),
+        ))
+        depth_stage = None
+        manifest_stage = None
     finally:
-        try:
-            actor.stop()
-        finally:
-            actor.destroy()
-    try:
-        with manifest_output_path.open("x", encoding="utf-8") as output:
-            output.write(json.dumps(manifest, indent=2) + "\n")
-    except Exception:
-        depth_output_path.unlink(missing_ok=True)
-        raise
+        if depth_stage is not None:
+            depth_stage.unlink(missing_ok=True)
+        if manifest_stage is not None:
+            manifest_stage.unlink(missing_ok=True)
     print(f"wrote {len(manifest['features'])} frozen features to {args.output}")
     return 0
 

@@ -10,10 +10,12 @@ import sys
 
 try:
     from tools.build_twin_calibration_manifest import (
+        validate_manifest_semantic_bindings,
         validate_strict_projection_provenance,
     )
 except ModuleNotFoundError:
     from build_twin_calibration_manifest import (
+        validate_manifest_semantic_bindings,
         validate_strict_projection_provenance,
     )
 
@@ -364,11 +366,18 @@ def _builder_contract(manifest):
         or counts["holdout_polylines"] < 2
     ):
         raise SiteManifestError("camera manifest builder feature counts are incomplete")
+    try:
+        semantic_bindings = validate_manifest_semantic_bindings(manifest)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise SiteManifestError(
+            f"camera manifest semantic binding failed: {exc}"
+        ) from exc
     return {
         "ue5_map": map_name,
         "ue5_map_opendrive_sha256": opendrive_sha256,
         "georeference_sha256": projection["georeference_sha256"],
         "counts": counts,
+        "semantic_bindings": semantic_bindings,
     }
 
 

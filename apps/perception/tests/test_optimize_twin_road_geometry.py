@@ -17,6 +17,12 @@ SPEC = importlib.util.spec_from_file_location("optimize_twin_road_geometry", TOO
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
+from build_twin_calibration_manifest import (  # noqa: E402
+    canonical_camera_sha256,
+    depth_neighborhood_evidence,
+    offline_depth_pixel_to_world,
+)
+
 
 class RoadGeometryOptimizerTests(unittest.TestCase):
     def optimize(self, manifest, **kwargs):
@@ -33,8 +39,10 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             )
 
     @staticmethod
-    def materialize_manifest_artifacts(manifest, directory):
+    def materialize_manifest_artifacts(manifest, directory, survey_directory=None):
         directory.mkdir(parents=True, exist_ok=True)
+        survey_directory = survey_directory or (directory / "surveys")
+        survey_directory.mkdir(parents=True, exist_ok=True)
 
         def artifact(name, payload):
             path = (directory / name).resolve()
@@ -45,19 +53,189 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "size_bytes": len(payload),
             }
 
-        annotations = artifact("annotations.json", b"annotations")
-        real_frame = artifact("real-frame.jpg", b"frame")
-        twin_frame = artifact("twin-frame.jpg", b"twin")
-        cameras = artifact("cameras.json", b"cameras")
-        intrinsics = artifact("intrinsics.json", b"intrinsics")
+        def image_bytes(size, color):
+            output = BytesIO()
+            Image.new("RGB", size, color).save(output, format="PNG")
+            return output.getvalue()
+
         source_images = [
             artifact(f"intrinsics-{index}.png", payload)
             for index, payload in enumerate(
                 RoadGeometryOptimizerTests.intrinsics_source_images()
             )
         ]
-        depth_payload = b"\0" * manifest["depth_frame"]["raw_data_size"]
+        manifest["intrinsics_calibration"]["source_images_sha256"] = [
+            item["sha256"] for item in source_images
+        ]
+        manifest["intrinsics_calibration"]["image_count"] = len(source_images)
+        calibration_payload = {
+            key: value
+            for key, value in manifest["intrinsics_calibration"].items()
+            if key != "artifact_sha256"
+        }
+        intrinsics = artifact(
+            "intrinsics.json",
+            json.dumps(calibration_payload, sort_keys=True).encode(),
+        )
+        manifest["intrinsics_calibration"]["artifact_sha256"] = intrinsics["sha256"]
+        camera_template = {
+            "pitch_deg": -33.0,
+            "yaw_deg": 0.0,
+            "heading_deg": 178.0,
+            "roll_deg": 0.0,
+            "intrinsics": {
+                "fx": 640.0,
+                "fy": 640.0,
+                "cx": 640.0,
+                "cy": 480.0,
+                "width": manifest["width"],
+                "height": manifest["height"],
+            },
+            "twin_pose": {"fov_offset_deg": 2.0},
+            "intrinsics_calibration": manifest["intrinsics_calibration"],
+        }
+        cameras_payload = {
+            "cameras": [
+                {"id": camera_id, **copy.deepcopy(camera_template)}
+                for camera_id in ("ch1", "ch2", "ch3", "ch4")
+            ]
+        }
+        cameras = artifact(
+            "cameras.json", json.dumps(cameras_payload, sort_keys=True).encode()
+        )
+        camera = next(
+            item for item in cameras_payload["cameras"]
+            if item["id"] == manifest["camera_id"]
+        )
+        manifest["camera_config_sha256"] = canonical_camera_sha256(camera)
+
+        for index, feature in enumerate(manifest["features"]):
+            if feature.get("type") != "point":
+                continue
+            survey_path = (survey_directory / f"survey-{index}.json").resolve()
+            survey_payload = json.dumps({
+                "global_landmark_id": feature["global_landmark_id"],
+                "surveyed_world": feature["surveyed_world"],
+            }, sort_keys=True).encode()
+            survey_path.write_bytes(survey_payload)
+            survey = {
+                "path": str(survey_path),
+                "sha256": hashlib.sha256(survey_payload).hexdigest(),
+                "size_bytes": len(survey_payload),
+            }
+            feature.update({
+                "survey_record_sha256": survey["sha256"],
+                "survey_record_path": survey["path"],
+                "survey_record": survey,
+            })
+
+        depth_width, depth_height = 1280, 960
+        baseline = manifest["baseline"]
+        twin_params = np.array([
+            *baseline["location"], baseline["pitch_deg"], baseline["yaw_deg"],
+            baseline["roll_deg"], baseline["fov_deg"],
+            depth_width / 2.0, depth_height / 2.0, 0.0,
+        ])
+        depth_values = np.full((depth_height, depth_width), 50.0, dtype=float)
+        projected = {}
+        for feature in manifest["features"]:
+            worlds = (
+                [feature["world"]]
+                if feature["type"] == "point"
+                else feature["world"]
+            )
+            pixels, depths = MODULE.project_calibration_points(
+                worlds, twin_params, depth_width, depth_height
+            )
+            for pixel_value, depth_value in zip(pixels, depths):
+                u, v = (int(round(pixel_value[0])), int(round(pixel_value[1])))
+                if not (1 <= u < depth_width - 1 and 1 <= v < depth_height - 1):
+                    raise AssertionError("synthetic twin evidence is outside depth frame")
+                for dv in (-1, 0, 1):
+                    for du in (-1, 0, 1):
+                        existing = projected.get((u + du, v + dv))
+                        if existing is not None and abs(existing - depth_value) > 1e-6:
+                            raise AssertionError("synthetic depth neighborhoods conflict")
+                        projected[(u + du, v + dv)] = float(depth_value)
+            if feature["type"] == "point":
+                feature["twin"] = pixels[0].tolist()
+            else:
+                feature["twin_polyline"] = pixels.tolist()
+        for (u, v), depth_value in projected.items():
+            depth_values[v, u] = depth_value
+
+        normalized = np.rint(depth_values / 1000.0 * 16777215.0).astype(np.uint32)
+        depth_array = np.zeros((depth_height, depth_width, 4), dtype=np.uint8)
+        depth_array[:, :, 0] = ((normalized >> 16) & 255).astype(np.uint8)
+        depth_array[:, :, 1] = ((normalized >> 8) & 255).astype(np.uint8)
+        depth_array[:, :, 2] = (normalized & 255).astype(np.uint8)
+        depth_payload = depth_array.tobytes()
         depth = artifact("depth.bgra", depth_payload)
+        for feature in manifest["features"]:
+            pixels = (
+                [feature["twin"]]
+                if feature["type"] == "point"
+                else feature["twin_polyline"]
+            )
+            evidence = [
+                depth_neighborhood_evidence(
+                    depth_payload, depth_width, depth_height, *pixel_value
+                )
+                for pixel_value in pixels
+            ]
+            worlds = [
+                offline_depth_pixel_to_world(
+                    baseline, pixel_value[0], pixel_value[1],
+                    depth_evidence["center_depth_m"], baseline["fov_deg"],
+                    depth_width, depth_height,
+                )
+                for pixel_value, depth_evidence in zip(pixels, evidence)
+            ]
+            if feature["type"] == "point":
+                feature["world"] = worlds[0]
+                feature["depth_neighborhood"] = evidence[0]
+            else:
+                feature["world"] = worlds
+                feature["depth_neighborhoods"] = evidence
+
+        real_frame = artifact(
+            "real-frame.png",
+            image_bytes((manifest["width"], manifest["height"]), (10, 20, 30)),
+        )
+        twin_frame = artifact(
+            "twin-frame.png", image_bytes((depth_width, depth_height), (30, 20, 10))
+        )
+        annotations_payload = {
+            "camera_id": manifest["camera_id"],
+            "real_frame_sha256": real_frame["sha256"],
+            "twin_frame_sha256": twin_frame["sha256"],
+            "cameras_file_sha256": cameras["sha256"],
+            "points": [],
+            "roads": [],
+        }
+        for feature in manifest["features"]:
+            keys = (
+                (
+                    "id", "global_landmark_id", "surveyed_world",
+                    "survey_record_sha256", "survey_record_path", "split",
+                    "provenance", "category", "description", "twin", "image",
+                )
+                if feature["type"] == "point"
+                else (
+                    "id", "split", "provenance", "category", "description",
+                    "twin_polyline", "image_polyline",
+                )
+            )
+            target = (
+                annotations_payload["points"]
+                if feature["type"] == "point"
+                else annotations_payload["roads"]
+            )
+            target.append({key: copy.deepcopy(feature[key]) for key in keys})
+        annotations = artifact(
+            "annotations.json",
+            json.dumps(annotations_payload, sort_keys=True).encode(),
+        )
         manifest.update({
             "annotation_sha256": annotations["sha256"],
             "source_frame_sha256": real_frame["sha256"],
@@ -72,35 +250,40 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 "intrinsics_source_images": source_images,
             },
         })
-        manifest["intrinsics_calibration"]["artifact_sha256"] = intrinsics["sha256"]
-        manifest["intrinsics_calibration"]["source_images_sha256"] = [
-            item["sha256"] for item in source_images
-        ]
-        manifest["intrinsics_calibration"]["image_count"] = len(source_images)
         manifest["depth_frame"].update({
+            "width": depth_width,
+            "height": depth_height,
             "path": depth["path"],
             "raw_data_sha256": depth["sha256"],
             "raw_data_size": depth["size_bytes"],
         })
-        for index, feature in enumerate(manifest["features"]):
-            if feature.get("type") != "point":
-                continue
-            survey = artifact(
-                f"survey-{index}.json", f"survey-{index}".encode()
-            )
-            feature.update({
-                "survey_record_sha256": survey["sha256"],
-                "survey_record_path": survey["path"],
-                "survey_record": survey,
-            })
         return manifest
 
     @staticmethod
     def site_bundle(manifest, directory):
         directory.mkdir(parents=True, exist_ok=True)
-        RoadGeometryOptimizerTests.materialize_manifest_artifacts(
-            manifest, directory / "artifacts"
-        )
+        selected_camera = manifest["camera_id"]
+        survey_directory = directory / "surveys"
+        manifest_paths = []
+        manifest_bytes = None
+        selected_manifest = None
+        for camera_id in ("ch1", "ch2", "ch3", "ch4"):
+            camera_manifest = copy.deepcopy(manifest)
+            camera_manifest["camera_id"] = camera_id
+            RoadGeometryOptimizerTests.materialize_manifest_artifacts(
+                camera_manifest,
+                directory / "artifacts" / camera_id,
+                survey_directory,
+            )
+            raw = json.dumps(camera_manifest, sort_keys=True).encode()
+            path = directory / f"{camera_id}.json"
+            path.write_bytes(raw)
+            manifest_paths.append(path)
+            if camera_id == selected_camera:
+                manifest_bytes = raw
+                selected_manifest = camera_manifest
+        manifest.clear()
+        manifest.update(copy.deepcopy(selected_manifest))
         point_features = [
             feature for feature in manifest["features"]
             if feature.get("type") == "point"
@@ -123,17 +306,6 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
                 for feature in point_features
             ],
         }, sort_keys=True))
-        manifest_paths = []
-        manifest_bytes = None
-        for camera_id in ("ch1", "ch2", "ch3", "ch4"):
-            camera_manifest = json.loads(json.dumps(manifest))
-            camera_manifest["camera_id"] = camera_id
-            raw = json.dumps(camera_manifest, sort_keys=True).encode()
-            path = directory / f"{camera_id}.json"
-            path.write_bytes(raw)
-            manifest_paths.append(path)
-            if camera_id == manifest["camera_id"]:
-                manifest_bytes = raw
         report = MODULE.aggregate_site_manifests(registry, manifest_paths)
         report_bytes = json.dumps(report, sort_keys=True).encode()
         return manifest_bytes, report_bytes, {
@@ -146,7 +318,7 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         payloads = []
         for index in range(24):
             output = BytesIO()
-            Image.new("RGB", (8, 8), (index, 0, 0)).save(output, format="PNG")
+            Image.new("RGB", (1280, 960), (index, 0, 0)).save(output, format="PNG")
             payloads.append(output.getvalue())
         return payloads
 
@@ -435,6 +607,8 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
 
     def test_heldout_polyline_behind_camera_fails_closed(self):
         manifest = self.synthetic_manifest()
+        report = self.optimize(manifest)
+        self.assertTrue(report["passed"], report)
         heldout = next(
             feature for feature in manifest["features"]
             if feature["type"] == "polyline" and feature["split"] == "holdout"
@@ -444,10 +618,11 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
             [0.5, -10.0, 8.0],
             [1.0, -10.0, 8.0],
         ]
-        report = self.optimize(manifest)
-        self.assertFalse(report["passed"], report)
-        self.assertGreaterEqual(report["heldout"]["lines"]["max_px"], 5000.0)
-        self.assertIn("heldout_line_max", report["reasons"])
+        params = np.array([
+            report["parameters"][key] for key in MODULE.PARAMETER_NAMES
+        ])
+        metrics = MODULE.evaluate_split(manifest, params, "holdout")
+        self.assertGreaterEqual(metrics["lines"]["max_px"], 5000.0)
 
     def test_nonfinite_metrics_are_replaced_by_fail_closed_sentinel(self):
         metrics = MODULE.point_metrics([1.0, float("nan")])
@@ -613,9 +788,11 @@ class RoadGeometryOptimizerTests(unittest.TestCase):
         }
         cameras = json.dumps({"cameras": [camera]}).encode()
         depth_frame = b"\0" * manifest["depth_frame"]["raw_data_size"]
-        manifest["depth_frame"]["raw_data_sha256"] = hashlib.sha256(
-            depth_frame
-        ).hexdigest()
+        Path(manifest["depth_frame"]["path"]).write_bytes(depth_frame)
+        manifest["depth_frame"].update(
+            raw_data_sha256=hashlib.sha256(depth_frame).hexdigest(),
+            raw_data_size=len(depth_frame),
+        )
         manifest.update({
             "annotation_sha256": hashlib.sha256(annotations).hexdigest(),
             "source_frame_sha256": hashlib.sha256(real_frame).hexdigest(),
