@@ -512,6 +512,81 @@ class TwinSync:
             return None
         return dimensions
 
+    @classmethod
+    def _strict_actor_integrity_reason(cls, actor, reviewed) -> Optional[str]:
+        if (
+            getattr(actor, "type_id", None)
+            != reviewed["blueprint"]["selected_blueprint_id"]
+        ):
+            return "active_blueprint_type_mismatch"
+        actual_dimensions = cls._actor_dimensions_m(actor)
+        expected_dimensions = reviewed["blueprint"]["expected_dimensions_m"]
+        tolerance = reviewed["blueprint"]["dimension_tolerance_m"]
+        if (
+            actual_dimensions is None
+            or any(
+                abs(actual_dimensions[key] - expected_dimensions[key]) > tolerance
+                for key in ("length", "width", "height")
+            )
+        ):
+            return "active_blueprint_dimensions_mismatch"
+        return None
+
+    @staticmethod
+    def _snapshot_track(track: TwinTrack) -> dict:
+        return {name: getattr(track, name) for name in track.__slots__}
+
+    @staticmethod
+    def _restore_track(track: TwinTrack, snapshot: dict) -> None:
+        for name, value in snapshot.items():
+            setattr(track, name, value)
+
+    @staticmethod
+    def _prepare_detection_metadata(
+        detection: dict, now: float, use_detection_ts: bool
+    ) -> dict:
+        gps = detection.get("gps_location")
+        if not isinstance(gps, dict):
+            raise ValueError("gps_location is not an object")
+        latitude = gps.get("latitude")
+        longitude = gps.get("longitude")
+        if (
+            isinstance(latitude, bool)
+            or isinstance(longitude, bool)
+            or not isinstance(latitude, (int, float))
+            or not isinstance(longitude, (int, float))
+            or not math.isfinite(float(latitude))
+            or not math.isfinite(float(longitude))
+            or not -90.0 <= float(latitude) <= 90.0
+            or not -180.0 <= float(longitude) <= 180.0
+        ):
+            raise ValueError("gps_location is invalid")
+        last_seen = now
+        if use_detection_ts:
+            detection_epoch = _parse_utc_epoch(detection.get("timestamp_utc"))
+            if detection_epoch is None or not math.isfinite(detection_epoch):
+                raise ValueError("timestamp_utc is invalid")
+            last_seen = detection_epoch
+        return {
+            "event_id": detection.get("event_id"),
+            "detection_timestamp_utc": detection.get("timestamp_utc"),
+            "media_timestamp_utc": detection.get("media_timestamp_utc"),
+            "timestamp_schema_version": detection.get("timestamp_schema_version"),
+            "media_time_trusted": detection.get("media_time_trusted") is True,
+            "media_clock": detection.get("media_clock"),
+            "device_id": detection.get("device_id"),
+            "track_id": detection.get("track_id"),
+            "bbox": detection.get("bbox") or (
+                (detection.get("camera_data") or {})
+                .get("bifocal_metadata", {})
+                .get("bbox")
+            ),
+            "gps_location": {
+                "latitude": float(latitude), "longitude": float(longitude),
+            },
+            "last_seen": last_seen,
+        }
+
     @staticmethod
     def _transform_matches(transform, intended, tolerance: float = 1e-6) -> bool:
         yaw_error = abs(
@@ -589,32 +664,13 @@ class TwinSync:
         detection: dict,
         now: float,
         use_detection_ts: bool,
+        prepared: Optional[dict] = None,
     ) -> None:
-        track.event_id = detection.get("event_id")
-        track.detection_timestamp_utc = detection.get("timestamp_utc")
-        track.media_timestamp_utc = detection.get("media_timestamp_utc")
-        track.timestamp_schema_version = detection.get("timestamp_schema_version")
-        track.media_time_trusted = detection.get("media_time_trusted") is True
-        track.media_clock = detection.get("media_clock")
-        track.device_id = detection.get("device_id")
-        track.track_id = detection.get("track_id")
-        track.bbox = detection.get("bbox") or (
-            (detection.get("camera_data") or {})
-            .get("bifocal_metadata", {})
-            .get("bbox")
+        metadata = prepared or self._prepare_detection_metadata(
+            detection, now, use_detection_ts
         )
-        gps = detection.get("gps_location") or {}
-        lat, lon = gps.get("latitude"), gps.get("longitude")
-        track.gps_location = (
-            {"latitude": float(lat), "longitude": float(lon)}
-            if lat is not None and lon is not None
-            else None
-        )
-        if use_detection_ts:
-            detection_epoch = _parse_utc_epoch(detection.get("timestamp_utc"))
-            track.last_seen = detection_epoch if detection_epoch is not None else now
-        else:
-            track.last_seen = now
+        for name, value in metadata.items():
+            setattr(track, name, value)
 
     # ------------------------------------------------------------------
     # Poll + apply
@@ -700,6 +756,16 @@ class TwinSync:
                     continue
             if object_type not in VEHICLE_TYPES and object_type != "person":
                 continue
+
+            prepared_metadata = None
+            if reviewed is not None:
+                try:
+                    prepared_metadata = self._prepare_detection_metadata(
+                        det, now, use_detection_ts
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    self._reject_strict(det, "strict_detection_metadata_invalid")
+                    continue
 
             track = self._tracks.get(object_id)
             if (
@@ -788,34 +854,21 @@ class TwinSync:
                             bp.id,
                             exc_info=True,
                         )
-                        cleanup_succeeded = self._destroy_owned_actor(
-                            track, actor, "spawn_setup_failed"
-                        )
+                        self._quarantine_actor(track, actor, "spawn_setup_failed")
+                        cleanup_succeeded = track.cleanup_failure is None
                         actor = None
                         if not cleanup_succeeded:
                             break
                         continue
                     if reviewed is not None:
                         actual_dimensions = self._actor_dimensions_m(actor)
-                        expected_dimensions = reviewed["blueprint"][
-                            "expected_dimensions_m"
-                        ]
-                        tolerance = reviewed["blueprint"][
-                            "dimension_tolerance_m"
-                        ]
-                        if (
-                            actual_dimensions is None
-                            or any(
-                                abs(actual_dimensions[key] - expected_dimensions[key])
-                                > tolerance
-                                for key in ("length", "width", "height")
-                            )
-                        ):
-                            self._reject_strict(
-                                det, "active_blueprint_dimensions_mismatch"
-                            )
+                        integrity_reason = self._strict_actor_integrity_reason(
+                            actor, reviewed
+                        )
+                        if integrity_reason is not None:
+                            self._reject_strict(det, integrity_reason)
                             self._quarantine_actor(
-                                track, actor, "blueprint_dimensions_mismatch"
+                                track, actor, integrity_reason
                             )
                             actor = None
                             break
@@ -834,15 +887,31 @@ class TwinSync:
                         SPAWN_BOOTSTRAP_MAX_OFFSET_M,
                     )
                     continue
-                track.actor_id = actor.id
                 if reviewed is not None:
-                    self._commit_reviewed_track(
-                        track, reviewed, location, actual_dimensions
-                    )
-                    self._commit_detection_metadata(
-                        track, det, now, use_detection_ts
-                    )
+                    prior_track = self._snapshot_track(track)
+                    try:
+                        track.actor_id = actor.id
+                        self._commit_reviewed_track(
+                            track, reviewed, location, actual_dimensions
+                        )
+                        self._commit_detection_metadata(
+                            track, det, now, use_detection_ts,
+                            prepared=prepared_metadata,
+                        )
+                    except Exception:
+                        self._restore_track(track, prior_track)
+                        self._reject_strict(det, "strict_actor_commit_failed")
+                        self._quarantine_actor(
+                            track, actor, "strict_actor_commit_failed"
+                        )
+                        logger.error(
+                            "Strict twin spawn commit failed for %s",
+                            object_id,
+                            exc_info=True,
+                        )
+                        continue
                 else:
+                    track.actor_id = actor.id
                     track.current = location
                     track.target = location
                 logger.info(
@@ -863,33 +932,27 @@ class TwinSync:
                         self._reject_strict(det, "strict_actor_vanished")
                         continue
                     actual_dimensions = self._actor_dimensions_m(actor)
-                    expected_dimensions = reviewed["blueprint"][
-                        "expected_dimensions_m"
-                    ]
-                    dimension_tolerance = reviewed["blueprint"][
-                        "dimension_tolerance_m"
-                    ]
-                    if (
-                        getattr(actor, "type_id", None)
-                        != reviewed["blueprint"]["selected_blueprint_id"]
-                        or actual_dimensions is None
-                        or any(
-                            abs(actual_dimensions[key] - expected_dimensions[key])
-                            > dimension_tolerance
-                            for key in ("length", "width", "height")
-                        )
-                    ):
-                        self._reject_strict(
-                            det, "active_blueprint_dimensions_mismatch"
-                        )
+                    integrity_reason = self._strict_actor_integrity_reason(
+                        actor, reviewed
+                    )
+                    if integrity_reason is not None:
+                        self._reject_strict(det, integrity_reason)
                         self._quarantine_actor(
-                            track, actor, "active_blueprint_dimensions_mismatch"
+                            track, actor, integrity_reason
                         )
                         continue
                     intended_transform = carla.Transform(
                         location,
                         carla.Rotation(yaw=reviewed["heading_deg"]),
                     )
+                    prior_track = self._snapshot_track(track)
+                    try:
+                        prior_transform = actor.get_transform()
+                    except Exception:
+                        self._reject_strict(
+                            det, "strict_previous_transform_unavailable"
+                        )
+                        continue
                     transform_error = self._set_transform_transactionally(
                         actor, intended_transform
                     )
@@ -905,12 +968,37 @@ class TwinSync:
                             transform_error,
                         )
                         continue
-                    self._commit_reviewed_track(
-                        track, reviewed, location, actual_dimensions
-                    )
-                    self._commit_detection_metadata(
-                        track, det, now, use_detection_ts
-                    )
+                    try:
+                        self._commit_reviewed_track(
+                            track, reviewed, location, actual_dimensions
+                        )
+                        self._commit_detection_metadata(
+                            track, det, now, use_detection_ts,
+                            prepared=prepared_metadata,
+                        )
+                    except Exception:
+                        self._restore_track(track, prior_track)
+                        rollback_failed = False
+                        try:
+                            actor.set_transform(prior_transform)
+                            rollback_failed = not self._transform_matches(
+                                actor.get_transform(), prior_transform
+                            )
+                        except Exception:
+                            rollback_failed = True
+                        reason = "strict_actor_commit_failed"
+                        self._reject_strict(det, reason)
+                        if rollback_failed:
+                            self._quarantine_actor(
+                                track, actor,
+                                "strict_actor_commit_rollback_failed",
+                            )
+                        logger.error(
+                            "Strict twin update commit failed for %s",
+                            object_id,
+                            exc_info=True,
+                        )
+                        continue
                     track.lerp_start = time.time()
                     track.lerp_duration = 0.0
                 else:
@@ -1107,6 +1195,8 @@ class TwinSync:
                         not self._transform_matches(
                             actor.get_transform(), intended
                         )
+                        or getattr(actor, "type_id", None)
+                        != reviewed["blueprint"]["selected_blueprint_id"]
                         or actual_dimensions is None
                         or any(
                             abs(actual_dimensions[key] - expected_dimensions[key])
@@ -1183,6 +1273,33 @@ class TwinSync:
                             "roll": float(transform.rotation.roll),
                         },
                     }
+                    if (
+                        actor_present
+                        and self._reviewed_placement == "strict"
+                        and track.reviewed_localization is not None
+                    ):
+                        reviewed = track.reviewed_localization
+                        position = reviewed["position_m"]
+                        yaw_error = abs(
+                            (
+                                float(transform.rotation.yaw)
+                                - float(reviewed["heading_deg"])
+                                + 180.0
+                            ) % 360.0 - 180.0
+                        )
+                        actor_present = (
+                            self._strict_actor_integrity_reason(actor, reviewed)
+                            is None
+                            and abs(float(transform.location.x) - position["x"])
+                            <= 1e-6
+                            and abs(float(transform.location.y) - position["y"])
+                            <= 1e-6
+                            and abs(float(transform.location.z) - position["z"])
+                            <= 1e-6
+                            and yaw_error <= 1e-6
+                            and abs(float(transform.rotation.pitch)) <= 1e-6
+                            and abs(float(transform.rotation.roll)) <= 1e-6
+                        )
                     if isinstance(track.raw_carla_location, dict):
                         raw_to_actor_planar_m = math.hypot(
                             float(transform.location.x)
@@ -1191,6 +1308,7 @@ class TwinSync:
                             - float(track.raw_carla_location["y"]),
                         )
             except Exception:
+                actor_present = False
                 logger.debug(
                     "Twin status transform unavailable for %s", track.object_id
                 )

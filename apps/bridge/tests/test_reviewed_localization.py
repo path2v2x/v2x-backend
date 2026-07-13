@@ -19,6 +19,7 @@ from digital_twin_bridge.reviewed_localization import (
     authority_signature,
     build_runtime_context,
     canonical_json_bytes,
+    canonical_object_sha256,
     contract_sha256,
     placement_key_sha256,
     seal_contract,
@@ -304,12 +305,34 @@ def test_canonical_json_and_authority_algorithm_are_unambiguous():
 
 
 def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
-    camera_hash = HASHES["c"]
     manifest_hash = HASHES["d"]
+    camera = {
+        "id": "ch1",
+        "intrinsics": {
+            "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
+            "width": 1280, "height": 960,
+        },
+        "intrinsics_calibration": {
+            "distortion": {
+                "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            },
+        },
+    }
+    camera_hash = canonical_object_sha256(camera)
+    def world(pixel, horizontal_offset_px=0.0):
+        depth = 20.0
+        return [
+            depth,
+            (pixel[0] + horizontal_offset_px - 640.0) * depth / 1000.0,
+            -(pixel[1] - 480.0) * depth / 1000.0,
+        ]
     point_features = [
         {
             "id": f"point-{index}", "type": "point", "split": "holdout",
             "image": [100.0 + index, 100.0],
+            "surveyed_world": world(
+                [100.0 + index, 100.0], 24.0 if index == 19 else 0.0
+            ),
         }
         for index in range(20)
     ]
@@ -317,12 +340,35 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
         {
             "id": f"road-{index}", "type": "polyline", "split": "holdout",
             "image_polyline": [[100.0, 200.0 + index], [200.0, 200.0 + index]],
+            "world": [
+                world([100.0, 200.0 + index], 12.0 if index == 1 else 0.0),
+                world([200.0, 200.0 + index]),
+            ],
         }
         for index in range(2)
     ]
     manifest = {
         "width": 1280,
         "height": 960,
+        "baseline": {
+            "location": [0.0, 0.0, 0.0],
+            "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
+        },
+        "deployment_model": {
+            "anchor_location": [0.0, 0.0, 0.0],
+            "base": {
+                "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
+            },
+        },
+        "intrinsics_calibration": {
+            "resolution": [1280, 960],
+            "camera_matrix": [
+                [1000.0, 0.0, 640.0],
+                [0.0, 1000.0, 480.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "distortion": camera["intrinsics_calibration"]["distortion"],
+        },
         "features": point_features + road_features,
     }
     evidence = {
@@ -335,10 +381,6 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
             {
                 "feature_id": feature["id"],
                 "observed_pixel": feature["image"],
-                "predicted_pixel": [
-                    feature["image"][0] + (24.0 if index == 19 else 0.0),
-                    feature["image"][1],
-                ],
             }
             for index, feature in enumerate(point_features)
         ],
@@ -346,12 +388,6 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
             {
                 "feature_id": feature["id"],
                 "observed_polyline": feature["image_polyline"],
-                "predicted_polyline": [
-                    [feature["image_polyline"][0][0]
-                     + (12.0 if index == 1 else 0.0),
-                     feature["image_polyline"][0][1]],
-                    feature["image_polyline"][1],
-                ],
             }
             for index, feature in enumerate(road_features)
         ],
@@ -362,15 +398,26 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
         },
     }
     _heldout_reprojection_metrics(
-        evidence, manifest, "ch1", camera_hash, manifest_hash
+        evidence, manifest, "ch1", camera_hash, manifest_hash, camera
     )
 
-    evidence["points"][-1]["predicted_pixel"][0] += 1e-9
+    circular = json.loads(json.dumps(evidence))
+    circular["points"][0]["predicted_pixel"] = circular["points"][0][
+        "observed_pixel"
+    ]
+    with pytest.raises(
+        ReviewedLocalizationError, match="static_reprojection_point_invalid"
+    ):
+        _heldout_reprojection_metrics(
+            circular, manifest, "ch1", camera_hash, manifest_hash, camera
+        )
+
+    manifest["features"][19]["surveyed_world"][1] += 1e-9
     with pytest.raises(
         ReviewedLocalizationError, match="static_reprojection_threshold_failed"
     ):
         _heldout_reprojection_metrics(
-            evidence, manifest, "ch1", camera_hash, manifest_hash
+            evidence, manifest, "ch1", camera_hash, manifest_hash, camera
         )
 
 
@@ -907,6 +954,106 @@ def test_blueprint_binding_and_actual_dimensions_fail_closed(mock_world):
     assert dimensions_mismatch.status()["strict_rejections"][
         "active_blueprint_dimensions_mismatch"
     ] == 1
+
+
+def test_spawn_and_tick_require_exact_selected_blueprint_type(mock_world):
+    original_spawn = mock_world.try_spawn_actor
+
+    def wrong_type_at_spawn(*args, **kwargs):
+        actor = original_spawn(*args, **kwargs)
+        actor.type_id = "vehicle.not-the-selected-blueprint"
+        return actor
+
+    mock_world.try_spawn_actor = wrong_type_at_spawn
+    rejected = strict_sync(mock_world)
+    rejected._apply([detection()])
+    assert rejected.actor_ids() == set()
+    assert any(actor.is_destroyed for actor in list(mock_world.get_actors()))
+    assert rejected.status()["strict_rejections"][
+        "active_blueprint_type_mismatch"
+    ] == 1
+
+    mock_world.try_spawn_actor = original_spawn
+    drifted = strict_sync(mock_world)
+    drifted._apply([detection()])
+    actor = mock_world.get_actor(next(iter(drifted.actor_ids())))
+    actor.type_id = "vehicle.replaced-after-spawn"
+    assert drifted.status()["objects"][0]["actor_present"] is False
+    drifted.tick()
+    assert actor.is_destroyed
+    assert drifted.status()["objects"][0]["actor_present"] is False
+
+
+def test_failed_provisional_destroy_is_quarantined_not_present(mock_world):
+    original_spawn = mock_world.try_spawn_actor
+    leaked = []
+
+    def broken_spawn(*args, **kwargs):
+        actor = original_spawn(*args, **kwargs)
+        leaked.append(actor)
+        actor.set_transform = lambda _transform: (_ for _ in ()).throw(
+            RuntimeError("injected provisional setup failure")
+        )
+        actor.destroy = lambda: False
+        return actor
+
+    mock_world.try_spawn_actor = broken_spawn
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+
+    status = sync.status()["objects"][0]
+    assert status["tracked_actor_id"] == leaked[0].id
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert status["quarantined_reason"] == "spawn_setup_failed"
+    assert status["cleanup_failure"].endswith("destroy_false")
+
+
+def test_malformed_baseline_gps_is_structured_reject_before_actor_mutation(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+    malformed = detection()
+    malformed["gps_location"] = {
+        "latitude": "not-a-number", "longitude": -122.0,
+    }
+
+    sync._apply([malformed])
+
+    assert sync.actor_ids() == set()
+    assert list(mock_world.get_actors()) == []
+    assert sync.status()["strict_rejections"][
+        "strict_detection_metadata_invalid"
+    ] == 1
+
+
+def test_unexpected_metadata_commit_failure_compensates_actor_and_track(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+    first = detection()
+    sync._apply([first])
+    actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+    prior_transform = actor.get_transform()
+    original_commit = sync._commit_detection_metadata
+
+    def fail_commit(*_args, **_kwargs):
+        raise RuntimeError("injected metadata commit failure")
+
+    sync._commit_detection_metadata = fail_commit
+    second = detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )
+    sync._apply([second])
+    sync._commit_detection_metadata = original_commit
+
+    status = sync.status()["objects"][0]
+    assert actor.get_transform().location.x == prior_transform.location.x
+    assert status["event_id"] == first["event_id"]
+    assert status["trajectory_sample_index"] == 0
+    assert status["actor_present"] is True
+    assert sync.status()["strict_rejections"]["strict_actor_commit_failed"] == 1
 
 
 @pytest.mark.parametrize("failure", ["false", "exception"])

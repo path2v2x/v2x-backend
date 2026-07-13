@@ -1,8 +1,10 @@
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
 import sys
+import threading
 
 import cv2
 import jsonschema
@@ -19,6 +21,7 @@ sys.path.insert(0, str(PERCEPTION))
 sys.path.insert(0, str(BRIDGE))
 sys.path.insert(0, str(BRIDGE_TESTS))
 
+import attach_reviewed_localizations as attachment_module  # noqa: E402
 from attach_reviewed_localizations import (  # noqa: E402
     AttachmentError,
     _appearance_embedding,
@@ -265,6 +268,10 @@ def build_inputs(tmp_path):
         )
         assert evidence["acceptance_eligible"] is True
         manifest = json.loads(Path(evidence["manifest_path"]).read_text())
+        assert manifest["session_id"] == f"session-{camera_id}"
+        assert manifest["detector_output"]["session_id"] == (
+            manifest["session_id"]
+        )
         detections.append(detection)
         contact = {
             "method": "reviewed_vehicle_footprint_midpoint",
@@ -560,6 +567,70 @@ def test_attaches_semantically_bound_two_camera_trajectory(tmp_path):
     manifest = json.loads(manifest_path.read_text())
     assert manifest["counts"] == {"detections": 2, "reviewed_localizations": 2}
     assert manifest["deployment_eligible"] is False
+
+
+def test_atomic_bundle_preserves_existing_destination_sentinel(tmp_path):
+    inputs = build_inputs(tmp_path)
+    bundle = tmp_path / "attached.ndjson"
+    bundle.mkdir()
+    sentinel = bundle / "owned-by-another-writer"
+    sentinel.write_text("preserve-me")
+
+    with pytest.raises(AttachmentError, match="already exists"):
+        run_attach(inputs)
+
+    assert sentinel.read_text() == "preserve-me"
+    assert sorted(path.name for path in bundle.iterdir()) == [sentinel.name]
+    assert not list(tmp_path.glob(".attached.ndjson.tmp-*"))
+
+
+def test_atomic_bundle_failure_leaves_no_half_pair(tmp_path, monkeypatch):
+    inputs = build_inputs(tmp_path)
+    bundle = tmp_path / "attached.ndjson"
+
+    def fail_publish(*_args):
+        raise AttachmentError("injected publish failure")
+
+    monkeypatch.setattr(
+        attachment_module, "_rename_directory_noreplace", fail_publish
+    )
+    with pytest.raises(AttachmentError, match="injected publish failure"):
+        run_attach(inputs)
+
+    assert not bundle.exists()
+    assert not list(tmp_path.glob(".attached.ndjson.tmp-*"))
+
+
+def test_atomic_bundle_allows_exactly_one_concurrent_publisher(
+    tmp_path, monkeypatch
+):
+    inputs = build_inputs(tmp_path)
+    original_publish = attachment_module._rename_directory_noreplace
+    publication_barrier = threading.Barrier(2)
+
+    def synchronized_publish(*args):
+        publication_barrier.wait(timeout=5.0)
+        return original_publish(*args)
+
+    monkeypatch.setattr(
+        attachment_module, "_rename_directory_noreplace", synchronized_publish
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run_attach, inputs) for _ in range(2)]
+    outcomes = []
+    for future in futures:
+        try:
+            outcomes.append(("success", future.result()))
+        except AttachmentError as exc:
+            outcomes.append(("rejected", str(exc)))
+
+    assert [kind for kind, _value in outcomes].count("success") == 1
+    assert [kind for kind, _value in outcomes].count("rejected") == 1
+    bundle = tmp_path / "attached.ndjson"
+    assert sorted(path.name for path in bundle.iterdir()) == [
+        "detections.ndjson", "manifest.json",
+    ]
+    assert not list(tmp_path.glob(".attached.ndjson.tmp-*"))
 
 
 def test_rejects_diagnostic_factor_graph_even_with_accepted_ids(tmp_path):

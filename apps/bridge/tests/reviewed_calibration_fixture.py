@@ -44,7 +44,6 @@ def build_reviewed_static_calibration(
     }
     registry = json.loads(registry_path.read_text())
     registry["cameras_file_sha256"] = cameras_sha256
-    _write_json(registry_path, registry)
     camera_index = {camera["id"]: camera for camera in cameras}
     for manifest_path in manifest_paths:
         manifest = json.loads(manifest_path.read_text())
@@ -75,13 +74,59 @@ def build_reviewed_static_calibration(
         manifest["ue5_map_opendrive_sha256"] = opendrive_sha256
         manifest["projection"]["map_name"] = map_name
         manifest["projection"]["opendrive_sha256"] = opendrive_sha256
+        manifest["baseline"]["location"] = [0.0, 0.0, 0.0]
+        manifest["baseline"]["pitch_deg"] = 0.0
+        manifest["baseline"]["yaw_deg"] = 0.0
+        manifest["baseline"]["roll_deg"] = 0.0
         manifest["baseline"]["cx"] = camera["intrinsics"]["cx"]
         manifest["baseline"]["cy"] = camera["intrinsics"]["cy"]
+        manifest["deployment_model"]["anchor_location"] = [0.0, 0.0, 0.0]
+        manifest["deployment_model"]["base"]["pitch_deg"] = 0.0
+        manifest["deployment_model"]["base"]["yaw_deg"] = 0.0
+        manifest["deployment_model"]["base"]["roll_deg"] = 0.0
         manifest["intrinsics_calibration"]["resolution"] = [width, height]
         manifest["intrinsics_calibration"]["camera_matrix"] = copy.deepcopy(
             camera["intrinsics_calibration"]["camera_matrix"]
         )
+        manifest["intrinsics_calibration"]["distortion"] = copy.deepcopy(
+            camera["intrinsics_calibration"]["distortion"]
+        )
+        fx = float(camera["intrinsics"]["fx"])
+        fy = float(camera["intrinsics"]["fy"])
+        cx = float(camera["intrinsics"]["cx"])
+        cy = float(camera["intrinsics"]["cy"])
+
+        def world_for_pixel(pixel, depth=20.0):
+            return [
+                depth,
+                (float(pixel[0]) - cx) * depth / fx,
+                -(float(pixel[1]) - cy) * depth / fy,
+            ]
+
+        for feature in manifest["features"]:
+            if feature["type"] == "point":
+                projected_world = world_for_pixel(feature["image"])
+                feature["world"] = projected_world
+                feature["surveyed_world"] = projected_world
+            else:
+                feature["world"] = [
+                    world_for_pixel(pixel)
+                    for pixel in feature["image_polyline"]
+                ]
         _write_json(manifest_path, manifest)
+    landmark_world = {}
+    for manifest_path in manifest_paths:
+        manifest = json.loads(manifest_path.read_text())
+        for feature in manifest["features"]:
+            if feature["type"] == "point":
+                landmark_world.setdefault(
+                    feature["global_landmark_id"], feature["surveyed_world"]
+                )
+    for landmark in registry["landmarks"]:
+        landmark["surveyed_world"] = landmark_world[
+            landmark["global_landmark_id"]
+        ]
+    _write_json(registry_path, registry)
     aggregate = aggregate_site_manifests(registry_path, manifest_paths)
     aggregate_path = root / "site-aggregation.json"
     aggregate_sha256 = _write_json(aggregate_path, aggregate)
@@ -98,13 +143,11 @@ def build_reviewed_static_calibration(
                 points.append({
                     "feature_id": feature["id"],
                     "observed_pixel": feature["image"],
-                    "predicted_pixel": feature["image"],
                 })
             else:
                 roads.append({
                     "feature_id": feature["id"],
                     "observed_polyline": feature["image_polyline"],
-                    "predicted_polyline": feature["image_polyline"],
                 })
         evidence = seal_authenticated_artifact({
             "schema": "v2x-camera-heldout-reprojection/v1",

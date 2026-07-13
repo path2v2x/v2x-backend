@@ -1,5 +1,6 @@
 import sys
 import copy
+import hashlib
 import io
 import json
 import math
@@ -17,6 +18,7 @@ import numpy as np
 PERCEPTION_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_DIR))
 
+import process_video  # noqa: E402
 from live_capture import bounded_frame_identity  # noqa: E402
 from process_video import (  # noqa: E402
     _BOUNDED_DIAGNOSTIC_FRAME_LIMIT,
@@ -38,6 +40,7 @@ from process_video import (  # noqa: E402
     detector_config_fingerprint,
     load_cameras_config,
     records_ready_for_upload,
+    snapshot_detector_model,
     vehicle_localization_acceptable,
 )
 from ffmpeg_capture import (  # noqa: E402
@@ -60,6 +63,47 @@ class FrameIdentityTests(unittest.TestCase):
         self.assertEqual(first, detector_config_fingerprint("a" * 64, 0.5))
         self.assertNotEqual(first, detector_config_fingerprint("a" * 64, 0.6))
         self.assertNotEqual(first, detector_config_fingerprint("b" * 64, 0.5))
+
+    def test_detector_workers_load_only_one_content_addressed_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "mutable-model.pt"
+            source.write_bytes(b"pinned-model-bytes")
+            snapshot, digest = snapshot_detector_model(source, root / "snapshots")
+            self.assertNotEqual(snapshot, source)
+            self.assertEqual(
+                digest, hashlib.sha256(b"pinned-model-bytes").hexdigest()
+            )
+            source.write_bytes(b"later-original-replacement")
+            loaded = []
+
+            class Model:
+                names = {}
+
+            with patch.object(
+                process_video, "YOLO",
+                side_effect=lambda path: (loaded.append(path), Model())[1],
+            ):
+                process_video.load_verified_detector_model(snapshot, digest)
+                process_video.load_verified_detector_model(snapshot, digest)
+            self.assertEqual(loaded, [str(snapshot), str(snapshot)])
+
+    def test_detector_snapshot_replacement_during_load_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "model.pt"
+            source.write_bytes(b"exact-model")
+            snapshot, digest = snapshot_detector_model(source, root / "snapshots")
+
+            def replace_snapshot(path):
+                replacement = Path(path).with_suffix(".replacement")
+                replacement.write_bytes(b"different-model")
+                os.replace(replacement, path)
+                return object()
+
+            with patch.object(process_video, "YOLO", side_effect=replace_snapshot):
+                with self.assertRaisesRegex(RuntimeError, "changed during load"):
+                    process_video.load_verified_detector_model(snapshot, digest)
 
 
 class WorldLocalizationUncertaintyTests(unittest.TestCase):

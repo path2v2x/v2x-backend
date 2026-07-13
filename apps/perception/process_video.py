@@ -79,6 +79,159 @@ def _safe_stack_symbol(value, pattern):
     return value if pattern.fullmatch(value) else "other"
 
 
+def _fd_identity(file_stat):
+    return (
+        int(file_stat.st_dev),
+        int(file_stat.st_ino),
+        int(file_stat.st_size),
+        int(file_stat.st_mtime_ns),
+        int(file_stat.st_ctime_ns),
+    )
+
+
+def _sha256_fd(file_descriptor):
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(file_descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_directory(path):
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_detector_model(source_path, snapshot_root):
+    """Freeze one verified content-addressed model before any worker loads it."""
+    source = Path(source_path).expanduser().resolve(strict=True)
+    root = Path(snapshot_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    source_fd = os.open(
+        str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    destination = None
+    created = False
+    try:
+        pre_stat = os.fstat(source_fd)
+        pre_identity = _fd_identity(pre_stat)
+        pre_hash = _sha256_fd(source_fd)
+        path_pre_stat = os.stat(source, follow_symlinks=False)
+        if _fd_identity(path_pre_stat) != pre_identity:
+            raise RuntimeError("detector model source identity changed before snapshot")
+        destination = root / f"sha256-{pre_hash}.pt"
+        try:
+            destination_fd = os.open(
+                str(destination),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o400,
+            )
+            created = True
+        except FileExistsError:
+            destination_fd = os.open(
+                str(destination), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        try:
+            if created:
+                offset = 0
+                while offset < pre_stat.st_size:
+                    chunk = os.pread(source_fd, 1024 * 1024, offset)
+                    if not chunk:
+                        raise RuntimeError("detector model source truncated during snapshot")
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_fd, view)
+                        view = view[written:]
+                    offset += len(chunk)
+                os.fsync(destination_fd)
+            else:
+                destination_hash = _sha256_fd(destination_fd)
+                if destination_hash != pre_hash:
+                    raise RuntimeError("content-addressed detector snapshot is corrupt")
+        finally:
+            os.close(destination_fd)
+        verification_fd = os.open(
+            str(destination), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            if _sha256_fd(verification_fd) != pre_hash:
+                if created:
+                    destination.unlink(missing_ok=True)
+                raise RuntimeError("detector snapshot verification failed")
+        finally:
+            os.close(verification_fd)
+        if created:
+            _fsync_directory(root)
+        post_stat = os.fstat(source_fd)
+        post_hash = _sha256_fd(source_fd)
+        try:
+            path_post_stat = os.stat(source, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("detector model source disappeared during snapshot") from exc
+        if (
+            _fd_identity(post_stat) != pre_identity
+            or post_hash != pre_hash
+            or _fd_identity(path_post_stat) != pre_identity
+        ):
+            if created:
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError("detector model source changed during snapshot")
+        return destination.absolute(), pre_hash
+    except Exception:
+        if created and destination is not None:
+            try:
+                destination.unlink(missing_ok=True)
+                _fsync_directory(root)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(source_fd)
+
+
+def load_verified_detector_model(snapshot_path, expected_sha256):
+    """Load YOLO from one exact snapshot and detect path/fd drift around load."""
+    path = Path(os.path.abspath(Path(snapshot_path).expanduser()))
+    descriptor = os.open(
+        str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        pre_stat = os.fstat(descriptor)
+        pre_identity = _fd_identity(pre_stat)
+        pre_hash = _sha256_fd(descriptor)
+        if pre_hash != expected_sha256:
+            raise RuntimeError("detector snapshot hash mismatch before load")
+        if _fd_identity(os.stat(path, follow_symlinks=False)) != pre_identity:
+            raise RuntimeError("detector snapshot identity mismatch before load")
+        model = YOLO(str(path))
+        post_stat = os.fstat(descriptor)
+        post_hash = _sha256_fd(descriptor)
+        try:
+            path_post_stat = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("detector snapshot disappeared during load") from exc
+        if (
+            _fd_identity(post_stat) != pre_identity
+            or post_hash != expected_sha256
+            or _fd_identity(path_post_stat) != pre_identity
+        ):
+            raise RuntimeError("detector snapshot changed during load")
+        return model
+    finally:
+        os.close(descriptor)
+
+
 def _diagnostic_thread_category(thread, frame):
     if thread is threading.current_thread():
         return "reporter"
@@ -763,6 +916,7 @@ def persist_vehicle_inference_evidence(record, frame, evidence_root):
         "event_id": event_id,
         "camera_id": device_id.rsplit("-", 1)[-1],
         "device_id": device_id,
+        "session_id": session_id,
         "frame_number": frame_number,
         "track_id": record.get("track_id"),
         "object_type": record.get("object_type"),
@@ -2723,17 +2877,7 @@ class MultiCameraPipeline:
                         frames_to_process[i] = snapshot["frame"]
                         source_epochs[i] = snapshot["source_epoch"]
                         source_monotonic[i] = snapshot["source_monotonic"]
-                        frame_media_clock = snapshot.get("media_clock")
-                        if isinstance(frame_media_clock, dict):
-                            frame_media_clock = dict(frame_media_clock)
-                            raw_clock = frame_media_clock.get("media_clock")
-                            if isinstance(raw_clock, dict):
-                                raw_clock = dict(raw_clock)
-                                raw_clock["session_id"] = (
-                                    f"{self.perception_run_id}:{camera_ids[i]}"
-                                )
-                                frame_media_clock["media_clock"] = raw_clock
-                        frame_media_clocks[i] = frame_media_clock
+                        frame_media_clocks[i] = snapshot.get("media_clock")
 
                     if not any(frame is not None for frame in frames_to_process):
                         time.sleep(0.02)
@@ -3072,7 +3216,11 @@ class VideoObjectDetector:
         """
 
         self.v2x_endpoint = os.getenv("V2X_DETECTIONS_ENDPOINT", self.V2X_ENDPOINT).rstrip("/")
-        self.model = YOLO(model_path)
+        self.model = (
+            load_verified_detector_model(model_path, detector_model_sha256)
+            if detector_model_sha256 is not None
+            else YOLO(model_path)
+        )
         self.conf = conf
         self.class_names = self.model.names
         self.K = K
@@ -3572,14 +3720,20 @@ if __name__ == "__main__":
     conf = env_float("V2X_PERCEPTION_CONFIDENCE", 0.5)
 
     cameras_config = load_cameras_config()
+    model_path, detector_model_sha256 = snapshot_detector_model(
+        model_path,
+        os.getenv(
+            "V2X_DETECTOR_SNAPSHOT_DIR",
+            "~/.local/share/v2x-perception/model-snapshots",
+        ),
+    )
+    detector_config_sha256 = detector_config_fingerprint(
+        detector_model_sha256, conf
+    )
     detectors = []
     if cameras_config:
         cameras_json_sha256, camera_hashes = camera_config_fingerprints(
             cameras_config
-        )
-        detector_model_sha256 = sha256_file(model_path)
-        detector_config_sha256 = detector_config_fingerprint(
-            detector_model_sha256, conf
         )
         site = cameras_config.get("site", {})
         for cam in cameras_config["cameras"]:
@@ -3630,10 +3784,10 @@ if __name__ == "__main__":
         base_lon = -122.33478756387032
 
         detectors = [
-            VideoObjectDetector(model_path, conf, K, None, 7.0, -39.20, -46.06, 200.0, "cam-001-ch1", base_lat, base_lon, "Richmond", "CA", "USA"),
-            VideoObjectDetector(model_path, conf, K, None, 7.0, -40.52, 71.25, 300.0, "cam-001-ch2", base_lat, base_lon, "Richmond", "CA", "USA"),
-            VideoObjectDetector(model_path, conf, K, None, 7.0, -30.42, 14.58, 315.0, "cam-001-ch3", base_lat, base_lon, "Richmond", "CA", "USA"),
-            VideoObjectDetector(model_path, conf, K, None, 7.0, -43.48, -22.63, 260.0, "cam-001-ch4", base_lat, base_lon, "Richmond", "CA", "USA"),
+            VideoObjectDetector(model_path, conf, K, None, 7.0, -39.20, -46.06, 200.0, "cam-001-ch1", base_lat, base_lon, "Richmond", "CA", "USA", detector_model_sha256=detector_model_sha256, detector_config_sha256=detector_config_sha256),
+            VideoObjectDetector(model_path, conf, K, None, 7.0, -40.52, 71.25, 300.0, "cam-001-ch2", base_lat, base_lon, "Richmond", "CA", "USA", detector_model_sha256=detector_model_sha256, detector_config_sha256=detector_config_sha256),
+            VideoObjectDetector(model_path, conf, K, None, 7.0, -30.42, 14.58, 315.0, "cam-001-ch3", base_lat, base_lon, "Richmond", "CA", "USA", detector_model_sha256=detector_model_sha256, detector_config_sha256=detector_config_sha256),
+            VideoObjectDetector(model_path, conf, K, None, 7.0, -43.48, -22.63, 260.0, "cam-001-ch4", base_lat, base_lon, "Richmond", "CA", "USA", detector_model_sha256=detector_model_sha256, detector_config_sha256=detector_config_sha256),
         ]
 
     pipeline = MultiCameraPipeline(detectors=detectors)

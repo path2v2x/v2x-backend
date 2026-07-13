@@ -576,12 +576,118 @@ def _pixel(value: Any, width: int, height: int, reason: str) -> list[float]:
     return pixel
 
 
+def _project_surveyed_world_pixel(
+    world_value: Any,
+    manifest: Mapping[str, Any],
+    camera: Mapping[str, Any],
+) -> list[float]:
+    """Project one retained CARLA-world point through the exact camera model."""
+    world = _vector(world_value, 3, "static_reprojection_world_invalid")
+    baseline = _object(
+        manifest.get("baseline"), "static_reprojection_extrinsics_invalid"
+    )
+    deployment = _object(
+        manifest.get("deployment_model"),
+        "static_reprojection_extrinsics_invalid",
+    )
+    deployment_base = _object(
+        deployment.get("base"), "static_reprojection_extrinsics_invalid"
+    )
+    location = _vector(
+        baseline.get("location"), 3, "static_reprojection_extrinsics_invalid"
+    )
+    rotation = [
+        baseline.get("pitch_deg"),
+        baseline.get("yaw_deg"),
+        baseline.get("roll_deg"),
+    ]
+    if any(not _finite(value) for value in rotation):
+        raise ReviewedLocalizationError("static_reprojection_extrinsics_invalid")
+    if (
+        deployment.get("anchor_location") != location
+        or any(
+            deployment_base.get(key) != baseline.get(key)
+            for key in ("pitch_deg", "yaw_deg", "roll_deg")
+        )
+    ):
+        raise ReviewedLocalizationError("static_reprojection_extrinsics_invalid")
+    intrinsics = _object(
+        camera.get("intrinsics"), "static_reprojection_intrinsics_invalid"
+    )
+    calibration = _object(
+        camera.get("intrinsics_calibration"),
+        "static_reprojection_intrinsics_invalid",
+    )
+    distortion = _object(
+        calibration.get("distortion"), "static_reprojection_intrinsics_invalid"
+    )
+    values = {
+        key: intrinsics.get(key) for key in ("fx", "fy", "cx", "cy")
+    }
+    values.update({
+        key: distortion.get(key) for key in ("k1", "k2", "p1", "p2", "k3")
+    })
+    if any(not _finite(value) for value in values.values()):
+        raise ReviewedLocalizationError("static_reprojection_intrinsics_invalid")
+    if float(values["fx"]) <= 0.0 or float(values["fy"]) <= 0.0:
+        raise ReviewedLocalizationError("static_reprojection_intrinsics_invalid")
+
+    pitch, yaw, roll = (math.radians(float(value)) for value in rotation)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cr, sr = math.cos(roll), math.sin(roll)
+    forward = (cp * cy, cp * sy, sp)
+    zero_roll_right = (-sy, cy, 0.0)
+    zero_roll_up = (-sp * cy, -sp * sy, cp)
+    right = tuple(
+        cr * zero_roll_right[index] - sr * zero_roll_up[index]
+        for index in range(3)
+    )
+    up = tuple(
+        sr * zero_roll_right[index] + cr * zero_roll_up[index]
+        for index in range(3)
+    )
+    relative = [world[index] - location[index] for index in range(3)]
+    camera_forward = sum(relative[index] * forward[index] for index in range(3))
+    camera_right = sum(relative[index] * right[index] for index in range(3))
+    camera_up = sum(relative[index] * up[index] for index in range(3))
+    if not math.isfinite(camera_forward) or camera_forward <= 1e-6:
+        raise ReviewedLocalizationError("static_reprojection_world_behind_camera")
+    normalized_x = camera_right / camera_forward
+    normalized_y = -camera_up / camera_forward
+    radius2 = normalized_x * normalized_x + normalized_y * normalized_y
+    radial = (
+        1.0
+        + float(values["k1"]) * radius2
+        + float(values["k2"]) * radius2 * radius2
+        + float(values["k3"]) * radius2 * radius2 * radius2
+    )
+    distorted_x = (
+        normalized_x * radial
+        + 2.0 * float(values["p1"]) * normalized_x * normalized_y
+        + float(values["p2"]) * (radius2 + 2.0 * normalized_x * normalized_x)
+    )
+    distorted_y = (
+        normalized_y * radial
+        + float(values["p1"]) * (radius2 + 2.0 * normalized_y * normalized_y)
+        + 2.0 * float(values["p2"]) * normalized_x * normalized_y
+    )
+    pixel = [
+        float(values["fx"]) * distorted_x + float(values["cx"]),
+        float(values["fy"]) * distorted_y + float(values["cy"]),
+    ]
+    if any(not math.isfinite(value) for value in pixel):
+        raise ReviewedLocalizationError("static_reprojection_projection_invalid")
+    return pixel
+
+
 def _heldout_reprojection_metrics(
     evidence: Mapping[str, Any],
     manifest: Mapping[str, Any],
     camera_id: str,
     camera_hash: str,
     manifest_hash: str,
+    camera: Mapping[str, Any],
 ) -> None:
     _exact_keys(
         evidence,
@@ -606,8 +712,32 @@ def _heldout_reprojection_metrics(
         or isinstance(height, bool)
         or height <= 0
         or evidence.get("native_resolution") != [width, height]
+        or canonical_object_sha256(camera) != camera_hash
     ):
         raise ReviewedLocalizationError("static_reprojection_binding_invalid")
+    camera_intrinsics = _object(
+        camera.get("intrinsics"), "static_reprojection_intrinsics_invalid"
+    )
+    camera_calibration = _object(
+        camera.get("intrinsics_calibration"),
+        "static_reprojection_intrinsics_invalid",
+    )
+    manifest_calibration = _object(
+        manifest.get("intrinsics_calibration"),
+        "static_reprojection_intrinsics_invalid",
+    )
+    expected_matrix = [
+        [camera_intrinsics.get("fx"), 0.0, camera_intrinsics.get("cx")],
+        [0.0, camera_intrinsics.get("fy"), camera_intrinsics.get("cy")],
+        [0.0, 0.0, 1.0],
+    ]
+    if (
+        manifest_calibration.get("resolution") != [width, height]
+        or manifest_calibration.get("camera_matrix") != expected_matrix
+        or manifest_calibration.get("distortion")
+        != camera_calibration.get("distortion")
+    ):
+        raise ReviewedLocalizationError("static_reprojection_intrinsics_invalid")
     features = manifest.get("features")
     if not isinstance(features, list):
         raise ReviewedLocalizationError("static_reprojection_manifest_invalid")
@@ -639,7 +769,7 @@ def _heldout_reprojection_metrics(
     for item in points:
         _exact_keys(
             _object(item, "static_reprojection_point_invalid"),
-            {"feature_id", "observed_pixel", "predicted_pixel"},
+            {"feature_id", "observed_pixel"},
             "static_reprojection_point_invalid",
         )
         feature_id = _text(
@@ -653,9 +783,8 @@ def _heldout_reprojection_metrics(
             item.get("observed_pixel"), width, height,
             "static_reprojection_point_invalid",
         )
-        predicted = _pixel(
-            item.get("predicted_pixel"), width, height,
-            "static_reprojection_point_invalid",
+        predicted = _project_surveyed_world_pixel(
+            feature.get("surveyed_world"), manifest, camera
         )
         if observed != [float(value) for value in feature.get("image", [])]:
             raise ReviewedLocalizationError(
@@ -667,7 +796,7 @@ def _heldout_reprojection_metrics(
     for item in roads:
         _exact_keys(
             _object(item, "static_reprojection_road_invalid"),
-            {"feature_id", "observed_polyline", "predicted_polyline"},
+            {"feature_id", "observed_polyline"},
             "static_reprojection_road_invalid",
         )
         feature_id = _text(
@@ -675,29 +804,26 @@ def _heldout_reprojection_metrics(
         )
         feature = holdout_roads.get(feature_id)
         observed_values = item.get("observed_polyline")
-        predicted_values = item.get("predicted_polyline")
         feature_values = feature.get("image_polyline") if feature else None
+        world_values = feature.get("world") if feature else None
         if (
             feature is None
             or feature_id in seen_roads
             or not isinstance(observed_values, list)
-            or not isinstance(predicted_values, list)
+            or not isinstance(world_values, list)
             or len(observed_values) < 2
-            or len(observed_values) != len(predicted_values)
+            or len(observed_values) != len(world_values)
             or observed_values != feature_values
         ):
             raise ReviewedLocalizationError("static_reprojection_road_invalid")
         seen_roads.add(feature_id)
-        for observed_value, predicted_value in zip(
-            observed_values, predicted_values
-        ):
+        for observed_value, world_value in zip(observed_values, world_values):
             observed = _pixel(
                 observed_value, width, height,
                 "static_reprojection_road_invalid",
             )
-            predicted = _pixel(
-                predicted_value, width, height,
-                "static_reprojection_road_invalid",
+            predicted = _project_surveyed_world_pixel(
+                world_value, manifest, camera
             )
             road_residuals.append(math.dist(observed, predicted))
     if seen_points != set(holdout_points) or seen_roads != set(holdout_roads):
@@ -728,6 +854,7 @@ def validate_static_calibration(
     cameras_json_sha256: str,
     camera_hashes: Mapping[str, str],
     camera_resolutions: Mapping[str, tuple[int, int]],
+    camera_models: Mapping[str, Mapping[str, Any]],
     map_name: str,
     opendrive_sha256: str,
     authority_registry: Mapping[str, dict],
@@ -780,6 +907,7 @@ def validate_static_calibration(
         }
         or set(camera_hashes) != {"ch1", "ch2", "ch3", "ch4"}
         or set(camera_resolutions) != set(camera_hashes)
+        or set(camera_models) != set(camera_hashes)
         or not isinstance(manifest_index, dict)
         or set(manifest_index) != set(camera_hashes)
         or not isinstance(registry_descriptor, dict)
@@ -858,6 +986,7 @@ def validate_static_calibration(
             camera_id,
             expected_hash,
             sha256_bytes(manifest_raw),
+            camera_models[camera_id],
         )
     return sha256_bytes(raw)
 
@@ -882,6 +1011,7 @@ def build_runtime_context(
         raise ReviewedLocalizationError("active_camera_config_invalid")
     indexed: dict[str, CameraPlacementContext] = {}
     camera_hashes = {}
+    camera_models = {}
     for camera in cameras:
         if not isinstance(camera, dict):
             raise ReviewedLocalizationError("active_camera_config_invalid")
@@ -902,6 +1032,7 @@ def build_runtime_context(
             ),
         )
         camera_hashes[camera_id] = camera_hash
+        camera_models[camera_id] = camera
     try:
         opendrive = carla_map.to_opendrive()
     except Exception as exc:
@@ -920,6 +1051,7 @@ def build_runtime_context(
             camera_id: placement.native_resolution
             for camera_id, placement in indexed.items()
         },
+        camera_models,
         map_name,
         opendrive_hash,
         authority_registry,

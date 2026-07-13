@@ -10,13 +10,16 @@ reviewed placement truth.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime
+import errno
 import json
 import math
 import os
 from pathlib import Path
+import shutil
 import sys
-import uuid
+import tempfile
 
 import cv2
 import numpy as np
@@ -64,6 +67,51 @@ APPEARANCE_MODEL_SCHEMA = "v2x-pinned-vehicle-appearance-model/v1"
 
 class AttachmentError(RuntimeError):
     pass
+
+
+def _fsync_directory(path):
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rename_directory_noreplace(source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise AttachmentError("atomic no-replace publication is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100, os.fsencode(source), -100, os.fsencode(destination), 1
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise AttachmentError("output evidence bundle already exists")
+    raise AttachmentError(
+        f"atomic no-replace publication failed: {os.strerror(error)}"
+    )
+
+
+def _write_fsynced_exclusive(path, payload):
+    descriptor = os.open(
+        str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def load_json(path, label):
@@ -304,7 +352,8 @@ def _producer_inference_evidence(base, detection, sample, camera_id):
     _exact_keys(
         output,
         {
-            "schema", "event_id", "camera_id", "device_id", "frame_number",
+            "schema", "event_id", "camera_id", "device_id", "session_id",
+            "frame_number",
             "track_id", "object_type", "confidence_score", "bbox",
             "segmentation_output_index", "mask_pixel_sha256",
             "detector_model_sha256", "detector_config_sha256",
@@ -323,6 +372,7 @@ def _producer_inference_evidence(base, detection, sample, camera_id):
         "event_id": detection.get("event_id"),
         "camera_id": camera_id,
         "device_id": detection.get("device_id"),
+        "session_id": timing.get("session_id"),
         "frame_number": sample.get("frame_number"),
         "track_id": detection.get("track_id"),
         "object_type": detection.get("object_type"),
@@ -866,6 +916,7 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
                 camera_id: value.native_resolution
                 for camera_id, value in camera_context.items()
             },
+            {camera["id"]: camera for camera in cameras["cameras"]},
             map_name,
             opendrive_hash,
             authority_registry,
@@ -1326,13 +1377,8 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
             value["reviewed_localization"] = contract
         updated.append(value)
     body = b"".join(canonical_json_bytes(value) for value in updated)
-    output_path = Path(output_path).expanduser().resolve()
-    manifest_path = output_path.with_name(output_path.name + ".manifest.json")
-    if output_path.exists() or manifest_path.exists():
-        raise AttachmentError("output or output manifest already exists")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.parent / f".{output_path.name}.tmp-{uuid.uuid4().hex}"
-    temporary_manifest = temporary.with_name(temporary.name + ".manifest.json")
+    bundle_path = Path(os.path.abspath(Path(output_path).expanduser()))
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "schema": ATTACHMENT_SCHEMA,
         "source_detections": str(detections_path),
@@ -1354,15 +1400,34 @@ def attach(detections_path, trajectory_path, output_path, authority_key_file):
         "deployment_eligible": False,
     }
     try:
-        temporary.write_bytes(body)
-        temporary_manifest.write_bytes(canonical_json_bytes(manifest))
-        os.rename(temporary, output_path)
-        os.rename(temporary_manifest, manifest_path)
+        staging_path = Path(tempfile.mkdtemp(
+            prefix=f".{bundle_path.name}.tmp-", dir=bundle_path.parent
+        ))
+    except OSError as exc:
+        raise AttachmentError("could not create evidence bundle staging area") from exc
+    output_file = staging_path / "detections.ndjson"
+    manifest_file = staging_path / "manifest.json"
+    published = False
+    try:
+        _write_fsynced_exclusive(output_file, body)
+        _write_fsynced_exclusive(
+            manifest_file, canonical_json_bytes(manifest)
+        )
+        _fsync_directory(staging_path)
+        _rename_directory_noreplace(staging_path, bundle_path)
+        published = True
+        _fsync_directory(bundle_path.parent)
     except Exception:
-        temporary.unlink(missing_ok=True)
-        temporary_manifest.unlink(missing_ok=True)
+        if published:
+            shutil.rmtree(bundle_path, ignore_errors=True)
+            try:
+                _fsync_directory(bundle_path.parent)
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(staging_path, ignore_errors=True)
         raise
-    return output_path, manifest_path
+    return bundle_path / output_file.name, bundle_path / manifest_file.name
 
 
 def main(argv=None):
