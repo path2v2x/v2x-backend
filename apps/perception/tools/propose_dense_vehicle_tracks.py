@@ -11,6 +11,11 @@ Resource admission: do not run CPU model jobs while live perception is active
 unless the job is isolated below a previously proven non-impact CPU and memory
 cap.  This proposal tool does not establish that cap.
 
+Every bound report, retained model, segmentation mask, and dense JPEG is copied
+to a content-addressed staged input before inference.  Original file identity
+and hashes are checked again before publication; the staged copies are also
+rehash-verified so a published proposal is self-contained and reproducible.
+
 SIGINT and SIGTERM remove only this invocation's exact staging directory.
 SIGKILL cannot be handled and can leave that directory behind.  Later runs do
 not sweep similarly named directories: an operator must prove the owning
@@ -118,6 +123,118 @@ def valid_sha256(value):
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def source_fingerprint(stat_result):
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def pin_source_file(path, expected_sha256, label):
+    try:
+        path = Path(path).expanduser().resolve()
+    except TypeError as exc:
+        raise DenseTrackError(f"{label} identity is invalid") from exc
+    if not path.is_file() or not valid_sha256(expected_sha256):
+        raise DenseTrackError(f"{label} identity is invalid")
+    try:
+        before = source_fingerprint(path.stat())
+        actual_sha256 = sha256_file(path)
+        after = source_fingerprint(path.stat())
+    except OSError as exc:
+        raise DenseTrackError(f"{label} cannot be pinned") from exc
+    if before != after or actual_sha256 != expected_sha256:
+        raise DenseTrackError(f"{label} changed while it was pinned")
+    return {
+        "source_path": str(path),
+        "sha256": expected_sha256,
+        "_source_fingerprint": after,
+    }
+
+
+def revalidate_source_files(bindings):
+    checked = set()
+    for binding in bindings:
+        key = (
+            binding["source_path"],
+            binding["sha256"],
+            binding["_source_fingerprint"],
+        )
+        if key in checked:
+            continue
+        checked.add(key)
+        path = Path(binding["source_path"])
+        try:
+            before = source_fingerprint(path.stat())
+            actual_sha256 = sha256_file(path)
+            after = source_fingerprint(path.stat())
+        except OSError as exc:
+            raise DenseTrackError(
+                f"bound source changed during dense tracking: {path}"
+            ) from exc
+        if (
+            before != binding["_source_fingerprint"]
+            or after != binding["_source_fingerprint"]
+            or actual_sha256 != binding["sha256"]
+        ):
+            raise DenseTrackError(
+                f"bound source changed during dense tracking: {path}"
+            )
+
+
+def snapshot_source_file(staged_root, binding, category, suffix, label):
+    relative = Path("inputs") / category / f"{binding['sha256']}{suffix}"
+    destination = Path(staged_root) / relative
+    if destination.exists():
+        if not destination.is_file() or sha256_file(destination) != binding["sha256"]:
+            raise DenseTrackError(f"{label} snapshot collision")
+    else:
+        copy_file_exclusive(binding["source_path"], destination, f"{label} snapshot")
+    if sha256_file(destination) != binding["sha256"]:
+        raise DenseTrackError(f"{label} changed while it was snapshotted")
+    return {
+        "source_path": binding["source_path"],
+        "path": relative.as_posix(),
+        "sha256": binding["sha256"],
+        "byte_count": destination.stat().st_size,
+    }
+
+
+def verify_bound_input_snapshots(staged_root, value):
+    descriptors = []
+
+    def collect(item):
+        if isinstance(item, dict):
+            if {"source_path", "path", "sha256", "byte_count"} <= set(item):
+                descriptors.append(item)
+            for nested in item.values():
+                collect(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                collect(nested)
+
+    collect(value)
+    root = Path(staged_root).resolve()
+    for descriptor in descriptors:
+        relative = descriptor["path"]
+        if not isinstance(relative, str) or Path(relative).is_absolute():
+            raise DenseTrackError("bound input snapshot path is invalid")
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root / "inputs")
+        except ValueError as exc:
+            raise DenseTrackError("bound input snapshot escapes inputs directory") from exc
+        if (
+            not path.is_file()
+            or path.stat().st_size != descriptor["byte_count"]
+            or sha256_file(path) != descriptor["sha256"]
+        ):
+            raise DenseTrackError("bound input snapshot changed during dense tracking")
 
 
 def write_bytes_exclusive(path, value, label):
@@ -275,6 +392,9 @@ def canonical_retained_path(report_path, relative):
 
 def load_dense_report(path, expected_source_report_sha256=None):
     report_path, raw, report = load_json(path, "dense capture report")
+    report_binding = pin_source_file(
+        report_path, sha256_bytes(raw), "dense capture report"
+    )
     if report.get("schema") != DENSE_SCHEMA:
         raise DenseTrackError("dense capture schema is unsupported")
     camera_id = report.get("camera_id")
@@ -326,8 +446,12 @@ def load_dense_report(path, expected_source_report_sha256=None):
         raise DenseTrackError(
             "dense source-event report is not the consensus capture denominator"
         )
+    source_binding = pin_source_file(
+        source_path, actual_source_hash, "dense source-event report"
+    )
 
     decoded = []
+    frame_bindings = []
     seen_indices = set()
     seen_hashes = set()
     previous_time = None
@@ -358,6 +482,9 @@ def load_dense_report(path, expected_source_report_sha256=None):
         encoded = frame_path.read_bytes()
         if len(encoded) != row.get("byte_count") or sha256_bytes(encoded) != expected_hash:
             raise DenseTrackError("dense frame byte identity mismatches report")
+        frame_binding = pin_source_file(
+            frame_path, expected_hash, f"dense frame {index}"
+        )
         image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise DenseTrackError("dense frame is not a decodable JPEG")
@@ -375,7 +502,9 @@ def load_dense_report(path, expected_source_report_sha256=None):
             "image": image,
             "width": width,
             "height": height,
+            "_source_binding": frame_binding,
         })
+        frame_bindings.append(frame_binding)
 
     source_events = report.get("source_events")
     expected_source_events = [
@@ -410,11 +539,46 @@ def load_dense_report(path, expected_source_report_sha256=None):
             "timestamp_utc": key[1],
             "frame_index": frame_index[key]["index"],
         })
-    return report_path, raw, report, decoded, anchors
+    return report_path, raw, report, decoded, anchors, {
+        "capture_report": report_binding,
+        "source_event_report": source_binding,
+        "frames": frame_bindings,
+    }
+
+
+def validated_native_bbox(value, frame, label):
+    if (
+        not isinstance(frame, dict)
+        or not isinstance(frame.get("width"), int)
+        or isinstance(frame.get("width"), bool)
+        or not isinstance(frame.get("height"), int)
+        or isinstance(frame.get("height"), bool)
+        or frame["width"] <= 0
+        or frame["height"] <= 0
+        or not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or not all(
+            isinstance(item, (int, float))
+            and not isinstance(item, bool)
+            and math.isfinite(float(item))
+            for item in value
+        )
+    ):
+        raise DenseTrackError(f"{label} bbox is invalid")
+    x1, y1, x2, y2 = map(float, value)
+    if not (
+        0.0 <= x1 < x2 <= float(frame["width"])
+        and 0.0 <= y1 < y2 <= float(frame["height"])
+    ):
+        raise DenseTrackError(f"{label} bbox is outside the frame")
+    return [x1, y1, x2, y2]
 
 
 def load_consensus(path, model_hash):
     consensus_path, raw, value = load_json(path, "segmentation consensus")
+    consensus_binding = pin_source_file(
+        consensus_path, sha256_bytes(raw), "segmentation consensus"
+    )
     if value.get("schema") != CONSENSUS_SCHEMA or value.get("acceptance_eligible") is not False:
         raise DenseTrackError("segmentation consensus contract is invalid")
     inputs = value.get("inputs")
@@ -423,6 +587,7 @@ def load_consensus(path, model_hash):
     sides = ["left", "right"]
     selected_side = None
     input_paths = []
+    input_evidence = []
     retained_model_hashes = set()
     for side, identity in zip(sides, inputs):
         model = identity.get("model") if isinstance(identity, dict) else None
@@ -451,6 +616,17 @@ def load_consensus(path, model_hash):
             )
         retained_model_hashes.add(retained_model_hash)
         input_paths.append(input_path)
+        input_evidence.append({
+            "report": pin_source_file(
+                input_path, identity.get("sha256"),
+                f"{side} segmentation proposal report",
+            ),
+            "model": pin_source_file(
+                model_path, retained_model_hash,
+                f"{side} retained segmentation model",
+            ),
+            "side": side,
+        })
         if retained_model_hash == model_hash:
             selected_side = side
     if selected_side is None:
@@ -467,6 +643,46 @@ def load_consensus(path, model_hash):
             raise DenseTrackError(
                 f"segmentation consensus {key} mismatches retained source evidence"
             )
+    capture_binding = None
+    for side, input_path, evidence in zip(sides, input_paths, input_evidence):
+        _path, _raw, input_report = load_json(
+            input_path, f"{side} segmentation proposal report"
+        )
+        capture = input_report.get("capture_report")
+        capture_path = (
+            Path(str(capture.get("path", ""))).expanduser().resolve()
+            if isinstance(capture, dict)
+            else None
+        )
+        capture_hash = capture.get("sha256") if isinstance(capture, dict) else None
+        current_capture = pin_source_file(
+            capture_path, capture_hash, "segmentation capture report"
+        )
+        if capture_binding is None:
+            capture_binding = current_capture
+        elif (
+            current_capture["source_path"] != capture_binding["source_path"]
+            or current_capture["sha256"] != capture_binding["sha256"]
+        ):
+            raise DenseTrackError("segmentation proposal capture bindings differ")
+        masks = []
+        events_value = input_report.get("events")
+        if not isinstance(events_value, list):
+            raise DenseTrackError("segmentation proposal event list is invalid")
+        for event in events_value:
+            descriptor = event.get("mask") if isinstance(event, dict) else None
+            if descriptor is None:
+                continue
+            mask_path = (
+                Path(str(descriptor.get("path", ""))).expanduser().resolve()
+                if isinstance(descriptor, dict)
+                else None
+            )
+            mask_hash = descriptor.get("sha256") if isinstance(descriptor, dict) else None
+            masks.append(pin_source_file(
+                mask_path, mask_hash, f"{side} segmentation proposal mask"
+            ))
+        evidence["masks"] = masks
     index = {}
     events = recomputed.get("events")
     if not isinstance(events, list):
@@ -485,13 +701,146 @@ def load_consensus(path, model_hash):
         instance = side_value.get("matched_instance") if isinstance(side_value, dict) else None
         frame = event.get("frame")
         if event.get("consensus") is not None and isinstance(instance, dict):
+            for source_side in sides:
+                source_event = event.get(source_side)
+                source_instance = (
+                    source_event.get("matched_instance")
+                    if isinstance(source_event, dict)
+                    else None
+                )
+                if not isinstance(source_instance, dict):
+                    raise DenseTrackError(
+                        f"accepted consensus lacks {source_side} matched instance"
+                    )
+                validated_native_bbox(
+                    source_instance.get("bbox_xyxy"), frame,
+                    f"accepted consensus {source_side}",
+                )
+            for metric in ("bbox_iou", "mask_iou"):
+                metric_value = event.get(metric)
+                if (
+                    not isinstance(metric_value, (int, float))
+                    or isinstance(metric_value, bool)
+                    or not math.isfinite(float(metric_value))
+                    or not 0.0 <= float(metric_value) <= 1.0
+                ):
+                    raise DenseTrackError(
+                        f"accepted consensus {metric} is outside [0, 1]"
+                    )
             index[key] = {
-                "bbox_xyxy": instance.get("bbox_xyxy"),
+                "bbox_xyxy": validated_native_bbox(
+                    instance.get("bbox_xyxy"), frame, "selected consensus model"
+                ),
                 "frame_sha256": frame.get("encoded_jpeg_sha256") if isinstance(frame, dict) else None,
                 "consensus_pixel": event["consensus"].get("pixel"),
                 "mask_iou": event.get("mask_iou"),
             }
-    return consensus_path, raw, value, index, selected_side
+    if capture_binding is None:
+        raise DenseTrackError("segmentation capture binding is missing")
+    return consensus_path, raw, value, index, selected_side, {
+        "consensus": consensus_binding,
+        "capture_report": capture_binding,
+        "inputs": input_evidence,
+    }
+
+
+def snapshot_consensus_evidence(staged_root, evidence):
+    bindings = [evidence["consensus"], evidence["capture_report"]]
+    published_inputs = []
+    for input_evidence in evidence["inputs"]:
+        bindings.extend([input_evidence["report"], input_evidence["model"]])
+        bindings.extend(input_evidence["masks"])
+        published_inputs.append({
+            "side": input_evidence["side"],
+            "report": snapshot_source_file(
+                staged_root, input_evidence["report"], "reports", ".json",
+                f"{input_evidence['side']} segmentation proposal report",
+            ),
+            "model": snapshot_source_file(
+                staged_root, input_evidence["model"], "models", ".pt",
+                f"{input_evidence['side']} segmentation model",
+            ),
+            "masks": [
+                snapshot_source_file(
+                    staged_root, binding, "consensus-masks", ".png",
+                    f"{input_evidence['side']} segmentation proposal mask",
+                )
+                for binding in input_evidence["masks"]
+            ],
+        })
+    return {
+        "consensus": snapshot_source_file(
+            staged_root, evidence["consensus"], "reports", ".json",
+            "segmentation consensus",
+        ),
+        "capture_report": snapshot_source_file(
+            staged_root, evidence["capture_report"], "reports", ".json",
+            "segmentation capture report",
+        ),
+        "inputs": published_inputs,
+    }, bindings
+
+
+def prepare_dense_window(
+    report_value, staged_root, expected_source_report_sha256=None
+):
+    loaded = load_dense_report(
+        report_value,
+        expected_source_report_sha256=expected_source_report_sha256,
+    )
+    report_path, report_raw, report, frames, anchors, evidence = loaded
+    capture_snapshot = snapshot_source_file(
+        staged_root, evidence["capture_report"], "reports", ".json",
+        "dense capture report",
+    )
+    source_snapshot = snapshot_source_file(
+        staged_root, evidence["source_event_report"], "reports", ".json",
+        "dense source-event report",
+    )
+    frame_snapshots = []
+    for frame, binding in zip(frames, evidence["frames"]):
+        snapshot = snapshot_source_file(
+            staged_root, binding, "frames", ".jpg",
+            f"dense frame {frame['index']}",
+        )
+        frame["_snapshot"] = snapshot
+        frame_snapshots.append({
+            "index": frame["index"],
+            "producer_timestamp_utc": frame["timestamp_utc"],
+            "width": frame["width"],
+            "height": frame["height"],
+            **snapshot,
+        })
+    return {
+        "loaded": (report_path, report_raw, report, frames, anchors),
+        "capture_snapshot": capture_snapshot,
+        "source_snapshot": source_snapshot,
+        "frame_snapshots": frame_snapshots,
+        "bindings": [
+            evidence["capture_report"],
+            evidence["source_event_report"],
+            *evidence["frames"],
+        ],
+    }
+
+
+def exact_numeric_scalars(value, expected_count, label):
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        array = np.asarray(value)
+        if array.size != expected_count:
+            raise DenseTrackError(
+                f"{label} must contain exactly {expected_count} scalar values"
+            )
+        scalars = [float(item) for item in array.reshape(-1)]
+    except DenseTrackError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DenseTrackError(f"{label} is malformed") from exc
+    if not all(math.isfinite(item) for item in scalars):
+        raise DenseTrackError(f"{label} contains a non-finite scalar")
+    return scalars
 
 
 def model_instances_from_result(result, image):
@@ -503,28 +852,45 @@ def model_instances_from_result(result, image):
     masks = result.masks.data.detach().cpu().numpy()
     height, width = image.shape[:2]
     box_count = len(result.boxes)
+    boxes = list(result.boxes)
+    if len(boxes) != box_count:
+        raise DenseTrackError("tracking boxes have inconsistent cardinality")
     if masks.ndim != 3 or masks.shape[0] != box_count:
         raise DenseTrackError("tracking masks are not ordered one-for-one with boxes")
-    if ids is not None and len(ids) != box_count:
-        raise DenseTrackError("tracking IDs are not ordered one-for-one with boxes")
+    id_values = (
+        None
+        if ids is None
+        else exact_numeric_scalars(ids, box_count, "tracking IDs")
+    )
+    if id_values is not None and any(
+        not value.is_integer() or value < 0.0 for value in id_values
+    ):
+        raise DenseTrackError("tracking model returned a non-integral tracker ID")
     instances = []
-    for index, box in enumerate(result.boxes):
-        class_id = int(box.cls[0].item())
-        label = str(result.names[class_id])
-        if label not in VEHICLE_LABELS:
-            continue
+    for index, box in enumerate(boxes):
+        class_value = exact_numeric_scalars(
+            box.cls, 1, "tracking class ID"
+        )[0]
+        if not class_value.is_integer() or class_value < 0.0:
+            raise DenseTrackError("tracking model returned an invalid class ID")
+        class_id = int(class_value)
+        try:
+            label_value = result.names[class_id]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise DenseTrackError("tracking model class ID has no label") from exc
+        if not isinstance(label_value, str) or not label_value:
+            raise DenseTrackError("tracking model class label is invalid")
+        label = label_value
+        confidence = exact_numeric_scalars(
+            box.conf, 1, "tracking confidence"
+        )[0]
+        if not 0.0 <= confidence <= 1.0:
+            raise DenseTrackError("tracking model returned an invalid confidence")
         if ids is None:
             continue
-        track_id_value = float(ids[index].item())
-        if (
-            not math.isfinite(track_id_value)
-            or not track_id_value.is_integer()
-            or track_id_value < 0
-        ):
-            raise DenseTrackError("tracking model returned a non-integral tracker ID")
-        confidence = float(box.conf[0].item())
-        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-            raise DenseTrackError("tracking model returned an invalid confidence")
+        track_id_value = id_values[index]
+        if label not in VEHICLE_LABELS:
+            continue
         mask = masks[index]
         if mask.ndim != 2 or not np.isfinite(mask).all():
             raise DenseTrackError("tracking model returned an invalid mask plane")
@@ -644,15 +1010,22 @@ def select_target_track(tracked_frames, anchors, consensus_index, camera_id):
 
 
 def dense_sequence_identity(
-    report_path, report_raw, report, model_sha256, consensus_sha256
+    report_path, report_raw, report, model_sha256, consensus_sha256,
+    capture_snapshot=None, source_snapshot=None,
 ):
     identity = {
         "camera_id": report["camera_id"],
         "model_object_id": report["object_id"],
         "capture_report_path": str(Path(report_path).resolve()),
         "capture_report_sha256": sha256_bytes(report_raw),
+        "capture_report_snapshot_path": (
+            capture_snapshot.get("path") if isinstance(capture_snapshot, dict) else None
+        ),
         "source_event_report_path": report["source_event_report"]["path"],
         "source_event_report_sha256": report["source_event_report"]["sha256"],
+        "source_event_report_snapshot_path": (
+            source_snapshot.get("path") if isinstance(source_snapshot, dict) else None
+        ),
         "tracking_model_sha256": model_sha256,
         "segmentation_consensus_sha256": consensus_sha256,
     }
@@ -923,16 +1296,19 @@ def make_review_sheet(entries, columns=4, tile_width=480, tile_height=390):
 def process_window(report_value, consensus_index, model_path, staged_root, model_factory,
                    confidence, iou_threshold, image_size, device,
                    expected_source_report_sha256=None, model_sha256=None,
-                   consensus_sha256=None):
-    report_path, report_raw, report, frames, anchors = load_dense_report(
-        report_value,
-        expected_source_report_sha256=expected_source_report_sha256,
-    )
+                   consensus_sha256=None, prepared_window=None):
+    if prepared_window is None:
+        prepared_window = prepare_dense_window(
+            report_value, staged_root,
+            expected_source_report_sha256=expected_source_report_sha256,
+        )
+    report_path, report_raw, report, frames, anchors = prepared_window["loaded"]
     camera_id = report["camera_id"]
     if not valid_sha256(model_sha256) or not valid_sha256(consensus_sha256):
         raise DenseTrackError("dense sequence model or consensus binding is invalid")
     sequence_id, sequence_identity_sha256, sequence_identity = dense_sequence_identity(
-        report_path, report_raw, report, model_sha256, consensus_sha256
+        report_path, report_raw, report, model_sha256, consensus_sha256,
+        prepared_window["capture_snapshot"], prepared_window["source_snapshot"],
     )
     model = model_factory(str(model_path))
     tracked = []
@@ -968,6 +1344,7 @@ def process_window(report_value, consensus_index, model_path, staged_root, model
                 "frame_index": frame["index"],
                 "producer_timestamp_utc": frame["timestamp_utc"],
                 "frame_sha256": frame["sha256"],
+                "frame_snapshot": frame["_snapshot"],
                 "track_id": target_id,
                 "label": instance["label"],
                 "confidence": instance["confidence"],
@@ -1076,8 +1453,9 @@ def process_window(report_value, consensus_index, model_path, staged_root, model
         "camera_id": camera_id,
         "model_object_id": report["object_id"],
         "model_object_id_is_identity_truth": False,
-        "capture_report": {"path": str(report_path), "sha256": sha256_bytes(report_raw)},
-        "source_event_report": report["source_event_report"],
+        "capture_report": prepared_window["capture_snapshot"],
+        "source_event_report": prepared_window["source_snapshot"],
+        "input_frames": prepared_window["frame_snapshots"],
         "target_track_id": target_id,
         "anchors": anchor_matches,
         "frames": selected_rows,
@@ -1115,9 +1493,17 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
     if not model_path.is_file():
         raise DenseTrackError("segmentation tracking model is unavailable")
     model_hash = sha256_file(model_path)
-    consensus_file, consensus_raw, consensus_value, consensus_index, side = load_consensus(
-        consensus_path, model_hash
+    model_binding = pin_source_file(
+        model_path, model_hash, "segmentation tracking model"
     )
+    (
+        consensus_file,
+        consensus_raw,
+        consensus_value,
+        consensus_index,
+        side,
+        consensus_evidence,
+    ) = load_consensus(consensus_path, model_hash)
     consensus_hash = sha256_bytes(consensus_raw)
     source_report_sha256 = consensus_value.get("capture_report_sha256")
     if not valid_sha256(source_report_sha256):
@@ -1142,11 +1528,35 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
     output.parent.mkdir(parents=True, exist_ok=True)
     with invocation_staging_directory(output) as (staged, owner_marker):
         try:
-            model_snapshot_relative = Path("inputs") / f"tracking-model-{model_hash}.pt"
-            model_snapshot = staged / model_snapshot_relative
-            copy_file_exclusive(model_path, model_snapshot, "tracking model snapshot")
-            if sha256_file(model_snapshot) != model_hash:
-                raise DenseTrackError("tracking model changed while it was snapshotted")
+            published_consensus, source_bindings = snapshot_consensus_evidence(
+                staged, consensus_evidence
+            )
+            model_snapshot_descriptor = snapshot_source_file(
+                staged, model_binding, "models", ".pt", "tracking model"
+            )
+            source_bindings.append(model_binding)
+            model_snapshot = staged / model_snapshot_descriptor["path"]
+            prepared_windows = [
+                prepare_dense_window(
+                    report, staged,
+                    expected_source_report_sha256=source_report_sha256,
+                )
+                for report in capture_reports
+            ]
+            for prepared_window in prepared_windows:
+                source_bindings.extend(prepared_window["bindings"])
+            bound_snapshot_tree = {
+                "consensus": published_consensus,
+                "tracking_model": model_snapshot_descriptor,
+                "dense_windows": [
+                    {
+                        "capture_report": prepared_window["capture_snapshot"],
+                        "source_event_report": prepared_window["source_snapshot"],
+                        "frames": prepared_window["frame_snapshots"],
+                    }
+                    for prepared_window in prepared_windows
+                ],
+            }
             sequences = [
                 process_window(
                     report, consensus_index, model_snapshot, staged, model_factory,
@@ -1154,8 +1564,9 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
                     expected_source_report_sha256=source_report_sha256,
                     model_sha256=model_hash,
                     consensus_sha256=consensus_hash,
+                    prepared_window=prepared_window,
                 )
-                for report in capture_reports
+                for report, prepared_window in zip(capture_reports, prepared_windows)
             ]
             sequence_ids = [sequence["sequence_id"] for sequence in sequences]
             if len(sequence_ids) != len(set(sequence_ids)):
@@ -1165,6 +1576,8 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
             verify_output_artifacts(staged, sequences)
             if sha256_file(model_snapshot) != model_hash:
                 raise DenseTrackError("tracking model snapshot changed during inference")
+            verify_bound_input_snapshots(staged, bound_snapshot_tree)
+            revalidate_source_files(source_bindings)
             payload = {
                 "schema": SCHEMA,
                 "generated_at_utc": utc_now(),
@@ -1176,18 +1589,16 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
                     "development_sequences_are_not_untouched_holdouts",
                 ],
                 "consensus": {
-                    "path": str(consensus_file),
-                    "sha256": consensus_hash,
+                    **published_consensus["consensus"],
                     "selected_model_side": side,
                     "capture_report_sha256": source_report_sha256,
+                    "capture_report": published_consensus["capture_report"],
+                    "inputs": published_consensus["inputs"],
                 },
                 "model": {
-                    "path": str(model_path),
+                    "source_path": str(model_path),
                     "sha256": model_hash,
-                    "execution_snapshot": {
-                        "path": model_snapshot_relative.as_posix(),
-                        "sha256": model_hash,
-                    },
+                    "execution_snapshot": model_snapshot_descriptor,
                 },
                 "runtime": {
                     **runtime,
@@ -1226,6 +1637,8 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
                 "dense track report",
             )
+            verify_bound_input_snapshots(staged, bound_snapshot_tree)
+            revalidate_source_files(source_bindings)
             owner_marker.unlink()
             fsync_directory(staged)
             write_text_exclusive(staged / "SHA256SUMS", "".join(

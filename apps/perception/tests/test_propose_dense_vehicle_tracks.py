@@ -195,6 +195,37 @@ def test_retained_track_mask_is_largest_component_inside_bbox():
             Result(), np.zeros((100, 100, 3), dtype=np.uint8)
         )
 
+    Result.boxes.id = np.asarray([7.0])
+    for malformed_class in (
+        np.asarray([2.5]), np.asarray([np.nan]), np.asarray([2, 3]), np.asarray([999])
+    ):
+        Box.cls = malformed_class
+        with pytest.raises(tracks.DenseTrackError, match="class"):
+            tracks.model_instances_from_result(
+                Result(), np.zeros((100, 100, 3), dtype=np.uint8)
+            )
+    Box.cls = np.asarray([2])
+
+    for malformed_confidence in (
+        np.asarray([np.nan]), np.asarray([0.9, 0.8]), np.asarray([1.1])
+    ):
+        Box.conf = malformed_confidence
+        with pytest.raises(tracks.DenseTrackError, match="confidence"):
+            tracks.model_instances_from_result(
+                Result(), np.zeros((100, 100, 3), dtype=np.uint8)
+            )
+    Box.conf = np.asarray([0.95])
+
+    for malformed_ids in (
+        np.asarray([np.nan]), np.asarray([7.0, 8.0]), np.asarray([-1.0])
+    ):
+        Result.boxes.id = malformed_ids
+        with pytest.raises(tracks.DenseTrackError, match="tracking ID|tracker ID"):
+            tracks.model_instances_from_result(
+                Result(), np.zeros((100, 100, 3), dtype=np.uint8)
+            )
+    Result.boxes.id = np.asarray([7.0])
+
 
 def _jpeg(value):
     image = np.full((48, 64, 3), value, dtype=np.uint8)
@@ -364,6 +395,69 @@ def write_consensus_fixture(tmp_path):
     return consensus_path, reports, models
 
 
+def write_bound_pipeline_fixture(tmp_path):
+    capture, dense = write_dense_fixture(tmp_path / "dense")
+    source_path = Path(dense["source_event_report"]["path"])
+    reports = []
+    models = []
+    masks = []
+    for side in ("left", "right"):
+        model = tmp_path / f"{side}.pt"
+        model.write_bytes(f"{side}-model".encode())
+        models.append(model)
+        events = []
+        for event_index, source_event in enumerate(dense["source_events"]):
+            mask = np.zeros((48, 64), dtype=np.uint8)
+            mask[12:39, 14:50] = 255
+            mask_path = tmp_path / f"{side}-{event_index}.png"
+            assert cv2.imwrite(str(mask_path), mask)
+            masks.append(mask_path)
+            events.append({
+                "event_id": source_event["event_id"],
+                "camera_id": "ch1",
+                "selected_frame_timestamp_utc": source_event[
+                    "selected_frame_timestamp_utc"
+                ],
+                "frame": {
+                    "encoded_jpeg_sha256": source_event["frame_sha256"],
+                    "width": 64,
+                    "height": 48,
+                },
+                "matched_instance": {"bbox_xyxy": [10, 8, 54, 42]},
+                "ground_contact_proposal": {
+                    "pixel": [31.5, 38.0],
+                    "covariance_px2": [[4, 0], [0, 4]],
+                },
+                "mask": {"path": str(mask_path), "sha256": _sha(mask_path.read_bytes())},
+            })
+        report = {
+            "schema": "v2x-segmentation-ground-contact-proposals/v1",
+            "acceptance_eligible": False,
+            "capture_report": {
+                "path": str(source_path),
+                "sha256": _sha(source_path.read_bytes()),
+            },
+            "model": {"path": str(model), "sha256": _sha(model.read_bytes())},
+            "events": events,
+        }
+        report_path = tmp_path / f"{side}.json"
+        report_path.write_text(json.dumps(report))
+        reports.append(report_path)
+    consensus = tracks.rebuild_segmentation_consensus(*reports)
+    consensus_path = tmp_path / "consensus.json"
+    consensus_path.write_text(json.dumps(consensus))
+    return {
+        "capture": capture,
+        "dense": dense,
+        "source": source_path,
+        "frames": [capture.parent / row["path"] for row in dense["frames"]],
+        "consensus": consensus_path,
+        "reports": reports,
+        "models": models,
+        "masks": masks,
+    }
+
+
 def test_consensus_requires_both_exact_retained_model_artifacts(tmp_path):
     consensus, reports, models = write_consensus_fixture(tmp_path)
     selected_hash = _sha(models[0].read_bytes())
@@ -380,6 +474,24 @@ def test_consensus_requires_both_exact_retained_model_artifacts(tmp_path):
     reports[1].write_text(json.dumps(value))
     with pytest.raises(tracks.DenseTrackError, match="report or model identity"):
         tracks.load_consensus(consensus, selected_hash)
+
+
+def test_dense_consensus_loader_defensively_rejects_nonfinite_source_bbox(
+    tmp_path, monkeypatch
+):
+    consensus, _reports, models = write_consensus_fixture(tmp_path)
+    value = json.loads(consensus.read_text())
+    value["events"][0]["right"]["matched_instance"]["bbox_xyxy"] = [
+        float("nan"), 35, 119, 80
+    ]
+    consensus.write_text(json.dumps(value))
+    monkeypatch.setattr(
+        tracks, "rebuild_segmentation_consensus",
+        lambda *_paths: json.loads(consensus.read_text()),
+    )
+
+    with pytest.raises(tracks.DenseTrackError, match="right bbox is invalid"):
+        tracks.load_consensus(consensus, _sha(models[0].read_bytes()))
 
 
 def _valid_track_instance(contact_x=31.5):
@@ -519,7 +631,17 @@ def test_propose_publishes_one_verified_model_snapshot_and_bound_artifact_tree(
         lambda _path, _hash: (
             consensus_file.resolve(), consensus_raw,
             {"capture_report_sha256": dense["source_event_report"]["sha256"]},
-            consensus_index, "left",
+            consensus_index, "left", {
+                "consensus": tracks.pin_source_file(
+                    consensus_file, _sha(consensus_raw), "test consensus"
+                ),
+                "capture_report": tracks.pin_source_file(
+                    dense["source_event_report"]["path"],
+                    dense["source_event_report"]["sha256"],
+                    "test capture report",
+                ),
+                "inputs": [],
+            },
         ),
     )
     monkeypatch.setattr(
@@ -543,10 +665,170 @@ def test_propose_publishes_one_verified_model_snapshot_and_bound_artifact_tree(
     assert sequence["summary"]["temporal_contact_rejection_pair_count"] == 0
     snapshot = output / report["model"]["execution_snapshot"]["path"]
     assert snapshot.read_bytes() == model.read_bytes()
+    assert report["consensus"]["path"].startswith("inputs/reports/")
+    assert (output / report["consensus"]["path"]).is_file()
+    assert sequence["capture_report"]["path"].startswith("inputs/reports/")
+    assert sequence["capture_report"]["source_path"] == str(capture.resolve())
+    assert len(sequence["input_frames"]) == 3
+    for descriptor in sequence["input_frames"]:
+        assert (output / descriptor["path"]).is_file()
+        assert _sha((output / descriptor["path"]).read_bytes()) == descriptor["sha256"]
     for line in (output / "SHA256SUMS").read_text().splitlines():
         expected, relative = line.split("  ", 1)
         assert _sha((output / relative).read_bytes()) == expected
     assert not (output / tracks.STAGING_OWNER_MARKER).exists()
+
+
+def test_propose_snapshots_every_bound_input_before_inference(tmp_path, monkeypatch):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    output = tmp_path / "output"
+    tracks.propose(
+        [fixture["capture"]], fixture["consensus"], fixture["models"][0], output,
+        model_factory=lambda _path: Model(), image_size=1280,
+    )
+
+    report = json.loads((output / "report.json").read_text())
+    sequence = report["sequences"][0]
+    descriptors = [
+        report["consensus"],
+        report["consensus"]["capture_report"],
+        report["model"]["execution_snapshot"],
+        sequence["capture_report"],
+        sequence["source_event_report"],
+        *sequence["input_frames"],
+    ]
+    for consensus_input in report["consensus"]["inputs"]:
+        descriptors.extend([
+            consensus_input["report"], consensus_input["model"],
+            *consensus_input["masks"],
+        ])
+    assert len(report["consensus"]["inputs"]) == 2
+    assert len(sequence["input_frames"]) == 3
+    assert all(descriptor["path"].startswith("inputs/") for descriptor in descriptors)
+    assert all(Path(descriptor["source_path"]).is_absolute() for descriptor in descriptors)
+    for descriptor in descriptors:
+        snapshot = output / descriptor["path"]
+        assert snapshot.is_file()
+        assert _sha(snapshot.read_bytes()) == descriptor["sha256"]
+    for line in (output / "SHA256SUMS").read_text().splitlines():
+        expected, relative = line.split("  ", 1)
+        assert _sha((output / relative).read_bytes()) == expected
+
+
+@pytest.mark.parametrize(
+    "source_key,index",
+    [
+        ("capture", None),
+        ("source", None),
+        ("frames", 0),
+        ("consensus", None),
+        ("reports", 0),
+        ("reports", 1),
+        ("models", 0),
+        ("models", 1),
+        ("masks", 0),
+        ("masks", 2),
+    ],
+)
+def test_mutation_of_any_bound_input_during_inference_fails_and_cleans(
+    tmp_path, monkeypatch, source_key, index
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+    source = fixture[source_key] if index is None else fixture[source_key][index]
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    mutated = False
+
+    def factory(_path):
+        nonlocal mutated
+        if not mutated:
+            source.write_bytes(source.read_bytes() + b"\nmutated")
+            mutated = True
+        return Model()
+
+    output = tmp_path / "output"
+    with pytest.raises(tracks.DenseTrackError, match="changed during dense tracking"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=factory, image_size=1280,
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
+def test_same_content_source_replacement_during_inference_fails_and_cleans(
+    tmp_path, monkeypatch
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+    source = fixture["capture"]
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    def factory(_path):
+        replacement = source.with_suffix(".replacement")
+        replacement.write_bytes(source.read_bytes())
+        replacement.replace(source)
+        return Model()
+
+    output = tmp_path / "output"
+    with pytest.raises(tracks.DenseTrackError, match="changed during dense tracking"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=factory, image_size=1280,
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
+def test_staged_input_snapshot_mutation_during_inference_fails_and_cleans(
+    tmp_path, monkeypatch
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    def factory(model_snapshot):
+        staged = Path(model_snapshot).parents[2]
+        report_snapshot = next((staged / "inputs" / "reports").glob("*.json"))
+        report_snapshot.write_bytes(report_snapshot.read_bytes() + b"\nmutated")
+        return Model()
+
+    output = tmp_path / "output"
+    with pytest.raises(tracks.DenseTrackError, match="input snapshot changed"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=factory, image_size=1280,
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
 
 
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
@@ -587,6 +869,15 @@ tracks.load_consensus = lambda _path, _hash: (
     {"capture_report_sha256": "a" * 64},
     {},
     "left",
+    {
+        "consensus": tracks.pin_source_file(
+            consensus, tracks.sha256_file(consensus), "test consensus"
+        ),
+        "capture_report": tracks.pin_source_file(
+            consensus, tracks.sha256_file(consensus), "test capture"
+        ),
+        "inputs": [],
+    },
 )
 
 def stall_after_owner_marker(*_args, **_kwargs):

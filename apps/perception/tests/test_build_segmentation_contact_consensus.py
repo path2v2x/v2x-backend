@@ -135,6 +135,41 @@ def test_consensus_rejects_wrong_mask_dimensions_or_covariance(tmp_path):
         module.build(left, right)
 
 
+@pytest.mark.parametrize(
+    "bbox,error",
+    [
+        ([float("nan"), 35, 119, 80], "invalid"),
+        ([40, float("inf"), 120, 80], "invalid"),
+        ([40, 35, 120], "invalid"),
+        ([True, 35, 120, 80], "invalid"),
+        ([40, 35, 40, 80], "outside"),
+        ([-1, 35, 120, 80], "outside"),
+        ([40, 35, 161, 80], "outside"),
+    ],
+)
+def test_consensus_rejects_malformed_or_out_of_frame_bboxes(tmp_path, bbox, error):
+    left = proposal(tmp_path, "left", "a" * 64, [80, 79])
+    right = proposal(tmp_path, "right", "b" * 64, [81, 78.5], shift=1)
+    value = json.loads(right.read_text())
+    value["events"][0]["matched_instance"]["bbox_xyxy"] = bbox
+    right.write_text(json.dumps(value))
+
+    with pytest.raises(module.ConsensusError, match=error):
+        module.build(left, right)
+
+
+@pytest.mark.parametrize("bad_iou", [float("nan"), float("inf"), -0.1, 1.1])
+def test_consensus_rejects_nonfinite_or_out_of_range_iou(
+    tmp_path, monkeypatch, bad_iou
+):
+    left = proposal(tmp_path, "left", "a" * 64, [80, 79])
+    right = proposal(tmp_path, "right", "b" * 64, [81, 78.5], shift=1)
+    monkeypatch.setattr(module, "bbox_iou", lambda *_args: bad_iou)
+
+    with pytest.raises(module.ConsensusError, match="IoU"):
+        module.build(left, right)
+
+
 def test_consensus_rejects_silently_shrunk_capture_denominator(tmp_path):
     left = proposal(tmp_path, "left", "a" * 64, [80, 79])
     right = proposal(tmp_path, "right", "b" * 64, [81, 78.5], shift=1)

@@ -105,6 +105,27 @@ def valid_frame(frame):
     )
 
 
+def validated_bbox(value, frame, label):
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or not all(
+            isinstance(item, (int, float))
+            and not isinstance(item, bool)
+            and math.isfinite(float(item))
+            for item in value
+        )
+    ):
+        raise ConsensusError(f"{label} bbox is invalid")
+    x1, y1, x2, y2 = map(float, value)
+    if not (
+        0.0 <= x1 < x2 <= float(frame["width"])
+        and 0.0 <= y1 < y2 <= float(frame["height"])
+    ):
+        raise ConsensusError(f"{label} bbox is outside the frame")
+    return [x1, y1, x2, y2]
+
+
 def covariance_matrix(proposal):
     try:
         covariance = np.asarray(proposal["covariance_px2"], dtype=float)
@@ -150,9 +171,15 @@ def consensus_event(event_id, left, right):
     if not reasons:
         left_instance = left.get("matched_instance") or {}
         right_instance = right.get("matched_instance") or {}
-        box_agreement = bbox_iou(
-            left_instance.get("bbox_xyxy"), right_instance.get("bbox_xyxy")
+        left_bbox = validated_bbox(
+            left_instance.get("bbox_xyxy"), left_frame, "left model"
         )
+        right_bbox = validated_bbox(
+            right_instance.get("bbox_xyxy"), right_frame, "right model"
+        )
+        box_agreement = bbox_iou(left_bbox, right_bbox)
+        if not math.isfinite(box_agreement) or not 0.0 <= box_agreement <= 1.0:
+            raise ConsensusError("bbox IoU is outside [0, 1]")
         if box_agreement < MINIMUM_BBOX_IOU:
             reasons.append("bbox_iou_below_gate")
         mask_agreement = mask_iou(
