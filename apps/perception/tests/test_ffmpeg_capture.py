@@ -1,9 +1,11 @@
 import sys
+from contextlib import ExitStack
 from fractions import Fraction
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -82,6 +84,562 @@ class FakeCapture:
 
 
 class FfmpegCaptureTests(unittest.TestCase):
+    def _run_real_open_boundary_probe(self, input_path, ffmpeg_binary):
+        script = r'''
+import gc
+import json
+import os
+import sys
+import threading
+import time
+
+sys.path.insert(0, sys.argv[1])
+import ffmpeg_capture
+
+created_directories = []
+real_temporary_directory = ffmpeg_capture.tempfile.TemporaryDirectory
+
+def tracked_temporary_directory(*args, **kwargs):
+    temporary = real_temporary_directory(*args, **kwargs)
+    created_directories.append(temporary.name)
+    return temporary
+
+ffmpeg_capture.tempfile.TemporaryDirectory = tracked_temporary_directory
+baseline_fds = len(os.listdir("/proc/self/fd"))
+baseline_threads = len(threading.enumerate())
+started = time.monotonic()
+try:
+    ffmpeg_capture.FfmpegNvdecCapture.from_file(
+        sys.argv[2],
+        ffmpeg_binary=sys.argv[3],
+        open_timeout_ms=100,
+        read_timeout_ms=100,
+    )
+except ffmpeg_capture.NvdecCaptureError as exc:
+    error = str(exc)
+else:
+    raise SystemExit(2)
+elapsed = time.monotonic() - started
+gc.collect()
+time.sleep(0.05)
+print(json.dumps({
+    "elapsed": elapsed,
+    "error": error,
+    "fd_delta": len(os.listdir("/proc/self/fd")) - baseline_fds,
+    "thread_delta": len(threading.enumerate()) - baseline_threads,
+    "temporary_paths_remaining": sum(
+        int(os.path.exists(path)) for path in created_directories
+    ),
+}), flush=True)
+'''
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(PERCEPTION_DIR),
+                str(input_path),
+                str(ffmpeg_binary),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2.5,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        return json.loads(process.stdout.strip().splitlines()[-1])
+
+    def test_real_early_exit_child_wakes_fifo_open_without_outer_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.mp4"
+            input_path.write_bytes(b"early-exit-open-boundary")
+            result = self._run_real_open_boundary_probe(
+                input_path, "/bin/true"
+            )
+
+        self.assertIn("open failed", result["error"])
+        self.assertLess(result["elapsed"], 1.0)
+        self.assertEqual(result["fd_delta"], 0)
+        self.assertEqual(result["thread_delta"], 0)
+        self.assertEqual(result["temporary_paths_remaining"], 0)
+
+    def test_real_alive_no_output_child_is_reaped_at_open_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            input_path = directory / "input.mp4"
+            input_path.write_bytes(b"alive-no-output-open-boundary")
+            pid_path = directory / "helper.pid"
+            helper = directory / "alive-no-output-ffmpeg"
+            helper.write_text(
+                f"#!{sys.executable}\n"
+                "import os\n"
+                "import time\n"
+                f"with open({str(pid_path)!r}, 'w') as handle:\n"
+                "    handle.write(str(os.getpid()))\n"
+                "    handle.flush()\n"
+                "    os.fsync(handle.fileno())\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            result = self._run_real_open_boundary_probe(input_path, helper)
+            self.assertTrue(pid_path.exists())
+            helper_pid = int(pid_path.read_text(encoding="utf-8"))
+
+        self.assertIn("open failed", result["error"])
+        self.assertLess(result["elapsed"], 1.0)
+        self.assertFalse(Path(f"/proc/{helper_pid}").exists())
+        self.assertEqual(result["fd_delta"], 0)
+        self.assertEqual(result["thread_delta"], 0)
+        self.assertEqual(result["temporary_paths_remaining"], 0)
+
+    def test_pending_cancel_after_child_start_skips_native_open(self):
+        cancel_event = threading.Event()
+
+        class Process:
+            pid = 54320
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout):
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        process = Process()
+
+        def start_child(*_args, **_kwargs):
+            cancel_event.set()
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.mp4"
+            input_path.write_bytes(b"pre-native-cancel-test")
+            with patch(
+                "ffmpeg_capture.subprocess.Popen", side_effect=start_child
+            ), patch(
+                "ffmpeg_capture.cv2.VideoCapture"
+            ) as video_capture, patch("ffmpeg_capture.os.killpg") as killpg:
+                with self.assertRaisesRegex(NvdecCaptureError, "cancelled"):
+                    FfmpegNvdecCapture.from_file(
+                        input_path,
+                        ffmpeg_binary="/bin/true",
+                        cancel_event=cancel_event,
+                    )
+
+        video_capture.assert_not_called()
+        killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertIsNotNone(process.poll())
+
+    def test_cancel_during_native_open_uses_monitored_producer_wake(self):
+        open_entered = threading.Event()
+        allow_open_return = threading.Event()
+        open_returned = threading.Event()
+        cancel_event = threading.Event()
+        observed_params = []
+        release_observed_dead = []
+        errors = []
+
+        class Process:
+            pid = 54321
+
+            def __init__(self):
+                self.returncode = None
+                self.waits = []
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout):
+                self.waits.append(timeout)
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        class BlockingCapture:
+            def __init__(self, _path, _backend, params):
+                observed_params.extend(params)
+                open_entered.set()
+                if not allow_open_return.wait(2.0):
+                    raise RuntimeError("test open boundary was not released")
+                open_returned.set()
+
+            def isOpened(self):
+                return True
+
+            def release(self):
+                release_observed_dead.append(process.poll() is not None)
+
+        process = Process()
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.mp4"
+            input_path.write_bytes(b"bounded-open-test")
+
+            def construct():
+                try:
+                    FfmpegNvdecCapture.from_file(
+                        input_path,
+                        ffmpeg_binary="/bin/true",
+                        open_timeout_ms=1234,
+                        read_timeout_ms=2345,
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch(
+                "ffmpeg_capture.subprocess.Popen", return_value=process
+            ), patch(
+                "ffmpeg_capture.cv2.VideoCapture", side_effect=BlockingCapture
+            ), patch("ffmpeg_capture.os.killpg") as killpg:
+                owner = threading.Thread(target=construct)
+                owner.start()
+                self.assertTrue(open_entered.wait(1.0))
+                cancel_event.set()
+                time.sleep(0.08)
+                self.assertEqual(killpg.call_count, 1)
+                self.assertIsNotNone(process.poll())
+                allow_open_return.set()
+                owner.join(2.0)
+
+            self.assertFalse(owner.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], NvdecCaptureError)
+        self.assertIn("cancelled", str(errors[0]))
+        self.assertTrue(open_returned.is_set())
+        killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertEqual(process.waits, [3])
+        self.assertEqual(release_observed_dead, [True])
+        open_timeout = getattr(
+            __import__("cv2"), "CAP_PROP_OPEN_TIMEOUT_MSEC", None
+        )
+        read_timeout = getattr(
+            __import__("cv2"), "CAP_PROP_READ_TIMEOUT_MSEC", None
+        )
+        if open_timeout is not None:
+            self.assertIn(open_timeout, observed_params)
+            self.assertEqual(
+                observed_params[observed_params.index(open_timeout) + 1], 1234
+            )
+        if read_timeout is not None:
+            self.assertIn(read_timeout, observed_params)
+            self.assertEqual(
+                observed_params[observed_params.index(read_timeout) + 1], 2345
+            )
+
+    def test_cancelled_native_open_reaps_real_ffmpeg_process(self):
+        open_entered = threading.Event()
+        allow_open_return = threading.Event()
+        cancel_event = threading.Event()
+        capture_released = threading.Event()
+        errors = []
+
+        class BlockingCapture:
+            def __init__(self, _path, _backend, _params):
+                open_entered.set()
+                if not allow_open_return.wait(3.0):
+                    raise RuntimeError("test open boundary was not released")
+
+            def isOpened(self):
+                return True
+
+            def release(self):
+                capture_released.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            input_path = directory / "input.mp4"
+            input_path.write_bytes(b"real-child-reap-test")
+            pid_path = directory / "ffmpeg.pid"
+            helper = directory / "bounded-ffmpeg-helper"
+            helper.write_text(
+                f"#!{sys.executable}\n"
+                "import os\n"
+                "import time\n"
+                "with open(os.environ['V2X_TEST_FFMPEG_PID'], 'w') as handle:\n"
+                "    handle.write(str(os.getpid()))\n"
+                "    handle.flush()\n"
+                "    os.fsync(handle.fileno())\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+
+            def construct():
+                try:
+                    FfmpegNvdecCapture.from_file(
+                        input_path,
+                        ffmpeg_binary=helper,
+                        open_timeout_ms=500,
+                        read_timeout_ms=500,
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            pid = None
+            owner = threading.Thread(target=construct)
+            started = time.monotonic()
+            try:
+                with patch(
+                    "ffmpeg_capture.cv2.VideoCapture",
+                    side_effect=BlockingCapture,
+                ), patch.dict(
+                    os.environ,
+                    {"V2X_TEST_FFMPEG_PID": str(pid_path)},
+                ):
+                    owner.start()
+                    self.assertTrue(open_entered.wait(1.0))
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline and not pid_path.exists():
+                        time.sleep(0.01)
+                    self.assertTrue(pid_path.exists())
+                    pid = int(pid_path.read_text(encoding="utf-8"))
+                    self.assertTrue(Path(f"/proc/{pid}").exists())
+                    cancel_event.set()
+                    time.sleep(0.08)
+                    # The boundary monitor reaps the writer, then supplies a
+                    # temporary FIFO EOF wake without releasing OpenCV itself.
+                    self.assertFalse(Path(f"/proc/{pid}").exists())
+                    allow_open_return.set()
+                    owner.join(3.0)
+            finally:
+                allow_open_return.set()
+                if owner.is_alive():
+                    owner.join(1.0)
+                if pid is not None and Path(f"/proc/{pid}").exists():
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            self.assertFalse(owner.is_alive())
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], NvdecCaptureError)
+            self.assertIn("cancelled", str(errors[0]))
+            self.assertTrue(capture_released.is_set())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+
+    def test_successful_open_starts_watcher_for_later_cancellation(self):
+        cancel_event = threading.Event()
+        watcher_signalled = threading.Event()
+        capture_released = threading.Event()
+
+        class Process:
+            pid = 54322
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout):
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        class OpenCapture:
+            def isOpened(self):
+                return True
+
+            def release(self):
+                capture_released.set()
+
+        process = Process()
+
+        def record_signal(pid, sent_signal):
+            self.assertEqual((pid, sent_signal), (process.pid, signal.SIGTERM))
+            watcher_signalled.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.mp4"
+            input_path.write_bytes(b"post-open-cancel-test")
+            with patch(
+                "ffmpeg_capture.subprocess.Popen", return_value=process
+            ), patch(
+                "ffmpeg_capture.cv2.VideoCapture", return_value=OpenCapture()
+            ), patch(
+                "ffmpeg_capture.os.killpg", side_effect=record_signal
+            ) as killpg:
+                capture = FfmpegNvdecCapture.from_file(
+                    input_path,
+                    ffmpeg_binary="/bin/true",
+                    cancel_event=cancel_event,
+                )
+                self.assertTrue(capture.isOpened())
+                cancel_event.set()
+                self.assertTrue(watcher_signalled.wait(1.0))
+                capture.release()
+
+        self.assertGreaterEqual(killpg.call_count, 2)
+        self.assertIsNotNone(process.poll())
+        self.assertTrue(capture_released.is_set())
+
+    def test_open_boundary_failures_always_use_owner_cleanup(self):
+        class Process:
+            pid = 54323
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout):
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        class StageCapture:
+            def __init__(self, stage, process, releases):
+                self.stage = stage
+                self.process = process
+                self.releases = releases
+
+            def isOpened(self):
+                if self.stage == "isOpened":
+                    raise RuntimeError("synthetic isOpened failure")
+                return True
+
+            def release(self):
+                self.releases.append(self.process.poll() is not None)
+
+        original_thread_start = threading.Thread.start
+        for stage in (
+            "constructor",
+            "isOpened",
+            "open_monitor_start",
+            "runtime_watcher_start",
+        ):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                input_path = Path(directory) / "input.mp4"
+                input_path.write_bytes(b"open-failure-test")
+                process = Process()
+                releases = []
+
+                def open_capture(*_args, **_kwargs):
+                    if stage == "constructor":
+                        raise RuntimeError("synthetic constructor failure")
+                    return StageCapture(stage, process, releases)
+
+                with ExitStack() as stack:
+                    stack.enter_context(patch(
+                        "ffmpeg_capture.subprocess.Popen",
+                        return_value=process,
+                    ))
+                    stack.enter_context(patch(
+                        "ffmpeg_capture.cv2.VideoCapture",
+                        side_effect=open_capture,
+                    ))
+                    killpg = stack.enter_context(patch(
+                        "ffmpeg_capture.os.killpg"
+                    ))
+                    if stage == "open_monitor_start":
+                        stack.enter_context(patch(
+                            "ffmpeg_capture.threading.Thread.start",
+                            side_effect=RuntimeError(
+                                "synthetic thread start failure"
+                            ),
+                        ))
+                    elif stage == "runtime_watcher_start":
+                        start_calls = []
+
+                        def fail_second_start(thread):
+                            start_calls.append(thread)
+                            if len(start_calls) == 2:
+                                raise RuntimeError(
+                                    "synthetic runtime watcher start failure"
+                                )
+                            return original_thread_start(thread)
+
+                        stack.enter_context(patch(
+                            "ffmpeg_capture.threading.Thread.start",
+                            autospec=True,
+                            side_effect=fail_second_start,
+                        ))
+                    with self.assertRaisesRegex(RuntimeError, "synthetic"):
+                        FfmpegNvdecCapture.from_file(
+                            input_path,
+                            ffmpeg_binary="/bin/true",
+                            cancel_event=threading.Event(),
+                        )
+
+                killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(
+                    releases,
+                    [True]
+                    if stage in ("isOpened", "runtime_watcher_start")
+                    else [],
+                )
+
+    def test_finite_native_open_timeout_returns_to_owner_cleanup(self):
+        observed_params = []
+
+        class Process:
+            pid = 54324
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout):
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        class TimedOutCapture:
+            def __init__(self, _path, _backend, params):
+                observed_params.extend(params)
+                time.sleep(0.05)
+
+            def isOpened(self):
+                return False
+
+            def release(self):
+                return None
+
+        process = Process()
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.mp4"
+            input_path.write_bytes(b"finite-open-timeout-test")
+            started = time.monotonic()
+            with patch(
+                "ffmpeg_capture.subprocess.Popen", return_value=process
+            ), patch(
+                "ffmpeg_capture.cv2.VideoCapture", side_effect=TimedOutCapture
+            ), patch("ffmpeg_capture.os.killpg") as killpg:
+                with self.assertRaisesRegex(NvdecCaptureError, "open failed"):
+                    FfmpegNvdecCapture.from_file(
+                        input_path,
+                        ffmpeg_binary="/bin/true",
+                        open_timeout_ms=75,
+                        read_timeout_ms=125,
+                    )
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertIsNotNone(process.poll())
+        open_timeout = getattr(
+            __import__("cv2"), "CAP_PROP_OPEN_TIMEOUT_MSEC", None
+        )
+        read_timeout = getattr(
+            __import__("cv2"), "CAP_PROP_READ_TIMEOUT_MSEC", None
+        )
+        if open_timeout is not None:
+            self.assertEqual(
+                observed_params[observed_params.index(open_timeout) + 1], 75
+            )
+        if read_timeout is not None:
+            self.assertEqual(
+                observed_params[observed_params.index(read_timeout) + 1], 125
+            )
+
     def test_release_fails_closed_and_retains_a_surviving_process(self):
         class SurvivingProcess:
             pid = 12345

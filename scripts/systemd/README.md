@@ -145,6 +145,15 @@ Do not kill the old tunnel before public config switches. After cutover require
 exactly one cloudflared process targeting `localhost:8090`; stopping either
 Quick Tunnel invalidates that process's hostname.
 
+The perception unit deliberately uses `KillMode=mixed`, not `process` or the
+default `control-group`. On a normal stop or restart, systemd sends SIGTERM only
+to the Python main process so its bounded owner cleanup can terminate and reap
+each FFmpeg FIFO writer before releasing the corresponding OpenCV capture. If
+Python crashes, exits with a surviving child, or fails to finish within
+`TimeoutStopSec=60`, systemd's subsequent SIGKILL covers the entire service
+cgroup before `Restart=always` starts a replacement. This preserves cooperative
+writer-first teardown without allowing decoder children to escape the unit.
+
 Install the source-controlled scripts into the reconciled live checkout first,
 then install units:
 

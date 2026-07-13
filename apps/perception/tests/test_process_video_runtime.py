@@ -996,6 +996,16 @@ class LivePipelineTimestampTests(unittest.TestCase):
             if line.startswith("TimeoutStopSec=")
         )
         self.assertGreater(value, _COOPERATIVE_SHUTDOWN_CEILING_SECONDS)
+        self.assertEqual(value, 60.0)
+        self.assertIn("KillMode=mixed", unit.splitlines())
+        self.assertNotIn("KillMode=process", unit.splitlines())
+        self.assertIn("KillSignal=SIGTERM", unit.splitlines())
+        self.assertIn("SendSIGKILL=yes", unit.splitlines())
+        self.assertIn("FinalKillSignal=SIGKILL", unit.splitlines())
+        launch = (
+            PERCEPTION_DIR.parents[1] / "scripts/launch-perception.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('exec "${PYTHON_BIN}" process_video.py', launch)
 
     @patch("process_video.LiveStreamReader", FakeReader)
     def test_pre_requested_shutdown_cleans_up_without_consuming_frames(self):

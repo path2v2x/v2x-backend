@@ -50,8 +50,14 @@ ExecStartPre=/usr/bin/test -x /usr/bin/ffmpeg
 ExecStart=/home/path/V2XCarla/v2x-backend/scripts/launch-perception.sh
 Restart=always
 RestartSec=10
+# Signal Python first so its bounded owner cleanup can reap FIFO writers before
+# OpenCV release. Any process surviving Python exit or this stop timeout is
+# still killed across the whole cgroup by systemd's mixed-mode SIGKILL phase.
+KillMode=mixed
 TimeoutStopSec=60
 KillSignal=SIGTERM
+SendSIGKILL=yes
+FinalKillSignal=SIGKILL
 
 [Install]
 WantedBy=multi-user.target
