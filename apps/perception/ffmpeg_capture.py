@@ -14,12 +14,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import inspect
 import os
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 from urllib.parse import urljoin, urlparse
 
 import cv2
@@ -202,6 +204,7 @@ class FfmpegNvdecCapture:
         read_timeout_ms=10_000,
         ffmpeg_binary="/usr/bin/ffmpeg",
         http_get=requests.get,
+        cancel_event=None,
     ):
         if (source_url is None) == (file_path is None):
             raise ValueError("provide exactly one of source_url or file_path")
@@ -210,6 +213,14 @@ class FfmpegNvdecCapture:
         self._memfd = None
         self._temporary_directory = None
         self._opened = False
+        self._cancel_event = cancel_event
+        self._cancel_watcher_stop = threading.Event()
+        self._cancel_watcher = None
+        self._process_lock = threading.RLock()
+
+        def raise_if_cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise NvdecCaptureError("NVDEC capture cancelled")
 
         binary = Path(ffmpeg_binary)
         if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
@@ -218,6 +229,7 @@ class FfmpegNvdecCapture:
             raise NvdecCaptureError("NVDEC FFmpeg binary is not executable")
 
         try:
+            raise_if_cancelled()
             self._temporary_directory = tempfile.TemporaryDirectory(
                 prefix="v2x-nvdec-"
             )
@@ -228,6 +240,7 @@ class FfmpegNvdecCapture:
             if source_url is not None:
                 response = http_get(str(source_url), timeout=10)
                 response.raise_for_status()
+                raise_if_cancelled()
                 master = rewrite_hls_master(str(source_url), response.text)
                 self._memfd = os.memfd_create("v2x-hls-master", 0)
                 os.write(self._memfd, master)
@@ -248,7 +261,7 @@ class FfmpegNvdecCapture:
             command = build_nvdec_command(
                 binary, input_reference, fifo_path, hls=is_hls
             )
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 command,
                 pass_fds=pass_fds,
                 stdin=subprocess.DEVNULL,
@@ -258,6 +271,14 @@ class FfmpegNvdecCapture:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            with self._process_lock:
+                self._process = process
+            if cancel_event is not None:
+                self._cancel_watcher = threading.Thread(
+                    target=self._watch_for_cancel,
+                    daemon=True,
+                )
+                self._cancel_watcher.start()
             params = []
             open_timeout = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
             read_timeout = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
@@ -268,6 +289,7 @@ class FfmpegNvdecCapture:
             self._capture = cv2.VideoCapture(
                 str(fifo_path), cv2.CAP_FFMPEG, params
             )
+            raise_if_cancelled()
             self._opened = bool(
                 self._capture is not None
                 and self._capture.isOpened()
@@ -307,12 +329,14 @@ class FfmpegNvdecCapture:
         return self._capture.get(property_id)
 
     def release(self):
+        self._cancel_watcher_stop.set()
         self._opened = False
         capture, self._capture = self._capture, None
         if capture is not None:
             capture.release()
 
-        process, self._process = self._process, None
+        with self._process_lock:
+            process, self._process = self._process, None
         if process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -337,6 +361,25 @@ class FfmpegNvdecCapture:
         temporary, self._temporary_directory = self._temporary_directory, None
         if temporary is not None:
             temporary.cleanup()
+        watcher, self._cancel_watcher = self._cancel_watcher, None
+        if (
+            watcher is not None
+            and watcher is not threading.current_thread()
+            and watcher.is_alive()
+        ):
+            watcher.join(timeout=0.2)
+
+    def _watch_for_cancel(self):
+        while not self._cancel_watcher_stop.is_set():
+            if self._cancel_event.wait(0.05):
+                with self._process_lock:
+                    process = self._process
+                if process is not None and process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                return
 
 
 def match_fragment_frame_nvdec(
@@ -346,6 +389,7 @@ def match_fragment_frame_nvdec(
     frame_identity,
     *,
     capture_factory=None,
+    cancel_event=None,
 ):
     """Match exactly one decoded frame using the same NVDEC pixel path."""
     capture_factory = capture_factory or FfmpegNvdecCapture.from_file
@@ -359,11 +403,28 @@ def match_fragment_frame_nvdec(
             fragment_file.write(init_bytes)
             fragment_file.write(segment_bytes)
 
-        capture = capture_factory(path)
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        try:
+            parameters = inspect.signature(capture_factory).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs = (
+            {"cancel_event": cancel_event}
+            if "cancel_event" in parameters
+            or any(
+                value.kind == inspect.Parameter.VAR_KEYWORD
+                for value in parameters.values()
+            )
+            else {}
+        )
+        capture = capture_factory(path, **kwargs)
         if capture is None or not capture.isOpened():
             return None
         matches = []
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             ok, frame = capture.read()
             if not ok or frame is None:
                 break

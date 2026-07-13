@@ -289,6 +289,7 @@ class FrameBroadcaster:
                 "terminal_failover_last_duration_seconds": None,
                 "terminal_failover_last_method": None,
                 "terminal_failover_last_stage": None,
+                "terminal_failover_last_evidence": None,
                 "media_clock_status": "unavailable",
                 "media_time_trusted": False,
                 "decode_latency_ms": None,
@@ -429,7 +430,8 @@ class FrameBroadcaster:
             self.condition.notify_all()
 
     def mark_terminal_failover(
-        self, camera_id, outcome, duration_seconds, method, stage=None
+        self, camera_id, outcome, duration_seconds, method, stage=None,
+        evidence=None,
     ):
         if outcome not in {"succeeded", "failed", "stopped"}:
             raise ValueError("terminal failover outcome is invalid")
@@ -451,13 +453,19 @@ class FrameBroadcaster:
             "first_frame",
             "capture_position",
             "recent_exact_anchor",
-            "prior_clock_validation",
             "clock_resolution",
             "clock_validation",
             "ready",
             "failed",
         }:
             raise ValueError("terminal failover stage is invalid")
+        if evidence not in {
+            None,
+            "recent_exact_sequence",
+            "exact_fragment_match",
+            "no_media_clock",
+        }:
+            raise ValueError("terminal failover evidence is invalid")
         with self.condition:
             health = self.camera_health[camera_id]
             health["terminal_failover_attempts"] += 1
@@ -468,6 +476,7 @@ class FrameBroadcaster:
             health["terminal_failover_last_outcome"] = outcome
             health["terminal_failover_last_method"] = method
             health["terminal_failover_last_stage"] = stage
+            health["terminal_failover_last_evidence"] = evidence
             health["terminal_failover_last_duration_seconds"] = round(
                 duration, 3
             )
@@ -546,6 +555,9 @@ class FrameBroadcaster:
                     ],
                     "terminal_failover_last_stage": entry[
                         "terminal_failover_last_stage"
+                    ],
+                    "terminal_failover_last_evidence": entry[
+                        "terminal_failover_last_evidence"
                     ],
                     "media_clock_status": entry["media_clock_status"],
                     "media_time_trusted": entry["media_time_trusted"],
@@ -1133,7 +1145,7 @@ class MultiCameraPipeline:
                 )
             return path
 
-        def _open_capture(source, live):
+        def _open_capture(source, live, cancel_event=None):
             if not live:
                 return cv2.VideoCapture(source)
 
@@ -1143,6 +1155,7 @@ class MultiCameraPipeline:
                     open_timeout_ms=open_timeout_ms,
                     read_timeout_ms=read_timeout_ms,
                     ffmpeg_binary=ffmpeg_binary,
+                    cancel_event=cancel_event,
                 )
 
             params = []
@@ -1169,7 +1182,8 @@ class MultiCameraPipeline:
 
             def _state_callback(index):
                 def callback(
-                    state, error, failures, delay_seconds, method=None, stage=None
+                    state, error, failures, delay_seconds, method=None, stage=None,
+                    evidence=None,
                 ):
                     if state == "connected":
                         if stream_broadcaster:
@@ -1182,12 +1196,12 @@ class MultiCameraPipeline:
                         if stream_broadcaster:
                             stream_broadcaster.mark_terminal_failover(
                                 camera_ids[index], outcome, delay_seconds, method,
-                                stage,
+                                stage, evidence,
                             )
                         print(
                             f"Camera {camera_ids[index]} terminal failover "
                             f"{outcome} at {stage or 'unknown'} after "
-                            f"{delay_seconds:.3f}s."
+                            f"{delay_seconds:.3f}s ({evidence or 'no evidence'})."
                         )
                         return
                     if stream_broadcaster:
@@ -1237,7 +1251,9 @@ class MultiCameraPipeline:
                 recovery = StreamRecovery(reconnect_initial, reconnect_max)
                 reader = LiveStreamReader(
                     source_factory=lambda index=index: _source_for(index),
-                    capture_factory=lambda source: _open_capture(source, True),
+                    capture_factory=lambda source, cancel_event=None: _open_capture(
+                        source, True, cancel_event=cancel_event
+                    ),
                     recovery=recovery,
                     state_callback=_state_callback(index),
                     frame_callback=_frame_callback(index),

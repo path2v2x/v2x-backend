@@ -19,6 +19,22 @@ from runtime_health import sanitize_source_error
 _PROACTIVE_PREPARATION_SEMAPHORE = threading.Semaphore(1)
 
 
+def _call_with_supported_kwargs(factory, *args, **kwargs):
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_keywords = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    supported = {
+        key: value for key, value in kwargs.items()
+        if accepts_keywords or key in parameters
+    }
+    return factory(*args, **supported)
+
+
 class _ProactiveRenewal(Exception):
     """Internal control flow for rotating a signed source before expiry."""
 
@@ -30,6 +46,8 @@ class _AsyncMediaClockResolution:
         self._factory = factory
         self._args = args
         self._kwargs = dict(kwargs or {})
+        self._cancelled = threading.Event()
+        self._kwargs.setdefault("cancel_event", self._cancelled)
         self._done = threading.Event()
         self._result = None
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -69,6 +87,15 @@ class _AsyncMediaClockResolution:
             return False, None
         return True, self._result
 
+    def discard(self):
+        self._cancelled.set()
+
+    def join(self, timeout=0.0):
+        self._thread.join(max(0.0, float(timeout)))
+
+    def is_alive(self):
+        return self._thread.is_alive()
+
 
 class _AsyncCapturePreparation:
     """Open, clock, and continuously drain a replacement capture off-thread."""
@@ -103,6 +130,7 @@ class _AsyncCapturePreparation:
         self._result_lock = threading.Lock()
         self._result = None
         self._failed = False
+        self._success_evidence = None
         self._stage_lock = threading.Lock()
         self._stage = "source"
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -115,6 +143,9 @@ class _AsyncCapturePreparation:
     def stage(self):
         with self._stage_lock:
             return self._stage
+
+    def evidence(self):
+        return self._success_evidence
 
     def _run(self):
         capture = None
@@ -142,7 +173,11 @@ class _AsyncCapturePreparation:
             )
             prepared_clock_source = clock_source
             self._set_stage("capture_open")
-            capture = self._capture_factory(source)
+            capture = _call_with_supported_kwargs(
+                self._capture_factory,
+                source,
+                cancel_event=self._discarded,
+            )
             if self._clock_source_factory is not None:
                 source = None
             if capture is None or not capture.isOpened():
@@ -178,6 +213,7 @@ class _AsyncCapturePreparation:
                             prepared_clock_source,
                         )
                         capture = None
+                    self._success_evidence = "no_media_clock"
                     return
                 if position is None:
                     self._set_stage("capture_position")
@@ -240,6 +276,7 @@ class _AsyncCapturePreparation:
                     )
                     capture = None
                 self._set_stage("ready")
+                self._success_evidence = "exact_fragment_match"
                 return
             raise RuntimeError("capture preparation stopped")
         except Exception:
@@ -253,6 +290,8 @@ class _AsyncCapturePreparation:
             self._media_clock_validator = None
             self._capture_position_milliseconds = None
             self._media_frame_identity = None
+            if clock_resolution is not None:
+                clock_resolution.discard()
             if capture is not None:
                 capture.release()
             if preparation_slot_acquired:
@@ -340,6 +379,7 @@ class _AsyncCaptureRestart:
         self._result_lock = threading.Lock()
         self._result = None
         self._failed = False
+        self._success_evidence = None
         self._stage_lock = threading.Lock()
         self._stage = "capture_open"
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -353,6 +393,9 @@ class _AsyncCaptureRestart:
         with self._stage_lock:
             return self._stage
 
+    def evidence(self):
+        return self._success_evidence
+
     def _run(self):
         capture = None
         clock_resolution = None
@@ -360,7 +403,11 @@ class _AsyncCaptureRestart:
         clock_source = self._clock_source
         try:
             self._set_stage("capture_open")
-            capture = self._capture_factory(source)
+            capture = _call_with_supported_kwargs(
+                self._capture_factory,
+                source,
+                cancel_event=self._discarded,
+            )
             if capture is None or not capture.isOpened():
                 raise RuntimeError("capture open failed")
             self._set_stage("first_frame")
@@ -462,41 +509,8 @@ class _AsyncCaptureRestart:
                                 )
                                 capture = None
                             self._set_stage("ready")
+                            self._success_evidence = "recent_exact_sequence"
                             return
-                if (
-                    self._prior_media_clock is not None
-                    and self._media_clock_validator is not None
-                ):
-                    self._set_stage("prior_clock_validation")
-                    prior_frame_clock = self._prior_media_clock.metadata_at(position)
-                    prior_clock_valid = (
-                        prior_frame_clock is not None
-                        and self._media_clock_validator(
-                            prior_frame_clock, source_epoch
-                        )
-                    )
-                    if prior_clock_valid:
-                        with self._result_lock:
-                            if self._discarded.is_set():
-                                return
-                            self._result = (
-                                capture,
-                                frame,
-                                source_epoch,
-                                source_monotonic,
-                                position,
-                                self._prior_media_clock,
-                                source,
-                                clock_source,
-                            )
-                            capture = None
-                        self._set_stage("ready")
-                        return
-                    # A restarted decoder may reset its capture cursor even
-                    # against the same signed HLS session. Try the prior exact
-                    # mapping once; an invalid mapping is discarded and the
-                    # existing exact fragment matcher remains the only fallback.
-                    self._prior_media_clock = None
                 if self._media_clock_factory is None:
                     with self._result_lock:
                         if self._discarded.is_set():
@@ -512,8 +526,15 @@ class _AsyncCaptureRestart:
                             clock_source,
                         )
                         capture = None
+                    self._success_evidence = "no_media_clock"
                     return
-                if clock_resolution is None:
+                if (
+                    clock_resolution is None
+                    and (
+                        not self._recent_exact_media_anchors
+                        or len(self._restart_exact_frames) >= 3
+                    )
+                ):
                     clock_resolution = _AsyncMediaClockResolution(
                         self._media_clock_factory,
                         (
@@ -530,6 +551,8 @@ class _AsyncCaptureRestart:
                         },
                     )
                     self._set_stage("clock_resolution")
+                if clock_resolution is None:
+                    continue
                 resolved, media_clock = clock_resolution.poll()
                 if not resolved:
                     continue
@@ -559,6 +582,7 @@ class _AsyncCaptureRestart:
                     )
                     capture = None
                 self._set_stage("ready")
+                self._success_evidence = "exact_fragment_match"
                 return
             raise RuntimeError("capture restart stopped")
         except Exception:
@@ -576,6 +600,8 @@ class _AsyncCaptureRestart:
             self._prior_media_time_utc = None
             self._capture_position_milliseconds = None
             self._media_frame_identity = None
+            if clock_resolution is not None:
+                clock_resolution.discard()
             if capture is not None:
                 capture.release()
             self._done.set()
@@ -838,7 +864,8 @@ class LiveStreamReader:
         return self.snapshot(after_sequence)
 
     def _notify(
-        self, state, error=None, delay_seconds=0.0, method=None, stage=None
+        self, state, error=None, delay_seconds=0.0, method=None, stage=None,
+        evidence=None,
     ):
         if self.state_callback:
             self.state_callback(
@@ -848,6 +875,7 @@ class LiveStreamReader:
                 delay_seconds=float(delay_seconds),
                 method=method,
                 stage=stage,
+                evidence=evidence,
             )
 
     def _remember_frame_identity(self, identity):
@@ -911,13 +939,14 @@ class LiveStreamReader:
         started = self.monotonic()
         deadline = started + self.terminal_read_failover_seconds
 
-        def finish(result, outcome, method, stage):
+        def finish(result, outcome, method, stage, evidence=None):
             elapsed = max(0.0, self.monotonic() - started)
             self._notify(
                 f"terminal_failover_{outcome}",
                 delay_seconds=elapsed,
                 method=method,
                 stage=stage,
+                evidence=evidence,
             )
             return result
 
@@ -949,7 +978,8 @@ class LiveStreamReader:
             if done:
                 if not failed and result is not None:
                     return finish(
-                        candidate.take(), "succeeded", method, candidate.stage()
+                        candidate.take(), "succeeded", method,
+                        candidate.stage(), candidate.evidence(),
                     )
                 failed_stage = candidate.stage()
                 candidate.discard()

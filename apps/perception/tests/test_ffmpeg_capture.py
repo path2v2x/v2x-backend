@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import threading
 import unittest
 
 import numpy as np
@@ -127,6 +128,22 @@ class FfmpegCaptureTests(unittest.TestCase):
         )
         self.assertEqual(result, 50.0)
         self.assertEqual(exact_calls, [1])
+
+    def test_cancelled_fragment_match_never_opens_a_decoder(self):
+        cancelled = threading.Event()
+        cancelled.set()
+
+        def forbidden_factory(_path):
+            raise AssertionError("cancelled match opened a decoder")
+
+        self.assertIsNone(match_fragment_frame_nvdec(
+            b"init",
+            b"segment",
+            b"target",
+            lambda frame: frame,
+            capture_factory=forbidden_factory,
+            cancel_event=cancelled,
+        ))
 
 
 if __name__ == "__main__":

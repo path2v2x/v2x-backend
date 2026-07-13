@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -25,6 +26,22 @@ class Response:
 
 
 class HlsMediaClockTests(unittest.TestCase):
+    def test_cancelled_resolution_does_not_request_a_signed_url(self):
+        cancelled = threading.Event()
+        cancelled.set()
+
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            resolve_hls_media_clock(
+                "https://example.invalid/media.m3u8?token=secret",
+                reference_frame="frame",
+                capture_position_milliseconds=0.0,
+                frame_identity=lambda frame: frame,
+                http_get=lambda *_args, **_kwargs: self.fail(
+                    "cancelled resolver issued a request"
+                ),
+                cancel_event=cancelled,
+            )
+
     def test_resolves_pdt_and_persists_no_signed_urls(self):
         master = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=1000

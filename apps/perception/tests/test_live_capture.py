@@ -8,7 +8,10 @@ import unittest
 PERCEPTION_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_DIR))
 
-from live_capture import LiveStreamReader  # noqa: E402
+from live_capture import (  # noqa: E402
+    LiveStreamReader,
+    _AsyncMediaClockResolution,
+)
 from runtime_health import StreamRecovery  # noqa: E402
 
 
@@ -153,6 +156,62 @@ class LiveStreamReaderTests(unittest.TestCase):
             time.sleep(0.01)
         return bool(predicate())
 
+    def test_discarded_media_clock_resolution_cancels_and_quiesces(self):
+        entered = threading.Event()
+        exited = threading.Event()
+
+        def resolve(_source, cancel_event=None):
+            entered.set()
+            cancel_event.wait(1.0)
+            exited.set()
+            return None
+
+        resolution = _AsyncMediaClockResolution(resolve, ("signed-source",))
+        self.assertTrue(entered.wait(1.0))
+        resolution.discard()
+        resolution.join(1.0)
+        self.assertTrue(exited.is_set())
+        self.assertFalse(resolution.is_alive())
+
+    def test_timed_out_terminal_capture_open_receives_cancellation(self):
+        captures = []
+        cancelled = threading.Event()
+        terminal_failed = threading.Event()
+
+        def capture_factory(_source, cancel_event=None):
+            if not captures:
+                capture = ScriptedCapture(["primary"])
+                capture.get = lambda _property: 0.0
+            elif cancel_event is not None:
+                cancel_event.wait(1.0)
+                if cancel_event.is_set():
+                    cancelled.set()
+                capture = ScriptedCapture([])
+            else:
+                capture = ScriptedCapture([])
+            captures.append(capture)
+            return capture
+
+        def state_callback(**event):
+            if event["state"] == "terminal_failover_failed":
+                terminal_failed.set()
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "signed-session",
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(1.0, 1.0),
+            state_callback=state_callback,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            terminal_read_failover_seconds=0.1,
+        )
+        reader.start()
+        try:
+            self.assertIsNotNone(reader.wait_for_frame(0, timeout=1.0))
+            self.assertTrue(terminal_failed.wait(1.0))
+            self.assertTrue(cancelled.wait(1.0))
+        finally:
+            reader.stop(timeout=2.0)
+
     def test_reconnect_renews_source_and_delivers_a_new_sequence(self):
         source_calls = []
         capture_sources = []
@@ -241,7 +300,10 @@ class LiveStreamReaderTests(unittest.TestCase):
                 terminal[0]["method"], "same_session_restart"
             )
             self.assertEqual(terminal[0]["stage"], "ready")
-            self.assertEqual(len(clock_sources), 1)
+            self.assertEqual(
+                terminal[0]["evidence"], "exact_fragment_match"
+            )
+            self.assertEqual(len(clock_sources), 2)
             self.assertTrue(all(
                 source == "clock-session-1" for source in clock_sources
             ))
@@ -251,7 +313,7 @@ class LiveStreamReaderTests(unittest.TestCase):
         finally:
             reader.stop(timeout=2.0)
 
-    def test_terminal_restart_reuses_only_a_validator_accepted_exact_clock(self):
+    def test_terminal_restart_does_not_trust_a_prior_cursor_without_exact_evidence(self):
         captures = []
         clock_calls = []
         states = []
@@ -292,14 +354,17 @@ class LiveStreamReaderTests(unittest.TestCase):
                 replacement["media_clock"]["media_timestamp_utc"],
                 "2026-07-10T03:57:23.388Z",
             )
-            # One exact match established the original clock. The same-session
-            # restart accepted that clock only through the unchanged validator.
-            self.assertEqual(len(clock_calls), 1)
+            # The prior cursor is never trusted merely because its mapped time
+            # remains receipt-plausible. A second exact fragment match is required.
+            self.assertEqual(len(clock_calls), 2)
             terminal = next(
                 event for event in states
                 if event["state"] == "terminal_failover_succeeded"
             )
             self.assertEqual(terminal["stage"], "ready")
+            self.assertEqual(
+                terminal["evidence"], "exact_fragment_match"
+            )
         finally:
             reader.stop(timeout=2.0)
 
@@ -375,12 +440,15 @@ class LiveStreamReaderTests(unittest.TestCase):
             replacement = reader.wait_for_frame(first["sequence"], timeout=2.0)
             self.assertEqual(replacement["frame"], "new-frame")
             self.assertEqual(exact_clock.reanchors, [(100.0, 100.0)])
-            self.assertEqual(len(clock_calls), 2)
+            self.assertEqual(len(clock_calls), 1)
             terminal = next(
                 event for event in states
                 if event["state"] == "terminal_failover_succeeded"
             )
             self.assertEqual(terminal["stage"], "ready")
+            self.assertEqual(
+                terminal["evidence"], "recent_exact_sequence"
+            )
         finally:
             fail_primary.set()
             hold_replacement.set()
