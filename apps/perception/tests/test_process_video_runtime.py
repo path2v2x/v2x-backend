@@ -483,6 +483,8 @@ class LivePipelineTimestampTests(unittest.TestCase):
 
         def __init__(self, **_kwargs):
             self.snapshot_calls = 0
+            self.stop_requested = False
+            self.joined = False
             self.kwargs = _kwargs
             self.instances.append(self)
 
@@ -509,9 +511,11 @@ class LivePipelineTimestampTests(unittest.TestCase):
             raise LivePipelineTimestampTests.StopPipeline()
 
         def request_stop(self):
+            self.stop_requested = True
             return None
 
         def join(self, _timeout):
+            self.joined = True
             return None
 
     class ThrottledFakeReader(FakeReader):
@@ -539,6 +543,34 @@ class LivePipelineTimestampTests(unittest.TestCase):
                 "source_epoch": 1_000.0 + index,
                 "source_monotonic": 500.0 + index,
             }
+
+    @patch("process_video.LiveStreamReader", FakeReader)
+    def test_pre_requested_shutdown_cleans_up_without_consuming_frames(self):
+        self.FakeReader.instances.clear()
+        pipeline = object.__new__(MultiCameraPipeline)
+        pipeline.detectors = [self.FakeDetector()]
+        pipeline.all_clean_detections = []
+        pipeline.global_tracks = {}
+        pipeline.local_to_global = {}
+        pipeline.next_global_id = 0
+        pipeline.extractor = Mock()
+        shutdown = threading.Event()
+        shutdown.set()
+
+        pipeline.process_streams(
+            ["v2x-backend-cam-ch1"],
+            show_live=False,
+            upload=False,
+            stream_broadcaster=FrameBroadcaster(["ch1"]),
+            camera_ids=["ch1"],
+            shutdown_event=shutdown,
+        )
+
+        self.assertEqual(len(self.FakeReader.instances), 1)
+        reader = self.FakeReader.instances[0]
+        self.assertEqual(reader.snapshot_calls, 0)
+        self.assertTrue(reader.stop_requested)
+        self.assertTrue(reader.joined)
 
     @patch("process_video.LiveStreamReader", FakeReader)
     def test_pipeline_uses_per_camera_capture_time_and_source_age(self):

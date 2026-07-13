@@ -4,6 +4,7 @@ import cv2
 import math
 import os
 import re
+import signal
 import threading
 from pathlib import Path
 import numpy as np
@@ -1021,7 +1022,7 @@ class MultiCameraPipeline:
 
         return tracked_buffer
 
-    def process_streams(self, video_paths, show_live=True, upload=False, output_json=None, output_video=None, output_image=None, output_validate=False, stream_broadcaster=None, camera_ids=None, upload_min_interval_sec=0.0):
+    def process_streams(self, video_paths, show_live=True, upload=False, output_json=None, output_video=None, output_image=None, output_validate=False, stream_broadcaster=None, camera_ids=None, upload_min_interval_sec=0.0, shutdown_event=None):
         """
         Processes multiple videos in parallel, running YOLO, 3D math, and deduplication.
 
@@ -1040,6 +1041,7 @@ class MultiCameraPipeline:
         Returns:
             None
         """
+        shutdown_event = shutdown_event or threading.Event()
         if len(self.detectors) != len(video_paths):
             print("Error: Number of detectors must match number of video paths.")
             return
@@ -1080,7 +1082,7 @@ class MultiCameraPipeline:
                 "V2X_PERCEPTION_TERMINAL_READ_FAILOVER_SEC must be between 0 and 10"
             )
         capture_hls_fragments = int(env_float(
-            "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 1
+            "V2X_PERCEPTION_CAPTURE_HLS_FRAGMENTS", 2
         ))
         clock_hls_fragments = int(env_float(
             "V2X_PERCEPTION_CLOCK_HLS_FRAGMENTS", 4
@@ -1340,7 +1342,7 @@ class MultiCameraPipeline:
                 if f is not None:
                     last_valid_frames[i] = f.copy()
 
-            while True:
+            while not shutdown_event.is_set():
                 frames_to_process = [None] * num_cams
                 pending_live_sequences = [None] * num_cams
                 source_epochs = [None] * num_cams
@@ -1978,6 +1980,13 @@ class VideoObjectDetector:
         return annotated
 
 if __name__ == "__main__":
+    shutdown_event = threading.Event()
+
+    def request_shutdown(_signum, _frame):
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
     model_path = os.getenv("V2X_PERCEPTION_MODEL_PATH", "yolov8n.pt")
     conf = env_float("V2X_PERCEPTION_CONFIDENCE", 0.5)
 
@@ -2057,6 +2066,7 @@ if __name__ == "__main__":
             stream_broadcaster=stream_broadcaster,
             camera_ids=camera_ids,
             upload_min_interval_sec=upload_min_interval_sec,
+            shutdown_event=shutdown_event,
         )
     finally:
         if stream_server:
