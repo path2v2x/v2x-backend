@@ -45,8 +45,9 @@ _MEDIA_PLAYLIST_LIMIT = 128 * 1024
 _HLS_RESOURCE_LIMIT = 32 * 1024 * 1024
 _FFPROBE_OUTPUT_LIMIT = 2 * 1024 * 1024
 _MAX_FRAGMENT_PACKETS = 10_000
-_SIDECAR_LINE_LIMIT = 512
+_SIDECAR_LINE_LIMIT = 160
 _SIDECAR_QUEUE_LIMIT = 64
+_MAX_CONSECUTIVE_OVERLAP_FRAMES = 120
 _HLS_IO_TIMEOUT_MICROSECONDS = 7_000_000
 _HLS_HOLD_COUNTERS = 3
 _HLS_FETCH_TIMEOUT_SECONDS = 7.0
@@ -1018,7 +1019,13 @@ def _probe_fragment_packets(
 
 
 class _FramePtsSidecar:
-    """Drain strict URL-free framecrc records and expose source frame PTS."""
+    """Drain strict pre-encode stats and expose pre-mux source frame PTS.
+
+    FFmpeg output muxers make DTS monotonic by clamping timestamps when a live
+    HLS fragment repeats keyframe/preroll frames. ``-stats_enc_pre`` writes the
+    exact decoded input PTS before that normalization to a dedicated anonymous
+    numeric pipe. Only validated Fractions enter this bounded queue.
+    """
 
     def __init__(self, descriptor, queue_limit=_SIDECAR_QUEUE_LIMIT):
         self._descriptor = descriptor
@@ -1027,7 +1034,8 @@ class _FramePtsSidecar:
         self._condition = threading.Condition()
         self._records = deque()
         self._time_base = None
-        self._last_pts = None
+        self._output_time_base = None
+        self._next_index = 0
         self._failed = False
         self._failure_reason = None
         self._done = False
@@ -1053,57 +1061,83 @@ class _FramePtsSidecar:
             return
         if not line:
             return
-        if line.startswith("#tb 0:"):
-            try:
-                time_base = _parse_fraction(
-                    line.split(":", 1)[1].strip(), "frame PTS time base"
-                )
-            except NvdecCaptureError:
-                self._fail("sidecar_time_base_invalid")
-                return
-            with self._condition:
-                if self._time_base is not None and self._time_base != time_base:
-                    self._failed = True
-                    self._failure_reason = "sidecar_time_base_changed"
-                    self._records.clear()
-                self._time_base = time_base
-                self._condition.notify_all()
-            return
-        if line.startswith("#"):
-            return
-        fields = [value.strip() for value in line.split(",")]
+        record_match = re.fullmatch(
+            r"v2xpts1,0,0,(0|[1-9][0-9]{0,18}),"
+            r"(0|[1-9][0-9]{0,18}),"
+            r"([1-9][0-9]{0,9})/([1-9][0-9]{0,9}),"
+            r"(-?(?:[1-9][0-9]{0,18})|0),"
+            r"([1-9][0-9]{0,9})/([1-9][0-9]{0,9}),"
+            r"(-?(?:[1-9][0-9]{0,18})|0)",
+            line,
+        )
         try:
-            if len(fields) < 6 or int(fields[0]) != 0:
+            if record_match is None:
                 raise ValueError
-            pts = int(fields[2])
-            int(fields[1])
-            int(fields[3])
-            if int(fields[4]) <= 0:
+            frame_index = int(record_match.group(1))
+            input_index = int(record_match.group(2))
+            output_time_base_numerator = int(record_match.group(3))
+            output_time_base_denominator = int(record_match.group(4))
+            pts = int(record_match.group(5))
+            input_time_base_numerator = int(record_match.group(6))
+            input_time_base_denominator = int(record_match.group(7))
+            input_pts = int(record_match.group(8))
+            output_time_base = Fraction(
+                output_time_base_numerator,
+                output_time_base_denominator,
+            )
+            time_base = Fraction(
+                input_time_base_numerator,
+                input_time_base_denominator,
+            )
+            if (
+                input_index != frame_index
+                or frame_index > 2**63 - 2
+                or max(
+                    output_time_base_numerator,
+                    output_time_base_denominator,
+                    input_time_base_numerator,
+                    input_time_base_denominator,
+                ) > 2**31 - 1
+                or not (-2**63 < pts < 2**63 - 1)
+                or not (-2**63 < input_pts < 2**63 - 1)
+                or output_time_base > 1
+                or time_base > 1
+            ):
                 raise ValueError
-            if not re.fullmatch(r"0x[0-9A-Fa-f]{8}", fields[5]):
-                raise ValueError
-        except ValueError:
+        except (ValueError, ZeroDivisionError):
+            self._fail("sidecar_record_invalid")
+            return
+        output_position = Fraction(pts) * output_time_base
+        source_pts = Fraction(input_pts) * time_base
+        if output_position != source_pts:
             self._fail("sidecar_record_invalid")
             return
         with self._condition:
-            if self._failed or self._time_base is None:
-                self._failed = True
-                self._failure_reason = (
-                    self._failure_reason or "sidecar_missing_time_base"
+            if self._failed:
+                pass
+            elif (
+                (self._time_base is not None and self._time_base != time_base)
+                or (
+                    self._output_time_base is not None
+                    and self._output_time_base != output_time_base
                 )
+            ):
+                self._failed = True
+                self._failure_reason = "sidecar_time_base_changed"
                 self._records.clear()
             elif len(self._records) >= self._queue_limit:
                 self._failed = True
                 self._failure_reason = "sidecar_queue_overflow"
                 self._records.clear()
             else:
-                source_pts = Fraction(pts) * self._time_base
-                if self._last_pts is not None and source_pts <= self._last_pts:
+                if frame_index != self._next_index:
                     self._failed = True
-                    self._failure_reason = "sidecar_pts_nonmonotonic"
+                    self._failure_reason = "sidecar_index_nonsequential"
                     self._records.clear()
                 else:
-                    self._last_pts = source_pts
+                    self._time_base = time_base
+                    self._output_time_base = output_time_base
+                    self._next_index += 1
                     self._records.append(source_pts)
             self._condition.notify_all()
 
@@ -1655,22 +1689,16 @@ def build_nvdec_command(
     else:
         command.extend(
             [
-                "-filter_complex",
-                "[0:v:0]hwdownload,format=nv12,split=2[full][timing];"
-                "[full]format=bgr24[frames];"
-                "[timing]scale=2:2,format=gray[timing_out]",
-                "-map", "[frames]",
+                "-map", "0:v:0",
                 "-fps_mode", "passthrough",
                 "-enc_time_base", "-1",
+                "-vf", "hwdownload,format=nv12,format=bgr24",
                 "-c:v", "rawvideo",
+                "-stats_enc_pre", f"pipe:{pts_fd}",
+                "-stats_enc_pre_fmt",
+                "v2xpts1,{fidx},{sidx},{n},{ni},{tb},{pts},{tbi},{ptsi}",
                 "-f", "nut",
                 "-y", str(fifo_path),
-                "-map", "[timing_out]",
-                "-fps_mode", "passthrough",
-                "-enc_time_base", "-1",
-                "-c:v", "rawvideo",
-                "-f", "framecrc",
-                f"pipe:{pts_fd}",
             ]
         )
     return command
@@ -1703,6 +1731,9 @@ class FfmpegNvdecCapture:
         self._last_source_position_ms = None
         self._last_transport_exact = False
         self._transport_diagnostic = "starting"
+        self._last_emitted_source_pts = None
+        self._consecutive_overlap_frames = 0
+        self._overlap_frames_dropped = 0
         self._source_pts_timeout_seconds = max(
             0.0, float(source_pts_timeout_ms) / 1000.0
         )
@@ -1855,33 +1886,56 @@ class FfmpegNvdecCapture:
         )
 
     def read(self):
-        if not self.isOpened():
-            return False, None
-        ok, frame = self._capture.read()
-        if not ok or frame is None:
-            return ok, frame
-        self._last_source_position_ms = None
-        self._last_transport_exact = False
-        sidecar = self._pts_sidecar
-        if sidecar is not None:
-            source_pts = sidecar.take(self._source_pts_timeout_seconds)
-            if source_pts is not None:
-                self._last_source_position_ms = float(source_pts * 1000)
-                mediator = self._mediator
-                if mediator is None:
-                    self._transport_diagnostic = "mediator_unavailable"
+        while self.isOpened():
+            ok, frame = self._capture.read()
+            if not ok or frame is None:
+                return ok, frame
+            self._last_source_position_ms = None
+            self._last_transport_exact = False
+            sidecar = self._pts_sidecar
+            source_pts = None
+            if sidecar is not None:
+                source_pts = sidecar.take(self._source_pts_timeout_seconds)
+                if source_pts is not None:
+                    self._last_source_position_ms = float(source_pts * 1000)
+                    mediator = self._mediator
+                    if mediator is None:
+                        self._transport_diagnostic = "mediator_unavailable"
+                    else:
+                        self._transport_diagnostic = (
+                            mediator.transport_diagnostic(
+                                self._last_source_position_ms
+                            )
+                        )
+                        self._last_transport_exact = (
+                            self._transport_diagnostic == "matched"
+                        )
                 else:
-                    self._transport_diagnostic = mediator.transport_diagnostic(
-                        self._last_source_position_ms
-                    )
-                    self._last_transport_exact = (
-                        self._transport_diagnostic == "matched"
-                    )
+                    self._transport_diagnostic = sidecar.diagnostic()
             else:
-                self._transport_diagnostic = sidecar.diagnostic()
-        else:
-            self._transport_diagnostic = "sidecar_unavailable"
-        return ok, frame
+                self._transport_diagnostic = "sidecar_unavailable"
+
+            if (
+                self._last_transport_exact
+                and self._last_emitted_source_pts is not None
+                and source_pts <= self._last_emitted_source_pts
+            ):
+                self._consecutive_overlap_frames += 1
+                if (
+                    self._consecutive_overlap_frames
+                    > _MAX_CONSECUTIVE_OVERLAP_FRAMES
+                ):
+                    self._last_transport_exact = False
+                    self._transport_diagnostic = "overlap_replay_exceeded"
+                    return ok, frame
+                self._overlap_frames_dropped += 1
+                continue
+
+            self._consecutive_overlap_frames = 0
+            if self._last_transport_exact:
+                self._last_emitted_source_pts = source_pts
+            return ok, frame
+        return False, None
 
     def get(self, property_id):
         if self._capture is None:

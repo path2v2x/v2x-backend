@@ -48,6 +48,7 @@ _TRANSPORT_DIAGNOSTICS = {
     "sidecar_time_base_invalid",
     "sidecar_time_base_changed",
     "sidecar_record_invalid",
+    "sidecar_index_nonsequential",
     "sidecar_missing_time_base",
     "sidecar_queue_overflow",
     "sidecar_pts_nonmonotonic",
@@ -56,6 +57,7 @@ _TRANSPORT_DIAGNOSTICS = {
     "sidecar_eof",
     "sidecar_waiting",
     "sidecar_ready",
+    "overlap_replay_exceeded",
     "closed",
 }
 

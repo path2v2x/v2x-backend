@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -207,10 +208,16 @@ class FfmpegCaptureTests(unittest.TestCase):
         rendered = " ".join(command)
         self.assertIn("-copyts", command)
         self.assertIn("-copytb 1", rendered)
-        self.assertEqual(rendered.count("-enc_time_base -1"), 2)
-        self.assertIn("split=2", rendered)
-        self.assertIn("scale=2:2", rendered)
-        self.assertIn("-f framecrc pipe:11", rendered)
+        self.assertEqual(rendered.count("-enc_time_base -1"), 1)
+        self.assertIn("-stats_enc_pre pipe:11", rendered)
+        self.assertIn(
+            "v2xpts1,{fidx},{sidx},{n},{ni},{tb},{pts},{tbi},{ptsi}",
+            command,
+        )
+        self.assertNotIn("split=2", rendered)
+        self.assertNotIn("scale=2:2", rendered)
+        self.assertNotIn("framecrc", rendered)
+        self.assertNotIn("showinfo", rendered)
         self.assertIn("-fps_mode passthrough", rendered)
         self.assertNotIn("https://", rendered)
         self.assertNotIn("SessionToken", rendered)
@@ -220,19 +227,19 @@ class FfmpegCaptureTests(unittest.TestCase):
                 hls=True, pts_fd=True,
             )
 
-    def test_framecrc_sidecar_pairs_static_frames_by_source_pts(self):
+    def test_preencode_sidecar_preserves_backward_source_pts(self):
         read_fd, write_fd = __import__("os").pipe()
         sidecar = _FramePtsSidecar(read_fd)
         try:
             __import__("os").write(write_fd, (
-                b"#software: Lavf\n"
-                b"#tb 0: 1/20\n"
-                b"0, 2, 2, 1, 4, 0x00000000\n"
-                b"0, 3, 3, 1, 4, 0x00000000\n"
+                b"v2xpts1,0,0,0,0,1/20,2,1/20,2\n"
+                b"v2xpts1,0,0,1,1,1/20,3,1/20,3\n"
+                b"v2xpts1,0,0,2,2,1/20,2,1/20,2\n"
             ))
             __import__("os").close(write_fd)
             self.assertEqual(sidecar.take(1.0), Fraction(1, 10))
             self.assertEqual(sidecar.take(1.0), Fraction(3, 20))
+            self.assertEqual(sidecar.take(1.0), Fraction(1, 10))
         finally:
             try:
                 __import__("os").close(write_fd)
@@ -242,13 +249,15 @@ class FfmpegCaptureTests(unittest.TestCase):
 
     def test_malformed_or_overflowed_sidecar_fails_closed(self):
         for body in (
-            b"0, 0, 0, 1, 4, 0x0\n",
-            b"#tb 0: 1/20\nnot,a,frame\n",
+            b"v2xpts1,0,0,0,0,1/20,2,1/20,3\n",
+            b"v2xpts1,0,0,1,1,1/20,2,1/20,2\n",
+            b"v2xpts1,0,0,0,0,1/20,2,0/1,2\n",
             (
-                b"#tb 0: 1/20\n"
-                b"0, 2, 2, 1, 4, 0x0\n"
-                b"0, 2, 2, 1, 4, 0x0\n"
+                b"v2xpts1,0,0,0,0,1/20,"
+                b"9223372036854775807,1/20,9223372036854775807\n"
             ),
+            b"https://example.invalid/?SessionToken=secret\n",
+            b"\xff\n",
         ):
             with self.subTest(body=body):
                 read_fd, write_fd = __import__("os").pipe()
@@ -259,7 +268,11 @@ class FfmpegCaptureTests(unittest.TestCase):
                     self.assertIsNone(sidecar.take(1.0))
                     self.assertIn(
                         sidecar.diagnostic(),
-                        {"sidecar_missing_time_base", "sidecar_record_invalid"},
+                        {
+                            "sidecar_record_invalid",
+                            "sidecar_index_nonsequential",
+                            "sidecar_non_ascii",
+                        },
                     )
                 finally:
                     try:
@@ -267,6 +280,108 @@ class FfmpegCaptureTests(unittest.TestCase):
                     except OSError:
                         pass
                     sidecar.close()
+
+        read_fd, write_fd = os.pipe()
+        sidecar = _FramePtsSidecar(read_fd, queue_limit=1)
+        try:
+            os.write(write_fd, (
+                b"v2xpts1,0,0,0,0,1/20,2,1/20,2\n"
+                b"v2xpts1,0,0,1,1,1/20,3,1/20,3\n"
+            ))
+            os.close(write_fd)
+            self.assertIsNone(sidecar.take(1.0))
+            self.assertEqual(sidecar.diagnostic(), "sidecar_queue_overflow")
+        finally:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+            sidecar.close()
+
+        read_fd, write_fd = os.pipe()
+        sidecar = _FramePtsSidecar(read_fd)
+        try:
+            os.write(write_fd, (
+                b"v2xpts1,0,0,0,0,1/20,2,1/20,2\n"
+                b"v2xpts1,0,0,1,1,1/25,3,1/25,3\n"
+            ))
+            os.close(write_fd)
+            self.assertIsNone(sidecar.take(1.0))
+            self.assertEqual(
+                sidecar.diagnostic(), "sidecar_time_base_changed"
+            )
+        finally:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+            sidecar.close()
+
+        read_fd, write_fd = os.pipe()
+        sidecar = _FramePtsSidecar(read_fd)
+        writer = threading.Thread(target=lambda: (
+            os.write(write_fd, b"invalid\n" + (
+                b"v2xpts1,0,0,0,0,1/20,2,1/20,2\n" * 4096
+            )),
+            os.close(write_fd),
+        ))
+        try:
+            writer.start()
+            writer.join(2.0)
+            self.assertFalse(writer.is_alive())
+            self.assertIsNone(sidecar.take(1.0))
+            self.assertEqual(sidecar.diagnostic(), "sidecar_record_invalid")
+        finally:
+            if writer.is_alive():
+                os.close(write_fd)
+                writer.join(1.0)
+            sidecar.close()
+
+    def test_host_preencode_stats_preserve_backward_input_pts(self):
+        if not Path("/usr/bin/ffmpeg").is_file():
+            self.skipTest("host FFmpeg is unavailable")
+        read_fd, write_fd = os.pipe()
+        sidecar = _FramePtsSidecar(read_fd)
+        process = None
+        with tempfile.TemporaryDirectory(prefix="v2x-stats-test-") as temp:
+            output = Path(temp) / "frames.nut"
+            command = [
+                "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-nostdin", "-f", "lavfi", "-i",
+                "testsrc2=size=64x48:rate=1:duration=6,"
+                "setpts='if(gte(N,3),PTS-2/TB,PTS)'",
+                "-vf", "format=bgr24", "-map", "0:v:0",
+                "-fps_mode", "passthrough", "-enc_time_base", "-1",
+                "-c:v", "rawvideo", "-stats_enc_pre", f"pipe:{write_fd}",
+                "-stats_enc_pre_fmt",
+                "v2xpts1,{fidx},{sidx},{n},{ni},{tb},{pts},{tbi},{ptsi}",
+                "-f", "nut", "-y", str(output),
+            ]
+            try:
+                process = subprocess.Popen(
+                    command,
+                    pass_fds=(write_fd,),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                os.close(write_fd)
+                write_fd = None
+                self.assertEqual(process.wait(timeout=10), 0)
+                self.assertEqual(
+                    [sidecar.take(1.0) for _ in range(6)],
+                    [
+                        Fraction(0), Fraction(1), Fraction(2),
+                        Fraction(1), Fraction(2), Fraction(3),
+                    ],
+                )
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+                sidecar.close()
 
     def test_sidecar_thread_is_the_only_descriptor_owner(self):
         read_fd, write_fd = os.pipe()
@@ -530,6 +645,10 @@ class FfmpegCaptureTests(unittest.TestCase):
         capture._source_pts_timeout_seconds = 0.1
         capture._last_source_position_ms = None
         capture._last_transport_exact = False
+        capture._transport_diagnostic = "starting"
+        capture._last_emitted_source_pts = None
+        capture._consecutive_overlap_frames = 0
+        capture._overlap_frames_dropped = 0
 
         fragment = _MediatedFragment(
             0.0, "1970-01-01T00:00:00.000Z", 1.0, 1, "fragment",
@@ -547,7 +666,8 @@ class FfmpegCaptureTests(unittest.TestCase):
         )
         positions = iter((Fraction(1, 10), Fraction(1, 5)))
         capture._pts_sidecar = SimpleNamespace(
-            take=lambda _timeout: next(positions)
+            take=lambda _timeout: next(positions),
+            diagnostic=lambda: "sidecar_ready",
         )
 
         self.assertTrue(capture.read()[0])
@@ -555,6 +675,107 @@ class FfmpegCaptureTests(unittest.TestCase):
         self.assertIs(capture.transport_media_clock(), clock)
         self.assertTrue(capture.read()[0])
         self.assertEqual(capture.get(0), 200.0)
+        self.assertIsNone(capture.transport_media_clock())
+
+    def test_capture_drops_exact_preroll_before_returning_newer_frame(self):
+        frames = [
+            np.full((2, 2, 3), value, dtype=np.uint8)
+            for value in range(4)
+        ]
+        capture = object.__new__(FfmpegNvdecCapture)
+        capture._opened = True
+        capture._capture = FakeCapture(frames, [0.0] * 4)
+        capture._process = SimpleNamespace(poll=lambda: None)
+        capture._source_pts_timeout_seconds = 0.1
+        capture._last_source_position_ms = None
+        capture._last_transport_exact = False
+        capture._transport_diagnostic = "starting"
+        capture._last_emitted_source_pts = None
+        capture._consecutive_overlap_frames = 0
+        capture._overlap_frames_dropped = 0
+
+        fragment = _MediatedFragment(
+            0.0, "1970-01-01T00:00:00.000Z", 1.0, 1, "fragment",
+            "https://example.test/init",
+            "https://example.test/segment?FragmentNumber=fragment",
+        )
+        clock = SameSessionTransportClock()
+        clock.add_fragment(fragment, (
+            _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
+            _PacketSample(1, Fraction(3, 20), Fraction(1, 20)),
+            _PacketSample(2, Fraction(1, 5), Fraction(1, 20)),
+            _PacketSample(3, Fraction(1, 4), Fraction(1, 20)),
+        ))
+        capture._mediator = SimpleNamespace(
+            clock=clock,
+            transport_diagnostic=clock.classify_position,
+        )
+        positions = iter((
+            Fraction(1, 10),
+            Fraction(1, 5),
+            Fraction(3, 20),
+            Fraction(1, 4),
+        ))
+        capture._pts_sidecar = SimpleNamespace(
+            take=lambda _timeout: next(positions),
+            diagnostic=lambda: "sidecar_ready",
+        )
+
+        ok, first = capture.read()
+        self.assertTrue(ok)
+        self.assertTrue(np.array_equal(first, frames[0]))
+        ok, second = capture.read()
+        self.assertTrue(ok)
+        self.assertTrue(np.array_equal(second, frames[1]))
+        ok, after_overlap = capture.read()
+        self.assertTrue(ok)
+        self.assertTrue(np.array_equal(after_overlap, frames[3]))
+        self.assertEqual(capture.get(0), 250.0)
+        self.assertEqual(capture._overlap_frames_dropped, 1)
+        self.assertEqual(capture.transport_clock_diagnostic(), "matched")
+        self.assertIs(capture.transport_media_clock(), clock)
+
+    def test_capture_bounds_continuous_overlap_replay(self):
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        capture = object.__new__(FfmpegNvdecCapture)
+        capture._opened = True
+        capture._capture = FakeCapture([frame] * 122, [0.0] * 122)
+        capture._process = SimpleNamespace(poll=lambda: None)
+        capture._source_pts_timeout_seconds = 0.1
+        capture._last_source_position_ms = None
+        capture._last_transport_exact = False
+        capture._transport_diagnostic = "starting"
+        capture._last_emitted_source_pts = None
+        capture._consecutive_overlap_frames = 0
+        capture._overlap_frames_dropped = 0
+
+        fragment = _MediatedFragment(
+            0.0, "1970-01-01T00:00:00.000Z", 1.0, 1, "fragment",
+            "https://example.test/init",
+            "https://example.test/segment?FragmentNumber=fragment",
+        )
+        clock = SameSessionTransportClock()
+        clock.add_fragment(fragment, (
+            _PacketSample(0, Fraction(1, 10), Fraction(1, 20)),
+            _PacketSample(1, Fraction(1, 5), Fraction(1, 20)),
+        ))
+        capture._mediator = SimpleNamespace(
+            clock=clock,
+            transport_diagnostic=clock.classify_position,
+        )
+        positions = iter((Fraction(1, 5),) + (Fraction(1, 10),) * 121)
+        capture._pts_sidecar = SimpleNamespace(
+            take=lambda _timeout: next(positions),
+            diagnostic=lambda: "sidecar_ready",
+        )
+
+        self.assertTrue(capture.read()[0])
+        self.assertTrue(capture.read()[0])
+        self.assertEqual(capture._overlap_frames_dropped, 120)
+        self.assertEqual(
+            capture.transport_clock_diagnostic(),
+            "overlap_replay_exceeded",
+        )
         self.assertIsNone(capture.transport_media_clock())
 
     def test_rejects_media_playlist_and_cross_origin_variant(self):

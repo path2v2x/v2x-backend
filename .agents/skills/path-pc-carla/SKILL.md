@@ -9,15 +9,43 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 10:55 UTC; verify rather than assume. These items
+Observed through 2026-07-13 12:22 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
-- Canonical `origin/main` is now PR 44 merge
-  `602096ffd4a73701cb781e6ec50dbe3333b61782`. PR 44 is not deployed. Live
+- Canonical `origin/main` is now PR 45 merge
+  `3ad755a9a33e0efaf6226d78634a1899e7dbe226`. PR 45 is not deployed. Live
   production remains the exact, detached, clean PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
   environment and timers restored. Do not describe PR 42, PR 43, or the
   same-session PTS follow-up below as production.
+- PR 45 fixed the valid KVS preroll rejection and added finite transport
+  diagnostics, but its first real upload-disabled canary is also rejected.
+  Evidence is at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T110704Z-pr45-preroll-affine-canary/`
+  and rollback is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T110704Z-pr45-preroll-affine/`.
+  All four channels exposed `sidecar_pts_nonmonotonic` within the first live
+  fragment roll, so the canary was intentionally stopped early rather than
+  waiting 150 seconds. Exact PR 35, its upload environment, and all three
+  timers were restored and verified by 11:08:24 UTC. CARLA, Drive, and web did
+  not restart; Richmond returned LIVE with zero sessions/actors/tracks and four
+  healthy cameras. Do not redeploy PR 45 unchanged.
+- The second root cause is now exact. FFmpeg 6.1.1 clamps backward preroll PTS
+  at the framecrc/NUT mux boundary: a real ch2 run repeated `16.006` seconds,
+  while a pre-mux `showinfo` probe proved the decoded PTS moved from `6.273`
+  back to `5.494` seconds. The current source-only branch is
+  `codex/v2x-premux-pts` on PR 45 main. It replaces the split/2x2/framecrc
+  branch with FFmpeg's dedicated numeric-only `-stats_enc_pre` pipe, strictly
+  validates output/input frame identity and rational PTS, permits only the
+  already affine-validated backward preroll, and drops replay frames until PTS
+  is newer before perception sees them. Stderr remains discarded and the
+  signed source remains out of argv/disk. A real standalone ch2 capture returned
+  700 strict-increasing trusted frames, safely dropped 25 overlap frames, kept
+  every diagnostic matched, and retained at least 3,358 MiB free GPU. The
+  focused suite passes 119 tests and full perception passes 218 plus syntax and
+  diff checks. This source is not merged or deployed; it still requires
+  independent re-review, canonical merge, and the unchanged rollback-gated
+  four-camera canary.
 - PR 44's first real zero-overlap NVDEC canary is rejected. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T103200Z-pr44-same-session-pts-canary/`
   and the verified rollback is
@@ -43,18 +71,16 @@ override every older PR 32/candidate statement below.
   fragment decode emitted a strictly increasing PTS subset and every emitted
   PTS existed in the probed union. The six-FFmpeg/two-auxiliary topology is the
   downstream replacement response, not the primary fault.
-- The current source-only branch is `codex/v2x-pts-runtime-diagnostics` on PR
-  44 main. It accepts preroll overlap only when every fragment agrees with one
+- PR 45's merged source accepts preroll overlap only when every fragment agrees with one
   frozen session-wide PTS/PDT affine origin within max(1 ms, packet ticks),
   while still rejecting backward PTS/PDT, duplicate sequence, changed fragment
   metadata, accumulated drift, and conflicting duplicate-PTS UTC. It also adds
   a finite allowlisted per-camera transport diagnostic and linearizes mediator
   failure state with clock classification; health/logs cannot contain a URL,
   raw exception, packet, credential, or numeric fragment detail. The focused
-  diagnostic suite passes 116 tests and the full perception suite passes 215,
-  plus syntax/diff checks. This source is not merged or deployed and still
-  requires independent re-review, canonical merge, and a rollback-gated,
-  upload-disabled four-camera NVDEC canary. Do not widen the 150-second,
+  diagnostic suite passed 116 tests and the full perception suite passed 215,
+  plus syntax/diff checks. The newer rejected PR 45 canary and pre-mux follow-up
+  above supersede that source-only verdict. Do not widen the 150-second,
   freshness, topology, or GPU thresholds.
 - PR 43's first zero-overlap, upload-disabled startup at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T062453Z-pr43-evidence-controlled-startup/`
@@ -74,7 +100,9 @@ override every older PR 32/candidate statement below.
 - PR 44's merged implementation mediates the exact capture HLS session through a capability-
   scoped loopback server, observes the exact init/fragment bytes actually
   served to FFmpeg, and pairs every OpenCV frame with the same FFmpeg graph's
-  source PTS from a bounded `framecrc` sidecar. Exact UTC is
+  source PTS from a bounded `framecrc` sidecar. That sidecar is now proven
+  mux-normalized during real preroll and is superseded by the pre-mux follow-up
+  above. Exact UTC is
   `fragment PDT + source PTS - first fragment video PTS`; evidence is named
   `exact_same_session_pts` and never carries `anchor_match_frame_count`.
   Signed upstream URLs/config enter only memory or inherited memfds, never
