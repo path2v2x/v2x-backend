@@ -24,6 +24,7 @@ import websockets
 from digital_twin_bridge.twin_camera_rig import (
     CARLA_DEFAULT_PINHOLE_LENS,
     TWIN_LENS_ATTRIBUTE_KEYS,
+    compute_twin_camera_transform,
 )
 
 
@@ -935,12 +936,15 @@ def cameras_config_fingerprint(path):
 
 
 def expected_twin_camera_transform(world, path, camera_id):
-    """Recompute the configured sensor pose independently for RR/CARLA 0.10.
+    """Recompute the configured sensor pose through the tracked rig model.
 
     RR camera actors are resolvable by ID but are absent from world snapshots,
     and an independent client receives a zero transform for them.  Bind the
     server-advertised spawn transform to the exact tracked site/camera JSON and
-    the live map georeference instead of accepting that zero placeholder.
+    the live map georeference instead of accepting that zero placeholder.  This
+    deliberately calls the same shared GPS projection and pose composition as
+    ``TwinCameraRig.spawn``; a verifier-local flat-earth approximation would not
+    reproduce RR/CARLA 0.10's OpenDRIVE georeference.
     """
     try:
         payload = json.loads(Path(path).read_text())
@@ -948,75 +952,30 @@ def expected_twin_camera_transform(world, path, camera_id):
         camera = next(
             item for item in payload["cameras"] if item.get("id") == camera_id
         )
-        carla_map = world.get_map()
-        import carla
-
-        origin = carla_map.transform_to_geolocation(carla.Location())
-        latitude = float(site["lat"])
-        longitude = float(site["lon"])
-        if hasattr(carla_map, "geolocation_to_transform"):
-            corrected_latitude = 2.0 * float(origin.latitude) - latitude
-            projected = carla_map.geolocation_to_transform(
-                carla.GeoLocation(
-                    latitude=corrected_latitude,
-                    longitude=longitude,
-                    altitude=0.0,
-                )
-            )
-            location = getattr(projected, "location", projected)
-        else:
-            meters_per_degree_latitude = 111_320.0
-            meters_per_degree_longitude = (
-                meters_per_degree_latitude
-                * math.cos(math.radians(float(origin.latitude)))
-            )
-            location = carla.Location(
-                x=(longitude - float(origin.longitude))
-                * meters_per_degree_longitude,
-                y=-(
-                    (latitude - float(origin.latitude))
-                    * meters_per_degree_latitude
-                ),
-                z=0.0,
-            )
-        waypoint = carla_map.get_waypoint(location, project_to_road=True)
-        if waypoint is not None:
-            location.z = float(waypoint.transform.location.z)
-        pose = camera.get("twin_pose") or {}
-        yaw = (
-            float(camera["heading_deg"])
-            + float(camera["yaw_deg"])
-            + float(pose.get("yaw_offset_deg", 0.0))
-            - 90.0
-        )
-        yaw = (yaw + 180.0) % 360.0 - 180.0
-        pitch = float(camera["pitch_deg"]) + float(
-            pose.get("pitch_offset_deg", 0.0)
-        )
-        location.z += float(camera["height_m"]) + float(
-            pose.get("height_offset_m", 0.0)
-        )
-        yaw_radians = math.radians(yaw)
-        forward = float(pose.get("forward_offset_m", 0.0))
-        right = float(pose.get("right_offset_m", 0.0))
-        location.x += forward * math.cos(yaw_radians)
-        location.y += forward * math.sin(yaw_radians)
-        location.x -= right * math.sin(yaw_radians)
-        location.y += right * math.cos(yaw_radians)
-        roll = float(camera.get("roll_deg", 0.0)) + float(
-            pose.get("roll_offset_deg", 0.0)
-        )
-    except (KeyError, OSError, StopIteration, TypeError, ValueError) as exc:
+        transform = compute_twin_camera_transform(world.get_map(), site, camera)
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise VerificationError(
-            "tracked camera transform cannot be independently recomputed"
+            "tracked camera transform cannot be recomputed through the shared rig model"
         ) from exc
     expected = {
         "location": {
-            "x": float(location.x),
-            "y": float(location.y),
-            "z": float(location.z),
+            "x": float(transform.location.x),
+            "y": float(transform.location.y),
+            "z": float(transform.location.z),
         },
-        "rotation": {"pitch": pitch, "yaw": yaw, "roll": roll},
+        "rotation": {
+            "pitch": float(transform.rotation.pitch),
+            "yaw": float(transform.rotation.yaw),
+            "roll": float(transform.rotation.roll),
+        },
     }
     return _finite_transform_payload(expected, "tracked camera transform")
 

@@ -39,6 +39,9 @@ from digital_twin_bridge.twin_camera_rig import (  # noqa: E402
 CAMERAS = {"ch1", "ch2", "ch3", "ch4"}
 INTRINSICS_METHODS = {"checkerboard", "charuco"}
 DISTORTION_KEYS = ("k1", "k2", "p1", "p2", "k3")
+MIN_TRAIN_HOLDOUT_WORLD_SEPARATION_M = 0.25
+MIN_TRAIN_HOLDOUT_IMAGE_SEPARATION_PX = 4.0
+MIN_TRAIN_HOLDOUT_TWIN_SEPARATION_PX = 2.0
 
 
 def decoded_image_size(image_bytes, label):
@@ -375,6 +378,52 @@ def validate_annotation_geometry(features, real_size, twin_size):
                     )
 
 
+def validate_resolved_point_independence(features):
+    """Reject train/holdout landmark reuse in image, twin, or world space."""
+    train = [
+        feature
+        for feature in features
+        if feature["type"] == "point" and feature["split"] == "train"
+    ]
+    holdout = [
+        feature
+        for feature in features
+        if feature["type"] == "point" and feature["split"] == "holdout"
+    ]
+    spaces = (
+        ("image", MIN_TRAIN_HOLDOUT_IMAGE_SEPARATION_PX, "px"),
+        ("twin", MIN_TRAIN_HOLDOUT_TWIN_SEPARATION_PX, "px"),
+        ("world", MIN_TRAIN_HOLDOUT_WORLD_SEPARATION_M, "m"),
+    )
+    for holdout_feature in holdout:
+        for train_feature in train:
+            for field, threshold, unit in spaces:
+                left = train_feature.get(field)
+                right = holdout_feature.get(field)
+                if (
+                    not isinstance(left, list)
+                    or not isinstance(right, list)
+                    or len(left) != len(right)
+                    or len(left) not in {2, 3}
+                    or not all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        for value in left + right
+                    )
+                ):
+                    raise ValueError(
+                        f"resolved point {field} coordinates are invalid"
+                    )
+                distance = math.dist(left, right)
+                if distance < threshold:
+                    raise ValueError(
+                        "holdout point is not independent of train point in "
+                        f"{field} space ({distance:.6f}{unit} < "
+                        f"{threshold:.6f}{unit})"
+                    )
+
+
 def validate_annotations(payload, camera_id, real_size, twin_size):
     """Return normalized annotations while preserving the frozen split."""
     if payload.get("camera_id") != camera_id or camera_id not in CAMERAS:
@@ -395,6 +444,7 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
         raise ValueError("annotations require point and road lists")
     normalized = []
     identifiers = set()
+    global_landmark_ids = set()
     descriptions = set()
     for feature in points:
         identifier = str(feature.get("id") or "").strip()
@@ -406,6 +456,17 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
             raise ValueError(f"{identifier}: split must be frozen train or holdout")
         if feature.get("provenance") != "manually_verified_unique":
             raise ValueError(f"{identifier}: point provenance is not independently verified")
+        global_landmark_id = feature.get("global_landmark_id")
+        if (
+            not isinstance(global_landmark_id, str)
+            or not global_landmark_id
+            or global_landmark_id.strip() != global_landmark_id
+            or global_landmark_id in global_landmark_ids
+        ):
+            raise ValueError(
+                "point global landmark IDs must be nonblank and globally unique"
+            )
+        global_landmark_ids.add(global_landmark_id)
         description = str(feature.get("description") or "").strip()
         description_key = description.casefold()
         if len(description) < 8 or description_key in descriptions:
@@ -416,6 +477,7 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
             raise ValueError(f"{identifier}: category is required")
         normalized.append({
             "id": identifier,
+            "global_landmark_id": global_landmark_id,
             "type": "point",
             "split": split,
             "provenance": "manually_verified_unique",
@@ -537,6 +599,7 @@ def resolve_manifest(
             )
         }
         if feature["type"] == "point":
+            base["global_landmark_id"] = feature["global_landmark_id"]
             world, depth_evidence = world_at(feature["twin"])
             base.update({
                 "world": world,
@@ -553,6 +616,7 @@ def resolve_manifest(
                 "depth_neighborhoods": [item[1] for item in resolved],
             })
         features.append(base)
+    validate_resolved_point_independence(features)
     intrinsics = camera["intrinsics"]
     intrinsics_calibration = validate_intrinsics_calibration(camera)
     return {

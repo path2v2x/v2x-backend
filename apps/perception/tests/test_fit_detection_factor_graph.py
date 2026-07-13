@@ -98,9 +98,11 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
         rows = []
         tracklet_rows = []
         assignments = {}
+        evidence_group_assignments = {}
         for camera_index, camera_id in enumerate(CAMERAS):
             for track_index in range(30):
                 tracklet_id = f"{camera_id}-track-{track_index:02d}"
+                evidence_group_id = f"physical-object-{track_index:02d}"
                 event_ids = []
                 for event_index in range(3):
                     event_id = f"{tracklet_id}-event-{event_index}"
@@ -123,6 +125,7 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
                     "lane_path_id": f"lane-{track_index % 3}",
                     "includes_turn": track_index % 10 == 0,
                     "motion_direction_deg": float(camera_index * 45 + track_index * 2),
+                    "evidence_group_id": evidence_group_id,
                     "review": {
                         "moving": True,
                         "occlusion_free": True,
@@ -136,6 +139,9 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
                     if track_index >= 27
                     else ("fit", "validation")[track_index % 2]
                 )
+                evidence_group_assignments[evidence_group_id] = assignments[
+                    tracklet_id
+                ]
 
         ledger = root / "ledger"
         ledger.mkdir()
@@ -161,6 +167,7 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
             "source_tracklets_sha256": tracklets_hash,
             "holdout_day_utc": "2026-07-12",
             "assignments": assignments,
+            "evidence_group_assignments": evidence_group_assignments,
         }))
 
         association_path = None
@@ -215,6 +222,17 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
         ledger, tracklets, associations, split, cameras = fixture
         return validate_inputs(ledger, tracklets, associations, split, cameras)
 
+    @staticmethod
+    def rebind_tracklets(fixture, mutate):
+        tracklets = json.loads(fixture[1].read_text())
+        mutate(tracklets)
+        fixture[1].write_text(json.dumps(tracklets))
+        split = json.loads(fixture[3].read_text())
+        split["source_tracklets_sha256"] = hashlib.sha256(
+            fixture[1].read_bytes()
+        ).hexdigest()
+        fixture[3].write_text(json.dumps(split))
+
     def test_complete_four_camera_fixture_passes_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             report = self.report(self.fixture(directory))
@@ -258,6 +276,57 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
             report = self.report(fixture)
             self.assertFalse(report["gate_passed"])
             self.assertIn("association_crosses_split", report["reasons"])
+
+    def test_tracklets_require_explicit_evidence_group_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory, associations=False)
+            self.rebind_tracklets(
+                fixture,
+                lambda tracklets: tracklets["tracklets"][0].pop(
+                    "evidence_group_id"
+                ),
+            )
+
+            report = self.report(fixture)
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn("tracklet_evidence_group", report["reasons"])
+
+    def test_evidence_group_cannot_leak_across_partitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory, associations=False)
+
+            def leak_group(tracklets):
+                target = next(
+                    item
+                    for item in tracklets["tracklets"]
+                    if item["tracklet_id"] == "ch1-track-01"
+                )
+                target["evidence_group_id"] = "physical-object-00"
+
+            self.rebind_tracklets(fixture, leak_group)
+
+            report = self.report(fixture)
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn("evidence_group_crosses_split", report["reasons"])
+            self.assertFalse(
+                report["optimizer_contract"]["whole_evidence_group_atomic"]
+            )
+
+    def test_declared_evidence_group_partition_must_match_recomputed_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory, associations=False)
+            split = json.loads(fixture[3].read_text())
+            split["evidence_group_assignments"]["physical-object-00"] = (
+                "validation"
+            )
+            fixture[3].write_text(json.dumps(split))
+
+            report = self.report(fixture)
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn("split_evidence_group_mismatch", report["reasons"])
 
     def test_bad_hash_and_timestamp_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

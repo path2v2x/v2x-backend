@@ -1,6 +1,8 @@
 import copy
 import json
 import hashlib
+import math
+from types import SimpleNamespace
 
 import pytest
 import tools.verify_phase4_live as live_probe
@@ -11,6 +13,7 @@ from tools.verify_phase4_live import (
     binary_digest,
     build_parser,
     choose_teleport_target,
+    expected_twin_camera_transform,
     project_world_xyz,
     receive_binary_frame,
     receive_live_twin_frame_packet,
@@ -425,6 +428,94 @@ def test_rr_sensor_zero_transform_uses_tracked_config_proof():
     )
     assert evidence["position_error_m"] is None
     assert evidence["configured_position_error_m"] == 0.0
+
+
+def test_expected_camera_transform_uses_carla010_opendrive_georeference(tmp_path):
+    from v2x_common.geodesy import TransverseMercator
+
+    georeference = (
+        "+proj=tmerc +lat_0=37.9 +lon_0=-122.3 +k=0.75 "
+        "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    )
+    projection = TransverseMercator.from_proj_string(georeference)
+    latitude, longitude = projection.inverse(300.0, 150.0)
+
+    class Carla010Map:
+        name = "Richmond_Carla010_Shared_Transform_Regression"
+
+        def transform_to_geolocation(self, location):
+            lat, lon = projection.inverse(float(location.x), -float(location.y))
+            return SimpleNamespace(latitude=lat, longitude=lon, altitude=0.0)
+
+        def to_opendrive(self):
+            return (
+                "<OpenDRIVE><header><geoReference><![CDATA["
+                + georeference
+                + "]]></geoReference></header></OpenDRIVE>"
+            )
+
+        def get_waypoint(self, location, project_to_road=True):
+            assert project_to_road is True
+            return SimpleNamespace(
+                transform=SimpleNamespace(
+                    location=SimpleNamespace(x=location.x, y=location.y, z=2.5)
+                )
+            )
+
+    carla_map = Carla010Map()
+    world = SimpleNamespace(get_map=lambda: carla_map)
+    camera = {
+        "id": "ch1",
+        "height_m": 7.0,
+        "pitch_deg": -39.2,
+        "yaw_deg": -46.06,
+        "heading_deg": 200.0,
+        "roll_deg": 1.0,
+        "intrinsics": {
+            "fx": 1325.4,
+            "fy": 1325.4,
+            "cx": 1280.0,
+            "cy": 960.0,
+            "width": 2560,
+            "height": 1920,
+        },
+        "twin_pose": {
+            "forward_offset_m": 1.25,
+            "right_offset_m": -0.5,
+            "height_offset_m": 0.4,
+            "pitch_offset_deg": 0.5,
+            "yaw_offset_deg": 2.0,
+            "roll_offset_deg": -0.25,
+        },
+    }
+    cameras_path = tmp_path / "cameras.json"
+    cameras_path.write_text(
+        json.dumps({
+            "site": {"lat": latitude, "lon": longitude},
+            "cameras": [camera],
+        })
+    )
+
+    shared = live_probe.compute_twin_camera_transform(
+        carla_map,
+        {"lat": latitude, "lon": longitude},
+        camera,
+    )
+    expected = expected_twin_camera_transform(world, cameras_path, "ch1")
+
+    assert expected["location"] == pytest.approx({
+        "x": shared.location.x,
+        "y": shared.location.y,
+        "z": shared.location.z,
+    })
+    assert expected["rotation"] == pytest.approx({
+        "pitch": shared.rotation.pitch,
+        "yaw": shared.rotation.yaw,
+        "roll": shared.rotation.roll,
+    })
+    # A stale degree-to-metre approximation ignores the OpenDRIVE k=0.75
+    # scale; the tracked inverse must retain the requested projected anchor.
+    assert math.hypot(shared.location.x, shared.location.y) > 300.0
 
 
 def test_projects_world_point_through_fingerprinted_camera_model():

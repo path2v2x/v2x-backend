@@ -14,6 +14,7 @@ from PIL import Image
 TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS_DIR))
 
+import build_twin_calibration_manifest as manifest_builder  # noqa: E402
 from build_twin_calibration_manifest import (  # noqa: E402
     build_deployment_model,
     decoded_image_size,
@@ -24,6 +25,7 @@ from build_twin_calibration_manifest import (  # noqa: E402
     validate_intrinsics_calibration,
     validate_intrinsics_source_images,
     validate_annotations,
+    validate_resolved_point_independence,
 )
 
 
@@ -44,6 +46,7 @@ def annotation_payload():
     )):
         points.append({
             "id": f"landmark-{index}",
+            "global_landmark_id": f"rfs-survey-landmark-{index}",
             "split": "train" if index < 8 else "holdout",
             "provenance": "manually_verified_unique",
             "category": "signal_corner",
@@ -320,6 +323,16 @@ def test_rejects_missing_or_untrusted_intrinsics_evidence(mutate, message):
             "semantic description",
         ),
         (
+            lambda payload: payload["points"][0].pop("global_landmark_id"),
+            "global landmark IDs",
+        ),
+        (
+            lambda payload: payload["points"][8].update(
+                global_landmark_id=payload["points"][0]["global_landmark_id"]
+            ),
+            "globally unique",
+        ),
+        (
             lambda payload: payload["points"][8].update(
                 image=payload["points"][0]["image"]
             ),
@@ -367,3 +380,91 @@ def test_rejects_collinear_or_fit_line_copied_holdouts():
     payload["roads"][1]["image_polyline"] = [[100, 1500], [2400, 1500]]
     with pytest.raises(ValueError, match="not independent of fit roads"):
         validate_annotations(payload, "ch1", (2560, 1920), (1280, 960))
+
+
+@pytest.mark.parametrize(
+    ("field", "near_value"),
+    [
+        ("image", [102.0, 101.0]),
+        ("twin", [101.0, 100.5]),
+        ("world", [0.1, 0.1, 0.0]),
+    ],
+)
+def test_resolved_holdouts_reject_proximity_to_train_in_every_space(
+    field, near_value
+):
+    train = {
+        "id": "train-point",
+        "global_landmark_id": "rfs-train-point",
+        "type": "point",
+        "split": "train",
+        "image": [100.0, 100.0],
+        "twin": [100.0, 100.0],
+        "world": [0.0, 0.0, 0.0],
+    }
+    holdout = {
+        "id": "holdout-point",
+        "global_landmark_id": "rfs-holdout-point",
+        "type": "point",
+        "split": "holdout",
+        "image": [500.0, 500.0],
+        "twin": [500.0, 500.0],
+        "world": [10.0, 10.0, 10.0],
+    }
+    holdout[field] = near_value
+
+    with pytest.raises(ValueError, match=f"{field} space"):
+        validate_resolved_point_independence([train, holdout])
+
+
+def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
+    monkeypatch
+):
+    annotations = [
+        {
+            "id": "train-point",
+            "global_landmark_id": "rfs-train-point",
+            "type": "point",
+            "split": "train",
+            "provenance": "manually_verified_unique",
+            "category": "signal_corner",
+            "description": "Unique surveyed train signal corner",
+            "twin": [2.0, 2.0],
+            "image": [10.0, 10.0],
+        },
+        {
+            "id": "holdout-point",
+            "global_landmark_id": "rfs-holdout-point",
+            "type": "point",
+            "split": "holdout",
+            "provenance": "manually_verified_unique",
+            "category": "signal_corner",
+            "description": "Unique surveyed holdout signal corner",
+            "twin": [5.0, 5.0],
+            "image": [100.0, 100.0],
+        },
+    ]
+    raw = depth_buffer(8, 8, 10.0)
+    depth = SimpleNamespace(width=8, height=8, frame=1, timestamp=1.0)
+    monkeypatch.setattr(
+        manifest_builder,
+        "depth_pixel_to_world",
+        lambda *_args: SimpleNamespace(x=1.0, y=2.0, z=3.0),
+    )
+
+    with pytest.raises(ValueError, match="world space"):
+        resolve_manifest(
+            annotations,
+            camera_id="ch1",
+            camera=measured_camera(),
+            transform=SimpleNamespace(),
+            depth_image=depth,
+            depth_raw=raw,
+            expected_twin_size=(8, 8),
+            real_frame_sha256="a" * 64,
+            twin_frame_sha256="b" * 64,
+            annotation_sha256="c" * 64,
+            cameras_file_sha256="d" * 64,
+            camera_config_sha256="e" * 64,
+            depth_raw_sha256="f" * 64,
+        )

@@ -373,6 +373,7 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
     if tracklets.get("source_observations_sha256") != observations_hash:
         reasons.append("tracklet_source_hash")
     tracklet_index = {}
+    evidence_groups = defaultdict(list)
     event_owners = {}
     tracklet_values = tracklets.get("tracklets")
     if not isinstance(tracklet_values, list):
@@ -383,6 +384,7 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             reasons.append("tracklet_invalid")
             continue
         tracklet_id = tracklet.get("tracklet_id")
+        evidence_group_id = tracklet.get("evidence_group_id")
         camera_id = tracklet.get("camera_id")
         event_ids = tracklet.get("event_ids")
         review = tracklet.get("review")
@@ -401,6 +403,9 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             not isinstance(tracklet_id, str)
             or not tracklet_id
             or tracklet_id in tracklet_index
+            or not isinstance(evidence_group_id, str)
+            or not evidence_group_id
+            or evidence_group_id.strip() != evidence_group_id
             or camera_id not in CAMERAS
             or not isinstance(event_ids, list)
             or len(event_ids) < 3
@@ -409,7 +414,13 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             or not isinstance(tracklet.get("lane_path_id"), str)
             or not finite(tracklet.get("motion_direction_deg"))
         ):
-            reasons.append("tracklet_invalid")
+            reasons.append(
+                "tracklet_evidence_group"
+                if not isinstance(evidence_group_id, str)
+                or not evidence_group_id
+                or evidence_group_id.strip() != evidence_group_id
+                else "tracklet_invalid"
+            )
             continue
         if any(event_id not in eligible for event_id in event_ids):
             reasons.append("tracklet_references_ineligible_observation")
@@ -423,6 +434,7 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
         for event_id in event_ids:
             event_owners[event_id] = tracklet_id
         tracklet_index[tracklet_id] = tracklet
+        evidence_groups[evidence_group_id].append(tracklet_id)
 
     split_file, split_raw, split = load_object(split_path, "track split")
     tracklets_hash = sha256_bytes(tracklets_raw)
@@ -436,6 +448,35 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
         assignments = {}
     elif any(value not in SPLITS for value in assignments.values()):
         reasons.append("split_assignment_value")
+    declared_group_assignments = split.get("evidence_group_assignments")
+    group_assignments_valid = True
+    if (
+        not isinstance(declared_group_assignments, dict)
+        or set(declared_group_assignments) != set(evidence_groups)
+    ):
+        reasons.append("split_evidence_group_assignments")
+        group_assignments_valid = False
+        declared_group_assignments = {}
+    elif any(
+        value not in SPLITS for value in declared_group_assignments.values()
+    ):
+        reasons.append("split_evidence_group_assignment_value")
+        group_assignments_valid = False
+
+    recomputed_group_assignments = {}
+    if assignments:
+        for evidence_group_id, tracklet_ids in evidence_groups.items():
+            partitions = {assignments.get(tracklet_id) for tracklet_id in tracklet_ids}
+            if len(partitions) != 1 or None in partitions:
+                reasons.append("evidence_group_crosses_split")
+                continue
+            partition = next(iter(partitions))
+            recomputed_group_assignments[evidence_group_id] = partition
+            if (
+                group_assignments_valid
+                and declared_group_assignments.get(evidence_group_id) != partition
+            ):
+                reasons.append("split_evidence_group_mismatch")
     holdout_day = split.get("holdout_day_utc")
     try:
         parsed_holdout_day = datetime.fromisoformat(holdout_day).date()
@@ -738,6 +779,7 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             "eligible_observations": len(eligible),
             "observation_rejections": dict(sorted(observation_rejections.items())),
             "tracklets": len(tracklet_index),
+            "evidence_groups": len(evidence_groups),
             "accepted_associations": len(association_index),
         },
         "cameras": camera_gates,
@@ -746,6 +788,11 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             "site_to_map_transform_frozen": True,
             "intrinsics_fixed_to_measured": True,
             "lane_prior_excluded_from_metrics": True,
+            "whole_evidence_group_atomic": (
+                group_assignments_valid
+                and len(recomputed_group_assignments) == len(evidence_groups)
+                and recomputed_group_assignments == declared_group_assignments
+            ),
             "diagnostic_until_independent_truth": True,
         },
     }
