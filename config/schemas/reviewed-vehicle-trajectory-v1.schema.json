@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://path2v2x.net/schemas/reviewed-vehicle-trajectory-v1.schema.json",
+  "title": "Reviewed vehicle trajectory attachment input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "acceptance_eligible", "global_track_id", "trajectory_id", "reviewer", "source", "samples"],
+  "properties": {
+    "schema": {"const": "v2x-reviewed-vehicle-trajectory/v1"},
+    "acceptance_eligible": {"const": true},
+    "global_track_id": {"type": "string", "minLength": 1},
+    "trajectory_id": {"type": "string", "minLength": 1},
+    "reviewer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {"kind": {"const": "human"}, "id": {"type": "string", "minLength": 1}}
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["detections_ndjson_sha256", "consensus", "factor_graph", "identity", "cameras_json", "opendrive"],
+      "properties": {
+        "detections_ndjson_sha256": {"$ref": "#/$defs/sha256"},
+        "consensus": {"$ref": "#/$defs/jsonArtifact"},
+        "factor_graph": {"$ref": "#/$defs/jsonArtifact"},
+        "identity": {"$ref": "#/$defs/jsonArtifact"},
+        "cameras_json": {"$ref": "#/$defs/fileArtifact"},
+        "opendrive": {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "sha256", "map_name"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "map_name": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "samples": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["event_id", "camera_id", "sample_index", "frame", "mask", "native_resolution", "frame_number", "contact", "timing", "placement"],
+        "properties": {
+          "event_id": {"type": "string", "minLength": 1},
+          "camera_id": {"type": "string", "minLength": 1},
+          "sample_index": {"type": "integer", "minimum": 0},
+          "frame": {"$ref": "#/$defs/fileArtifact"},
+          "mask": {"$ref": "#/$defs/fileArtifact"},
+          "native_resolution": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}], "items": false},
+          "frame_number": {"type": "integer", "minimum": 0},
+          "contact": {"$ref": "#/$defs/contact"},
+          "timing": {"$ref": "#/$defs/timing"},
+          "placement": {"$ref": "#/$defs/placement"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "fileArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "jsonArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "schema"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema": {"type": "string", "minLength": 1}
+      }
+    },
+    "point2": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}], "items": false},
+    "contact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method", "left_ground_pixel", "right_ground_pixel", "footprint_midpoint_pixel", "covariance_px2"],
+      "properties": {
+        "method": {"const": "reviewed_vehicle_footprint_midpoint"},
+        "left_ground_pixel": {"$ref": "#/$defs/point2"},
+        "right_ground_pixel": {"$ref": "#/$defs/point2"},
+        "footprint_midpoint_pixel": {"$ref": "#/$defs/point2"},
+        "covariance_px2": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}}
+      }
+    },
+    "timing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method", "trusted", "session_id", "pts_seconds", "media_timestamp_utc", "timestamp_error_ms"],
+      "properties": {
+        "method": {"const": "exact_same_session_pts"},
+        "trusted": {"const": true},
+        "session_id": {"type": "string", "minLength": 1},
+        "pts_seconds": {"type": "number", "minimum": 0},
+        "media_timestamp_utc": {"type": "string", "format": "date-time"},
+        "timestamp_error_ms": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "placement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["coordinate_frame", "position_semantics", "position_m", "covariance_m2", "uncertainty_m", "heading_deg", "dimensions_m", "blueprint_family"],
+      "properties": {
+        "coordinate_frame": {"const": "carla_world"},
+        "position_semantics": {"const": "ue5_actor_center"},
+        "position_m": {
+          "type": "object", "additionalProperties": false, "required": ["x", "y", "z"],
+          "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}
+        },
+        "covariance_m2": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}},
+        "uncertainty_m": {"type": "number", "minimum": 0, "maximum": 2},
+        "heading_deg": {"type": "number"},
+        "dimensions_m": {
+          "type": "object", "additionalProperties": false, "required": ["length", "width", "height"],
+          "properties": {
+            "length": {"type": "number", "minimum": 0.1, "maximum": 30},
+            "width": {"type": "number", "minimum": 0.1, "maximum": 5},
+            "height": {"type": "number", "minimum": 0.1, "maximum": 6}
+          }
+        },
+        "blueprint_family": {"enum": ["passenger_car", "truck", "bus"]}
+      }
+    }
+  }
+}

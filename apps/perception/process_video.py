@@ -588,6 +588,19 @@ def canonical_object_sha256(value):
     return hashlib.sha256(payload).hexdigest()
 
 
+def detector_config_fingerprint(model_sha256, confidence):
+    """Fingerprint the exact source-controlled detector/tracker invocation."""
+    return canonical_object_sha256({
+        "schema": "v2x-perception-detector-config/v1",
+        "model_sha256": model_sha256,
+        "confidence": float(confidence),
+        "tracker": "botsort.yaml",
+        "persist_tracks": True,
+        "allowed_classes": ["car", "person", "truck"],
+        "ground_contact_method": "bbox_bottom_center_diagnostic",
+    })
+
+
 def camera_config_fingerprints(config, path=None):
     """Bind emitted observations to the exact file and selected camera."""
     config_path = Path(
@@ -2778,6 +2791,7 @@ class VideoObjectDetector:
                  calibration_uncertainty_m=float("inf"), image_width=None,
                  image_height=None, cameras_json_sha256=None,
                  camera_config_sha256=None, detector_model_sha256=None,
+                 detector_config_sha256=None,
                  map_georeference=None):
 
         """
@@ -2812,6 +2826,7 @@ class VideoObjectDetector:
         self.cameras_json_sha256 = cameras_json_sha256
         self.camera_config_sha256 = camera_config_sha256
         self.detector_model_sha256 = detector_model_sha256
+        self.detector_config_sha256 = detector_config_sha256
         self.map_georeference = map_georeference
 
         self.pitch_deg = pitch_deg
@@ -3105,6 +3120,9 @@ class VideoObjectDetector:
                     "detector_model_sha256": getattr(
                         self, "detector_model_sha256", None
                     ),
+                    "detector_config_sha256": getattr(
+                        self, "detector_config_sha256", None
+                    ),
                 },
                 "optimizer_contract": {
                     "pixel_observation_is_input": True,
@@ -3260,6 +3278,9 @@ if __name__ == "__main__":
             cameras_config
         )
         detector_model_sha256 = sha256_file(model_path)
+        detector_config_sha256 = detector_config_fingerprint(
+            detector_model_sha256, conf
+        )
         site = cameras_config.get("site", {})
         for cam in cameras_config["cameras"]:
             pixel_sigma, calibration_uncertainty_m = (
@@ -3291,6 +3312,7 @@ if __name__ == "__main__":
                 cameras_json_sha256=cameras_json_sha256,
                 camera_config_sha256=camera_hashes[cam["id"]],
                 detector_model_sha256=detector_model_sha256,
+                detector_config_sha256=detector_config_sha256,
                 map_georeference=site.get("map_georeference"),
             ))
     else:

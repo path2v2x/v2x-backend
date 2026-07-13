@@ -13,6 +13,7 @@ Disable entirely with DTB_TWIN_SYNC=off.
 """
 
 import asyncio
+from collections import Counter, deque
 import hashlib
 import logging
 import math
@@ -23,6 +24,12 @@ import requests
 
 from digital_twin_bridge.detection_pages import fetch_all_detection_pages
 from digital_twin_bridge.geo_utils import gps_to_carla
+from digital_twin_bridge.reviewed_localization import (
+    ReviewedLocalizationError,
+    ReviewedPlacementContext,
+    build_runtime_context,
+    validate_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +93,9 @@ class TwinTrack:
         "device_id", "track_id", "bbox", "gps_location",
         "raw_carla_location", "lane_snap_distance_m",
         "raw_to_target_planar_m", "placement_planar_error_m",
+        "reviewed_localization", "trajectory_id", "sample_index",
+        "reviewed_media_epoch", "blueprint_family", "placement_key_sha256",
+        "vehicle_dimensions_m",
     )
 
     def __init__(self, object_id: str, object_type: str) -> None:
@@ -112,6 +122,13 @@ class TwinTrack:
         self.lane_snap_distance_m = None
         self.raw_to_target_planar_m = None
         self.placement_planar_error_m = None
+        self.reviewed_localization = None
+        self.trajectory_id = None
+        self.sample_index = None
+        self.reviewed_media_epoch = None
+        self.blueprint_family = None
+        self.placement_key_sha256 = None
+        self.vehicle_dimensions_m = None
 
 
 class TwinSync:
@@ -132,6 +149,9 @@ class TwinSync:
         detection_max_age: float = 8.0,
         detection_future_tolerance: float = 5.0,
         range_fetcher=None,
+        reviewed_placement: str = "off",
+        reviewed_context: Optional[ReviewedPlacementContext] = None,
+        cameras_json_path: str = "",
     ) -> None:
         self._world = world
         self._map = carla_map
@@ -145,6 +165,18 @@ class TwinSync:
         # Callable (start_iso, end_iso, limit) -> {"items": [...]} against the
         # detections DB; enables replaying the twin at past timestamps.
         self._range_fetcher = range_fetcher
+        placement_mode = str(reviewed_placement).strip().lower()
+        if placement_mode not in {"off", "strict"}:
+            raise ValueError("reviewed_placement must be 'off' or 'strict'")
+        self._reviewed_placement = placement_mode
+        if placement_mode == "strict":
+            self._reviewed_context = reviewed_context or build_runtime_context(
+                carla_map, cameras_json_path
+            )
+        else:
+            self._reviewed_context = None
+        self._strict_rejections = Counter()
+        self._recent_strict_rejections = deque(maxlen=20)
         self._tracks: Dict[str, TwinTrack] = {}
         self._vehicle_blueprints: List[object] = []
         self._truck_blueprints: List[object] = []
@@ -199,7 +231,7 @@ class TwinSync:
     def _blueprint_for(self, track: TwinTrack):
         if track.object_type == "person":
             pool = self._walker_blueprints
-        elif track.object_type in {"truck", "bus"}:
+        elif track.blueprint_family in {"truck", "bus"} or track.object_type in {"truck", "bus"}:
             pool = self._truck_blueprints
         else:
             pool = self._vehicle_blueprints
@@ -209,7 +241,10 @@ class TwinSync:
         # Python's hash() is randomized per process.  A stable digest keeps a
         # replayed physical track on the same UE5 blueprint across bounded
         # retries and service restarts, making visual evidence reproducible.
-        digest = hashlib.sha256(track.object_id.encode("utf-8")).digest()
+        if track.placement_key_sha256 is not None:
+            digest = bytes.fromhex(track.placement_key_sha256)
+        else:
+            digest = hashlib.sha256(track.object_id.encode("utf-8")).digest()
         bp = pool[int.from_bytes(digest[:8], "big") % len(pool)]
         try:
             bp.set_attribute("role_name", "twin_object")
@@ -282,6 +317,97 @@ class TwinSync:
         )
         return location
 
+    def _reviewed_location_for(self, reviewed: dict):
+        """Return the exact reviewed UE5 actor-centre coordinate.
+
+        Strict reviewed placement never calls map waypoint projection and never
+        adds a surface/collision offset.  The artifact is explicitly required to
+        carry actor-centre semantics, so any adjustment here would destroy the
+        reviewed world-coordinate evidence.
+        """
+        import carla
+
+        position = reviewed["position_m"]
+        return carla.Location(
+            x=position["x"], y=position["y"], z=position["z"]
+        )
+
+    def _commit_reviewed_track(
+        self, track: TwinTrack, reviewed: dict, location
+    ) -> None:
+        position = reviewed["position_m"]
+        track.raw_carla_location = dict(position)
+        track.lane_snap_distance_m = None
+        track.raw_to_target_planar_m = 0.0
+        track.placement_planar_error_m = 0.0
+        track.yaw = reviewed["heading_deg"]
+        track.reviewed_localization = reviewed
+        track.trajectory_id = reviewed["trajectory_id"]
+        track.sample_index = reviewed["sample_index"]
+        track.reviewed_media_epoch = reviewed["media_epoch"]
+        track.blueprint_family = reviewed["blueprint_family"]
+        track.placement_key_sha256 = reviewed["placement_key_sha256"]
+        track.vehicle_dimensions_m = reviewed["dimensions_m"]
+        track.current = location
+        track.target = location
+
+    def _reject_strict(self, detection: dict, reason: str) -> None:
+        self._strict_rejections[reason] += 1
+        self._recent_strict_rejections.append({
+            "event_id": detection.get("event_id"),
+            "object_id": detection.get("object_id"),
+            "reason": reason,
+        })
+
+    def _strict_sequence_is_valid(
+        self, track: TwinTrack, reviewed: dict, object_type: str
+    ) -> Optional[str]:
+        if track.object_type != object_type:
+            return "trajectory_object_type_changed"
+        if track.trajectory_id is not None and track.trajectory_id != reviewed["trajectory_id"]:
+            return "trajectory_identity_changed"
+        if track.sample_index is not None and reviewed["sample_index"] <= track.sample_index:
+            return "trajectory_sample_not_monotonic"
+        if (
+            track.reviewed_media_epoch is not None
+            and reviewed["media_epoch"] < track.reviewed_media_epoch
+        ):
+            return "trajectory_timestamp_regressed"
+        return None
+
+    def _commit_detection_metadata(
+        self,
+        track: TwinTrack,
+        detection: dict,
+        now: float,
+        use_detection_ts: bool,
+    ) -> None:
+        track.event_id = detection.get("event_id")
+        track.detection_timestamp_utc = detection.get("timestamp_utc")
+        track.media_timestamp_utc = detection.get("media_timestamp_utc")
+        track.timestamp_schema_version = detection.get("timestamp_schema_version")
+        track.media_time_trusted = detection.get("media_time_trusted") is True
+        track.media_clock = detection.get("media_clock")
+        track.device_id = detection.get("device_id")
+        track.track_id = detection.get("track_id")
+        track.bbox = detection.get("bbox") or (
+            (detection.get("camera_data") or {})
+            .get("bifocal_metadata", {})
+            .get("bbox")
+        )
+        gps = detection.get("gps_location") or {}
+        lat, lon = gps.get("latitude"), gps.get("longitude")
+        track.gps_location = (
+            {"latitude": float(lat), "longitude": float(lon)}
+            if lat is not None and lon is not None
+            else None
+        )
+        if use_detection_ts:
+            detection_epoch = _parse_utc_epoch(detection.get("timestamp_utc"))
+            track.last_seen = detection_epoch if detection_epoch is not None else now
+        else:
+            track.last_seen = now
+
     # ------------------------------------------------------------------
     # Poll + apply
     # ------------------------------------------------------------------
@@ -321,44 +447,69 @@ class TwinSync:
         if now is None:
             now = time.time()
 
+        if self._reviewed_placement == "strict":
+            detections = sorted(
+                detections,
+                key=lambda item: (
+                    str((item.get("reviewed_localization") or {}).get("trajectory_id", "")),
+                    (item.get("reviewed_localization") or {}).get("sample_index", -1)
+                    if isinstance((item.get("reviewed_localization") or {}).get("sample_index"), int)
+                    else -1,
+                    str(item.get("event_id", "")),
+                ),
+            )
+
         for det in detections:
             object_id = det.get("object_id")
             object_type = det.get("object_type") or "car"
-            gps = det.get("gps_location") or {}
-            lat, lon = gps.get("latitude"), gps.get("longitude")
-            if not object_id or lat is None or lon is None:
-                continue
+            reviewed = None
+            if self._reviewed_placement == "strict":
+                try:
+                    reviewed = validate_contract(
+                        det.get("reviewed_localization"),
+                        det,
+                        self._reviewed_context,
+                    )
+                except ReviewedLocalizationError as exc:
+                    self._reject_strict(det, exc.reason)
+                    continue
+                object_id = reviewed["global_track_id"]
+                if object_type not in VEHICLE_TYPES:
+                    self._reject_strict(det, "strict_mode_vehicle_only")
+                    continue
+            else:
+                gps = det.get("gps_location") or {}
+                lat, lon = gps.get("latitude"), gps.get("longitude")
+                if not object_id or lat is None or lon is None:
+                    continue
             if object_type not in VEHICLE_TYPES and object_type != "person":
                 continue
 
             track = self._tracks.get(object_id)
+            if reviewed is not None and track is not None:
+                sequence_error = self._strict_sequence_is_valid(
+                    track, reviewed, object_type
+                )
+                if sequence_error is not None:
+                    self._reject_strict(det, sequence_error)
+                    continue
             if track is None:
                 track = TwinTrack(object_id, object_type)
                 self._tracks[object_id] = track
-            track.event_id = det.get("event_id")
-            track.detection_timestamp_utc = det.get("timestamp_utc")
-            track.media_timestamp_utc = det.get("media_timestamp_utc")
-            track.timestamp_schema_version = det.get("timestamp_schema_version")
-            track.media_time_trusted = det.get("media_time_trusted") is True
-            track.media_clock = det.get("media_clock")
-            track.device_id = det.get("device_id")
-            track.track_id = det.get("track_id")
-            track.bbox = det.get("bbox") or (
-                (det.get("camera_data") or {})
-                .get("bifocal_metadata", {})
-                .get("bbox")
-            )
-            track.gps_location = {
-                "latitude": float(lat),
-                "longitude": float(lon),
-            }
-            if use_detection_ts:
-                det_ts = _parse_utc_epoch(det.get("timestamp_utc"))
-                track.last_seen = det_ts if det_ts is not None else now
-            else:
-                track.last_seen = now
+            gps = det.get("gps_location") or {}
+            lat, lon = gps.get("latitude"), gps.get("longitude")
+            if reviewed is None:
+                self._commit_detection_metadata(track, det, now, use_detection_ts)
 
-            location = self._location_for(track, float(lat), float(lon))
+            if reviewed is not None:
+                # The family/key are needed for deterministic blueprint choice
+                # before a first spawn.  The reviewed sample itself is committed
+                # only after the exact transform succeeds.
+                track.blueprint_family = reviewed["blueprint_family"]
+                track.placement_key_sha256 = reviewed["placement_key_sha256"]
+                location = self._reviewed_location_for(reviewed)
+            else:
+                location = self._location_for(track, float(lat), float(lon))
             if location is None:
                 continue
 
@@ -368,7 +519,9 @@ class TwinSync:
                     continue
                 intended_transform = carla.Transform(
                     location,
-                    carla.Rotation(yaw=track.yaw),
+                    carla.Rotation(
+                        yaw=(reviewed["heading_deg"] if reviewed else track.yaw)
+                    ),
                 )
                 actor = None
                 for dx, dy, dz in SPAWN_BOOTSTRAP_OFFSETS:
@@ -378,7 +531,9 @@ class TwinSync:
                             y=location.y + dy,
                             z=location.z + dz,
                         ),
-                        carla.Rotation(yaw=track.yaw),
+                        carla.Rotation(
+                            yaw=(reviewed["heading_deg"] if reviewed else track.yaw)
+                        ),
                     )
                     actor = self._world.try_spawn_actor(bp, candidate_transform)
                     if actor is None:
@@ -420,24 +575,58 @@ class TwinSync:
                     )
                     continue
                 track.actor_id = actor.id
-                track.current = location
-                track.target = location
+                if reviewed is not None:
+                    self._commit_reviewed_track(track, reviewed, location)
+                    self._commit_detection_metadata(
+                        track, det, now, use_detection_ts
+                    )
+                else:
+                    track.current = location
+                    track.target = location
                 logger.info(
                     "Twin spawn: %s (%s) as %s at (%.1f, %.1f)",
                     object_id, object_type, bp.id, location.x, location.y,
                 )
             else:
                 # New GPS fix: update motion yaw, retarget the lerp.
-                if track.current is not None:
+                if reviewed is None and track.current is not None:
                     dx = location.x - track.current.x
                     dy = location.y - track.current.y
                     if math.hypot(dx, dy) > 1.5:
                         track.yaw = math.degrees(math.atan2(dy, dx))
-                track.target = location
-                # Lerp progress always runs on the wall clock, even when
-                # `now` is a replay clock.
-                track.lerp_start = time.time()
-                track.lerp_duration = self._poll_interval
+                if reviewed is not None:
+                    actor = self._world.get_actor(track.actor_id)
+                    if actor is None:
+                        track.actor_id = None
+                        self._reject_strict(det, "strict_actor_vanished")
+                        continue
+                    try:
+                        actor.set_transform(
+                            carla.Transform(
+                                location,
+                                carla.Rotation(yaw=reviewed["heading_deg"]),
+                            )
+                        )
+                    except Exception:
+                        self._reject_strict(det, "strict_exact_transform_failed")
+                        logger.warning(
+                            "Strict twin transform failed for %s",
+                            object_id,
+                            exc_info=True,
+                        )
+                        continue
+                    self._commit_reviewed_track(track, reviewed, location)
+                    self._commit_detection_metadata(
+                        track, det, now, use_detection_ts
+                    )
+                    track.lerp_start = time.time()
+                    track.lerp_duration = 0.0
+                else:
+                    track.target = location
+                    # Lerp progress always runs on the wall clock, even when
+                    # `now` is a replay clock.
+                    track.lerp_start = time.time()
+                    track.lerp_duration = self._poll_interval
 
         self._despawn_stale(now)
 
@@ -654,7 +843,7 @@ class TwinSync:
                     "Twin status transform unavailable for %s", track.object_id
                 )
 
-        return {
+        payload = {
             "object_id": track.object_id,
             "object_type": track.object_type,
             "event_id": track.event_id,
@@ -691,6 +880,55 @@ class TwinSync:
             "actor_type": actor_type,
             "carla_transform": transform_payload,
         }
+        if self._reviewed_placement == "strict":
+            reviewed = track.reviewed_localization
+            reviewed_target = reviewed.get("position_m") if reviewed else None
+            reviewed_to_actor_planar_m = None
+            if reviewed_target is not None and transform_payload is not None:
+                actor_location = transform_payload["location"]
+                reviewed_to_actor_planar_m = math.hypot(
+                    actor_location["x"] - reviewed_target["x"],
+                    actor_location["y"] - reviewed_target["y"],
+                )
+            payload.update({
+                "reviewed_placement_mode": "strict",
+                "reviewed_localization_schema": (
+                    reviewed.get("schema") if reviewed else None
+                ),
+                "reviewed_contract_sha256": (
+                    reviewed.get("contract_sha256") if reviewed else None
+                ),
+                "trajectory_id": track.trajectory_id,
+                "trajectory_sample_index": track.sample_index,
+                "reviewed_world_location": reviewed_target,
+                "reviewed_to_actor_planar_m": reviewed_to_actor_planar_m,
+                "placement_planar_error_m": reviewed_to_actor_planar_m,
+                "placement_metric_status": "reviewed_world_exact",
+                "blueprint_family": track.blueprint_family,
+                "blueprint_selection_digest": track.placement_key_sha256,
+                "vehicle_dimensions_m": track.vehicle_dimensions_m,
+                "placement_provenance": (
+                    {
+                        key: reviewed[key]
+                        for key in (
+                            "frame_sha256",
+                            "mask_sha256",
+                            "detector_model_sha256",
+                            "detector_config_sha256",
+                            "cameras_json_sha256",
+                            "camera_config_sha256",
+                            "intrinsics_artifact_sha256",
+                            "opendrive_sha256",
+                            "consensus_sha256",
+                            "factor_graph_sha256",
+                            "identity_evidence_sha256",
+                            "uncertainty_m",
+                        )
+                    }
+                    if reviewed else None
+                ),
+            })
+        return payload
 
     def status(self) -> dict:
         clock = self.replay_clock()
@@ -698,7 +936,7 @@ class TwinSync:
             self._track_status(self._tracks[object_id])
             for object_id in sorted(self._tracks)
         ]
-        return {
+        payload = {
             "tracks": len(self._tracks),
             "actors": sum(1 for item in objects if item["actor_present"]),
             "poll_failures": self._poll_failures,
@@ -708,6 +946,18 @@ class TwinSync:
             "replay_clock": _epoch_to_iso(clock) if clock is not None else None,
             "objects": objects,
         }
+        if self._reviewed_placement == "strict":
+            payload.update({
+                "reviewed_placement_mode": "strict",
+                "strict_rejections": dict(sorted(self._strict_rejections.items())),
+                "recent_strict_rejections": list(self._recent_strict_rejections),
+                "strict_context": {
+                    "map_name": self._reviewed_context.map_name,
+                    "opendrive_sha256": self._reviewed_context.opendrive_sha256,
+                    "cameras_json_sha256": self._reviewed_context.cameras_json_sha256,
+                },
+            })
+        return payload
 
     def clear(self) -> None:
         """Destroy all twin actors and forget tracks (keeps polling)."""

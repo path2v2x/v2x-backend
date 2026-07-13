@@ -35,6 +35,7 @@ from process_video import (  # noqa: E402
     assess_media_clock,
     camera_intrinsics_evidence,
     camera_localization_parameters,
+    detector_config_fingerprint,
     load_cameras_config,
     records_ready_for_upload,
     vehicle_localization_acceptable,
@@ -53,6 +54,12 @@ class FrameIdentityTests(unittest.TestCase):
         changed = frame.copy()
         changed[61:68, 93:100] = 255
         self.assertNotEqual(identity, bounded_frame_identity(changed))
+
+    def test_detector_config_fingerprint_is_stable_and_configuration_bound(self):
+        first = detector_config_fingerprint("a" * 64, 0.5)
+        self.assertEqual(first, detector_config_fingerprint("a" * 64, 0.5))
+        self.assertNotEqual(first, detector_config_fingerprint("a" * 64, 0.6))
+        self.assertNotEqual(first, detector_config_fingerprint("b" * 64, 0.5))
 
 
 class WorldLocalizationUncertaintyTests(unittest.TestCase):
@@ -188,6 +195,7 @@ class WorldLocalizationUncertaintyTests(unittest.TestCase):
         detector.cameras_json_sha256 = "a" * 64
         detector.camera_config_sha256 = "b" * 64
         detector.detector_model_sha256 = "c" * 64
+        detector.detector_config_sha256 = "d" * 64
         record = detector.compute_3d_detections(
             [
                 {
@@ -215,6 +223,7 @@ class WorldLocalizationUncertaintyTests(unittest.TestCase):
         )
         self.assertFalse(raw["optimizer_contract"]["acceptance_eligible"])
         self.assertEqual(raw["fingerprints"]["camera_config_sha256"], "b" * 64)
+        self.assertEqual(raw["fingerprints"]["detector_config_sha256"], "d" * 64)
 
 
 class FrameBroadcasterTests(unittest.TestCase):
