@@ -25,6 +25,15 @@ from export_detection_corpus import canonical_json_bytes, sha256_bytes  # noqa: 
 CAMERAS = ("ch1", "ch2", "ch3", "ch4")
 SPLITS = frozenset({"fit", "validation", "holdout"})
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+ACCEPT_REVIEW_ENTRY_KEYS = frozenset({
+    "proposal_id",
+    "decision",
+    "lane_path_id",
+    "evidence_group_id",
+    "includes_turn",
+    "motion_direction_deg",
+    "checks",
+})
 
 
 class FactorGraphError(RuntimeError):
@@ -372,6 +381,89 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
         reasons.append("tracklet_schema")
     if tracklets.get("source_observations_sha256") != observations_hash:
         reasons.append("tracklet_source_hash")
+    bound_proposal_index = {}
+    bound_review_entry_index = {}
+    try:
+        _proposals_path, _proposals_raw, bound_proposals = verify_bound_file(
+            tracklets_file.parent,
+            tracklets,
+            "source_proposals_path",
+            "source_proposals_sha256",
+            "tracklet source proposals",
+            require_json=True,
+        )
+        _review_path, _review_raw, bound_review = verify_bound_file(
+            tracklets_file.parent,
+            tracklets,
+            "review_path",
+            "review_sha256",
+            "tracklet review",
+            require_json=True,
+        )
+        proposal_values = bound_proposals.get("proposals")
+        review_entries = bound_review.get("entries")
+        if (
+            bound_proposals.get("schema") != "v2x-tracklet-proposals/v1"
+            or bound_proposals.get("source_observations_sha256")
+            != observations_hash
+            or bound_review.get("schema") != "v2x-tracklet-review/v1"
+            or bound_review.get("source_proposals_sha256")
+            != tracklets.get("source_proposals_sha256")
+            or bound_review.get("reviewer") != tracklets.get("reviewer")
+            or not isinstance(proposal_values, list)
+            or not isinstance(review_entries, list)
+        ):
+            raise FactorGraphError("tracklet review artifacts do not bind")
+        for proposal in proposal_values:
+            proposal_id = (
+                proposal.get("proposal_id") if isinstance(proposal, dict) else None
+            )
+            event_ids = (
+                proposal.get("event_ids") if isinstance(proposal, dict) else None
+            )
+            if (
+                not isinstance(proposal_id, str)
+                or not proposal_id
+                or proposal_id.strip() != proposal_id
+                or proposal_id in bound_proposal_index
+                or not isinstance(event_ids, list)
+                or len(event_ids) < 3
+                or not all(
+                    isinstance(event_id, str) and bool(event_id)
+                    for event_id in event_ids
+                )
+                or len(set(event_ids)) != len(event_ids)
+            ):
+                raise FactorGraphError("tracklet proposal entries are malformed")
+            bound_proposal_index[proposal_id] = proposal
+        seen_review_proposal_ids = set()
+        for entry in review_entries:
+            proposal_id = (
+                entry.get("proposal_id") if isinstance(entry, dict) else None
+            )
+            if (
+                not isinstance(proposal_id, str)
+                or not proposal_id
+                or proposal_id.strip() != proposal_id
+                or proposal_id not in bound_proposal_index
+                or proposal_id in seen_review_proposal_ids
+                or entry.get("decision") not in {"accept", "reject"}
+            ):
+                raise FactorGraphError("tracklet review entries are malformed")
+            if entry["decision"] == "accept" and set(entry) != ACCEPT_REVIEW_ENTRY_KEYS:
+                raise FactorGraphError("accepted tracklet review entry is malformed")
+            if entry["decision"] == "reject" and (
+                not isinstance(entry.get("reason"), str)
+                or not entry["reason"].strip()
+            ):
+                raise FactorGraphError("rejected tracklet review entry is malformed")
+            seen_review_proposal_ids.add(proposal_id)
+            if entry["decision"] == "accept":
+                bound_review_entry_index[proposal_id] = entry
+    except (FactorGraphError, TypeError, ValueError):
+        reasons.append("tracklet_review_artifacts_unbound")
+        bound_proposal_index = {}
+        bound_review_entry_index = {}
     tracklet_index = {}
     evidence_groups = defaultdict(list)
     event_owners = {}
@@ -398,6 +490,7 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             and review["reviewer"].get("kind") == "human"
             and isinstance(review["reviewer"].get("id"), str)
             and bool(review["reviewer"]["id"].strip())
+            and sha256_valid(review.get("review_entry_sha256"))
         )
         if (
             not isinstance(tracklet_id, str)
@@ -409,6 +502,10 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             or camera_id not in CAMERAS
             or not isinstance(event_ids, list)
             or len(event_ids) < 3
+            or not all(
+                isinstance(event_id, str) and bool(event_id)
+                for event_id in event_ids
+            )
             or len(set(event_ids)) != len(event_ids)
             or not valid_review
             or not isinstance(tracklet.get("lane_path_id"), str)
@@ -421,6 +518,41 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
                 or evidence_group_id.strip() != evidence_group_id
                 else "tracklet_invalid"
             )
+            continue
+        proposal = bound_proposal_index.get(tracklet_id)
+        review_entry = bound_review_entry_index.get(tracklet_id)
+        expected_checks = {
+            "moving": True,
+            "occlusion_free": True,
+            "not_truncated": True,
+            "optical_flow_consistent": True,
+        }
+        if (
+            proposal is None
+            or review_entry is None
+            or proposal.get("camera_id") != camera_id
+            or proposal.get("event_ids") != event_ids
+            or proposal.get("start_media_timestamp_utc")
+            != tracklet.get("start_media_timestamp_utc")
+            or proposal.get("end_media_timestamp_utc")
+            != tracklet.get("end_media_timestamp_utc")
+            or review_entry.get("lane_path_id") != tracklet.get("lane_path_id")
+            or review_entry.get("evidence_group_id") != evidence_group_id
+            or (review_entry.get("includes_turn") is True)
+            != (tracklet.get("includes_turn") is True)
+            or not finite(review_entry.get("motion_direction_deg"))
+            or float(review_entry["motion_direction_deg"])
+            != float(tracklet["motion_direction_deg"])
+            or review_entry.get("checks") != expected_checks
+            or review.get("reviewer") != tracklets.get("reviewer")
+            or review.get("review_entry_sha256")
+            != sha256_bytes(
+                json.dumps(
+                    review_entry, sort_keys=True, separators=(",", ":")
+                ).encode()
+            )
+        ):
+            reasons.append("tracklet_review_binding")
             continue
         if any(event_id not in eligible for event_id in event_ids):
             reasons.append("tracklet_references_ineligible_observation")
@@ -519,10 +651,13 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             reasons.append("association_source_hash")
         precision = associations.get("precision_evidence")
         association_values = associations.get("associations")
+        if not isinstance(association_values, list):
+            reasons.append("associations_not_list")
+            association_values = []
         association_candidates_sha256 = (
             sha256_bytes(canonical_json_bytes(association_values))
-            if isinstance(association_values, list)
-            else None
+            if association_values
+            else sha256_bytes(canonical_json_bytes([]))
         )
         if (
             not isinstance(precision, dict)
@@ -561,7 +696,11 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
                         )
                         candidate = candidate_index.get(association_id)
                         if (
-                            candidate is None
+                            not isinstance(entry, dict)
+                            or not isinstance(association_id, str)
+                            or not association_id
+                            or association_id.strip() != association_id
+                            or candidate is None
                             or association_id in reviewed_ids
                             or entry.get("tracklet_ids")
                             != candidate.get("tracklet_ids")
@@ -600,9 +739,6 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
                     raise FactorGraphError("association precision evidence mismatch")
             except FactorGraphError:
                 reasons.append("association_precision_artifact")
-        if not isinstance(association_values, list):
-            reasons.append("associations_not_list")
-            association_values = []
         for association in association_values:
             ids = association.get("tracklet_ids") if isinstance(association, dict) else None
             evidence = association.get("evidence") if isinstance(association, dict) else None
@@ -614,11 +750,17 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
             if (
                 not isinstance(association_id, str)
                 or not association_id
+                or association_id.strip() != association_id
                 or association_id in association_ids
                 or not isinstance(ids, list)
                 or len(ids) < 2
+                or not all(
+                    isinstance(tracklet_id, str) and bool(tracklet_id)
+                    for tracklet_id in ids
+                )
                 or len(set(ids)) != len(ids)
                 or any(tracklet_id not in tracklet_index for tracklet_id in ids)
+                or len({tracklet_index[tracklet_id]["camera_id"] for tracklet_id in ids}) < 2
                 or not isinstance(evidence, dict)
                 or evidence.get("reviewed") is not True
                 or not finite(evidence.get("appearance_similarity"))
@@ -627,9 +769,22 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
                 reasons.append("association_invalid")
                 continue
             association_ids.add(association_id)
-            association_splits = {assignments.get(tracklet_id) for tracklet_id in ids}
-            if len(association_splits) != 1:
+            association_splits = {
+                assignments.get(tracklet_id) for tracklet_id in ids
+            }
+            if len(association_splits) != 1 or None in association_splits:
                 reasons.append("association_crosses_split")
+                continue
+            evidence_group_ids = {
+                tracklet_index[tracklet_id]["evidence_group_id"]
+                for tracklet_id in ids
+            }
+            if (
+                len(evidence_group_ids) != 1
+                or association.get("evidence_group_id")
+                != next(iter(evidence_group_ids))
+            ):
+                reasons.append("association_evidence_group_mismatch")
                 continue
             synchronized_pairs = association.get("synchronized_pairs", [])
             if not isinstance(synchronized_pairs, list):
@@ -646,6 +801,10 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
                 if (
                     not isinstance(pair_ids, list)
                     or len(pair_ids) != 2
+                    or not all(
+                        isinstance(event_id, str) and bool(event_id)
+                        for event_id in pair_ids
+                    )
                     or len(set(pair_ids)) != 2
                     or any(event_id not in association_events for event_id in pair_ids)
                     or eligible[pair_ids[0]]["camera_id"] == eligible[pair_ids[1]]["camera_id"]
@@ -681,6 +840,8 @@ def validate_inputs(ledger_dir, tracklets_path, associations_path, split_path, c
                             )
                         )
             association_index.append(association)
+    else:
+        reasons.append("reviewed_cross_camera_associations_missing")
 
     counts_by_camera = Counter(
         tracklet["camera_id"] for tracklet in tracklet_index.values()

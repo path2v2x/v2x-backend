@@ -4,6 +4,30 @@ Use this workflow for camera calibration, detection localization, mapping, or
 same-car twin proof. It is intentionally offline until every deployment gate
 passes.
 
+## Current acceptance state
+
+- Canonical `origin/main` and the clean live V2X tree are PR 54 merge
+  `400c3277452154985096bc251fe65b4be60cef36`. PR 52's bounded perception
+  lifecycle is accepted and remains part of that live revision.
+- Schema-V2 uploads are enabled and passed the controlled activation at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T183416Z-pr54-v2-upload-activation/`.
+  The retained row has exact DynamoDB/API/object-history parity and the live
+  UE5 observation has 3/3 tracked-object-to-present-actor parity. Roll back with
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T183416Z-pr54-v2-upload-activation/`;
+  the preceding PR 54 bridge rollback is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T183135Z-pr54-twin-spawn/`.
+- Those runtime results do not pass calibration. The strict static gate is 0/4
+  cameras; all 895 retained diagnostic evaluations remain
+  `acceptance_eligible=false`. The calibrated reconciliation branch is
+  source-only and not deployed. Do not modify its holdouts or optimizer, relax
+  a threshold, or promote a diagnostic pose.
+- The isolated V2X UE5 source workspace is `/mnt/v2x-ue5`. UE6 is a separate
+  task and is excluded from this workflow, its evidence, and its gates.
+- The paginated persistence gate is row-complete and fail-closed: any unknown
+  camera, rejected row, missing/blank `event_id`, or duplicate `event_id`
+  anywhere in the queried window fails the global result. Duplicate page items
+  never count toward a camera's span or recency evidence.
+
 ## Non-circular evidence contract
 
 - Never fit to persisted GPS, camera-local XZ, current CARLA actor positions,
@@ -96,6 +120,23 @@ The optimizer holds measured intrinsics and the site transform fixed, uses weak
 lane distance without snapping, excludes pose priors from its Jacobian rank
 test, and always reports `acceptance_eligible=false`. A successful synthetic or
 diagnostic fit is not production proof.
+
+Before any four-camera fit, bind exactly one manifest per channel to one
+surveyed site registry with
+`apps/bridge/tools/aggregate_twin_calibration_manifests.py`. The registry and
+all four manifests must be SHA-256-recorded by the aggregation report; one
+canonical `global_landmark_id` maps to one frozen split, surveyed XYZ, and
+survey-record hash site-wide. Reuse across cameras is valid only with that
+exact identity. Different IDs within 0.05 m, cross-camera split changes,
+malformed entries, missing cameras, or inconsistent survey identity fail
+closed. The aggregation remains `acceptance_eligible=false` and does not
+authorize deployment by itself.
+
+RR/CARLA 0.10 live camera acceptance must recompute the tracked transform in
+strict projection mode and retain `projection.source="opendrive_georeference"`.
+`origin_centered_fallback` is diagnostic only. A missing/malformed declaration
+or a syntactically valid projection that disagrees with CARLA's map origin is a
+hard failure.
 
 ## Richmond map-correction gate
 

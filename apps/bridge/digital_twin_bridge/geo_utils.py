@@ -25,6 +25,7 @@ from v2x_common.geodesy import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _MAP_PROJECTION_CACHE = {}
+MAX_STRICT_MAP_ORIGIN_ERROR_M = 0.5
 
 
 def _projection_for_map(carla_map):
@@ -67,6 +68,45 @@ def _projection_for_map(carla_map):
     result = (projection, source)
     _MAP_PROJECTION_CACHE[key] = result
     return result
+
+
+def map_projection_with_provenance(
+    carla_map, *, require_opendrive_georeference=False
+):
+    """Return projection plus explicit provenance for acceptance callers.
+
+    RR/CARLA 0.10 has no inverse geolocation API, so acceptance must use the
+    map's actual OpenDRIVE projection.  The origin-centred construction remains
+    available only for diagnostics and test doubles.  Strict mode also checks
+    that the declared projection agrees with CARLA's world-origin geolocation;
+    a syntactically valid declaration for another map is not acceptable.
+    """
+    projection, source = _projection_for_map(carla_map)
+    origin = carla_map.transform_to_geolocation(carla.Location())
+    origin_error_m = None
+    if source == "opendrive_georeference":
+        origin_easting, origin_northing = projection.forward(
+            float(origin.latitude), float(origin.longitude)
+        )
+        origin_error_m = math.hypot(origin_easting, origin_northing)
+    if require_opendrive_georeference:
+        if source != "opendrive_georeference":
+            raise GeodesyError(
+                "strict projection requires a usable OpenDRIVE georeference"
+            )
+        if (
+            origin_error_m is None
+            or not math.isfinite(origin_error_m)
+            or origin_error_m > MAX_STRICT_MAP_ORIGIN_ERROR_M
+        ):
+            raise GeodesyError(
+                "OpenDRIVE georeference disagrees with the CARLA map origin"
+            )
+    return projection, {
+        "source": source,
+        "strict": bool(require_opendrive_georeference),
+        "map_origin_error_m": origin_error_m,
+    }
 
 
 def lateral_shift(transform: carla.Transform, shift: float) -> carla.Location:
@@ -161,7 +201,12 @@ def extract_road_network_gps(carla_map: carla.Map) -> List[List[List[float]]]:
 
 
 def gps_to_carla(
-    carla_map: carla.Map, lat: float, lon: float
+    carla_map: carla.Map,
+    lat: float,
+    lon: float,
+    *,
+    require_opendrive_georeference: bool = False,
+    return_projection_provenance: bool = False,
 ) -> carla.Location:
     """Convert GPS coordinates to a CARLA world Location.
 
@@ -199,11 +244,23 @@ def gps_to_carla(
         # PythonAPI builds expose the projected Location directly, so accept
         # both shapes at this version boundary.
         location = getattr(projected, "location", projected)
+        projection_provenance = {
+            "source": "carla_geolocation_to_transform",
+            "strict": False,
+            "map_origin_error_m": None,
+        }
+        if require_opendrive_georeference:
+            raise GeodesyError(
+                "strict projection requires RR/CARLA 0.10 OpenDRIVE provenance"
+            )
     else:
         # CARLA 0.10 removed the inverse API. Invert the map's actual
         # OpenDRIVE transverse-Mercator declaration using the shared WGS-84
         # implementation; CARLA world x=easting and y=-northing.
-        projection, _source = _projection_for_map(carla_map)
+        projection, projection_provenance = map_projection_with_provenance(
+            carla_map,
+            require_opendrive_georeference=require_opendrive_georeference,
+        )
         easting, northing = projection.forward(float(lat), float(lon))
         location = carla.Location(
             x=easting,
@@ -216,6 +273,8 @@ def gps_to_carla(
     if wp is not None:
         location.z = wp.transform.location.z
 
+    if return_projection_provenance:
+        return location, projection_provenance
     return location
 
 

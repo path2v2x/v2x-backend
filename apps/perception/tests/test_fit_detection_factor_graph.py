@@ -97,6 +97,9 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
 
         rows = []
         tracklet_rows = []
+        proposal_rows = []
+        review_entries = []
+        reviewer = {"kind": "human", "id": "reviewer@example.test"}
         assignments = {}
         evidence_group_assignments = {}
         for camera_index, camera_id in enumerate(CAMERAS):
@@ -122,6 +125,8 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
                     "tracklet_id": tracklet_id,
                     "camera_id": camera_id,
                     "event_ids": event_ids,
+                    "start_media_timestamp_utc": rows[-3]["media_timestamp_utc"],
+                    "end_media_timestamp_utc": rows[-1]["media_timestamp_utc"],
                     "lane_path_id": f"lane-{track_index % 3}",
                     "includes_turn": track_index % 10 == 0,
                     "motion_direction_deg": float(camera_index * 45 + track_index * 2),
@@ -131,9 +136,41 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
                         "occlusion_free": True,
                         "not_truncated": True,
                         "optical_flow_consistent": True,
-                        "reviewer": {"kind": "human", "id": "reviewer@example.test"},
+                        "reviewer": reviewer,
                     },
                 })
+                proposal_rows.append({
+                    "proposal_id": tracklet_id,
+                    "camera_id": camera_id,
+                    "event_ids": event_ids,
+                    "start_media_timestamp_utc": rows[-3]["media_timestamp_utc"],
+                    "end_media_timestamp_utc": rows[-1]["media_timestamp_utc"],
+                    "status": "ready_for_human_track_review",
+                })
+                review_entry = {
+                    "proposal_id": tracklet_id,
+                    "decision": "accept",
+                    "lane_path_id": f"lane-{track_index % 3}",
+                    "evidence_group_id": evidence_group_id,
+                    "includes_turn": track_index % 10 == 0,
+                    "motion_direction_deg": float(
+                        camera_index * 45 + track_index * 2
+                    ),
+                    "checks": {
+                        "moving": True,
+                        "occlusion_free": True,
+                        "not_truncated": True,
+                        "optical_flow_consistent": True,
+                    },
+                }
+                review_entries.append(review_entry)
+                tracklet_rows[-1]["review"]["review_entry_sha256"] = (
+                    hashlib.sha256(json.dumps(
+                        review_entry,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()).hexdigest()
+                )
                 assignments[tracklet_id] = (
                     "holdout"
                     if track_index >= 27
@@ -152,9 +189,33 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
             "observations_sha256": hashlib.sha256(observations_raw).hexdigest(),
         }))
 
+        proposals_path = root / "proposals.json"
+        proposals_path.write_text(json.dumps({
+            "schema": "v2x-tracklet-proposals/v1",
+            "source_observations_sha256": hashlib.sha256(
+                observations_raw
+            ).hexdigest(),
+            "proposals": proposal_rows,
+        }))
+        review_path = root / "review.json"
+        review_path.write_text(json.dumps({
+            "schema": "v2x-tracklet-review/v1",
+            "source_proposals_sha256": hashlib.sha256(
+                proposals_path.read_bytes()
+            ).hexdigest(),
+            "reviewer": reviewer,
+            "entries": review_entries,
+        }))
         tracklets = {
             "schema": "v2x-tracklet-set/v1",
             "source_observations_sha256": hashlib.sha256(observations_raw).hexdigest(),
+            "source_proposals_path": str(proposals_path),
+            "source_proposals_sha256": hashlib.sha256(
+                proposals_path.read_bytes()
+            ).hexdigest(),
+            "review_path": str(review_path),
+            "review_sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+            "reviewer": reviewer,
             "tracklets": tracklet_rows,
         }
         tracklets_path = root / "tracklets.json"
@@ -186,6 +247,7 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
                 association_rows.append({
                     "association_id": f"association-{association_index}",
                     "tracklet_ids": ids,
+                    "evidence_group_id": f"physical-object-{track_index:02d}",
                     "evidence": {"reviewed": True, "appearance_similarity": 0.95},
                 })
             association_path = root / "associations.json"
@@ -255,7 +317,23 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
             manifest["observations_sha256"] = hashlib.sha256(raw).hexdigest()
             (right_ledger / "manifest.json").write_text(json.dumps(manifest))
             tracklets_value = json.loads(right[1].read_text())
-            tracklets_value["source_observations_sha256"] = hashlib.sha256(raw).hexdigest()
+            observations_hash = hashlib.sha256(raw).hexdigest()
+            proposals_path = Path(tracklets_value["source_proposals_path"])
+            proposals_value = json.loads(proposals_path.read_text())
+            proposals_value["source_observations_sha256"] = observations_hash
+            proposals_path.write_text(json.dumps(proposals_value))
+            proposals_hash = hashlib.sha256(
+                proposals_path.read_bytes()
+            ).hexdigest()
+            review_path = Path(tracklets_value["review_path"])
+            review_value = json.loads(review_path.read_text())
+            review_value["source_proposals_sha256"] = proposals_hash
+            review_path.write_text(json.dumps(review_value))
+            tracklets_value["source_observations_sha256"] = observations_hash
+            tracklets_value["source_proposals_sha256"] = proposals_hash
+            tracklets_value["review_sha256"] = hashlib.sha256(
+                review_path.read_bytes()
+            ).hexdigest()
             right[1].write_text(json.dumps(tracklets_value))
             new_tracklets_hash = hashlib.sha256(right[1].read_bytes()).hexdigest()
             split_value = json.loads(right[3].read_text())
@@ -277,6 +355,68 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
             self.assertFalse(report["gate_passed"])
             self.assertIn("association_crosses_split", report["reasons"])
 
+    def test_cross_camera_associations_are_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self.report(self.fixture(directory, associations=False))
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn(
+                "reviewed_cross_camera_associations_missing", report["reasons"]
+            )
+
+    def test_association_must_declare_one_canonical_evidence_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            associations = json.loads(fixture[2].read_text())
+            associations["associations"][0]["tracklet_ids"] = [
+                "ch1-track-00",
+                "ch2-track-02",
+            ]
+            fixture[2].write_text(json.dumps(associations))
+
+            report = self.report(fixture)
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn(
+                "association_evidence_group_mismatch", report["reasons"]
+            )
+
+    def test_evidence_group_relabel_cannot_rebind_named_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory, associations=False)
+            self.rebind_tracklets(
+                fixture,
+                lambda tracklets: tracklets["tracklets"][0].update(
+                    evidence_group_id="caller-relabelled-group"
+                ),
+            )
+
+            report = self.report(fixture)
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn("tracklet_review_binding", report["reasons"])
+
+    def test_malformed_event_and_association_ids_fail_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            self.rebind_tracklets(
+                fixture,
+                lambda tracklets: tracklets["tracklets"][0].update(
+                    event_ids=[{}, "event-two", "event-three"]
+                ),
+            )
+            associations = json.loads(fixture[2].read_text())
+            associations["associations"][0]["association_id"] = {
+                "malformed": True
+            }
+            fixture[2].write_text(json.dumps(associations))
+
+            report = self.report(fixture)
+
+            self.assertFalse(report["gate_passed"])
+            self.assertIn("tracklet_invalid", report["reasons"])
+            self.assertIn("association_invalid", report["reasons"])
+
     def test_tracklets_require_explicit_evidence_group_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory, associations=False)
@@ -295,16 +435,36 @@ class DetectionFactorGraphPreflightTests(unittest.TestCase):
     def test_evidence_group_cannot_leak_across_partitions(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory, associations=False)
-
-            def leak_group(tracklets):
-                target = next(
-                    item
-                    for item in tracklets["tracklets"]
-                    if item["tracklet_id"] == "ch1-track-01"
-                )
-                target["evidence_group_id"] = "physical-object-00"
-
-            self.rebind_tracklets(fixture, leak_group)
+            tracklets = json.loads(fixture[1].read_text())
+            target = next(
+                item
+                for item in tracklets["tracklets"]
+                if item["tracklet_id"] == "ch1-track-01"
+            )
+            target["evidence_group_id"] = "physical-object-00"
+            review_path = Path(tracklets["review_path"])
+            review = json.loads(review_path.read_text())
+            review_entry = next(
+                item
+                for item in review["entries"]
+                if item["proposal_id"] == "ch1-track-01"
+            )
+            review_entry["evidence_group_id"] = "physical-object-00"
+            target["review"]["review_entry_sha256"] = hashlib.sha256(
+                json.dumps(
+                    review_entry, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            review_path.write_text(json.dumps(review))
+            tracklets["review_sha256"] = hashlib.sha256(
+                review_path.read_bytes()
+            ).hexdigest()
+            fixture[1].write_text(json.dumps(tracklets))
+            split = json.loads(fixture[3].read_text())
+            split["source_tracklets_sha256"] = hashlib.sha256(
+                fixture[1].read_bytes()
+            ).hexdigest()
+            fixture[3].write_text(json.dumps(split))
 
             report = self.report(fixture)
 

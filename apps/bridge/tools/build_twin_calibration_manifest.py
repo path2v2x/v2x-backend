@@ -426,6 +426,8 @@ def validate_resolved_point_independence(features):
 
 def validate_annotations(payload, camera_id, real_size, twin_size):
     """Return normalized annotations while preserving the frozen split."""
+    if not isinstance(payload, dict):
+        raise ValueError("annotation payload must be an object")
     if payload.get("camera_id") != camera_id or camera_id not in CAMERAS:
         raise ValueError("annotation camera_id does not match the requested channel")
     source_hash = str(payload.get("real_frame_sha256") or "")
@@ -447,6 +449,8 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
     global_landmark_ids = set()
     descriptions = set()
     for feature in points:
+        if not isinstance(feature, dict):
+            raise ValueError("point annotation entries must be objects")
         identifier = str(feature.get("id") or "").strip()
         if not identifier or identifier in identifiers:
             raise ValueError("annotation feature IDs must be nonblank and unique")
@@ -467,6 +471,27 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
                 "point global landmark IDs must be nonblank and globally unique"
             )
         global_landmark_ids.add(global_landmark_id)
+        surveyed_world = feature.get("surveyed_world")
+        survey_record_sha256 = feature.get("survey_record_sha256")
+        if (
+            not isinstance(surveyed_world, list)
+            or len(surveyed_world) != 3
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in surveyed_world
+            )
+            or not isinstance(survey_record_sha256, str)
+            or len(survey_record_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in survey_record_sha256
+            )
+        ):
+            raise ValueError(
+                f"{identifier}: surveyed world identity is invalid or unbound"
+            )
         description = str(feature.get("description") or "").strip()
         description_key = description.casefold()
         if len(description) < 8 or description_key in descriptions:
@@ -478,6 +503,8 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
         normalized.append({
             "id": identifier,
             "global_landmark_id": global_landmark_id,
+            "surveyed_world": [float(value) for value in surveyed_world],
+            "survey_record_sha256": survey_record_sha256,
             "type": "point",
             "split": split,
             "provenance": "manually_verified_unique",
@@ -487,6 +514,8 @@ def validate_annotations(payload, camera_id, real_size, twin_size):
             "image": _pixel(feature.get("image"), f"{identifier}.image", *real_size),
         })
     for feature in roads:
+        if not isinstance(feature, dict):
+            raise ValueError("road annotation entries must be objects")
         identifier = str(feature.get("id") or "").strip()
         if not identifier or identifier in identifiers:
             raise ValueError("annotation feature IDs must be nonblank and unique")
@@ -600,6 +629,8 @@ def resolve_manifest(
         }
         if feature["type"] == "point":
             base["global_landmark_id"] = feature["global_landmark_id"]
+            base["surveyed_world"] = feature["surveyed_world"]
+            base["survey_record_sha256"] = feature["survey_record_sha256"]
             world, depth_evidence = world_at(feature["twin"])
             base.update({
                 "world": world,

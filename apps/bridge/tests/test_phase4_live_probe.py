@@ -503,19 +503,120 @@ def test_expected_camera_transform_uses_carla010_opendrive_georeference(tmp_path
     )
     expected = expected_twin_camera_transform(world, cameras_path, "ch1")
 
-    assert expected["location"] == pytest.approx({
+    assert expected["transform"]["location"] == pytest.approx({
         "x": shared.location.x,
         "y": shared.location.y,
         "z": shared.location.z,
     })
-    assert expected["rotation"] == pytest.approx({
+    assert expected["transform"]["rotation"] == pytest.approx({
         "pitch": shared.rotation.pitch,
         "yaw": shared.rotation.yaw,
         "roll": shared.rotation.roll,
     })
+    assert expected["projection"]["source"] == "opendrive_georeference"
+    assert expected["projection"]["strict"] is True
+    assert expected["projection"]["map_origin_error_m"] == pytest.approx(
+        0.0, abs=2e-5
+    )
     # A stale degree-to-metre approximation ignores the OpenDRIVE k=0.75
     # scale; the tracked inverse must retain the requested projected anchor.
     assert math.hypot(shared.location.x, shared.location.y) > 300.0
+
+
+def _strict_projection_inputs(tmp_path, carla_map, name):
+    origin = carla_map.transform_to_geolocation(SimpleNamespace(x=0, y=0, z=0))
+    camera = {
+        "id": "ch1",
+        "height_m": 7.0,
+        "pitch_deg": -39.2,
+        "yaw_deg": -46.06,
+        "heading_deg": 200.0,
+        "intrinsics": {
+            "fx": 1325.4,
+            "fy": 1325.4,
+            "cx": 1280.0,
+            "cy": 960.0,
+            "width": 2560,
+            "height": 1920,
+        },
+    }
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps({
+        "site": {"lat": origin.latitude, "lon": origin.longitude},
+        "cameras": [camera],
+    }))
+    return SimpleNamespace(get_map=lambda: carla_map), path
+
+
+class _StrictProjectionMap:
+    def __init__(self, name, opendrive):
+        self.name = name
+        self._opendrive = opendrive
+
+    def transform_to_geolocation(self, _location):
+        return SimpleNamespace(latitude=37.9, longitude=-122.3, altitude=0.0)
+
+    def to_opendrive(self):
+        if self._opendrive is None:
+            raise AttributeError("OpenDRIVE unavailable")
+        return self._opendrive
+
+    def get_waypoint(self, location, project_to_road=True):
+        return SimpleNamespace(transform=SimpleNamespace(location=location))
+
+
+@pytest.mark.parametrize(
+    ("name", "opendrive", "message"),
+    [
+        ("missing", None, "usable OpenDRIVE georeference"),
+        (
+            "malformed",
+            "<OpenDRIVE><header><geoReference>not-a-projection"
+            "</geoReference></header></OpenDRIVE>",
+            "usable OpenDRIVE georeference",
+        ),
+        (
+            "wrong-map",
+            "<OpenDRIVE><header><geoReference><![CDATA["
+            "+proj=tmerc +lat_0=0 +lon_0=0 +k=1 +x_0=0 +y_0=0 "
+            "+datum=WGS84 +units=m +no_defs"
+            "]]></geoReference></header></OpenDRIVE>",
+            "disagrees with the CARLA map origin",
+        ),
+    ],
+)
+def test_live_camera_acceptance_rejects_missing_malformed_or_wrong_georef(
+    tmp_path, name, opendrive, message
+):
+    carla_map = _StrictProjectionMap(f"strict-{name}", opendrive)
+    world, cameras_path = _strict_projection_inputs(
+        tmp_path, carla_map, name
+    )
+
+    with pytest.raises(VerificationError, match="shared rig model") as raised:
+        expected_twin_camera_transform(world, cameras_path, "ch1")
+
+    assert message in str(raised.value.__cause__)
+
+
+def test_nonstrict_projection_exposes_fallback_as_diagnostic(tmp_path):
+    carla_map = _StrictProjectionMap("diagnostic-fallback", None)
+    world, cameras_path = _strict_projection_inputs(
+        tmp_path, carla_map, "diagnostic"
+    )
+
+    expected = expected_twin_camera_transform(
+        world,
+        cameras_path,
+        "ch1",
+        require_opendrive_georeference=False,
+    )
+
+    assert expected["projection"] == {
+        "source": "origin_centered_fallback",
+        "strict": False,
+        "map_origin_error_m": None,
+    }
 
 
 def test_projects_world_point_through_fingerprinted_camera_model():

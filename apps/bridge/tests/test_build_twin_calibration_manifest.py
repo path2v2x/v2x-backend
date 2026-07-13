@@ -47,6 +47,10 @@ def annotation_payload():
         points.append({
             "id": f"landmark-{index}",
             "global_landmark_id": f"rfs-survey-landmark-{index}",
+            "surveyed_world": [float(index * 2), float(index), 0.5],
+            "survey_record_sha256": hashlib.sha256(
+                f"survey-record-{index}".encode()
+            ).hexdigest(),
             "split": "train" if index < 8 else "holdout",
             "provenance": "manually_verified_unique",
             "category": "signal_corner",
@@ -83,6 +87,20 @@ def test_accepts_complete_frozen_manual_evidence():
     assert sum(item["type"] == "point" for item in features) == 12
     assert sum(item["type"] == "polyline" for item in features) == 5
     assert sum(item["split"] == "holdout" for item in features) == 6
+
+
+@pytest.mark.parametrize("kind", ["payload", "point", "road"])
+def test_malformed_annotation_objects_fail_controlled(kind):
+    payload = copy.deepcopy(annotation_payload())
+    if kind == "payload":
+        payload = []
+    elif kind == "point":
+        payload["points"][0] = None
+    else:
+        payload["roads"][0] = None
+
+    with pytest.raises(ValueError, match="object"):
+        validate_annotations(payload, "ch1", (2560, 1920), (1280, 960))
 
 
 def test_deployment_model_reverses_existing_offsets_exactly():
@@ -396,6 +414,8 @@ def test_resolved_holdouts_reject_proximity_to_train_in_every_space(
     train = {
         "id": "train-point",
         "global_landmark_id": "rfs-train-point",
+        "surveyed_world": [0.0, 0.0, 0.0],
+        "survey_record_sha256": "a" * 64,
         "type": "point",
         "split": "train",
         "image": [100.0, 100.0],
@@ -405,6 +425,8 @@ def test_resolved_holdouts_reject_proximity_to_train_in_every_space(
     holdout = {
         "id": "holdout-point",
         "global_landmark_id": "rfs-holdout-point",
+        "surveyed_world": [10.0, 10.0, 10.0],
+        "survey_record_sha256": "b" * 64,
         "type": "point",
         "split": "holdout",
         "image": [500.0, 500.0],
@@ -424,6 +446,8 @@ def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
         {
             "id": "train-point",
             "global_landmark_id": "rfs-train-point",
+            "surveyed_world": [0.0, 0.0, 0.0],
+            "survey_record_sha256": "a" * 64,
             "type": "point",
             "split": "train",
             "provenance": "manually_verified_unique",
@@ -435,6 +459,8 @@ def test_resolve_manifest_checks_world_proximity_after_depth_resolution(
         {
             "id": "holdout-point",
             "global_landmark_id": "rfs-holdout-point",
+            "surveyed_world": [10.0, 10.0, 10.0],
+            "survey_record_sha256": "b" * 64,
             "type": "point",
             "split": "holdout",
             "provenance": "manually_verified_unique",

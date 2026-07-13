@@ -935,7 +935,9 @@ def cameras_config_fingerprint(path):
     return hashlib.sha256(canonical).hexdigest()
 
 
-def expected_twin_camera_transform(world, path, camera_id):
+def expected_twin_camera_transform(
+    world, path, camera_id, *, require_opendrive_georeference=True
+):
     """Recompute the configured sensor pose through the tracked rig model.
 
     RR camera actors are resolvable by ID but are absent from world snapshots,
@@ -952,7 +954,13 @@ def expected_twin_camera_transform(world, path, camera_id):
         camera = next(
             item for item in payload["cameras"] if item.get("id") == camera_id
         )
-        transform = compute_twin_camera_transform(world.get_map(), site, camera)
+        transform, projection = compute_twin_camera_transform(
+            world.get_map(),
+            site,
+            camera,
+            require_opendrive_georeference=require_opendrive_georeference,
+            return_projection_provenance=True,
+        )
     except (
         AttributeError,
         KeyError,
@@ -977,7 +985,12 @@ def expected_twin_camera_transform(world, path, camera_id):
             "roll": float(transform.rotation.roll),
         },
     }
-    return _finite_transform_payload(expected, "tracked camera transform")
+    return {
+        "transform": _finite_transform_payload(
+            expected, "tracked camera transform"
+        ),
+        "projection": projection,
+    }
 
 
 def validate_twin_camera_model(
@@ -1966,10 +1979,14 @@ async def verify_twin(args, world=None):
             cameras_config_fingerprint(args.cameras_json),
         )
         if world is not None:
+            expected_camera = expected_twin_camera_transform(
+                world, args.cameras_json, args.twin_camera
+            )
             evidence["validated_camera_model"]["expected_config_transform"] = (
-                expected_twin_camera_transform(
-                    world, args.cameras_json, args.twin_camera
-                )
+                expected_camera["transform"]
+            )
+            evidence["validated_camera_model"]["projection_provenance"] = (
+                expected_camera["projection"]
             )
             evidence["validated_camera_actor"] = validate_live_twin_camera_actor(
                 world, evidence["validated_camera_model"]
@@ -2489,11 +2506,11 @@ async def verify_twin_metadata(args, carla_module=None):
                 camera_config_fingerprint(args.cameras_json, camera_id),
                 evidence["cameras_config_sha256"],
             )
-            model["expected_config_transform"] = (
-                expected_twin_camera_transform(
-                    world, args.cameras_json, camera_id
-                )
+            expected_camera = expected_twin_camera_transform(
+                world, args.cameras_json, camera_id
             )
+            model["expected_config_transform"] = expected_camera["transform"]
+            model["projection_provenance"] = expected_camera["projection"]
             actor = validate_live_twin_camera_actor(world, model)
             _jpeg, jpeg_digest, frame_metadata = (
                 await receive_live_twin_frame_packet(

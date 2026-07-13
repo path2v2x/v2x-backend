@@ -9,16 +9,39 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 16:47 UTC; verify rather than assume. These items
-override every older PR 32/candidate statement below.
+Observed through 2026-07-13 18:37 UTC; verify rather than assume. These items
+override every older candidate, deployment, and next-gate statement below.
 
 - Canonical `origin/main` and the exact, detached, clean live production tree
-  are now PR 52 merge `0181c83c1d173681089e394b49b6259d324700cf`.
-  Perception is active with `KillMode=mixed`, the 60-second whole-cgroup
-  fail-safe retained, exactly four FFmpeg readers, and no environment override
-  file. CARLA, Drive, and web retained their pre-canary PIDs and zero restart
-  counts; all three intended timers are active. Do not describe PR 42-51 as
-  production.
+  are now PR 54 merge `400c3277452154985096bc251fe65b4be60cef36`.
+  PR 54 preserves the accepted PR 52 perception lifecycle and adds bounded,
+  deterministic UE5 twin-actor spawn bootstrap retries that always move a
+  provisional actor to the exact detection-derived transform before tracking.
+  Its controlled bridge deployment evidence is
+  `/home/path/V2XCarla/v2x-evidence/bridge/20260713T183135Z-pr54-twin-spawn-deploy/`;
+  its verified rollback is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T183135Z-pr54-twin-spawn/`.
+  CARLA, perception, and web retained their fingerprints, Drive restarted once
+  into the candidate, all services held `NRestarts=0`, Richmond returned LIVE
+  with zero sessions, and all intended timers were restored.
+- Production schema-V2 uploads are now enabled and the controlled PR 54
+  activation passed. Retain
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T183416Z-pr54-v2-upload-activation/`
+  and rollback
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T183416Z-pr54-v2-upload-activation/`.
+  One new trusted schema-V2 row had exact one-for-one DynamoDB, API, and object-
+  history parity with identical SHA-256, 0 ms media reconstruction error, and
+  seven-day expiry. The observational UE5 check was LIVE with zero sessions
+  and exact 3/3 tracked-object-to-present-actor parity. This proves persistence
+  and actor lifecycle only; it is not camera calibration, same-car visual
+  overlap, or placement-accuracy acceptance.
+- The strict static calibration gate remains **0/4 cameras passing**. The 895
+  retained inverse-render evaluations are diagnostic only and remain
+  `acceptance_eligible=false`; do not relax thresholds, consume a holdout again,
+  or promote their poses. The current calibration reconciliation branch is
+  source-only in the clean Codex worktree and is not deployed. The dedicated
+  V2X UE5 source workspace is `/mnt/v2x-ue5`. UE6 remains excluded from this
+  task, its evidence, and every V2X acceptance decision.
 - PR 51's diagnostic five-child canary is rejected. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T160437Z-pr51-shutdown-diagnostics-canary/`,
   its bounded diagnostic is
@@ -74,9 +97,9 @@ override every older PR 32/candidate statement below.
   fingerprints, and all intended timers. A prior 16:35 UTC harness attempt
   rejected before candidate start because this systemd reports equivalent
   signals as `15`/`9`; it rolled exact PR 35 back cleanly and is not runtime
-  evidence. The next perception gate is controlled V2 upload/history proof,
-  not another lifecycle retry. Fable still fails authentication before file
-  access; never claim a Fable pass.
+  evidence. That lifecycle gate remains accepted in live PR 54; the newer V2
+  upload/history activation above has also passed. Fable still fails
+  authentication before file access; never claim a Fable pass.
 - PR 50's first complete five-child stop canary is rejected. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T153621Z-pr50-claimed-handover-shutdown-canary/`
   and the verified rollback is
@@ -1142,7 +1165,7 @@ section:
   samples; never opt down to one sample for an acceptance-labelled workflow.
   The latest completed bounded isolated UE5 search is
   `/home/path/V2XCarla/v2x-evidence/calibration/20260712T104045Z-inverse-render-search-v6/`.
-  It retained 896 candidates (224 per camera except 223 for ch3) across broad
+  It retained 895 diagnostic evaluations across broad
   pose/FOV ranges. Every selected candidate fails the fixed geometry gate and
   visual review; ch1/ch2/ch3/ch4 road-surface scores are approximately
   0.702/0.540/0.470/0.508 and all remain below the contract. A subsequent cold
@@ -1720,6 +1743,14 @@ default pole displacement in one path. Resolve candidate landmarks directly
 from the UE5 map/depth buffer with `build_twin_camera_landmarks.py`; legacy
 camera-local XZ converted through the heading under test is circular evidence.
 Reject sparse, collinear, clustered, or non-global datasets before fitting.
+Aggregate the four per-camera manifests against one hash-bound surveyed site
+registry with `aggregate_twin_calibration_manifests.py` before any joint fit.
+Require one canonical landmark ID to retain one split and surveyed world
+identity across every camera; reject renamed near-duplicates and keep the
+aggregation `acceptance_eligible=false` until every independent gate passes.
+For RR/CARLA 0.10 live acceptance, the shared transform must report strict
+`opendrive_georeference` provenance; `origin_centered_fallback` is never an
+accepted live projection.
 
 Feature matchers (SIFT, LoFTR, RoMa, or successors) may propose landmarks but
 cannot themselves certify held-out truth. Repeated lane/crosswalk markings can
@@ -1943,7 +1974,7 @@ each feed, and rejects query-bearing endpoint input:
 ```bash
 /home/path/V2XCarla/perception-venv/bin/python \
   /home/path/V2XCarla/v2x-backend/apps/perception/tools/verify_live_feeds.py \
-  http://127.0.0.1:8090 --max-decode-latency-ms 10000
+  http://127.0.0.1:8090
 ```
 
 For a bounded Drive/twin/replay regression, run the tracked verifier

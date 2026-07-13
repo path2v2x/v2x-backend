@@ -2,6 +2,7 @@
 """Verify paginated, trusted schema-v2 persistence for every street camera."""
 
 import argparse
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -209,13 +210,37 @@ def evaluate_persistence(
     grouped = {camera_id: [] for camera_id in CAMERA_IDS}
     rejected = {camera_id: 0 for camera_id in CAMERA_IDS}
     unknown_devices = 0
-    for item in items:
+    invalid_event_id_indexes = set()
+    event_ids_by_index = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            invalid_event_id_indexes.add(index)
+            continue
+        raw_event_id = item.get("event_id")
+        if not isinstance(raw_event_id, str) or not raw_event_id.strip():
+            invalid_event_id_indexes.add(index)
+            continue
+        event_ids_by_index[index] = raw_event_id.strip()
+    event_id_counts = Counter(event_ids_by_index.values())
+    duplicate_event_ids = {
+        event_id for event_id, count in event_id_counts.items() if count > 1
+    }
+    duplicate_event_id_indexes = {
+        index
+        for index, event_id in event_ids_by_index.items()
+        if event_id in duplicate_event_ids
+    }
+
+    for index, item in enumerate(items):
         if not isinstance(item, dict):
             unknown_devices += 1
             continue
         camera_id = camera_id_for_item(item)
         if camera_id is None:
             unknown_devices += 1
+            continue
+        if index in invalid_event_id_indexes or index in duplicate_event_id_indexes:
+            rejected[camera_id] += 1
             continue
         timestamp, reasons = trusted_media_time(item)
         if timestamp is None or reasons or not start <= timestamp <= end:
@@ -234,9 +259,28 @@ def evaluate_persistence(
         "pages": pages,
         "total_items": len(items),
         "unknown_device_items": unknown_devices,
+        "invalid_event_id_items": len(invalid_event_id_indexes),
+        "duplicate_event_id_items": len(duplicate_event_id_indexes),
+        "duplicate_event_ids": len(duplicate_event_ids),
         "cameras": {},
         "reasons": [],
     }
+    if unknown_devices:
+        result["gate_passed"] = False
+        result["reasons"].append(
+            f"{unknown_devices} item(s) have an unknown camera device"
+        )
+    if invalid_event_id_indexes:
+        result["gate_passed"] = False
+        result["reasons"].append(
+            f"{len(invalid_event_id_indexes)} item(s) have a missing or blank event_id"
+        )
+    if duplicate_event_id_indexes:
+        result["gate_passed"] = False
+        result["reasons"].append(
+            f"{len(duplicate_event_id_indexes)} item(s) reuse "
+            f"{len(duplicate_event_ids)} duplicate event_id value(s)"
+        )
     for camera_id in CAMERA_IDS:
         timestamps = sorted(grouped[camera_id])
         count = len(timestamps)
@@ -251,7 +295,8 @@ def evaluate_persistence(
             (end - last).total_seconds() / 3600.0 if last is not None else None
         )
         camera_passed = (
-            count >= minimum_trusted_per_camera
+            rejected[camera_id] == 0
+            and count >= minimum_trusted_per_camera
             and span_hours >= minimum_span_hours
             and latest_age_hours is not None
             and -5.0 / 3600.0 <= latest_age_hours <= max_latest_age_hours
@@ -267,7 +312,17 @@ def evaluate_persistence(
                 round(latest_age_hours, 3) if latest_age_hours is not None else None
             ),
         }
-        if not camera_passed:
+        if rejected[camera_id]:
+            result["gate_passed"] = False
+            result["reasons"].append(
+                f"{camera_id} has {rejected[camera_id]} rejected item(s)"
+            )
+        if not (
+            count >= minimum_trusted_per_camera
+            and span_hours >= minimum_span_hours
+            and latest_age_hours is not None
+            and -5.0 / 3600.0 <= latest_age_hours <= max_latest_age_hours
+        ):
             result["gate_passed"] = False
             result["reasons"].append(
                 f"{camera_id} lacks required trusted persistence span or recency"

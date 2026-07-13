@@ -18,6 +18,23 @@ class TrackletReviewError(RuntimeError):
     pass
 
 
+ACCEPT_REVIEW_ENTRY_KEYS = {
+    "proposal_id",
+    "decision",
+    "lane_path_id",
+    "evidence_group_id",
+    "includes_turn",
+    "motion_direction_deg",
+    "checks",
+}
+
+
+def review_entry_sha256(entry):
+    return sha256_bytes(
+        json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
+    )
+
+
 def apply_tracklet_reviews(ledger_dir, proposals_path, review_path, output_path):
     _ledger_dir, _manifest, observations, observations_hash = load_ledger(ledger_dir)
     proposals_path = Path(proposals_path).expanduser().resolve()
@@ -41,11 +58,26 @@ def apply_tracklet_reviews(ledger_dir, proposals_path, review_path, output_path)
         or not reviewer["id"].strip()
     ):
         raise TrackletReviewError("tracklet review requires a named human")
-    proposal_index = {
-        value["proposal_id"]: value for value in proposals.get("proposals", [])
-        if isinstance(value, dict) and isinstance(value.get("proposal_id"), str)
-    }
-    if len(proposal_index) != len(proposals.get("proposals", [])):
+    proposal_values = proposals.get("proposals")
+    if not isinstance(proposal_values, list):
+        raise TrackletReviewError("proposal list is malformed")
+    proposal_index = {}
+    for value in proposal_values:
+        proposal_id = value.get("proposal_id") if isinstance(value, dict) else None
+        event_ids = value.get("event_ids") if isinstance(value, dict) else None
+        if (
+            not isinstance(proposal_id, str)
+            or not proposal_id.strip()
+            or proposal_id != proposal_id.strip()
+            or proposal_id in proposal_index
+            or not isinstance(event_ids, list)
+            or len(event_ids) < 3
+            or not all(isinstance(event_id, str) and event_id for event_id in event_ids)
+            or len(set(event_ids)) != len(event_ids)
+        ):
+            raise TrackletReviewError("proposal IDs/event IDs are invalid or duplicated")
+        proposal_index[proposal_id] = value
+    if len(proposal_index) != len(proposal_values):
         raise TrackletReviewError("proposal IDs are invalid or duplicated")
     observation_index = {value["event_id"]: value for value in observations}
     entries = review.get("entries")
@@ -65,6 +97,8 @@ def apply_tracklet_reviews(ledger_dir, proposals_path, review_path, output_path)
             if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
                 raise TrackletReviewError("rejected tracklet requires a reason")
             continue
+        if set(entry) != ACCEPT_REVIEW_ENTRY_KEYS:
+            raise TrackletReviewError("accepted tracklet review entry is malformed")
         proposal = proposal_index[proposal_id]
         rows = [observation_index[event_id] for event_id in proposal["event_ids"]]
         if proposal.get("status") != "ready_for_human_track_review" or any(
@@ -100,9 +134,7 @@ def apply_tracklet_reviews(ledger_dir, proposals_path, review_path, output_path)
                 "not_truncated": True,
                 "optical_flow_consistent": True,
                 "reviewer": reviewer,
-                "review_entry_sha256": sha256_bytes(
-                    json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
-                ),
+                "review_entry_sha256": review_entry_sha256(entry),
             },
         })
     if not accepted:
@@ -114,7 +146,9 @@ def apply_tracklet_reviews(ledger_dir, proposals_path, review_path, output_path)
     output = {
         "schema": "v2x-tracklet-set/v1",
         "source_observations_sha256": observations_hash,
+        "source_proposals_path": str(proposals_path),
         "source_proposals_sha256": sha256_bytes(proposals_raw),
+        "review_path": str(review_path),
         "review_sha256": sha256_bytes(review_path.read_bytes()),
         "reviewer": reviewer,
         "tracklets": sorted(accepted, key=lambda value: value["tracklet_id"]),

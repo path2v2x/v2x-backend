@@ -189,7 +189,14 @@ def configure_twin_camera_blueprint(
         raise ValueError("twin lens overrides are held for runtime safety")
 
 
-def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
+def compute_twin_camera_transform(
+    carla_map,
+    site: dict,
+    camera: dict,
+    *,
+    require_opendrive_georeference: bool = False,
+    return_projection_provenance: bool = False,
+):
     """CARLA Transform for a real camera: pole GPS + height, mirrored pose.
 
     Optional per-camera ``twin_pose`` overrides in cameras.json refine the
@@ -202,7 +209,17 @@ def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
     import carla
 
     twin_pose = camera.get("twin_pose") or {}
-    location = gps_to_carla(carla_map, site["lat"], site["lon"])
+    if require_opendrive_georeference or return_projection_provenance:
+        location, projection_provenance = gps_to_carla(
+            carla_map,
+            site["lat"],
+            site["lon"],
+            require_opendrive_georeference=require_opendrive_georeference,
+            return_projection_provenance=True,
+        )
+    else:
+        location = gps_to_carla(carla_map, site["lat"], site["lon"])
+        projection_provenance = None
     # gps_to_carla snaps z to the road surface; the camera sits on the
     # pole `height_m` above that.
     location.z += float(camera["height_m"])
@@ -223,7 +240,10 @@ def compute_twin_camera_transform(carla_map, site: dict, camera: dict):
         yaw=absolute["yaw_deg"],
         roll=absolute["roll_deg"],
     )
-    return carla.Transform(location, rotation)
+    transform = carla.Transform(location, rotation)
+    if return_projection_provenance:
+        return transform, projection_provenance
+    return transform
 
 
 class TwinCameraRig:
