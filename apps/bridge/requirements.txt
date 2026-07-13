@@ -5,3 +5,6 @@ boto3
 websockets
 pytest
 pytest-asyncio
+scipy
+laspy[lazrs]
+pyproj

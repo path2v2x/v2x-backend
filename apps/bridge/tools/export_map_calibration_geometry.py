@@ -16,6 +16,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -104,6 +105,139 @@ def split_crosswalk_polygons(locations):
     return polygons
 
 
+def stable_crosswalk_id(points):
+    """Return an orientation/start-order independent content identity."""
+    ring = [tuple(round(float(value), 3) for value in point) for point in points]
+    if len(ring) >= 2 and ring[0] == ring[-1]:
+        ring = ring[:-1]
+    if len(ring) < 3 or len(set(ring)) < 3:
+        raise RuntimeError("crosswalk polygon is degenerate")
+    candidates = []
+    for oriented in (ring, list(reversed(ring))):
+        candidates.extend(
+            tuple(oriented[index:] + oriented[:index]) for index in range(len(oriented))
+        )
+    canonical = min(candidates)
+    digest = canonical_hash(canonical)[:16]
+    return f"crosswalk-geometry-{digest}"
+
+
+def _world_polyline(waypoints, side=None, z_offset=0.04):
+    points = []
+    for waypoint in waypoints:
+        transform = waypoint.transform
+        location = transform.location
+        yaw = math.radians(transform.rotation.yaw)
+        right_x, right_y = -math.sin(yaw), math.cos(yaw)
+        offset = 0.0 if side is None else float(waypoint.lane_width) / 2.0
+        if side == "left":
+            offset *= -1.0
+        points.append([
+            location.x + right_x * offset,
+            location.y + right_y * offset,
+            location.z + z_offset,
+        ])
+    return points
+
+
+def segmented_road_marks(key, waypoints):
+    """Preserve each contiguous sampled road-mark range with a stable ID."""
+    output = []
+    for side in ("left", "right"):
+        values = [str(getattr(item, f"{side}_lane_marking").type) for item in waypoints]
+        start = 0
+        for end in range(1, len(waypoints) + 1):
+            if end < len(waypoints) and values[end] == values[start]:
+                continue
+            selected = waypoints[start:end]
+            start_s, end_s = float(selected[0].s), float(selected[-1].s)
+            identity_input = {
+                "road_id": key[0], "section_id": key[1], "lane_id": key[2],
+                "side": side, "marking_type": values[start],
+                "start_s_m": round(start_s, 3), "end_s_m": round(end_s, 3),
+            }
+            output.append({
+                "id": f"road-mark-{canonical_hash(identity_input)[:16]}",
+                **identity_input,
+                "sample_count": len(selected),
+                "boundary_world": _world_polyline(selected, side=side),
+                "usable_as_polyline": len(selected) >= 2,
+            })
+            start = end
+    return output
+
+
+def lane_geometry_from_waypoints(key, waypoints):
+    widths = [float(item.lane_width) for item in waypoints]
+    segments = segmented_road_marks(key, waypoints)
+    return {
+        "id": f"road-{key[0]}-section-{key[1]}-lane-{key[2]}",
+        "road_id": key[0],
+        "section_id": key[1],
+        "lane_id": key[2],
+        "s_range_m": [float(waypoints[0].s), float(waypoints[-1].s)],
+        "lane_width_m": float(np.median(widths)),
+        "lane_width_range_m": [min(widths), max(widths)],
+        "center_world": _world_polyline(waypoints, side=None, z_offset=0.03),
+        "left_boundary_world": _world_polyline(waypoints, side="left"),
+        "right_boundary_world": _world_polyline(waypoints, side="right"),
+        "road_mark_segment_ids": [item["id"] for item in segments],
+        "road_mark_segments": segments,
+    }
+
+
+def opendrive_road_mark_ranges(opendrive_bytes):
+    """Extract exact lane-section roadMark ranges without collapsing changes."""
+    root = ET.fromstring(opendrive_bytes)
+    if root.tag != "OpenDRIVE":
+        raise RuntimeError("active map did not return an OpenDRIVE document")
+    ranges = []
+    for road in root.findall("road"):
+        road_id, road_length = road.get("id"), float(road.get("length"))
+        sections = road.findall("./lanes/laneSection")
+        for section_index, section in enumerate(sections):
+            section_start = float(section.get("s"))
+            section_end = (
+                float(sections[section_index + 1].get("s"))
+                if section_index + 1 < len(sections) else road_length
+            )
+            for lane in (
+                section.findall("./left/lane")
+                + section.findall("./center/lane")
+                + section.findall("./right/lane")
+            ):
+                marks = sorted(
+                    lane.findall("roadMark"), key=lambda item: float(item.get("sOffset"))
+                )
+                for mark_index, mark in enumerate(marks):
+                    start_s = section_start + float(mark.get("sOffset"))
+                    end_s = (
+                        section_start + float(marks[mark_index + 1].get("sOffset"))
+                        if mark_index + 1 < len(marks) else section_end
+                    )
+                    if not section_start <= start_s < end_s <= section_end + 1e-8:
+                        raise RuntimeError(
+                            f"road {road_id} lane {lane.get('id')} has an invalid roadMark range"
+                        )
+                    values = {
+                        "road_id": road_id,
+                        "section_start_s_m": round(section_start, 6),
+                        "lane_id": lane.get("id"),
+                        "start_s_m": round(start_s, 6),
+                        "end_s_m": round(end_s, 6),
+                        "type": mark.get("type"),
+                        "color": mark.get("color"),
+                        "weight": mark.get("weight"),
+                        "lane_change": mark.get("laneChange"),
+                        "width_m": float(mark.get("width")) if mark.get("width") else None,
+                    }
+                    ranges.append({
+                        "id": f"opendrive-road-mark-{canonical_hash(values)[:16]}",
+                        **values,
+                    })
+    return sorted(ranges, key=lambda item: item["id"])
+
+
 def nearby_lane_polylines(carla_map, anchor, radius_m, spacing_m):
     import carla
 
@@ -122,40 +256,7 @@ def nearby_lane_polylines(carla_map, anchor, radius_m, spacing_m):
         waypoints.sort(key=lambda item: float(item.s))
         if len(waypoints) < 3:
             continue
-        center, left, right = [], [], []
-        marking = None
-        for waypoint in waypoints:
-            transform = waypoint.transform
-            location = transform.location
-            yaw = math.radians(transform.rotation.yaw)
-            right_x, right_y = -math.sin(yaw), math.cos(yaw)
-            half_width = float(waypoint.lane_width) / 2.0
-            center.append([location.x, location.y, location.z + 0.03])
-            left.append([
-                location.x - right_x * half_width,
-                location.y - right_y * half_width,
-                location.z + 0.04,
-            ])
-            right.append([
-                location.x + right_x * half_width,
-                location.y + right_y * half_width,
-                location.z + 0.04,
-            ])
-            marking = {
-                "left": str(waypoint.left_lane_marking.type),
-                "right": str(waypoint.right_lane_marking.type),
-            }
-        output.append({
-            "id": f"road-{key[0]}-section-{key[1]}-lane-{key[2]}",
-            "road_id": key[0],
-            "section_id": key[1],
-            "lane_id": key[2],
-            "lane_width_m": float(np.median([item.lane_width for item in waypoints])),
-            "marking_types": marking,
-            "center_world": center,
-            "left_boundary_world": left,
-            "right_boundary_world": right,
-        })
+        output.append(lane_geometry_from_waypoints(key, waypoints))
     return output
 
 
@@ -169,7 +270,8 @@ def static_objects(world, label_name, anchor, radius_m):
         if distance_xy(location, anchor) > radius_m:
             continue
         output.append({
-            "id": str(item.id),
+            "id": f"environment-{label_name}-{item.id}",
+            "source_object_id": str(item.id),
             "name": str(item.name),
             "category": label_name,
             "center_world": [location.x, location.y, location.z],
@@ -307,6 +409,7 @@ def main():
     world = client.get_world()
     carla_map = world.get_map()
     opendrive = carla_map.to_opendrive().encode("utf-8")
+    exact_road_mark_ranges = opendrive_road_mark_ranges(opendrive)
     transforms, computed_transforms = {}, {}
     for camera in config["cameras"]:
         camera_id = camera["id"]
@@ -328,10 +431,17 @@ def main():
         )
     anchor = transforms["ch1"].location
     polygons = []
-    for index, polygon in enumerate(split_crosswalk_polygons(carla_map.get_crosswalks())):
+    for polygon in split_crosswalk_polygons(carla_map.get_crosswalks()):
         if min(math.hypot(point[0] - anchor.x, point[1] - anchor.y) for point in polygon) <= args.radius_m:
-            polygons.append({"id": f"crosswalk-{index}", "world": polygon})
+            polygons.append({"id": stable_crosswalk_id(polygon), "world": polygon})
+    polygons.sort(key=lambda item: item["id"])
+    if len({item["id"] for item in polygons}) != len(polygons):
+        raise SystemExit("active map contains duplicate content-identical crosswalk polygons")
     lanes = nearby_lane_polylines(carla_map, anchor, args.radius_m, args.lane_spacing_m)
+    road_mark_segments = sorted(
+        (segment for lane in lanes for segment in lane.pop("road_mark_segments")),
+        key=lambda item: item["id"],
+    )
     objects = []
     for label in ("TrafficLight", "TrafficSigns"):
         objects.extend(static_objects(world, label, anchor, args.radius_m))
@@ -339,7 +449,13 @@ def main():
     # ``Other`` rather than ``Poles``.  Keep only the immediate intersection
     # neighborhood so those globally identified objects remain reviewable.
     objects.extend(static_objects(world, "Other", anchor, min(args.radius_m, 30.0)))
-    geometry = {"crosswalks": polygons, "lanes": lanes, "objects": objects}
+    geometry = {
+        "crosswalks": polygons,
+        "lanes": lanes,
+        "road_mark_segments": road_mark_segments,
+        "opendrive_road_mark_ranges": exact_road_mark_ranges,
+        "objects": objects,
+    }
 
     output_dir.mkdir(parents=True, exist_ok=True)
     camera_reports = {}

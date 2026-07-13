@@ -2,6 +2,8 @@ import importlib.util
 import math
 from pathlib import Path
 
+import pytest
+
 
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "compare_opendrive_geometry.py"
 SPEC = importlib.util.spec_from_file_location("compare_opendrive_geometry", TOOL_PATH)
@@ -133,3 +135,45 @@ def test_exclusive_writer_refuses_overwrite(tmp_path):
         pass
     else:
         raise AssertionError("writer overwrote immutable evidence")
+
+
+def test_lane_width_road_mark_and_connectivity_drift_is_explicit(tmp_path):
+    template = """<OpenDRIVE>
+<header revMajor="1" revMinor="4"><geoReference>same</geoReference></header>
+<road id="1" length="10" junction="-1">
+  <link><successor elementType="road" elementId="{successor}" contactPoint="start"/></link>
+  <planView><geometry s="0" x="0" y="0" hdg="0" length="10"><line/></geometry></planView>
+  <lanes><laneSection s="0"><right><lane id="-1" type="driving" level="false">
+    <link><successor id="{lane_successor}"/></link>
+    <width sOffset="0" a="{width}" b="0" c="0" d="0"/>
+    <roadMark sOffset="0" type="{mark}" color="white"/>
+  </lane></right></laneSection></lanes>
+</road>
+<junction id="7"><connection id="1" incomingRoad="1" connectingRoad="{successor}" contactPoint="start">
+  <laneLink from="-1" to="{lane_successor}"/>
+</connection></junction></OpenDRIVE>"""
+    deployed_path, candidate_path = tmp_path / "deployed.xodr", tmp_path / "candidate.xodr"
+    deployed_path.write_text(template.format(successor="2", lane_successor="-1", width="3.5", mark="solid"))
+    candidate_path.write_text(template.format(successor="3", lane_successor="-2", width="3.8", mark="broken"))
+    deployed, candidate = tool.parse_map(deployed_path), tool.parse_map(candidate_path)
+    report = tool.compare_maps(deployed, candidate, road_spacing_m=1.0)
+    lane_id = "road-1-section-s0.000-lane--1"
+    assert report["lane_profiles"]["width_changed"] == [lane_id]
+    assert report["lane_profiles"]["road_mark_changed"] == [lane_id]
+    assert report["lane_profiles"]["lane_link_changed"] == [lane_id]
+    assert report["lane_profiles"]["width_difference_m"]["max"] == pytest.approx(0.3)
+    assert report["road_links"]["changed"] == ["1"]
+    assert report["junction_links"]["changed"] == ["junction-7-connection-1"]
+
+
+def test_identical_lane_profiles_have_no_false_drift(tmp_path):
+    path = tmp_path / "same.xodr"
+    path.write_text("""<OpenDRIVE><header><geoReference>same</geoReference></header>
+<road id="1" length="2" junction="-1"><planView><geometry s="0" x="0" y="0" hdg="0" length="2"><line/></geometry></planView>
+<lanes><laneSection s="0"><right><lane id="-1" type="driving"><width sOffset="0" a="3.5" b="0" c="0" d="0"/><roadMark sOffset="0" type="solid"/></lane></right></laneSection></lanes>
+</road></OpenDRIVE>""")
+    model = tool.parse_map(path)
+    comparison = tool.compare_lane_profiles(model["lane_profiles"], model["lane_profiles"])
+    assert comparison["width_changed"] == []
+    assert comparison["road_mark_changed"] == []
+    assert comparison["width_difference_m"]["max"] == 0.0

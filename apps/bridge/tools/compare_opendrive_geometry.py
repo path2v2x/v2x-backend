@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Compare geometry in two OpenDRIVE revisions without loading CARLA.
 
-Road reference lines, crosswalk polygons, and signal locations are evaluated
-in their shared OpenDRIVE frame.  This is not a road/lane connectivity or
-routing-topology comparison.  It is diagnostic-only and intended to
-distinguish a camera-fit residual from geometric map-content drift.  The tool
-never changes a CARLA world or Unreal asset.
+Road reference lines, crosswalk polygons, signal locations, lane-width and
+road-mark profiles, road links, and junction lane links are evaluated in their
+shared OpenDRIVE frame.  It is diagnostic-only and intended to distinguish a
+camera-fit residual from geometric map-content drift.  The tool never changes
+a CARLA world or Unreal asset.
 """
 
 import argparse
@@ -19,6 +19,8 @@ from pathlib import Path
 import statistics
 import sys
 import xml.etree.ElementTree as ET
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -235,6 +237,97 @@ def object_geometry(road, plan_view, element, kind):
     }
 
 
+def _float_attributes(element, names):
+    return {name: float(element.get(name, 0.0)) for name in names}
+
+
+def parse_lane_profiles(road):
+    sections = road.findall("./lanes/laneSection")
+    road_length = float(road.get("length"))
+    profiles = []
+    for section_index, section in enumerate(sections):
+        section_start = float(section.get("s"))
+        section_end = (
+            float(sections[section_index + 1].get("s"))
+            if section_index + 1 < len(sections) else road_length
+        )
+        if section_end <= section_start:
+            raise ValueError(f"road {road.get('id')} has an invalid lane-section range")
+        for lane in section.findall("./left/lane") + section.findall("./center/lane") + section.findall("./right/lane"):
+            lane_id = lane.get("id")
+            identity = f"road-{road.get('id')}-section-s{section_start:.3f}-lane-{lane_id}"
+            widths = [
+                {"s_offset": float(item.get("sOffset")), **_float_attributes(item, ("a", "b", "c", "d"))}
+                for item in lane.findall("width")
+            ]
+            widths.sort(key=lambda item: item["s_offset"])
+            road_marks = [
+                {
+                    "s_offset": float(item.get("sOffset")),
+                    "type": item.get("type"),
+                    "color": item.get("color"),
+                    "weight": item.get("weight"),
+                    "lane_change": item.get("laneChange"),
+                    "width": float(item.get("width")) if item.get("width") is not None else None,
+                }
+                for item in lane.findall("roadMark")
+            ]
+            road_marks.sort(key=lambda item: item["s_offset"])
+            link = lane.find("link")
+            profiles.append({
+                "id": identity,
+                "road_id": road.get("id"),
+                "section_start_s": section_start,
+                "section_end_s": section_end,
+                "lane_id": lane_id,
+                "type": lane.get("type"),
+                "level": lane.get("level"),
+                "widths": widths,
+                "road_marks": road_marks,
+                "predecessor_lane_id": (
+                    link.find("predecessor").get("id")
+                    if link is not None and link.find("predecessor") is not None else None
+                ),
+                "successor_lane_id": (
+                    link.find("successor").get("id")
+                    if link is not None and link.find("successor") is not None else None
+                ),
+            })
+    return sorted(profiles, key=lambda item: item["id"])
+
+
+def parse_road_link(road):
+    link = road.find("link")
+    result = {}
+    for relation in ("predecessor", "successor"):
+        element = link.find(relation) if link is not None else None
+        result[relation] = None if element is None else {
+            "element_type": element.get("elementType"),
+            "element_id": element.get("elementId"),
+            "contact_point": element.get("contactPoint"),
+        }
+    return result
+
+
+def parse_junction_links(root):
+    output = []
+    for junction in root.findall("junction"):
+        for connection in junction.findall("connection"):
+            lane_links = sorted(
+                (item.get("from"), item.get("to")) for item in connection.findall("laneLink")
+            )
+            output.append({
+                "id": f"junction-{junction.get('id')}-connection-{connection.get('id')}",
+                "junction_id": junction.get("id"),
+                "connection_id": connection.get("id"),
+                "incoming_road": connection.get("incomingRoad"),
+                "connecting_road": connection.get("connectingRoad"),
+                "contact_point": connection.get("contactPoint"),
+                "lane_links": lane_links,
+            })
+    return sorted(output, key=lambda item: item["id"])
+
+
 def parse_map(path):
     root = ET.parse(path).getroot()
     if root.tag != "OpenDRIVE":
@@ -259,12 +352,15 @@ def parse_map(path):
             "length": float(road.get("length")),
             "junction": road.get("junction"),
             "plan_view": plan_view,
+            "link": parse_road_link(road),
         })
         for element in road.findall("./objects/object"):
             if (element.get("type") or "").lower() == "crosswalk":
                 crosswalks.append(object_geometry(road, plan_view, element, "crosswalk"))
         for element in road.findall("./signals/signal"):
             signals.append(object_geometry(road, plan_view, element, "signal"))
+    lane_profiles = [profile for road in root.findall("road") for profile in parse_lane_profiles(road)]
+    junction_links = parse_junction_links(root)
     return {
         "path": str(Path(path).resolve()),
         "sha256": sha256(path),
@@ -277,7 +373,12 @@ def parse_map(path):
         "signal_count": len(signals),
         "crosswalk_count": len(crosswalks),
         "plan_view_geometry_counts": dict(sorted(shape_counts.items())),
+        "lane_profile_count": len(lane_profiles),
+        "road_mark_range_count": sum(len(item["road_marks"]) for item in lane_profiles),
+        "junction_connection_count": len(junction_links),
         "roads": roads,
+        "lane_profiles": lane_profiles,
+        "junction_links": junction_links,
         "crosswalks": crosswalks,
         "signals": signals,
     }
@@ -560,11 +661,91 @@ def match_features(left, right, max_distance_m, require_same_class=False):
     }
 
 
+def _evaluate_width(profile, station_offset):
+    selected = None
+    for width in profile["widths"]:
+        if width["s_offset"] <= station_offset + 1e-12:
+            selected = width
+        else:
+            break
+    if selected is None:
+        return None
+    delta = station_offset - selected["s_offset"]
+    return selected["a"] + selected["b"] * delta + selected["c"] * delta**2 + selected["d"] * delta**3
+
+
+def compare_lane_profiles(left_profiles, right_profiles, spacing_m=0.25):
+    left = {item["id"]: item for item in left_profiles}
+    right = {item["id"]: item for item in right_profiles}
+    common = sorted(set(left) & set(right))
+    width_differences, width_changed = [], []
+    road_mark_changed, lane_link_changed, semantic_changed = [], [], []
+    for identity in common:
+        deployed, candidate = left[identity], right[identity]
+        length = min(
+            deployed["section_end_s"] - deployed["section_start_s"],
+            candidate["section_end_s"] - candidate["section_start_s"],
+        )
+        stations = np.arange(0.0, length + 1e-9, spacing_m) if length > 0 else []
+        local_differences = []
+        for station in stations:
+            deployed_width = _evaluate_width(deployed, float(station))
+            candidate_width = _evaluate_width(candidate, float(station))
+            if deployed_width is None and candidate_width is None:
+                continue
+            if deployed_width is None or candidate_width is None:
+                local_differences.append(math.inf)
+            else:
+                local_differences.append(abs(deployed_width - candidate_width))
+        width_differences.extend(local_differences)
+        if any(not math.isfinite(value) or value > 1e-9 for value in local_differences):
+            width_changed.append(identity)
+        if deployed["road_marks"] != candidate["road_marks"]:
+            road_mark_changed.append(identity)
+        if (
+            deployed["predecessor_lane_id"], deployed["successor_lane_id"]
+        ) != (
+            candidate["predecessor_lane_id"], candidate["successor_lane_id"]
+        ):
+            lane_link_changed.append(identity)
+        if (deployed["type"], deployed["level"]) != (candidate["type"], candidate["level"]):
+            semantic_changed.append(identity)
+    finite = [value for value in width_differences if math.isfinite(value)]
+    return {
+        "sample_spacing_m": spacing_m,
+        "matched_lane_profile_count": len(common),
+        "missing_from_candidate": sorted(set(left) - set(right)),
+        "added_in_candidate": sorted(set(right) - set(left)),
+        "width_changed": width_changed,
+        "width_difference_m": {
+            "rmse": math.sqrt(statistics.mean(value * value for value in finite)) if finite else None,
+            "max": max(finite) if finite else None,
+            "unmatched_width_samples": len(width_differences) - len(finite),
+        },
+        "road_mark_changed": road_mark_changed,
+        "lane_link_changed": lane_link_changed,
+        "lane_semantic_changed": semantic_changed,
+    }
+
+
+def compare_identity_records(left, right, identity_key="id"):
+    deployed = {item[identity_key]: item for item in left}
+    candidate = {item[identity_key]: item for item in right}
+    common = sorted(set(deployed) & set(candidate))
+    return {
+        "missing_from_candidate": sorted(set(deployed) - set(candidate)),
+        "added_in_candidate": sorted(set(candidate) - set(deployed)),
+        "changed": [identity for identity in common if deployed[identity] != candidate[identity]],
+        "unchanged_count": sum(deployed[identity] == candidate[identity] for identity in common),
+    }
+
+
 def public_map_summary(model):
     return {key: model[key] for key in (
         "path", "sha256", "header", "georeference", "header_offset", "road_count",
         "junction_count", "object_count", "signal_count", "crosswalk_count",
-        "plan_view_geometry_counts",
+        "plan_view_geometry_counts", "lane_profile_count", "road_mark_range_count",
+        "junction_connection_count",
     )}
 
 
@@ -577,8 +758,8 @@ def compare_maps(deployed, candidate, road_spacing_m=1.0, max_road_distance_m=10
         "schema": "v2x-opendrive-geometry-comparison/v1",
         "acceptance_eligible": False,
         "limitations": [
-            "does_not_compare_road_or_lane_connectivity",
-            "does_not_compare_lane_widths_or_traffic_direction",
+            "lane_widths_are_compared_at_fixed_0.25m_samples",
+            "connectivity_comparison_is_structural_and_does_not_execute_routes",
             "feature_assignment_is_geometric_and_not_identity_truth",
             "cannot_certify_physical_site_alignment_without_surveyed_holdouts",
         ],
@@ -607,6 +788,17 @@ def compare_maps(deployed, candidate, road_spacing_m=1.0, max_road_distance_m=10
         "signals": match_features(
             deployed["signals"], candidate["signals"], feature_match_distance_m,
             require_same_class=True,
+        ),
+        "lane_profiles": compare_lane_profiles(
+            deployed["lane_profiles"], candidate["lane_profiles"]
+        ),
+        "road_links": compare_identity_records([
+            {"id": item["id"], **item["link"]} for item in deployed["roads"]
+        ], [
+            {"id": item["id"], **item["link"]} for item in candidate["roads"]
+        ]),
+        "junction_links": compare_identity_records(
+            deployed["junction_links"], candidate["junction_links"]
         ),
     }
     if site_anchor_xy is not None:
