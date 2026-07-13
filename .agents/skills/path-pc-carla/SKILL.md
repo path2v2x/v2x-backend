@@ -9,8 +9,47 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 01:17 UTC; verify rather than assume. These items
+Observed through 2026-07-13 02:39 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
+
+- Live production remains the verified PR 35 rollback
+  `76e561cd41d070a6402c39c98847e646bd81cc9a`; CARLA, Drive, perception,
+  and web were active with zero restart counters at 02:39 UTC. Do not describe
+  PR 37 or any later terminal-recovery candidate as deployed.
+- The newest isolated terminal-recovery candidate is
+  `49ac21bb83f66a64f2088435cbbd88910f3bd0e6`. It retains the active signed
+  capture and clock URLs only inside the reader, exposes secret-safe terminal
+  stage telemetry, reuses a prior exact clock only when the unchanged validator
+  accepts the restarted cursor, prunes only HLS fragments that end before the
+  last trusted media time, reserves exact-match capacity for terminal recovery,
+  serializes proactive preparations process-wide, and keeps a bounded URL-free
+  ring of exact full-frame digests. When a restarted decoder emits exactly one
+  retained trusted frame, `HlsMediaClock.reanchor_from_exact_match` translates
+  the new cursor through that exact frame and then runs the unchanged receipt-
+  time validator; absent, duplicate, or invalid evidence falls back to the
+  existing exact fragment matcher and still fails closed. No freshness, clock,
+  inference, duplicate-frame, or zero-reconnect threshold is weakened.
+- Candidate `49ac21b` passes 145 perception tests. Its upload-disabled isolated
+  four-camera forced-terminal canary killed the four exact canary-owned FFmpeg
+  readers once each: ch1/ch2/ch3/ch4 recovered in 4.399/3.739/1.561/1.821
+  seconds, every 100 ms sample remained ready, capture and inference advanced,
+  and final telemetry reported four successes and zero failures. The tracked
+  four-feed verifier also proved two distinct complete JPEG hashes and advancing
+  capture/event/inference clocks for every camera. Cleanup completed with
+  `Result=success`, port 18090 closed, and production fingerprints unchanged.
+  Evidence is at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T023600Z-pr49-exact-ring-terminal-canary/`.
+  This passes only the isolated forced-reader gate. Before live deployment,
+  require full bridge/infrastructure regression, a fresh rollback bundle,
+  zero Drive sessions, timer hold, controlled upload-disabled then enabled
+  startup, ten-minute and 30-minute watches, a natural hourly restart, and a
+  fresh 24-hour monitor. Any failure restores PR 35 perception only.
+- Historical experiments `f76d493`, `d0802cc`, `b515e4b`, `7127779`,
+  `ec1cd2a`, `2e27521`, `4162e96`, `75c1cda`, and `0c73261` are rejected or
+  intermediate evidence, not deployment targets. Their forced canaries exposed
+  respectively late capture-open or clock-resolution paths, and some rejected
+  transient units required a process-group timeout during cleanup. Never cite
+  those partial successes as release proof.
 
 - PR 37 merged as canonical
   `80db3de34870379ddaa6984497607726a563a17d`. Its terminal-FIFO
