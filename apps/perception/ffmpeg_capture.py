@@ -1743,6 +1743,7 @@ class FfmpegNvdecCapture:
         self._cancel_watcher_stop = threading.Event()
         self._cancel_watcher = None
         self._process_lock = threading.RLock()
+        self._release_lock = threading.Lock()
 
         def raise_if_cancelled():
             if cancel_event is not None and cancel_event.is_set():
@@ -1965,95 +1966,106 @@ class FfmpegNvdecCapture:
         return self._transport_diagnostic
 
     def release(self):
-        self._cancel_watcher_stop.set()
-        self._opened = False
-        cleanup_error = None
-        capture, self._capture = self._capture, None
-        if capture is not None:
-            try:
-                capture.release()
-            except Exception as exc:
-                cleanup_error = exc
+        # Only the owning cleanup path tears down OpenCV and connection-local
+        # state.  The cancellation watcher merely wakes a blocked FIFO read by
+        # signalling FFmpeg.  Serializing here also makes concurrent terminal
+        # and proactive cleanup idempotent.
+        with self._release_lock:
+            self._cancel_watcher_stop.set()
+            self._opened = False
+            cleanup_error = None
 
-        with self._process_lock:
-            process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                if process.poll() is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        if process.poll() is None:
-                            cleanup_error = NvdecCaptureError(
-                                "NVDEC FFmpeg process did not exit"
-                            )
-
-        process_dead = process is None or process.poll() is not None
-        if process_dead:
             with self._process_lock:
-                if self._process is process:
-                    self._process = None
+                process = self._process
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            if process.poll() is None:
+                                cleanup_error = NvdecCaptureError(
+                                    "NVDEC FFmpeg process did not exit"
+                                )
 
-        if process_dead and self._memfd is not None:
-            try:
-                os.close(self._memfd)
-            except OSError:
-                pass
-            self._memfd = None
-        if process_dead:
-            sidecar = getattr(self, "_pts_sidecar", None)
-            if sidecar is not None:
+            process_dead = process is None or process.poll() is not None
+            if process_dead:
+                with self._process_lock:
+                    if self._process is process:
+                        self._process = None
+
+            # cv2.VideoCapture.release() can block on a FIFO while its writer
+            # is still alive.  Reap the writer first; if even SIGKILL cannot do
+            # that, fail closed without entering an unbounded native release.
+            if process_dead:
+                capture, self._capture = self._capture, None
+                if capture is not None:
+                    try:
+                        capture.release()
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+
+            if process_dead and self._memfd is not None:
                 try:
-                    sidecar.close(timeout=1.0)
-                except Exception as exc:
-                    if cleanup_error is None:
-                        cleanup_error = exc
-                else:
-                    self._pts_sidecar = None
-            mediator = getattr(self, "_mediator", None)
-            if mediator is not None:
-                try:
-                    mediator.close()
-                except Exception as exc:
-                    if cleanup_error is None:
-                        cleanup_error = exc
-                else:
-                    self._mediator = None
-            write_fd = getattr(self, "_pts_write_fd", None)
-            if write_fd is not None:
-                try:
-                    os.close(write_fd)
+                    os.close(self._memfd)
                 except OSError:
                     pass
-                self._pts_write_fd = None
-        if process_dead:
-            temporary, self._temporary_directory = (
-                self._temporary_directory,
-                None,
-            )
-            if temporary is not None:
-                temporary.cleanup()
-        self._last_source_position_ms = None
-        self._last_transport_exact = False
-        watcher, self._cancel_watcher = self._cancel_watcher, None
-        if (
-            watcher is not None
-            and watcher is not threading.current_thread()
-            and watcher.is_alive()
-        ):
-            watcher.join(timeout=0.2)
-        if cleanup_error is not None:
-            raise cleanup_error
+                self._memfd = None
+            if process_dead:
+                sidecar = getattr(self, "_pts_sidecar", None)
+                if sidecar is not None:
+                    try:
+                        sidecar.close(timeout=1.0)
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                    else:
+                        self._pts_sidecar = None
+                mediator = getattr(self, "_mediator", None)
+                if mediator is not None:
+                    try:
+                        mediator.close()
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                    else:
+                        self._mediator = None
+                write_fd = getattr(self, "_pts_write_fd", None)
+                if write_fd is not None:
+                    try:
+                        os.close(write_fd)
+                    except OSError:
+                        pass
+                    self._pts_write_fd = None
+            if process_dead:
+                temporary, self._temporary_directory = (
+                    self._temporary_directory,
+                    None,
+                )
+                if temporary is not None:
+                    temporary.cleanup()
+            self._last_source_position_ms = None
+            self._last_transport_exact = False
+            watcher, self._cancel_watcher = self._cancel_watcher, None
+            if (
+                watcher is not None
+                and watcher is not threading.current_thread()
+                and watcher.is_alive()
+            ):
+                watcher.join(timeout=0.2)
+            if cleanup_error is not None:
+                raise cleanup_error
 
     def _watch_for_cancel(self):
         while not self._cancel_watcher_stop.is_set():
@@ -2064,14 +2076,6 @@ class FfmpegNvdecCapture:
                     try:
                         os.killpg(process.pid, signal.SIGTERM)
                     except ProcessLookupError:
-                        pass
-                mediator = getattr(self, "_mediator", None)
-                if mediator is not None:
-                    try:
-                        mediator.close()
-                    except Exception:
-                        # release() retains and reports failed cleanup; the
-                        # cancellation watcher must not leak a traceback.
                         pass
                 return
 

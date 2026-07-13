@@ -1,12 +1,12 @@
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 import math
 import inspect
 import os
 import re
 import tempfile
+import time
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import boto3
@@ -19,6 +19,7 @@ from ffmpeg_capture import (
     match_fragment_frame_nvdec,
 )
 from decoder_admission import acquire_auxiliary_decoder_slot
+from bounded_executor import DaemonWorkerPool
 
 load_dotenv()
 
@@ -27,19 +28,36 @@ load_dotenv()
 # is enforced separately by the shared auxiliary GPU budget: cold/terminal work
 # may use both permits, while a proactive capture holds one permit through
 # handover and leaves one for its own exact match.
-_NVDEC_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+_NVDEC_FRAGMENT_MATCH_EXECUTOR = DaemonWorkerPool(
+    max_workers=2,
+    thread_name_prefix="v2x-fragment-match",
+)
 # A separate executor prevents urgent futures from queueing behind normal work;
 # priority-aware auxiliary admission also lets an urgent waiter enter before any
 # queued normal matcher when a permit is released.
-_NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+_NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR = DaemonWorkerPool(
+    max_workers=2,
+    thread_name_prefix="v2x-urgent-fragment-match",
+)
 
 
-def shutdown_media_clock_executors():
-    """Quiesce URL-free fragment workers during cooperative process shutdown."""
-    _NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR.shutdown(
-        wait=True, cancel_futures=True
+def shutdown_media_clock_executors(timeout=5.0):
+    """Boundedly quiesce URL-free fragment workers during process shutdown."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    executors = (
+        _NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR,
+        _NVDEC_FRAGMENT_MATCH_EXECUTOR,
     )
-    _NVDEC_FRAGMENT_MATCH_EXECUTOR.shutdown(wait=True, cancel_futures=True)
+    for executor in executors:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return all(
+        executor.shutdown(
+            wait=True,
+            cancel_futures=True,
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
+        for executor in executors
+    )
 
 
 def _run_nvdec_fragment_match(
@@ -546,8 +564,20 @@ def resolve_hls_media_clock(
         # budget decode at most two candidates across every camera and pool.
         # A terminal recovery holds an urgent window across its whole batch, so
         # normal clock work cannot slip between later urgent candidates.
-        with ThreadPoolExecutor(max_workers=min(5, len(fragments))) as executor:
-            downloaded = list(executor.map(download_fragment, fragments))
+        download_executor = DaemonWorkerPool(
+            max_workers=min(5, len(fragments)),
+            thread_name_prefix="v2x-fragment-download",
+        )
+        try:
+            downloaded = [
+                future.result()
+                for future in (
+                    download_executor.submit(download_fragment, fragment)
+                    for fragment in fragments
+                )
+            ]
+        finally:
+            download_executor.shutdown(wait=False, cancel_futures=True)
         match_executor = (
             _NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR
             if urgent
@@ -565,15 +595,24 @@ def resolve_hls_media_clock(
         and http_get is requests.get
         and fragment_matcher is _match_fragment_frame
     ):
-        with ThreadPoolExecutor(max_workers=min(5, len(fragments))) as executor:
-            candidates = list(
-                executor.map(
-                    lambda fragment: match_downloaded_fragment(
-                        download_fragment(fragment)
-                    ),
-                    fragments,
+        match_pool = DaemonWorkerPool(
+            max_workers=min(5, len(fragments)),
+            thread_name_prefix="v2x-fragment-cpu-match",
+        )
+        try:
+            candidates = [
+                future.result()
+                for future in (
+                    match_pool.submit(
+                        lambda current=fragment: match_downloaded_fragment(
+                            download_fragment(current)
+                        )
+                    )
+                    for fragment in fragments
                 )
-            )
+            ]
+        finally:
+            match_pool.shutdown(wait=False, cancel_futures=True)
     else:
         candidates = [
             match_downloaded_fragment(download_fragment(fragment))

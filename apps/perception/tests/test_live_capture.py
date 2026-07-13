@@ -1,6 +1,9 @@
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import select
+import subprocess
 import threading
 import time
 import unittest
@@ -503,6 +506,154 @@ class LiveStreamReaderTests(unittest.TestCase):
         )
         result[0].release()
 
+    def test_done_publication_cannot_drop_claimed_handover_lease(self):
+        read_entered = threading.Event()
+        allow_read = threading.Event()
+        done_published = threading.Event()
+        allow_done_return = threading.Event()
+        coordination_failed = threading.Event()
+
+        class BlockingCapture(PositionedScriptedCapture):
+            def read(self):
+                read_entered.set()
+                if not allow_read.wait(2.0):
+                    coordination_failed.set()
+                return super().read()
+
+        class GateEvent:
+            def __init__(self):
+                self._event = threading.Event()
+
+            def set(self):
+                self._event.set()
+                done_published.set()
+                if not allow_done_return.wait(2.0):
+                    coordination_failed.set()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def wait(self, timeout=None):
+                return self._event.wait(timeout)
+
+        capture = BlockingCapture(["frame"], [0.0])
+        preparation = _AsyncCapturePreparation(
+            source_factory=lambda: "capture-source",
+            clock_source_factory=None,
+            capture_factory=lambda _source: capture,
+            media_clock_factory=None,
+            media_clock_validator=None,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=time.monotonic,
+            reserve_decoder_slot=True,
+        )
+        self.assertTrue(read_entered.wait(1.0))
+        preparation._done = GateEvent()
+        allow_read.set()
+        self.assertTrue(done_published.wait(1.0))
+        consumed = threading.Event()
+        outcome = {}
+
+        def consume():
+            outcome["poll"] = preparation.poll()
+            outcome["result"] = preparation.take()
+            consumed.set()
+
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        self.assertFalse(consumed.wait(0.02))
+        allow_done_return.set()
+        consumer.join(1.0)
+        preparation.join(1.0)
+
+        self.assertTrue(consumed.is_set())
+        self.assertFalse(preparation.is_alive())
+        self.assertFalse(coordination_failed.is_set())
+        done, polled_result, failed = outcome["poll"]
+        self.assertTrue(done)
+        self.assertFalse(failed)
+        self.assertIsNotNone(polled_result)
+        result = outcome["result"]
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"], 1
+        )
+        self.assertEqual(
+            capture_preparation_topology()["proactive_preparations"], 1
+        )
+        preparation.adopt()
+        self.assertEqual(
+            AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"], 0
+        )
+        result[0].release()
+
+    def test_discard_during_done_publication_cannot_leak_lease(self):
+        read_entered = threading.Event()
+        allow_read = threading.Event()
+        done_published = threading.Event()
+        allow_done_return = threading.Event()
+        coordination_failed = threading.Event()
+
+        class BlockingCapture(PositionedScriptedCapture):
+            def read(self):
+                read_entered.set()
+                if not allow_read.wait(2.0):
+                    coordination_failed.set()
+                return super().read()
+
+        class GateEvent:
+            def __init__(self):
+                self._event = threading.Event()
+
+            def set(self):
+                self._event.set()
+                done_published.set()
+                if not allow_done_return.wait(2.0):
+                    coordination_failed.set()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def wait(self, timeout=None):
+                return self._event.wait(timeout)
+
+        capture = BlockingCapture(["frame"], [0.0])
+        preparation = _AsyncCapturePreparation(
+            source_factory=lambda: "capture-source",
+            clock_source_factory=None,
+            capture_factory=lambda _source: capture,
+            media_clock_factory=None,
+            media_clock_validator=None,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=time.monotonic,
+            reserve_decoder_slot=True,
+        )
+        self.assertTrue(read_entered.wait(1.0))
+        preparation._done = GateEvent()
+        allow_read.set()
+        self.assertTrue(done_published.wait(1.0))
+        discard = threading.Thread(target=preparation.discard)
+        discard.start()
+        self.assertTrue(discard.is_alive())
+        allow_done_return.set()
+        discard.join(1.0)
+        preparation.join(1.0)
+
+        self.assertFalse(discard.is_alive())
+        self.assertFalse(preparation.is_alive())
+        self.assertFalse(coordination_failed.is_set())
+        self.assertTrue(capture.released)
+        self.assertTrue(self.wait_until(lambda: (
+            AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"] == 0
+            and capture_preparation_topology()["proactive_preparations"] == 0
+        )))
+
     def test_global_cancel_cannot_release_a_claimed_handover_lease(self):
         capture = PositionedScriptedCapture(["frame"], [0.0])
         preparation = _AsyncCapturePreparation(
@@ -532,6 +683,59 @@ class LiveStreamReaderTests(unittest.TestCase):
         self.assertEqual(
             AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"], 0
         )
+        result[0].release()
+
+    def test_claimed_handover_quiesces_after_old_writer_termination(self):
+        old_release_entered = threading.Event()
+        old_writer_dead = threading.Event()
+        capture = PositionedScriptedCapture(["frame"], [0.0])
+        preparation = _AsyncCapturePreparation(
+            source_factory=lambda: "capture-source",
+            clock_source_factory=None,
+            capture_factory=lambda _source: capture,
+            media_clock_factory=None,
+            media_clock_validator=None,
+            capture_position_milliseconds=lambda cap: cap.get(0),
+            media_frame_identity=lambda frame: frame,
+            stop_event=threading.Event(),
+            wall_time=time.time,
+            monotonic=time.monotonic,
+            reserve_decoder_slot=True,
+        )
+        self.assertTrue(self.wait_until(lambda: preparation.poll()[0]))
+        result = preparation.take()
+        self.assertIsNotNone(result)
+
+        class OldCapture:
+            def release(self):
+                old_release_entered.set()
+                self_test.assertTrue(old_writer_dead.wait(1.0))
+
+        self_test = self
+
+        def handover():
+            OldCapture().release()
+            preparation.adopt()
+
+        owner = threading.Thread(target=handover)
+        owner.start()
+        self.assertTrue(old_release_entered.wait(1.0))
+        self.assertFalse(_cancel_proactive_preparations(timeout=0.02))
+        self.assertEqual(
+            AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"], 1
+        )
+        self.assertEqual(
+            capture_preparation_topology()["proactive_preparations"], 1
+        )
+
+        old_writer_dead.set()
+        owner.join(1.0)
+        self.assertFalse(owner.is_alive())
+        self.assertTrue(self.wait_until(lambda: (
+            AUXILIARY_DECODER_ADMISSION.snapshot()["in_use"] == 0
+            and capture_preparation_topology()["proactive_preparations"] == 0
+            and capture_preparation_topology()["terminal_cleanups"] == 0
+        )))
         result[0].release()
 
     def test_terminal_window_rejects_new_proactive_registration(self):
@@ -721,6 +925,399 @@ class LiveStreamReaderTests(unittest.TestCase):
         self.assertTrue(self.wait_until(lambda: (
             capture_preparation_topology()["terminal_cleanups"] == 0
         )))
+
+    def test_stop_during_failed_read_skips_terminal_recovery(self):
+        read_entered = threading.Event()
+
+        class BlockingFailedCapture:
+            def __init__(self):
+                self.released = False
+                self.cancel_event = None
+
+            def isOpened(self):
+                return not self.released
+
+            def read(self):
+                read_entered.set()
+                self_test.assertIsNotNone(self.cancel_event)
+                self_test.assertTrue(self.cancel_event.wait(1.0))
+                return False, None
+
+            def release(self):
+                self.released = True
+
+        capture = BlockingFailedCapture()
+        self_test = self
+        cancel_events = []
+
+        def capture_factory(_source, cancel_event=None):
+            cancel_events.append(cancel_event)
+            capture.cancel_event = cancel_event
+            return capture
+
+        reader = LiveStreamReader(
+            source_factory=lambda: "capture-source",
+            capture_factory=capture_factory,
+            recovery=StreamRecovery(0.1, 0.1),
+            terminal_read_failover_seconds=0.5,
+        )
+        terminal_calls = []
+        reader._recover_terminal_read = lambda *_args, **_kwargs: (
+            terminal_calls.append(True)
+        )
+        reader.start()
+        self.assertTrue(read_entered.wait(1.0))
+        deadline = time.monotonic() + 0.5
+        reader.request_stop(deadline=deadline)
+        reader.join(1.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(terminal_calls, [])
+        self.assertEqual(cancel_events, [reader._stop_event])
+        self.assertTrue(capture.released)
+        self.assertEqual(
+            capture_preparation_topology()["terminal_cleanups"], 0
+        )
+
+    def test_process_sigterm_reaps_blocked_fifo_writer_without_sigkill(self):
+        script = r'''
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, sys.argv[1])
+from ffmpeg_capture import FfmpegNvdecCapture
+from live_capture import LiveStreamReader
+from runtime_health import StreamRecovery
+
+created = threading.Event()
+shutdown = threading.Event()
+
+class BlockingFifoCapture:
+    def __init__(self, process):
+        self.process = process
+        self.released = False
+
+    def isOpened(self):
+        return not self.released
+
+    def read(self):
+        while self.process.poll() is None:
+            time.sleep(0.01)
+        return False, None
+
+    def release(self):
+        if self.process.poll() is None:
+            raise RuntimeError("writer still alive at OpenCV release")
+        self.released = True
+
+def capture_factory(_source, cancel_event=None):
+    process = subprocess.Popen(
+        ["/bin/sleep", "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    capture = object.__new__(FfmpegNvdecCapture)
+    capture._capture = BlockingFifoCapture(process)
+    capture._process = process
+    capture._test_pid = process.pid
+    capture._memfd = None
+    capture._mediator = None
+    capture._pts_sidecar = None
+    capture._pts_write_fd = None
+    capture._temporary_directory = None
+    capture._opened = True
+    capture._cancel_event = cancel_event
+    capture._cancel_watcher_stop = threading.Event()
+    capture._process_lock = threading.RLock()
+    capture._release_lock = threading.Lock()
+    capture._last_source_position_ms = None
+    capture._last_transport_exact = False
+    capture._cancel_watcher = threading.Thread(
+        target=capture._watch_for_cancel,
+        daemon=True,
+    )
+    capture._cancel_watcher.start()
+    print(f"READY {process.pid}", flush=True)
+    created.set()
+    return capture
+
+reader = LiveStreamReader(
+    source_factory=lambda: "local-fifo",
+    capture_factory=capture_factory,
+    recovery=StreamRecovery(0.1, 0.1),
+    terminal_read_failover_seconds=0.5,
+)
+
+def stop(_signum, _frame):
+    shutdown.set()
+    reader.request_stop(deadline=time.monotonic() + 2.0)
+
+signal.signal(signal.SIGTERM, stop)
+reader.start()
+if not created.wait(2.0):
+    raise SystemExit(3)
+while not shutdown.wait(0.05):
+    pass
+reader.join(2.5)
+if reader.is_alive():
+    raise SystemExit(4)
+print("DONE", flush=True)
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(PERCEPTION_DIR)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 3.0)
+            self.assertTrue(ready, "signal harness did not become ready")
+            line = process.stdout.readline().strip()
+            self.assertRegex(line, r"^READY [0-9]+$")
+            child_pid = int(line.split()[1])
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=5.0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=2.0)
+
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("DONE", stdout)
+        self.assertFalse(os.path.exists(f"/proc/{child_pid}"))
+
+    def test_process_sigterm_during_claimed_handover_reaches_zero_topology(self):
+        script = r'''
+import atexit
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, sys.argv[1])
+from decoder_admission import AUXILIARY_DECODER_ADMISSION
+from ffmpeg_capture import FfmpegNvdecCapture
+from live_capture import (
+    LiveStreamReader,
+    _cancel_proactive_preparations,
+    capture_preparation_topology,
+)
+from runtime_health import StreamRecovery
+
+handover_blocked = threading.Event()
+release_old_capture = threading.Event()
+shutdown = threading.Event()
+captures = []
+
+def cleanup_owned_children():
+    release_old_capture.set()
+    for capture in tuple(captures):
+        try:
+            capture.release()
+        except Exception:
+            process = getattr(capture, "_test_process", None)
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+
+atexit.register(cleanup_owned_children)
+
+class SyntheticOpenCvCapture:
+    def __init__(self, process, block_release):
+        self.process = process
+        self.block_release = block_release
+        self.released = False
+        self.position = 0.0
+
+    def isOpened(self):
+        return not self.released
+
+    def read(self):
+        if self.process.poll() is not None:
+            return False, None
+        self.position += 50.0
+        time.sleep(0.002)
+        return True, f"frame-{self.process.pid}-{self.position}"
+
+    def get(self, _property):
+        return self.position
+
+    def release(self):
+        if self.process.poll() is None:
+            raise RuntimeError("writer still alive at OpenCV release")
+        if self.block_release:
+            handover_blocked.set()
+            if not release_old_capture.wait(8.0):
+                raise RuntimeError("handover release gate timed out")
+        self.released = True
+
+def capture_factory(_source, cancel_event=None):
+    process = subprocess.Popen(
+        ["/bin/sleep", "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    capture = object.__new__(FfmpegNvdecCapture)
+    capture._capture = SyntheticOpenCvCapture(
+        process, block_release=(len(captures) == 0)
+    )
+    capture._process = process
+    capture._test_pid = process.pid
+    capture._test_process = process
+    capture._memfd = None
+    capture._mediator = None
+    capture._pts_sidecar = None
+    capture._pts_write_fd = None
+    capture._temporary_directory = None
+    capture._opened = True
+    capture._cancel_event = cancel_event
+    capture._cancel_watcher_stop = threading.Event()
+    capture._process_lock = threading.RLock()
+    capture._release_lock = threading.Lock()
+    capture._source_pts_timeout_seconds = 0.01
+    capture._last_source_position_ms = None
+    capture._last_transport_exact = False
+    capture._transport_diagnostic = "starting"
+    capture._last_emitted_source_pts = None
+    capture._consecutive_overlap_frames = 0
+    capture._overlap_frames_dropped = 0
+    capture._cancel_watcher = threading.Thread(
+        target=capture._watch_for_cancel,
+        daemon=True,
+    )
+    capture._cancel_watcher.start()
+    captures.append(capture)
+    return capture
+
+reader = LiveStreamReader(
+    source_factory=lambda: "local-fifo",
+    capture_factory=capture_factory,
+    recovery=StreamRecovery(0.1, 0.1),
+    frame_identity=lambda frame: frame,
+    connection_max_age_seconds=0.08,
+    connection_renewal_lead_seconds=0.02,
+    terminal_read_failover_seconds=0.5,
+    reserve_proactive_decoder_slot=True,
+)
+
+def stop(_signum, _frame):
+    shutdown.set()
+    reader.request_stop(deadline=time.monotonic() + 2.5)
+
+signal.signal(signal.SIGTERM, stop)
+reader.start()
+if not handover_blocked.wait(8.0):
+    raise SystemExit(3)
+if len(captures) != 2:
+    raise SystemExit(4)
+children = [capture._test_pid for capture in captures]
+print("READY " + " ".join(str(pid) for pid in children), flush=True)
+while not shutdown.wait(0.05):
+    pass
+
+cleanup_result = []
+cleanup = threading.Thread(
+    target=lambda: cleanup_result.append(
+        _cancel_proactive_preparations(timeout=2.0)
+    )
+)
+cleanup.start()
+deadline = time.monotonic() + 1.0
+while (
+    capture_preparation_topology()["terminal_cleanups"] < 1
+    and time.monotonic() < deadline
+):
+    time.sleep(0.01)
+pre = capture_preparation_topology()
+admission_pre = AUXILIARY_DECODER_ADMISSION.snapshot()
+if pre["proactive_preparations"] != 1 or admission_pre["in_use"] != 1:
+    raise SystemExit(5)
+release_old_capture.set()
+reader.join(3.0)
+cleanup.join(3.0)
+deadline = time.monotonic() + 1.0
+while time.monotonic() < deadline:
+    topology = capture_preparation_topology()
+    admission = AUXILIARY_DECODER_ADMISSION.snapshot()
+    if (
+        topology["proactive_preparations"] == 0
+        and topology["terminal_recoveries"] == 0
+        and topology["terminal_cleanups"] == 0
+        and topology["terminal_cleanup_failures"] == 0
+        and admission["in_use"] == 0
+    ):
+        break
+    time.sleep(0.01)
+if reader.is_alive() or cleanup.is_alive() or cleanup_result != [True]:
+    raise SystemExit(6)
+if any(os.path.exists(f"/proc/{pid}") for pid in children):
+    raise SystemExit(7)
+topology = capture_preparation_topology()
+admission = AUXILIARY_DECODER_ADMISSION.snapshot()
+if any((
+    topology["proactive_preparations"],
+    topology["terminal_recoveries"],
+    topology["terminal_cleanups"],
+    topology["terminal_cleanup_failures"],
+    admission["in_use"],
+)):
+    raise SystemExit(8)
+print("DONE topology=zero children=reaped", flush=True)
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(PERCEPTION_DIR)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 10.0)
+            if not ready:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=2.0)
+                self.fail(
+                    "claimed-handover harness was not ready: "
+                    f"returncode={process.returncode} stdout={stdout!r} "
+                    f"stderr={stderr!r}"
+                )
+            line = process.stdout.readline().strip()
+            if not line:
+                stdout, stderr = process.communicate(timeout=2.0)
+                self.fail(
+                    "claimed-handover harness exited before READY: "
+                    f"returncode={process.returncode} stdout={stdout!r} "
+                    f"stderr={stderr!r}"
+                )
+            self.assertRegex(line, r"^READY [0-9]+ [0-9]+$")
+            child_pids = [int(value) for value in line.split()[1:]]
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=10.0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=2.0)
+
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("DONE topology=zero children=reaped", stdout)
+        self.assertTrue(all(
+            not os.path.exists(f"/proc/{pid}") for pid in child_pids
+        ))
 
     def test_terminal_recovery_waits_for_active_clock_cleanup(self):
         resolver_entered = threading.Event()

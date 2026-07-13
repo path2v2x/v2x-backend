@@ -202,7 +202,14 @@ def fetch_bytes(url: str, *, limit: int, timeout_seconds: float, label: str) -> 
         with urlopen(request, timeout=timeout_seconds) as response:
             body = response.read(limit + 1)
     except Exception as exc:
-        raise _network_error(label, exc) from None
+        error = _network_error(label, exc)
+        close = getattr(exc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        raise error from None
     if len(body) > limit:
         raise VerificationError(f"{label} response exceeds its bounded size limit")
     return body

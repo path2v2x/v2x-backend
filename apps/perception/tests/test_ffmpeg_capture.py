@@ -110,6 +110,7 @@ class FfmpegCaptureTests(unittest.TestCase):
         capture._opened = True
         capture._capture = None
         capture._process_lock = threading.RLock()
+        capture._release_lock = threading.Lock()
         capture._process = process
         capture._memfd = None
         capture._temporary_directory = temporary
@@ -158,6 +159,7 @@ class FfmpegCaptureTests(unittest.TestCase):
         capture._opened = True
         capture._capture = BrokenCapture()
         capture._process_lock = threading.RLock()
+        capture._release_lock = threading.Lock()
         capture._process = process
         capture._memfd = None
         capture._temporary_directory = temporary
@@ -170,6 +172,50 @@ class FfmpegCaptureTests(unittest.TestCase):
         killpg.assert_called_once()
         self.assertIsNone(capture._process)
         self.assertTrue(temporary.cleaned)
+
+    def test_release_reaps_fifo_writer_before_opencv_capture(self):
+        process_dead = threading.Event()
+        capture_released = threading.Event()
+        release_observed_process_dead = []
+
+        class BlockingCapture:
+            def release(self):
+                release_observed_process_dead.append(process_dead.is_set())
+                if not process_dead.wait(0.5):
+                    raise RuntimeError("FIFO writer was not reaped first")
+                capture_released.set()
+
+        class Process:
+            pid = 12345
+
+            def poll(self):
+                return 0 if process_dead.is_set() else None
+
+            def wait(self, timeout):
+                process_dead.set()
+                return 0
+
+        class TemporaryDirectory:
+            def cleanup(self):
+                return None
+
+        capture = object.__new__(FfmpegNvdecCapture)
+        capture._cancel_watcher_stop = threading.Event()
+        capture._opened = True
+        capture._capture = BlockingCapture()
+        capture._process_lock = threading.RLock()
+        capture._release_lock = threading.Lock()
+        capture._process = Process()
+        capture._memfd = None
+        capture._temporary_directory = TemporaryDirectory()
+        capture._cancel_watcher = None
+
+        with patch("ffmpeg_capture.os.killpg"):
+            capture.release()
+
+        self.assertEqual(release_observed_process_dead, [True])
+        self.assertTrue(capture_released.is_set())
+        self.assertIsNone(capture._process)
 
     def test_master_is_rewritten_same_origin_without_command_line_url(self):
         source = "https://example.test/master.m3u8?token=secret"
@@ -1400,7 +1446,7 @@ class FfmpegCaptureTests(unittest.TestCase):
             self.assertEqual(mediator._routes, {})
             self.assertEqual(mediator._init_bytes, {})
 
-    def test_capture_cancellation_closes_the_mediator(self):
+    def test_capture_cancellation_only_signals_the_fifo_writer(self):
         class Process:
             pid = 12345
 
@@ -1425,7 +1471,7 @@ class FfmpegCaptureTests(unittest.TestCase):
         with patch("ffmpeg_capture.os.killpg") as killpg:
             capture._watch_for_cancel()
         killpg.assert_called_once_with(12345, __import__("signal").SIGTERM)
-        self.assertTrue(capture._mediator.closed)
+        self.assertFalse(capture._mediator.closed)
 
     def test_loopback_mediator_keeps_four_bounded_playlist_generations(self):
         source = "https://example.test/master.m3u8?SessionToken=secret"

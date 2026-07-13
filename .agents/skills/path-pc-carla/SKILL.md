@@ -9,15 +9,50 @@ Treat this file as an operating procedure, not proof of current state. Re-run th
 
 ## Newest perception release chronology
 
-Observed through 2026-07-13 12:52 UTC; verify rather than assume. These items
+Observed through 2026-07-13 13:47 UTC; verify rather than assume. These items
 override every older PR 32/candidate statement below.
 
-- Canonical `origin/main` is now PR 46 merge
-  `f5ae049ed8b7413e32c5331b275021281956b056`. PR 46 is not deployed. Live
+- Canonical `origin/main` is now PR 47 merge
+  `b0e47026036694245e3477a5729f9c79216583eb`. PR 47 is not deployed. Live
   production remains the exact, detached, clean PR 35 rollback
   `76e561cd41d070a6402c39c98847e646bd81cc9a`, with its original upload
-  environment and timers restored. Do not describe PR 42, PR 43, or the
-  same-session PTS follow-up below as production.
+  environment and timers restored. Do not describe PR 42-47 or the bounded-
+  cleanup follow-up below as production.
+- PR 47's upload-disabled canary is rejected at
+  `/home/path/V2XCarla/v2x-evidence/perception/20260713T133034Z-pr47-affine-discontinuity-canary/`;
+  its verified rollback is
+  `/home/path/V2XCarla/v2x-backend-backups/v2x-rollback-20260713T133034Z-pr47-affine-discontinuity/`.
+  PR 47 reached all-four ready in eight seconds. Five complete soak samples
+  stayed fresh, inference-fresh, trusted, and `matched`; sample six still had
+  exact healthy clocks but exposed one auxiliary decoder and two proactive
+  preparations. The unchanged clean-topology gate correctly stopped the
+  candidate. During that stop, ch1's blocked read returned after SIGTERM and
+  incorrectly entered terminal recovery; a claimed proactive handover then
+  blocked while old OpenCV FIFO teardown ran before its FFmpeg writer was
+  killed. Unbounded reader/cleanup joins consumed `TimeoutStopSec=60`, so
+  systemd killed Python and one surviving FFmpeg. PR 35 was restored by
+  13:32:36 UTC; CARLA, Drive, and web did not restart. Do not retry PR 47
+  unchanged or relax the zero-helper gate.
+- Current source-only branch `codex/v2x-bounded-cleanup` starts from PR 47. It
+  serializes capture release, kills and reaps the FIFO writer before calling
+  OpenCV release, leaves mediator/state teardown with the owner rather than the
+  cancellation watcher, skips terminal recovery after shutdown is requested,
+  and applies one finite reader/helper cleanup deadline inside systemd's stop
+  bound. It deliberately keeps a claimed proactive decoder lease registered
+  until the old writer is dead and handover adopts the replacement. Focused and
+  full perception suites currently pass 152 and 229 tests, including release-
+  order, stop-during-failed-read, forced claimed-handover interleaving, active-
+  inference shutdown, real-child SIGTERM, and stubborn-reader cases. Twenty
+  standalone real Kinesis/NVDEC sessions returned 400 matched frames, reaped
+  every child, and returned descriptors/threads exactly to baseline.
+  This branch is not merged, deployed, or canary-proven. Fable still fails
+  authentication before file access; never claim a Fable pass.
+- The next live gate is a fresh zero-session perception-only rollback window.
+  In addition to unchanged exact-clock, freshness, inference, feed, GPU, and
+  fingerprint gates, deliberately stop once while a proactive helper is active
+  and require systemd `Result=success`, no SIGKILL/timeout, zero remaining
+  FFmpeg/helper/lease/cleanup state, and a clean exact restart before forced
+  reader recovery or uploads. Any failure restores exact PR 35 immediately.
 - PR 46's first candidate window is rejected before readiness. Evidence is at
   `/home/path/V2XCarla/v2x-evidence/perception/20260713T123958Z-pr46-premux-pts-canary/`
   and rollback is

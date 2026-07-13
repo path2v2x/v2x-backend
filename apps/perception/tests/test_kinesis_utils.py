@@ -254,9 +254,10 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, sys.argv[1])
 import kinesis_utils
+from bounded_executor import DaemonWorkerPool
 kinesis_utils.shutdown_media_clock_executors()
-kinesis_utils._NVDEC_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=1)
-kinesis_utils._NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+kinesis_utils._NVDEC_FRAGMENT_MATCH_EXECUTOR = DaemonWorkerPool(1, "normal")
+kinesis_utils._NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR = DaemonWorkerPool(1, "urgent")
 kinesis_utils._NVDEC_FRAGMENT_MATCH_EXECUTOR.submit(lambda: 1)
 kinesis_utils._NVDEC_URGENT_FRAGMENT_MATCH_EXECUTOR.submit(lambda: 2)
 kinesis_utils.shutdown_media_clock_executors()
@@ -270,6 +271,44 @@ print("clean")
             timeout=5.0,
         )
         self.assertEqual(completed.stdout.strip(), "clean")
+
+    def test_blocked_matcher_cannot_pin_process_sigterm(self):
+        code = """
+import os
+import signal
+import sys
+import threading
+import time
+sys.path.insert(0, sys.argv[1])
+import kinesis_utils
+
+blocked = threading.Event()
+kinesis_utils._NVDEC_FRAGMENT_MATCH_EXECUTOR.submit(blocked.wait)
+
+def stop(_signum, _frame):
+    quiesced = kinesis_utils.shutdown_media_clock_executors(timeout=0.1)
+    print(f"bounded quiesced={str(quiesced).lower()}", flush=True)
+    raise SystemExit(0)
+
+def terminate():
+    time.sleep(0.1)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+signal.signal(signal.SIGTERM, stop)
+threading.Thread(target=terminate, daemon=True).start()
+while True:
+    time.sleep(1.0)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(PERCEPTION_DIR)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        self.assertEqual(
+            completed.stdout.strip(), "bounded quiesced=false"
+        )
 
     def test_cancelled_resolution_does_not_request_a_signed_url(self):
         cancelled = threading.Event()

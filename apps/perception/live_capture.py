@@ -685,13 +685,17 @@ class _AsyncCapturePreparation:
                 capture.release()
             if preparation_slot_acquired:
                 _PROACTIVE_PREPARATION_SEMAPHORE.release()
-            self._done.set()
             with self._result_lock:
                 retain_lease = (
                     self._result is not None
                     and not self._discarded.is_set()
                     and not self._failed
                 )
+                # Completion publication and retained ownership are one state
+                # transition. take() and discard() both serialize on this same
+                # lock, so neither can clear the result between the decision
+                # and making _done visible.
+                self._done.set()
             if not retain_lease:
                 self._release_decoder_lease()
                 self._unregister()
@@ -1320,6 +1324,8 @@ class LiveStreamReader:
 
         self._condition = threading.Condition()
         self._stop_event = threading.Event()
+        self._shutdown_deadline_lock = threading.Lock()
+        self._shutdown_deadline = None
         self._pending_terminal_cleanups = []
         self._thread = None
         self._sequence = 0
@@ -1336,6 +1342,8 @@ class LiveStreamReader:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        with self._shutdown_deadline_lock:
+            self._shutdown_deadline = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1343,10 +1351,28 @@ class LiveStreamReader:
         self.request_stop()
         self.join(timeout)
 
-    def request_stop(self):
+    def request_stop(self, deadline=None):
+        if deadline is not None:
+            deadline = float(deadline)
+            if not math.isfinite(deadline):
+                raise ValueError("shutdown deadline must be finite")
+        with self._shutdown_deadline_lock:
+            if deadline is not None:
+                self._shutdown_deadline = (
+                    deadline
+                    if self._shutdown_deadline is None
+                    else min(self._shutdown_deadline, deadline)
+                )
         self._stop_event.set()
         with self._condition:
             self._condition.notify_all()
+
+    def _shutdown_remaining(self):
+        with self._shutdown_deadline_lock:
+            deadline = self._shutdown_deadline
+        if deadline is None:
+            return None
+        return max(0.0, deadline - self.monotonic())
 
     def join(self, timeout=None):
         if self._thread:
@@ -1513,15 +1539,28 @@ class LiveStreamReader:
         if cleanup not in self._pending_terminal_cleanups:
             self._pending_terminal_cleanups.append(cleanup)
 
-    def _wait_for_terminal_cleanups(self):
+    def _wait_for_terminal_cleanups(self, timeout=None):
         cleanups, self._pending_terminal_cleanups = (
             self._pending_terminal_cleanups,
             [],
         )
+        deadline = (
+            None
+            if timeout is None
+            else self.monotonic() + max(0.0, float(timeout))
+        )
         succeeded = True
         for cleanup in cleanups:
-            cleanup.wait()
-            succeeded = cleanup.succeeded() and succeeded
+            remaining = (
+                None
+                if deadline is None
+                else max(0.0, deadline - self.monotonic())
+            )
+            if not cleanup.wait(remaining):
+                self._pending_terminal_cleanups.append(cleanup)
+                succeeded = False
+            else:
+                succeeded = cleanup.succeeded() and succeeded
         return succeeded
 
     def _cleanup_candidate_until(self, candidate, deadline):
@@ -1800,7 +1839,11 @@ class LiveStreamReader:
                 last_capture_position = None
                 unclocked_frame_sequence = deque(maxlen=3)
                 media_clock_attempted = False
-                cap = self.capture_factory(source)
+                cap = _call_with_supported_kwargs(
+                    self.capture_factory,
+                    source,
+                    cancel_event=self._stop_event,
+                )
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("capture open failed")
                 if self.media_clock_source_factory is not None:
@@ -1852,6 +1895,12 @@ class LiveStreamReader:
                     if prepared is None:
                         ret, frame = cap.read()
                         if not ret or frame is None:
+                            # SIGTERM can arrive while OpenCV is blocked in the
+                            # FIFO read.  Once it returns, cooperative shutdown
+                            # owns cleanup; starting terminal recovery here
+                            # creates a fresh decoder during process teardown.
+                            if self._stop_event.is_set():
+                                break
                             terminal_started = self.monotonic()
                             failed_capture, cap = cap, None
                             active_clock_resolution = clock_resolution
@@ -2289,10 +2338,17 @@ class LiveStreamReader:
                 self._stop_event.wait(delay)
             finally:
                 if clock_resolution is not None:
-                    clock_resolution.discard()
-                    clock_resolution.join()
+                    cleanup = _start_candidate_cleanup(clock_resolution)
+                    self._track_terminal_cleanup(cleanup)
                 if proactive_preparation is not None:
-                    self._discard_and_quiesce(proactive_preparation)
+                    cleanup = _start_candidate_cleanup(proactive_preparation)
+                    self._track_terminal_cleanup(cleanup)
                 if cap is not None:
-                    cap.release()
-        self._wait_for_terminal_cleanups()
+                    if self._stop_event.is_set():
+                        cleanup = _start_terminal_cleanup(
+                            ("capture", id(cap)), cap.release
+                        )
+                        self._track_terminal_cleanup(cleanup)
+                    else:
+                        cap.release()
+        self._wait_for_terminal_cleanups(self._shutdown_remaining())

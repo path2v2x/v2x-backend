@@ -1,5 +1,5 @@
 from ultralytics import YOLO
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import cv2
 import math
 import os
@@ -15,6 +15,7 @@ import requests
 import tracking_utils
 import kinesis_utils
 from ffmpeg_capture import FfmpegNvdecCapture
+from bounded_executor import DaemonWorkerPool
 from decoder_admission import AUXILIARY_DECODER_ADMISSION
 from live_capture import (
     LiveStreamReader,
@@ -38,6 +39,7 @@ from tracking_utils import AppearanceExtractor, KalmanTracker
 
 
 TIMESTAMP_SCHEMA_VERSION = 2
+_INFERENCE_SHUTDOWN_POLL_SECONDS = 0.05
 
 
 def assess_media_clock(
@@ -1496,7 +1498,7 @@ class MultiCameraPipeline:
             writer = cv2.VideoWriter(output_video, fourcc, out_fps, out_size)
 
         print(f"Starting Multi-Stream Pipeline for {num_cams} cameras...")
-        inference_executor = ThreadPoolExecutor(
+        inference_executor = DaemonWorkerPool(
             max_workers=inference_workers if live_mode else 1,
             thread_name_prefix="v2x-inference",
         )
@@ -1631,8 +1633,26 @@ class MultiCameraPipeline:
                     for job in inference_jobs
                 ]
 
+                inference_stopped = False
                 for future in inference_results:
-                    i, frame, frame_utc_str, det_3d = future.result()
+                    while not shutdown_event.is_set():
+                        try:
+                            inference_result = future.result(
+                                timeout=_INFERENCE_SHUTDOWN_POLL_SECONDS
+                            )
+                            break
+                        except FutureTimeoutError:
+                            if future.done():
+                                # concurrent.futures.TimeoutError aliases the
+                                # builtin TimeoutError. A completed model call
+                                # that raised it is an inference failure, not a
+                                # signal to poll the same finished future.
+                                future.result()
+                            continue
+                    else:
+                        inference_stopped = True
+                        break
+                    i, frame, frame_utc_str, det_3d = inference_result
                     detector = self.detectors[i]
 
                     for det in det_3d:
@@ -1652,6 +1672,9 @@ class MultiCameraPipeline:
                         stream_broadcaster.publish_detections(
                             camera_ids[i], det_3d, frame_utc_str
                         )
+
+                if inference_stopped:
+                    break
 
                 # Deduplicate objects crossing the seams
                 # Using a smaller radius (1.5m) so we don't accidentally merge multiple people in the same frame
@@ -1702,23 +1725,45 @@ class MultiCameraPipeline:
                             break
 
         finally:
-            inference_executor.shutdown(wait=True, cancel_futures=True)
-            for reader in live_readers:
-                reader.request_stop()
+            shutdown_error = None
+            # One deadline covers reader cancellation, decoder teardown, and
+            # tracked helper cleanup.  It remains well inside systemd's
+            # TimeoutStopSec so the service can fail visibly instead of being
+            # killed after an unbounded Python join.
             stop_deadline = time.monotonic() + max(
                 1.0, (open_timeout_ms + read_timeout_ms) / 1000.0 + 1.0
             )
             for reader in live_readers:
-                reader.join(max(0.0, stop_deadline - time.monotonic()))
+                reader.request_stop(deadline=stop_deadline)
+            inference_executor.shutdown(wait=False, cancel_futures=True)
             for reader in live_readers:
-                if reader.is_alive():
-                    reader.join()
-            if not wait_for_terminal_cleanups():
-                raise RuntimeError("terminal decoder cleanup failed")
+                reader.join(max(0.0, stop_deadline - time.monotonic()))
+            if any(reader.is_alive() for reader in live_readers):
+                shutdown_error = RuntimeError(
+                    "live reader shutdown exceeded its bounded deadline"
+                )
+            if not wait_for_terminal_cleanups(
+                max(0.0, stop_deadline - time.monotonic())
+            ):
+                shutdown_error = RuntimeError(
+                    "terminal decoder cleanup exceeded its bounded deadline"
+                )
+            inference_quiesced = inference_executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+                timeout=max(0.0, stop_deadline - time.monotonic()),
+            )
+            if not inference_quiesced:
+                print(
+                    "Inference worker exceeded the cooperative shutdown "
+                    "deadline; the process boundary will terminate it."
+                )
             for cap in caps:
                 if cap is not None:
                     cap.release()
             cv2.destroyAllWindows()
+            if shutdown_error is not None:
+                raise shutdown_error
             print(f"Multi-Stream complete. Processed {frame_count} frames, found {len(self.all_clean_detections)} total unique objects.")
 
             if writer:

@@ -3,6 +3,7 @@ import copy
 import os
 from pathlib import Path
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -747,6 +748,7 @@ class LivePipelineTimestampTests(unittest.TestCase):
         def __init__(self, **_kwargs):
             self.snapshot_calls = 0
             self.stop_requested = False
+            self.shutdown_deadline = None
             self.joined = False
             self.kwargs = _kwargs
             self.instances.append(self)
@@ -773,8 +775,9 @@ class LivePipelineTimestampTests(unittest.TestCase):
                 }
             raise LivePipelineTimestampTests.StopPipeline()
 
-        def request_stop(self):
+        def request_stop(self, deadline=None):
             self.stop_requested = True
+            self.shutdown_deadline = deadline
             return None
 
         def join(self, _timeout=None):
@@ -843,8 +846,8 @@ class LivePipelineTimestampTests(unittest.TestCase):
         self.assertTrue(reader.joined)
         self.assertTrue(reader.kwargs["reserve_proactive_decoder_slot"])
 
-    def test_pipeline_shutdown_waits_past_soft_deadline_for_reader_death(self):
-        class LingeringReader(self.FakeReader):
+    def test_pipeline_shutdown_uses_only_bounded_reader_join(self):
+        class BoundedReader(self.FakeReader):
             instances = []
 
             def __init__(self, **kwargs):
@@ -854,7 +857,7 @@ class LivePipelineTimestampTests(unittest.TestCase):
 
             def join(self, timeout=None):
                 self.join_timeouts.append(timeout)
-                if timeout is None:
+                if timeout is not None:
                     self.alive = False
                 self.joined = True
 
@@ -871,7 +874,7 @@ class LivePipelineTimestampTests(unittest.TestCase):
         shutdown = threading.Event()
         shutdown.set()
 
-        with patch("process_video.LiveStreamReader", LingeringReader):
+        with patch("process_video.LiveStreamReader", BoundedReader):
             pipeline.process_streams(
                 ["v2x-backend-cam-ch1"],
                 show_live=False,
@@ -881,11 +884,132 @@ class LivePipelineTimestampTests(unittest.TestCase):
                 shutdown_event=shutdown,
             )
 
-        reader = LingeringReader.instances[0]
-        self.assertGreaterEqual(len(reader.join_timeouts), 2)
+        reader = BoundedReader.instances[0]
+        self.assertEqual(len(reader.join_timeouts), 1)
         self.assertIsNotNone(reader.join_timeouts[0])
-        self.assertIsNone(reader.join_timeouts[-1])
+        self.assertIsNotNone(reader.shutdown_deadline)
         self.assertFalse(reader.is_alive())
+
+    def test_pipeline_shutdown_rejects_stubborn_reader_inside_wall_bound(self):
+        class StubbornReader(self.FakeReader):
+            instances = []
+
+            def is_alive(self):
+                return True
+
+        pipeline = object.__new__(MultiCameraPipeline)
+        pipeline.detectors = [self.FakeDetector()]
+        pipeline.all_clean_detections = []
+        pipeline.global_tracks = {}
+        pipeline.local_to_global = {}
+        pipeline.next_global_id = 0
+        pipeline.extractor = Mock()
+        shutdown = threading.Event()
+        shutdown.set()
+
+        started = time.monotonic()
+        with patch("process_video.LiveStreamReader", StubbornReader), patch.dict(
+            os.environ,
+            {
+                "V2X_PERCEPTION_OPEN_TIMEOUT_MS": "1",
+                "V2X_PERCEPTION_READ_TIMEOUT_MS": "1",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bounded deadline"):
+                pipeline.process_streams(
+                    ["v2x-backend-cam-ch1"],
+                    show_live=False,
+                    upload=False,
+                    stream_broadcaster=FrameBroadcaster(["ch1"]),
+                    camera_ids=["ch1"],
+                    shutdown_event=shutdown,
+                )
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertTrue(StubbornReader.instances[0].stop_requested)
+        self.assertIsNotNone(StubbornReader.instances[0].shutdown_deadline)
+
+    def test_active_inference_observes_shutdown_inside_wall_bound(self):
+        inference_entered = threading.Event()
+        release_inference = threading.Event()
+        shutdown = threading.Event()
+        detector = self.FakeDetector()
+
+        def blocked_track(*_args, **_kwargs):
+            inference_entered.set()
+            release_inference.wait(3.0)
+            return []
+
+        detector.model.track = blocked_track
+        pipeline = object.__new__(MultiCameraPipeline)
+        pipeline.detectors = [detector]
+        pipeline.all_clean_detections = []
+        pipeline.global_tracks = {}
+        pipeline.local_to_global = {}
+        pipeline.next_global_id = 0
+        pipeline.extractor = Mock()
+
+        def request_shutdown():
+            self.assertTrue(inference_entered.wait(1.0))
+            shutdown.set()
+
+        stopper = threading.Thread(target=request_shutdown)
+        stopper.start()
+        started = time.monotonic()
+        try:
+            with patch("process_video.LiveStreamReader", self.FakeReader), patch.dict(
+                os.environ,
+                {
+                    "V2X_PERCEPTION_OPEN_TIMEOUT_MS": "1",
+                    "V2X_PERCEPTION_READ_TIMEOUT_MS": "1",
+                },
+            ):
+                pipeline.process_streams(
+                    ["v2x-backend-cam-ch1"],
+                    show_live=False,
+                    upload=False,
+                    stream_broadcaster=FrameBroadcaster(["ch1"]),
+                    camera_ids=["ch1"],
+                    shutdown_event=shutdown,
+                )
+        finally:
+            release_inference.set()
+            stopper.join(1.0)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.5)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and any(
+            thread.name.startswith("v2x-inference-")
+            for thread in threading.enumerate()
+        ):
+            time.sleep(0.01)
+        self.assertFalse(any(
+            thread.name.startswith("v2x-inference-")
+            for thread in threading.enumerate()
+        ))
+
+    def test_model_timeout_error_propagates_instead_of_polling_forever(self):
+        detector = self.FakeDetector()
+        detector.model.track = Mock(side_effect=TimeoutError("model timeout"))
+        pipeline = object.__new__(MultiCameraPipeline)
+        pipeline.detectors = [detector]
+        pipeline.all_clean_detections = []
+        pipeline.global_tracks = {}
+        pipeline.local_to_global = {}
+        pipeline.next_global_id = 0
+        pipeline.extractor = Mock()
+
+        started = time.monotonic()
+        with patch("process_video.LiveStreamReader", self.FakeReader):
+            with self.assertRaisesRegex(TimeoutError, "model timeout"):
+                pipeline.process_streams(
+                    ["v2x-backend-cam-ch1"],
+                    show_live=False,
+                    upload=False,
+                    stream_broadcaster=FrameBroadcaster(["ch1"]),
+                    camera_ids=["ch1"],
+                )
+        self.assertLess(time.monotonic() - started, 0.5)
 
     @patch("process_video.LiveStreamReader", FakeReader)
     def test_pipeline_uses_per_camera_capture_time_and_source_age(self):
