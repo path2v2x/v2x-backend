@@ -140,11 +140,30 @@ def _world_polyline(waypoints, side=None, z_offset=0.04):
     return points
 
 
+def _normalized_marking_value(value):
+    if value is None:
+        return None
+    return "".join(character for character in str(value).split(".")[-1].lower() if character.isalnum())
+
+
+def marking_signature(marking):
+    width = getattr(marking, "width", None)
+    width = float(width) if width is not None else None
+    if width is not None and (not math.isfinite(width) or width < 0):
+        raise RuntimeError("CARLA lane marking width is invalid")
+    return {
+        "type": _normalized_marking_value(getattr(marking, "type", None)),
+        "color": _normalized_marking_value(getattr(marking, "color", None)),
+        "width_m": width,
+        "lane_change": _normalized_marking_value(getattr(marking, "lane_change", None)),
+    }
+
+
 def segmented_road_marks(key, waypoints):
     """Preserve each contiguous sampled road-mark range with a stable ID."""
     output = []
     for side in ("left", "right"):
-        values = [str(getattr(item, f"{side}_lane_marking").type) for item in waypoints]
+        values = [marking_signature(getattr(item, f"{side}_lane_marking")) for item in waypoints]
         start = 0
         for end in range(1, len(waypoints) + 1):
             if end < len(waypoints) and values[end] == values[start]:
@@ -153,11 +172,11 @@ def segmented_road_marks(key, waypoints):
             start_s, end_s = float(selected[0].s), float(selected[-1].s)
             identity_input = {
                 "road_id": key[0], "section_id": key[1], "lane_id": key[2],
-                "side": side, "marking_type": values[start],
+                "side": side, **values[start],
                 "start_s_m": round(start_s, 3), "end_s_m": round(end_s, 3),
             }
             output.append({
-                "id": f"road-mark-{canonical_hash(identity_input)[:16]}",
+                "id": f"unbound-road-mark-{canonical_hash(identity_input)[:16]}",
                 **identity_input,
                 "sample_count": len(selected),
                 "boundary_world": _world_polyline(selected, side=side),
@@ -221,14 +240,15 @@ def opendrive_road_mark_ranges(opendrive_bytes):
                         )
                     values = {
                         "road_id": road_id,
+                        "section_index": section_index,
                         "section_start_s_m": round(section_start, 6),
                         "lane_id": lane.get("id"),
                         "start_s_m": round(start_s, 6),
                         "end_s_m": round(end_s, 6),
-                        "type": mark.get("type"),
-                        "color": mark.get("color"),
+                        "type": _normalized_marking_value(mark.get("type")),
+                        "color": _normalized_marking_value(mark.get("color")),
                         "weight": mark.get("weight"),
-                        "lane_change": mark.get("laneChange"),
+                        "lane_change": _normalized_marking_value(mark.get("laneChange")),
                         "width_m": float(mark.get("width")) if mark.get("width") else None,
                     }
                     ranges.append({
@@ -236,6 +256,68 @@ def opendrive_road_mark_ranges(opendrive_bytes):
                         **values,
                     })
     return sorted(ranges, key=lambda item: item["id"])
+
+
+def _source_lane_for_boundary(lane_id, side):
+    if lane_id < 0:
+        return lane_id if side == "right" else lane_id + 1
+    if lane_id > 0:
+        return lane_id if side == "left" else lane_id - 1
+    return 0
+
+
+def _marking_signatures_compatible(sampled, exact):
+    for key in ("type", "color", "lane_change"):
+        if exact.get(key) is not None and sampled.get(key) != exact.get(key):
+            return False
+    exact_width, sampled_width = exact.get("width_m"), sampled.get("width_m")
+    if exact_width is not None and (
+        sampled_width is None or not math.isclose(sampled_width, exact_width, abs_tol=0.01)
+    ):
+        return False
+    return True
+
+
+def bind_sampled_road_marks(lanes, exact_ranges, spacing_m):
+    """Bind every CARLA-sampled boundary segment to one exact XODR range."""
+    output = []
+    for lane in lanes:
+        bound_ids = []
+        for sampled in lane.pop("road_mark_segments"):
+            source_lane_id = _source_lane_for_boundary(int(lane["lane_id"]), sampled["side"])
+            candidates = [
+                item for item in exact_ranges
+                if str(item["road_id"]) == str(lane["road_id"])
+                and int(item["section_index"]) == int(lane["section_id"])
+                and int(item["lane_id"]) == source_lane_id
+                and item["start_s_m"] - spacing_m <= sampled["start_s_m"]
+                and sampled["end_s_m"] <= item["end_s_m"] + spacing_m
+                and _marking_signatures_compatible(sampled, item)
+            ]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"sampled road marking {sampled['id']} maps to {len(candidates)} exact ranges"
+                )
+            exact = candidates[0]
+            identity = (
+                f"{exact['id']}-sample-{sampled['side']}-"
+                f"road-{lane['road_id']}-lane-{lane['lane_id']}"
+            )
+            bound = {
+                **sampled,
+                "id": identity,
+                "opendrive_range_id": exact["id"],
+                "opendrive_source_lane_id": source_lane_id,
+                "opendrive_range": exact,
+                "boundary_world_sha256": canonical_hash(sampled["boundary_world"]),
+            }
+            output.append(bound)
+            bound_ids.append(identity)
+        lane["road_mark_segment_ids"] = bound_ids
+    identities = [item["id"] for item in output]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("bound sampled road-mark identities are not unique")
+    return sorted(output, key=lambda item: item["id"])
 
 
 def nearby_lane_polylines(carla_map, anchor, radius_m, spacing_m):
@@ -438,9 +520,8 @@ def main():
     if len({item["id"] for item in polygons}) != len(polygons):
         raise SystemExit("active map contains duplicate content-identical crosswalk polygons")
     lanes = nearby_lane_polylines(carla_map, anchor, args.radius_m, args.lane_spacing_m)
-    road_mark_segments = sorted(
-        (segment for lane in lanes for segment in lane.pop("road_mark_segments")),
-        key=lambda item: item["id"],
+    road_mark_segments = bind_sampled_road_marks(
+        lanes, exact_road_mark_ranges, args.lane_spacing_m
     )
     objects = []
     for label in ("TrafficLight", "TrafficSigns"):
@@ -527,6 +608,23 @@ def main():
             **reports,
         }
 
+    opendrive_root = ET.fromstring(opendrive)
+    georeference = (opendrive_root.findtext("./header/geoReference") or "").strip()
+    if not georeference:
+        raise SystemExit("active OpenDRIVE map has no georeference")
+    geometry_provenance = {
+        "schema": "v2x-map-geometry-provenance/v1",
+        "exporter_sha256": sha256(Path(__file__).resolve()),
+        "map": carla_map.name,
+        "opendrive_sha256": hashlib.sha256(opendrive).hexdigest(),
+        "opendrive_georeference_sha256": hashlib.sha256(georeference.encode()).hexdigest(),
+        "pair_manifest_sha256": hashlib.sha256(pair_bytes).hexdigest(),
+        "cameras_file_sha256": hashlib.sha256(cameras_bytes).hexdigest(),
+        "radius_m": args.radius_m,
+        "lane_spacing_m": args.lane_spacing_m,
+        "geometry_payload_sha256": canonical_hash(geometry),
+        "exact_road_mark_ranges_sha256": canonical_hash(exact_road_mark_ranges),
+    }
     report = {
         "schema": "v2x-map-calibration-geometry/v1",
         "acceptance_eligible": False,
@@ -538,6 +636,7 @@ def main():
         "cameras_file_sha256": hashlib.sha256(cameras_bytes).hexdigest(),
         "radius_m": args.radius_m,
         "lane_spacing_m": args.lane_spacing_m,
+        "geometry_provenance": geometry_provenance,
         "geometry": geometry,
         "cameras": camera_reports,
     }

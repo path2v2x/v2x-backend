@@ -177,3 +177,31 @@ def test_identical_lane_profiles_have_no_false_drift(tmp_path):
     assert comparison["width_changed"] == []
     assert comparison["road_mark_changed"] == []
     assert comparison["width_difference_m"]["max"] == 0.0
+
+
+def test_vertical_lateral_lane_offset_and_junction_assignment_drift_is_explicit(tmp_path):
+    template = """<OpenDRIVE><header><geoReference>same</geoReference></header>
+<road id="1" length="10" junction="{junction}">
+<planView><geometry s="0" x="0" y="0" hdg="0" length="10"><line/></geometry></planView>
+<elevationProfile><elevation s="0" a="{elevation}" b="0" c="0" d="0"/></elevationProfile>
+<lateralProfile><superelevation s="0" a="{superelevation}" b="0" c="0" d="0"/>
+<shape s="0" t="0" a="{shape}" b="0" c="0" d="0"/></lateralProfile>
+<lanes><laneOffset s="0" a="{offset}" b="0" c="0" d="0"/><laneSection s="0"/></lanes>
+</road></OpenDRIVE>"""
+    deployed_path, candidate_path = tmp_path / "vertical-a.xodr", tmp_path / "vertical-b.xodr"
+    deployed_path.write_text(template.format(
+        junction="-1", elevation="0", superelevation="0", shape="0", offset="0"
+    ))
+    candidate_path.write_text(template.format(
+        junction="7", elevation="0.2", superelevation="0.01", shape="0.1", offset="0.3"
+    ))
+    report = tool.compare_maps(tool.parse_map(deployed_path), tool.parse_map(candidate_path))
+    assert report["elevation_profiles"]["changed"] == ["road-1-elevation-s0.000000000"]
+    assert report["lane_offsets"]["changed"] == ["road-1-lane_offset-s0.000000000"]
+    assert report["lateral_profiles"]["superelevation"]["changed"] == [
+        "road-1-superelevation-s0.000000000"
+    ]
+    assert report["lateral_profiles"]["shape"]["changed"] == [
+        "road-1-lateral_shape-s0.000000000-t0.000000000"
+    ]
+    assert report["road_junction_assignment"]["changed"] == ["1"]

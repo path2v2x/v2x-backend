@@ -8,6 +8,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from export_map_calibration_geometry import (  # noqa: E402
+    bind_sampled_road_marks,
     canonical_hash,
     lane_geometry_from_waypoints,
     opendrive_road_mark_ranges,
@@ -24,6 +25,9 @@ class Location:
 class Value:
     def __init__(self, value):
         self.type = value
+        self.color = "White"
+        self.width = 0.15
+        self.lane_change = "Both"
 
 
 class Rotation:
@@ -83,14 +87,17 @@ class ExportMapCalibrationGeometryTests(unittest.TestCase):
         ]
         lane = lane_geometry_from_waypoints((12, 0, -1), waypoints)
         ranges = [
-            (item["side"], item["marking_type"], item["start_s_m"], item["end_s_m"])
+            (
+                item["side"], item["type"], item["color"], item["width_m"],
+                item["lane_change"], item["start_s_m"], item["end_s_m"],
+            )
             for item in lane["road_mark_segments"]
         ]
         self.assertEqual(ranges, [
-            ("left", "Solid", 0.0, 1.0),
-            ("left", "Broken", 2.0, 4.0),
-            ("right", "Broken", 0.0, 2.0),
-            ("right", "Solid", 3.0, 4.0),
+            ("left", "solid", "white", 0.15, "both", 0.0, 1.0),
+            ("left", "broken", "white", 0.15, "both", 2.0, 4.0),
+            ("right", "broken", "white", 0.15, "both", 0.0, 2.0),
+            ("right", "solid", "white", 0.15, "both", 3.0, 4.0),
         ])
         self.assertEqual(len({item["id"] for item in lane["road_mark_segments"]}), 4)
         self.assertNotIn("marking_types", lane)
@@ -107,6 +114,21 @@ class ExportMapCalibrationGeometryTests(unittest.TestCase):
             [("solid", 2.0, 7.0), ("broken", 7.0, 14.0), ("solid", 14.0, 20.0)],
         )
         self.assertEqual(len({item["id"] for item in ranges}), 3)
+
+    def test_sampled_mark_geometry_binds_exact_xodr_range_and_attributes(self):
+        lanes = [lane_geometry_from_waypoints(
+            (7, 0, -1), [Waypoint(value, "Solid", "Solid") for value in range(5)]
+        )]
+        exact = opendrive_road_mark_ranges(b"""<OpenDRIVE><road id="7" length="4">
+<lanes><laneSection s="0"><center><lane id="0"><roadMark sOffset="0" type="solid" color="white" width="0.15" laneChange="both"/></lane></center>
+<right><lane id="-1"><roadMark sOffset="0" type="solid" color="white" width="0.15" laneChange="both"/></lane></right>
+</laneSection></lanes></road></OpenDRIVE>""")
+        segments = bind_sampled_road_marks(lanes, exact, spacing_m=1.0)
+        self.assertEqual(len(segments), 2)
+        self.assertTrue(all(item["id"].startswith(item["opendrive_range_id"]) for item in segments))
+        self.assertTrue(all(item["type"] == "solid" and item["color"] == "white" for item in segments))
+        self.assertTrue(all(item["width_m"] == 0.15 and item["lane_change"] == "both" for item in segments))
+        self.assertTrue(all(item["boundary_world_sha256"] for item in segments))
 
 
 if __name__ == "__main__":

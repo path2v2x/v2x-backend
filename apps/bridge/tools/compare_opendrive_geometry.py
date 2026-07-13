@@ -328,6 +328,31 @@ def parse_junction_links(root):
     return sorted(output, key=lambda item: item["id"])
 
 
+def parse_polynomial_profiles(road):
+    road_id = road.get("id")
+    definitions = (
+        ("elevation", "./elevationProfile/elevation", ("s",)),
+        ("lane_offset", "./lanes/laneOffset", ("s",)),
+        ("superelevation", "./lateralProfile/superelevation", ("s",)),
+        ("lateral_shape", "./lateralProfile/shape", ("s", "t")),
+    )
+    output = {name: [] for name, _, _ in definitions}
+    for name, query, identity_fields in definitions:
+        for element in road.findall(query):
+            identity_values = tuple(round(float(element.get(field)), 9) for field in identity_fields)
+            record = {
+                "id": f"road-{road_id}-{name}-" + "-".join(
+                    f"{field}{value:.9f}" for field, value in zip(identity_fields, identity_values)
+                ),
+                "road_id": road_id,
+                **{field: value for field, value in zip(identity_fields, identity_values)},
+                **_float_attributes(element, ("a", "b", "c", "d")),
+            }
+            output[name].append(record)
+        output[name].sort(key=lambda item: item["id"])
+    return output
+
+
 def parse_map(path):
     root = ET.parse(path).getroot()
     if root.tag != "OpenDRIVE":
@@ -343,6 +368,9 @@ def parse_map(path):
     roads = []
     crosswalks = []
     signals = []
+    polynomial_profiles = {
+        "elevation": [], "lane_offset": [], "superelevation": [], "lateral_shape": []
+    }
     shape_counts = Counter()
     for road in root.findall("road"):
         plan_view = parse_plan_view(road)
@@ -354,6 +382,9 @@ def parse_map(path):
             "plan_view": plan_view,
             "link": parse_road_link(road),
         })
+        parsed_profiles = parse_polynomial_profiles(road)
+        for name, values in parsed_profiles.items():
+            polynomial_profiles[name].extend(values)
         for element in road.findall("./objects/object"):
             if (element.get("type") or "").lower() == "crosswalk":
                 crosswalks.append(object_geometry(road, plan_view, element, "crosswalk"))
@@ -376,9 +407,14 @@ def parse_map(path):
         "lane_profile_count": len(lane_profiles),
         "road_mark_range_count": sum(len(item["road_marks"]) for item in lane_profiles),
         "junction_connection_count": len(junction_links),
+        "elevation_profile_count": len(polynomial_profiles["elevation"]),
+        "lane_offset_count": len(polynomial_profiles["lane_offset"]),
+        "superelevation_count": len(polynomial_profiles["superelevation"]),
+        "lateral_shape_count": len(polynomial_profiles["lateral_shape"]),
         "roads": roads,
         "lane_profiles": lane_profiles,
         "junction_links": junction_links,
+        "polynomial_profiles": polynomial_profiles,
         "crosswalks": crosswalks,
         "signals": signals,
     }
@@ -746,6 +782,8 @@ def public_map_summary(model):
         "junction_count", "object_count", "signal_count", "crosswalk_count",
         "plan_view_geometry_counts", "lane_profile_count", "road_mark_range_count",
         "junction_connection_count",
+        "elevation_profile_count", "lane_offset_count", "superelevation_count",
+        "lateral_shape_count",
     )}
 
 
@@ -793,13 +831,38 @@ def compare_maps(deployed, candidate, road_spacing_m=1.0, max_road_distance_m=10
             deployed["lane_profiles"], candidate["lane_profiles"]
         ),
         "road_links": compare_identity_records([
-            {"id": item["id"], **item["link"]} for item in deployed["roads"]
+            {"id": item["id"], "junction": item["junction"], **item["link"]}
+            for item in deployed["roads"]
         ], [
-            {"id": item["id"], **item["link"]} for item in candidate["roads"]
+            {"id": item["id"], "junction": item["junction"], **item["link"]}
+            for item in candidate["roads"]
+        ]),
+        "road_junction_assignment": compare_identity_records([
+            {"id": item["id"], "junction": item["junction"]} for item in deployed["roads"]
+        ], [
+            {"id": item["id"], "junction": item["junction"]} for item in candidate["roads"]
         ]),
         "junction_links": compare_identity_records(
             deployed["junction_links"], candidate["junction_links"]
         ),
+        "elevation_profiles": compare_identity_records(
+            deployed["polynomial_profiles"]["elevation"],
+            candidate["polynomial_profiles"]["elevation"],
+        ),
+        "lane_offsets": compare_identity_records(
+            deployed["polynomial_profiles"]["lane_offset"],
+            candidate["polynomial_profiles"]["lane_offset"],
+        ),
+        "lateral_profiles": {
+            "superelevation": compare_identity_records(
+                deployed["polynomial_profiles"]["superelevation"],
+                candidate["polynomial_profiles"]["superelevation"],
+            ),
+            "shape": compare_identity_records(
+                deployed["polynomial_profiles"]["lateral_shape"],
+                candidate["polynomial_profiles"]["lateral_shape"],
+            ),
+        },
     }
     if site_anchor_xy is not None:
         anchor_xy = site_anchor_xy["anchor_xy"]
