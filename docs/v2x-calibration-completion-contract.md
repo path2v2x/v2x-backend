@@ -1,6 +1,6 @@
 # V2X calibration and same-car placement completion contract
 
-Status: active execution contract
+Status: active execution contract, claim matrix version 2
 
 Scope: Path PC production V2X stack and the packaged Unreal Engine 5.5
 RR/CARLA 0.10 worker only. Unreal Engine 6 is excluded.
@@ -9,6 +9,26 @@ This contract supersedes diagnostic-only calibration plans. A phase is complete
 only when its retained evidence passes the fixed gates below. Aggregate visual
 improvement, an actor existing in CARLA, or coordinates derived by the model
 under test are not acceptance evidence.
+
+## Claim matrix version 2
+
+| Claim | Required evidence | Release state when physical prerequisites are unavailable |
+|---|---|---|
+| Tier A — absolute-world calibrated twin | Every requirement in this contract, including measured intrinsics, authenticated survey, GNSS optical timing, RTK vehicle truth, thermal envelope, dense-ray optical consistency, and direct world-centroid error | `UNAVAILABLE`; globally incomplete; never inferred or marked passing |
+| Tier B — map-relative visual mirroring | Every non-physical mechanism in this contract plus every gate in `tier-b-map-relative-calibration-execution-plan.md`, including frozen nominal gauges, relative-clock proof, static image-space geometry, blind identity/contact evidence, predictive cross-camera consistency, same-car replay, rollback, and claim metadata | May release only as `calibration_claim_tier=map_relative_visual_mirroring`; no absolute camera, map, time, uncertainty, or world-coordinate claim |
+
+Tier B is a versioned amendment, not a waiver. Numeric image-space, identity,
+terminal-accounting, persistence, cleanup, isolation, and service gates in this
+contract remain binding and may only be tightened. A Tier-B release report must
+show every Tier-A physical row as `UNAVAILABLE`, name the frozen map and optical
+gauge, state the observed operating envelope, and disclose common-mode map,
+time, and coordinate bias as unobservable. Tier-B deployment is prohibited
+unless the amendment plan passes exact Fable and independent review and all of
+its implementation/evidence gates pass from the integrated release commit.
+Tier-B UI/API schemas may expose model-conditioned predictive regions and the
+legacy `<=2 m` association cutoff only when labeled as operational diagnostics;
+they must never name either value calibrated uncertainty, accuracy, or world
+error.
 
 ## 0. Durable baseline and corpus
 
