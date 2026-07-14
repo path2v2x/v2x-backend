@@ -24,7 +24,9 @@ process is gone and the final output is absent before removing an orphan.
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import math
@@ -36,6 +38,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import uuid
 
 import cv2
 import numpy as np
@@ -1409,6 +1412,10 @@ def pin_publication_tree(root):
     if "report.json" not in records or "SHA256SUMS" not in records:
         raise DenseTrackError("dense-track staging publication contract is incomplete")
     return {
+        "parent_identity": (
+            root_metadata.st_dev,
+            root.parent.lstat().st_ino,
+        ),
         "root_identity": (root_metadata.st_dev, root_metadata.st_ino),
         "directories": directories,
         "files": records,
@@ -1492,27 +1499,108 @@ def verify_published_tree(root, contract):
         raise DenseTrackError("dense-track publication changed during final verification")
 
 
-def remove_failed_publication(output, root_identity):
+def rename_noreplace_at(directory_fd, source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise DenseTrackError("atomic dense-track quarantine is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.ENOENT:
+        raise FileNotFoundError(error, os.strerror(error), source)
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), destination)
+    raise OSError(error, os.strerror(error), source)
+
+
+def remove_failed_publication(output, contract):
+    """Atomically quarantine only this invocation's exact published inode.
+
+    POSIX has no conditional rmdir-by-inode operation.  Deleting through a
+    pathname after an identity check could therefore remove a foreign swap.
+    Keep an owned failed tree in a private, mode-700 quarantine instead.  A
+    later offline cleaner can remove it after proving exclusive ownership.
+    """
     output = Path(output)
+    parent = output.parent
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = None
+    quarantine_name = None
     try:
-        metadata = output.lstat()
-    except FileNotFoundError:
-        return
+        directory_fd = os.open(parent, flags)
+        parent_metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or (parent_metadata.st_dev, parent_metadata.st_ino)
+            != contract["parent_identity"]
+        ):
+            raise DenseTrackError(
+                "failed dense-track publication parent was replaced"
+            )
+        for _attempt in range(100):
+            candidate = f".{output.name}.failed-{uuid.uuid4().hex}"
+            try:
+                rename_noreplace_at(directory_fd, output.name, candidate)
+                quarantine_name = candidate
+                break
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                return None
+        if quarantine_name is None:
+            raise DenseTrackError("dense-track quarantine name space is exhausted")
+        quarantined = os.stat(
+            quarantine_name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        quarantined_identity = (quarantined.st_dev, quarantined.st_ino)
+        if quarantined_identity != contract["root_identity"]:
+            # A foreign path won the race before the atomic rename.  Restore it
+            # without replacement; if another path now occupies the output
+            # name, retain both foreign objects rather than deleting either.
+            try:
+                rename_noreplace_at(directory_fd, quarantine_name, output.name)
+                quarantine_name = None
+            except FileExistsError:
+                pass
+            os.fsync(directory_fd)
+            return None
+        quarantine_fd = os.open(
+            quarantine_name,
+            flags,
+            dir_fd=directory_fd,
+        )
+        try:
+            pinned = os.fstat(quarantine_fd)
+            if (pinned.st_dev, pinned.st_ino) != contract["root_identity"]:
+                raise DenseTrackError("owned dense-track quarantine was replaced")
+            os.fchmod(quarantine_fd, stat.S_IRWXU)
+            os.fsync(quarantine_fd)
+        finally:
+            os.close(quarantine_fd)
+        os.fsync(directory_fd)
+        return parent / quarantine_name
     except OSError as exc:
-        raise DenseTrackError("failed dense-track publication cannot be inspected") from exc
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or (metadata.st_dev, metadata.st_ino) != root_identity
-    ):
-        # Never remove a path that is not the exact staging directory this
-        # invocation published.  The caller still receives the original
-        # publication failure, while a concurrent owner's path is preserved.
-        return
-    try:
-        shutil.rmtree(output)
-        fsync_directory(output.parent)
-    except OSError as exc:
-        raise DenseTrackError("failed dense-track publication cannot be removed") from exc
+        raise DenseTrackError("failed dense-track publication cannot be quarantined") from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def publish_staged_tree(staged, output):
@@ -1522,10 +1610,14 @@ def publish_staged_tree(staged, output):
         verify_published_tree(output, contract)
         fsync_directory(Path(output).parent)
         verify_published_tree(output, contract)
-    except (DenseTrackError, StaticCaptureError) as exc:
-        remove_failed_publication(output, contract["root_identity"])
+    except (DenseTrackError, StaticCaptureError, OSError) as exc:
+        remove_failed_publication(output, contract)
         if isinstance(exc, StaticCaptureError):
             raise DenseTrackError("atomic dense-track publication failed") from exc
+        if isinstance(exc, OSError):
+            raise DenseTrackError(
+                "dense-track publication durability verification failed"
+            ) from exc
         raise
 
 

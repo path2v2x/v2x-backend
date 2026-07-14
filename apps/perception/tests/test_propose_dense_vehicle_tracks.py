@@ -953,6 +953,85 @@ def test_staged_tamper_inside_atomic_publish_fails_removes_output_and_cleans(
     assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
 
 
+def test_parent_fsync_failure_quarantines_unverified_publication(tmp_path, monkeypatch):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    output = tmp_path / "output"
+    original_fsync = tracks.fsync_directory
+
+    def fail_published_parent(directory):
+        if Path(directory) == tmp_path and output.exists():
+            raise OSError("injected parent fsync failure")
+        return original_fsync(directory)
+
+    monkeypatch.setattr(tracks, "fsync_directory", fail_published_parent)
+    with pytest.raises(
+        tracks.DenseTrackError, match="publication durability verification failed"
+    ):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
+        )
+    assert not output.exists()
+    quarantines = list(tmp_path.glob(f".{output.name}.failed-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].stat().st_mode & 0o077 == 0
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
+def test_cleanup_swap_preserves_and_restores_foreign_output(tmp_path, monkeypatch):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    output = tmp_path / "output"
+    detached_owned = tmp_path / "detached-owned-failed-publication"
+    original_publish = tracks.atomic_publish_directory
+    original_quarantine_rename = tracks.rename_noreplace_at
+    cleanup_swap_done = False
+
+    def publish_tampered(staged, destination):
+        artifact = next((Path(staged) / "masks").rglob("*.png"))
+        artifact.write_bytes(artifact.read_bytes() + b"force-cleanup")
+        return original_publish(staged, destination)
+
+    def swap_before_quarantine(directory_fd, source, destination):
+        nonlocal cleanup_swap_done
+        if source == output.name and destination.startswith(f".{output.name}.failed-"):
+            output.rename(detached_owned)
+            output.mkdir()
+            (output / "foreign.txt").write_text("foreign-owner\n")
+            cleanup_swap_done = True
+        return original_quarantine_rename(directory_fd, source, destination)
+
+    monkeypatch.setattr(tracks, "atomic_publish_directory", publish_tampered)
+    monkeypatch.setattr(tracks, "rename_noreplace_at", swap_before_quarantine)
+    with pytest.raises(tracks.DenseTrackError, match="changed during publication"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
+        )
+    assert cleanup_swap_done is True
+    assert (output / "foreign.txt").read_text() == "foreign-owner\n"
+    assert detached_owned.is_dir()
+    assert list(tmp_path.glob(f".{output.name}.failed-*")) == []
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
 def test_subprocess_interrupt_removes_only_its_owned_staging_directory(
     tmp_path, termination_signal
