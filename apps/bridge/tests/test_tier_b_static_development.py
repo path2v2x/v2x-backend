@@ -509,7 +509,24 @@ def test_line_image_points_are_distinct_and_cross_the_interior():
     assert fitter._line_image_points(np.asarray((1.0, 0.0, 0.0)), 1280, 960).shape == (0, 2)
     points = fitter._line_image_points(np.asarray((0.0, 1.0, -480.0)), 1280, 960)
     assert points.shape == (2, 2)
-    assert np.linalg.norm(points[0] - points[1]) >= fitter.MIN_HORIZON_CHORD_PX
+    assert np.linalg.norm(points[0] - points[1]) >= fitter.MIN_HORIZON_CHORD_REFERENCE_PX
+
+
+def test_horizon_chord_exact_reference_boundary_is_accepted():
+    # x+y=sqrt(2) has endpoints (0,sqrt(2)), (sqrt(2),0): an exact 2 px chord.
+    points = fitter._line_image_points(
+        np.asarray((1.0, 1.0, -math.sqrt(2.0))), 1280, 960
+    )
+    assert points.shape == (2, 2)
+    assert np.linalg.norm(points[0] - points[1]) == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("native_chord,accepted", [(3.0, False), (4.0, True), (4.002, True)])
+def test_horizon_chord_uses_reference_gauge_at_2560x1920(native_chord, accepted):
+    # Uniform 2x native resolution: a native chord is half as long on 1280x960.
+    line = np.asarray((1.0, 1.0, -native_chord / math.sqrt(2.0)))
+    points = fitter._line_image_points(line, 2560, 1920)
+    assert (points.shape == (2, 2)) is accepted
 
 
 def _rotate_direction(value, radians):

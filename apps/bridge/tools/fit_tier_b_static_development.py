@@ -61,7 +61,7 @@ SPLIT_NEAR_DUPLICATE_IMAGE_PX = 0.05
 SPLIT_NEAR_DUPLICATE_DIRECTION_RAD = 1e-6
 SPLIT_POINT_WORLD_DISTANCE_M = 1e-6
 SPLIT_POLYLINE_WORLD_DISTANCE_M = 0.05
-MIN_HORIZON_CHORD_PX = 2.0
+MIN_HORIZON_CHORD_REFERENCE_PX = 2.0
 
 
 class DevelopmentFitError(ValueError):
@@ -188,9 +188,18 @@ def _line_image_points(line: np.ndarray, width: int, height: int) -> np.ndarray:
          valid[left], valid[right])
         for left in range(len(valid)) for right in range(left + 1, len(valid))
     ]
-    distance, first, second = max(pairs, key=lambda item: item[0])
+    _native_distance, first, second = max(pairs, key=lambda item: item[0])
     midpoint = (np.asarray(first) + np.asarray(second)) / 2.0
-    if (distance < MIN_HORIZON_CHORD_PX
+    reference_distance = float(np.linalg.norm(
+        (np.asarray(first) - np.asarray(second))
+        * np.asarray((1280.0 / width, 960.0 / height))
+    ))
+    chord_too_short = (
+        reference_distance < MIN_HORIZON_CHORD_REFERENCE_PX
+        and not math.isclose(reference_distance, MIN_HORIZON_CHORD_REFERENCE_PX,
+                             rel_tol=1e-12, abs_tol=1e-9)
+    )
+    if (chord_too_short
             or not (1e-6 < midpoint[0] < width - 1 - 1e-6
                     and 1e-6 < midpoint[1] < height - 1 - 1e-6)):
         return np.empty((0, 2))
@@ -1066,7 +1075,7 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
             "near_duplicate_direction_rad": SPLIT_NEAR_DUPLICATE_DIRECTION_RAD,
             "point_world_distance_m": SPLIT_POINT_WORLD_DISTANCE_M,
             "polyline_world_distance_m": SPLIT_POLYLINE_WORLD_DISTANCE_M,
-            "minimum_horizon_chord_px": MIN_HORIZON_CHORD_PX,
+            "minimum_horizon_chord_reference_px": MIN_HORIZON_CHORD_REFERENCE_PX,
         },
         "optimizer": {
             "seed": seed, "requested_multistarts": starts, "starts": len(seeds),
