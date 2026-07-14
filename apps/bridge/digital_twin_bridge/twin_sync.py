@@ -933,7 +933,20 @@ class TwinSync:
                     if math.hypot(dx, dy) > 1.5:
                         track.yaw = math.degrees(math.atan2(dy, dx))
                 if reviewed is not None:
-                    actor = self._world.get_actor(track.actor_id)
+                    try:
+                        actor = self._world.get_actor(track.actor_id)
+                    except Exception:
+                        reason = "strict_actor_lookup_failed"
+                        self._reject_strict(det, reason)
+                        track.quarantined_reason = reason
+                        track.cleanup_failure = "actor_lookup_failed"
+                        logger.error(
+                            "Strict twin actor lookup failed for %s actor=%s",
+                            object_id,
+                            track.actor_id,
+                            exc_info=True,
+                        )
+                        continue
                     if actor is None:
                         track.actor_id = None
                         self._reject_strict(det, "strict_actor_vanished")

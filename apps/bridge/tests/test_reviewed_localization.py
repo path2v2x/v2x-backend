@@ -1169,6 +1169,61 @@ def test_update_commits_the_dimensions_that_passed_post_move_readback(mock_world
     assert status["actual_actor_dimensions_m"]["length"] == pytest.approx(4.8)
 
 
+def test_update_actor_lookup_exception_stays_quarantined_after_recovery(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+    first = detection()
+    sync._apply([first])
+    actor_id = next(iter(sync.actor_ids()))
+    original_get_actor = mock_world.get_actor
+    calls = 0
+
+    def fail_first_lookup(requested_actor_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected active actor lookup failure")
+        return original_get_actor(requested_actor_id)
+
+    mock_world.get_actor = fail_first_lookup
+    second = detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )
+    sync._apply([second])
+
+    status = sync.status()["objects"][0]
+    assert calls >= 2
+    assert status["event_id"] == first["event_id"]
+    assert status["trajectory_sample_index"] == 0
+    assert status["tracked_actor_id"] == actor_id
+    assert status["actor_id"] is None
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert status["quarantined_reason"] == "strict_actor_lookup_failed"
+    assert status["cleanup_failure"] == "actor_lookup_failed"
+    assert sync.status()["strict_rejections"][
+        "strict_actor_lookup_failed"
+    ] == 1
+
+    recovered_lookup_calls = calls
+    sync._apply([second])
+    blocked_status = sync.status()["objects"][0]
+    assert calls == recovered_lookup_calls + 1
+    assert blocked_status["event_id"] == first["event_id"]
+    assert blocked_status["trajectory_sample_index"] == 0
+    assert blocked_status["actor_present"] is False
+    assert blocked_status["actor_quarantined"] is True
+    assert sync.status()["strict_rejections"]["strict_cleanup_pending"] == 1
+
+    actor = original_get_actor(actor_id)
+    sync.stop()
+    assert actor.is_destroyed
+    assert sync.actor_ids() == set()
+    assert sync.status()["objects"] == []
+
+
 def test_failed_provisional_destroy_is_quarantined_not_present(mock_world):
     original_spawn = mock_world.try_spawn_actor
     leaked = []
