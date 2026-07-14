@@ -120,20 +120,37 @@ release_lock() {
   if [[ "${LOCK_CLAIMED}" != "true" ]]; then
     return 0
   fi
-  local current_value
-  if ! current_value="$(aws_cli ssm get-parameter --name "${APPLY_LOCK_NAME}" --query 'Parameter.Value' --output text 2>/dev/null)"; then
-    echo "WARNING: unable to read the apply lock during cleanup; it was not cleared" >&2
-    return 0
+  local current_value error="${WORKDIR}/lock-release.err"
+  if ! current_value="$(aws_cli ssm get-parameter --name "${APPLY_LOCK_NAME}" \
+      --query 'Parameter.Value' --output text 2>"${error}")"; then
+    cat "${error}" >&2
+    echo "Unable to read the owned apply lock before release; refusing to report success" >&2
+    return 1
   fi
+  rm -f "${error}"
   if [[ "${current_value}" != "${LOCK_TOKEN}" ]]; then
-    echo "WARNING: apply lock ownership changed; refusing to clear it" >&2
-    return 0
+    echo "Apply lock ownership changed; refusing to clear it or report success" >&2
+    return 1
   fi
-  if aws_cli ssm delete-parameter --name "${APPLY_LOCK_NAME}" >/dev/null; then
-    LOCK_CLAIMED=false
-  else
-    echo "WARNING: unable to clear the owned apply lock ${APPLY_LOCK_NAME}" >&2
+  if ! aws_cli ssm delete-parameter --name "${APPLY_LOCK_NAME}" \
+      >"${WORKDIR}/lock-delete.json" 2>"${error}"; then
+    cat "${error}" >&2
+    echo "Unable to delete the owned apply lock; refusing to report success" >&2
+    return 1
   fi
+  rm -f "${error}"
+  if aws_cli ssm get-parameter --name "${APPLY_LOCK_NAME}" --output json \
+      >"${WORKDIR}/lock-after-delete.json" 2>"${error}"; then
+    echo "Apply lock still exists after delete; refusing to report success" >&2
+    return 1
+  fi
+  if ! error_has_exact_code "${error}" 'ParameterNotFound'; then
+    cat "${error}" >&2
+    echo "Unable to verify exact ParameterNotFound after apply-lock deletion; refusing to report success" >&2
+    return 1
+  fi
+  rm -f "${error}"
+  LOCK_CLAIMED=false
 }
 
 cleanup() {

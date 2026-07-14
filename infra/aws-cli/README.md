@@ -50,7 +50,11 @@ mutation. A failed, interrupted, or non-convergent apply deliberately retains
 its owned lock and prints the rollback bundle plus the manual recovery gate;
 only exact successful readback clears it. Never clear a failed lock until a
 separate review has compared its token and rollback bundle with a fresh
-plan-only state. The transaction creates the audit bucket
+plan-only state. Successful release itself is fail-closed: the script must read
+back the exact owned value, delete it, and then receive exact
+`ParameterNotFound`. A read error, ownership mismatch, delete error, surviving
+parameter, or ambiguous absence exits nonzero and suppresses the verified
+banner. The transaction creates the audit bucket
 with Object Lock at creation, applies a 365-day COMPLIANCE default, denies
 deletion and retention mutation, reconciles the least-privilege writer and
 read-only planner roles, configures the fixed single-region write-only trail,

@@ -304,7 +304,15 @@ case "${service}:${operation}" in
   ssm:get-parameter)
     if [[ "${MOCK_HIDE_LOCK_READS:-false}" == "true" && " $* " != *" --query "* ]]; then error ParameterNotFound; fi
     [[ -f "${STATE}/lock" ]] || error ParameterNotFound
-    if [[ " $* " == *" --query "* && " $* " == *" --output text "* ]]; then cat "${STATE}/lock";
+    if [[ -f "${STATE}/lock-delete-attempted" && "${MOCK_RELEASE_VERIFY_FAILURE:-false}" == "true" ]]; then error AccessDenied; fi
+    if [[ -f "${STATE}/trail.logging" && "${MOCK_RELEASE_GET_FAILURE:-false}" == "true" &&
+          " $* " == *" --query "* ]]; then error AccessDenied; fi
+    if [[ " $* " == *" --query "* && " $* " == *" --output text "* ]]; then
+      if [[ -f "${STATE}/trail.logging" && "${MOCK_RELEASE_OWNERSHIP_CHANGE:-false}" == "true" ]]; then
+        echo '{"schema":"foreign-lock"}'
+      else
+        cat "${STATE}/lock"
+      fi
     else jq -n --arg value "$(<"${STATE}/lock")" '{Parameter:{Name:"/v2x/calibration/evidence-prerequisites/apply-lock",Type:"String",Value:$value,Version:1,ARN:"mock"}}'; fi
     ;;
   ssm:put-parameter)
@@ -318,7 +326,15 @@ case "${service}:${operation}" in
     else error ParameterAlreadyExists; fi
     ;;
   ssm:delete-parameter)
-    mutate; rm -f "${STATE}/lock"; echo '{}'
+    mutate
+    if [[ "${MOCK_RELEASE_DELETE_FAILURE:-false}" == "true" ]]; then error AccessDenied; fi
+    if [[ "${MOCK_RELEASE_VERIFY_FAILURE:-false}" == "true" ]]; then
+      : >"${STATE}/lock-delete-attempted"
+      echo '{}'
+    else
+      rm -f "${STATE}/lock"
+      echo '{}'
+    fi
     ;;
   *) echo "Unsupported mock call: ${service} ${operation} $*" >&2; exit 97 ;;
 esac
@@ -604,5 +620,38 @@ grep -q 'retaining the owned SSM apply lock for manual recovery review' \
   "${TMP}/postlock-drift-output.log" || fail "failed-lock recovery diagnostic missing"
 assert_eq "$(grep -c '^MUTATE ' "${drift_log}" || true)" 1 "post-lock drift mutated more than its SSM lock"
 grep -q '^MUTATE ssm put-parameter$' "${drift_log}" || fail "post-lock drift did not claim only the SSM lock"
+
+# Lock release is part of acceptance: every ambiguous read/delete/absence or
+# ownership change fails nonzero, suppresses success, and retains safety state.
+for release_case in get_failure ownership_change delete_failure verify_failure; do
+  release_state="${TMP}/release-${release_case}-state"
+  release_plan="${TMP}/release-${release_case}-plan"
+  release_log="${TMP}/release-${release_case}.log"
+  run_plan "${release_state}" "${release_plan}" "${release_log}"
+  release_current="$(hash_file "${release_plan}/current.json")"
+  release_desired="$(hash_file "${release_plan}/desired.json")"
+  release_flag=()
+  case "${release_case}" in
+    get_failure) release_flag=(MOCK_RELEASE_GET_FAILURE=true) ;;
+    ownership_change) release_flag=(MOCK_RELEASE_OWNERSHIP_CHANGE=true) ;;
+    delete_failure) release_flag=(MOCK_RELEASE_DELETE_FAILURE=true) ;;
+    verify_failure) release_flag=(MOCK_RELEASE_VERIFY_FAILURE=true) ;;
+  esac
+  if env PATH="${MOCK_BIN}:${PATH}" MOCK_AWS_STATE="${release_state}" MOCK_AWS_LOG="${release_log}" \
+    "${release_flag[@]}" AWS_BIN=aws AWS_REGION=us-west-1 PLAN_ONLY=false \
+    TRUST_PRINCIPAL_ARN="${TRUST}" TRUST_PRINCIPAL_ARN_CONFIRM="${TRUST}" \
+    EXPECTED_CURRENT_STATE_HASH="${release_current}" EXPECTED_DESIRED_STATE_HASH="${release_desired}" \
+    CONFIRM_PREREQUISITES=CONFIGURE_CALIBRATION_EVIDENCE_PREREQUISITES \
+    CONFIRM_COMPLIANCE_AUDIT=CREATE_COMPLIANCE_LOCKED_CALIBRATION_AUDIT_LOG \
+    BACKUP_ROOT="${TMP}/release-${release_case}-backups" VERIFY_ATTEMPTS=1 VERIFY_DELAY_SECONDS=0 \
+    "${SCRIPT}" >"${TMP}/release-${release_case}-output.log" 2>&1; then
+    fail "${release_case} lock release unexpectedly succeeded"
+  fi
+  [[ -f "${release_state}/lock" ]] || fail "${release_case} did not retain lock safety state"
+  ! grep -q 'Calibration evidence AWS prerequisites verified' \
+    "${TMP}/release-${release_case}-output.log" || fail "${release_case} printed success banner"
+  grep -q 'retaining the owned SSM apply lock for manual recovery review' \
+    "${TMP}/release-${release_case}-output.log" || fail "${release_case} omitted recovery diagnostic"
+done
 
 echo "PASS: calibration evidence prerequisite provisioner mocked tests"
