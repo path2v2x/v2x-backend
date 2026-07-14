@@ -30,8 +30,8 @@ mkdir -p "$attacker_tree/apps/bridge"
 cat >"$attacker_tree/apps/bridge/pytest.py" <<EOF
 from pathlib import Path
 Path('$fake_marker').touch()
-print('collected 550 items')
-print('550 passed')
+print('collected 620 items')
+print('620 passed')
 print('collected 97 items')
 print('97 passed')
 EOF
@@ -53,7 +53,7 @@ if /bin/bash -p -c '
   exit 1
 fi
 if [[ -e "$fake_marker" ]] || grep -E \
-  "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "collected (620|97) items|620 passed|97 passed|\[bridge\]" \
   "$symlink_source_output" >/dev/null; then
   echo "symlink-sourced runner used attacker verifier or started a lane" >&2
   exit 1
@@ -75,7 +75,7 @@ if /bin/bash -p -c '
   echo "runner accepted source execution with equal source and zero names" >&2
   exit 1
 fi
-if grep -E "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+if grep -E "collected (620|97) items|620 passed|97 passed|\[bridge\]" \
   "$equal_zero_source_output" >/dev/null; then
   echo "equal-zero sourced runner forged or started a test lane" >&2
   exit 1
@@ -91,7 +91,7 @@ if ATTACKER_TREE="$attacker_tree" /bin/bash -p -c '
   exit 1
 fi
 if [[ -e "$fake_marker" ]] || grep -E \
-  "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "collected (620|97) items|620 passed|97 passed|\[bridge\]" \
   "$forged_builtin_source_output" >/dev/null; then
   echo "forged-builtin sourced runner touched attacker state or started a lane" >&2
   exit 1
@@ -108,7 +108,7 @@ if ATTACKER_TREE="$attacker_tree" /bin/bash -p -c '
   exit 1
 fi
 if [[ -e "$fake_marker" ]] || grep -E \
-  "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "collected (620|97) items|620 passed|97 passed|\[bridge\]" \
   "$forged_return_source_output" >/dev/null; then
   echo "forged-return sourced runner touched attacker state or started a lane" >&2
   exit 1
@@ -127,7 +127,7 @@ if [[ -e "$fake_marker" ]]; then
   echo "sourced runner executed attacker-controlled pytest" >&2
   exit 1
 fi
-if grep -E "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+if grep -E "collected (620|97) items|620 passed|97 passed|\[bridge\]" \
   "$privileged_source_output" >/dev/null; then
   echo "privileged sourced runner forged or started a test lane" >&2
   exit 1
@@ -285,8 +285,8 @@ PYTEST_ADDOPTS="${hostile_addopts[*]}" \
 PYTEST_PLUGINS="hostile_plugin_must_not_be_imported" \
   "$runner" | tee "$output"
 
-grep -F "collected 550 items" "$output" >/dev/null
-grep -F "550 passed" "$output" >/dev/null
+grep -F "collected 620 items" "$output" >/dev/null
+grep -F "620 passed" "$output" >/dev/null
 grep -F "collected 97 items" "$output" >/dev/null
 grep -F "97 passed" "$output" >/dev/null
 if grep -E "collected 0 items|deselected|no tests ran" "$output" >/dev/null; then
