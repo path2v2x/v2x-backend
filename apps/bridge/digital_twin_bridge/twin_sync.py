@@ -513,12 +513,12 @@ class TwinSync:
         return dimensions
 
     @classmethod
-    def _strict_actor_integrity_reason(cls, actor, reviewed) -> Optional[str]:
+    def _strict_actor_integrity(cls, actor, reviewed) -> tuple[Optional[str], Optional[dict]]:
         if (
             getattr(actor, "type_id", None)
             != reviewed["blueprint"]["selected_blueprint_id"]
         ):
-            return "active_blueprint_type_mismatch"
+            return "active_blueprint_type_mismatch", None
         actual_dimensions = cls._actor_dimensions_m(actor)
         expected_dimensions = reviewed["blueprint"]["expected_dimensions_m"]
         tolerance = reviewed["blueprint"]["dimension_tolerance_m"]
@@ -529,8 +529,12 @@ class TwinSync:
                 for key in ("length", "width", "height")
             )
         ):
-            return "active_blueprint_dimensions_mismatch"
-        return None
+            return "active_blueprint_dimensions_mismatch", actual_dimensions
+        return None, actual_dimensions
+
+    @classmethod
+    def _strict_actor_integrity_reason(cls, actor, reviewed) -> Optional[str]:
+        return cls._strict_actor_integrity(actor, reviewed)[0]
 
     @staticmethod
     def _snapshot_track(track: TwinTrack) -> dict:
@@ -865,8 +869,7 @@ class TwinSync:
                             break
                         continue
                     if reviewed is not None:
-                        actual_dimensions = self._actor_dimensions_m(actor)
-                        integrity_reason = self._strict_actor_integrity_reason(
+                        integrity_reason, actual_dimensions = self._strict_actor_integrity(
                             actor, reviewed
                         )
                         if integrity_reason is not None:
@@ -935,8 +938,7 @@ class TwinSync:
                         track.actor_id = None
                         self._reject_strict(det, "strict_actor_vanished")
                         continue
-                    actual_dimensions = self._actor_dimensions_m(actor)
-                    integrity_reason = self._strict_actor_integrity_reason(
+                    integrity_reason, _actual_dimensions = self._strict_actor_integrity(
                         actor, reviewed
                     )
                     if integrity_reason is not None:
@@ -972,7 +974,7 @@ class TwinSync:
                             transform_error,
                         )
                         continue
-                    integrity_reason = self._strict_actor_integrity_reason(
+                    integrity_reason, actual_dimensions = self._strict_actor_integrity(
                         actor, reviewed
                     )
                     if integrity_reason is not None:
@@ -1048,6 +1050,8 @@ class TwinSync:
                 track.cleanup_failure = None
                 return True
         except Exception:
+            if track.quarantined_reason is None:
+                track.quarantined_reason = "track_cleanup"
             track.cleanup_failure = "actor_lookup_failed"
             logger.error("Twin actor lookup failed for %s", track.actor_id, exc_info=True)
             return False
@@ -1266,6 +1270,7 @@ class TwinSync:
         transform_payload = None
         raw_to_actor_planar_m = None
         reference_to_actor_m = None
+        readback_actual_dimensions = track.actual_dimensions_m
         if track.actor_id is not None:
             try:
                 actor = self._world.get_actor(track.actor_id)
@@ -1300,9 +1305,13 @@ class TwinSync:
                                 + 180.0
                             ) % 360.0 - 180.0
                         )
+                        integrity_reason, current_dimensions = (
+                            self._strict_actor_integrity(actor, reviewed)
+                        )
+                        if current_dimensions is not None:
+                            readback_actual_dimensions = current_dimensions
                         actor_present = (
-                            self._strict_actor_integrity_reason(actor, reviewed)
-                            is None
+                            integrity_reason is None
                             and abs(float(transform.location.x) - position["x"])
                             <= 1e-6
                             and abs(float(transform.location.y) - position["y"])
@@ -1399,7 +1408,7 @@ class TwinSync:
                 "blueprint_family": track.blueprint_family,
                 "blueprint_selection_digest": track.placement_key_sha256,
                 "vehicle_dimensions_m": track.vehicle_dimensions_m,
-                "actual_actor_dimensions_m": track.actual_dimensions_m,
+                "actual_actor_dimensions_m": readback_actual_dimensions,
                 "blueprint_catalog_sha256": track.blueprint_catalog_sha256,
                 "blueprint_pool_sha256": track.blueprint_pool_sha256,
                 "selected_blueprint_id": (

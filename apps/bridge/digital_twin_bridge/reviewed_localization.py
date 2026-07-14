@@ -21,6 +21,7 @@ from typing import Any, Mapping, Optional
 from digital_twin_bridge.twin_camera_rig import (
     absolute_twin_model,
     heading_to_carla_yaw,
+    horizontal_fov_deg,
 )
 
 try:
@@ -615,6 +616,7 @@ def _project_surveyed_world_pixel(
                 float(camera["heading_deg"]), float(camera["yaw_deg"])
             ),
             "roll_deg": float(camera.get("roll_deg", 0.0)),
+            "fov_deg": horizontal_fov_deg(camera["intrinsics"]),
         }
         deployed = absolute_twin_model(
             deployment.get("anchor_location"),
@@ -631,6 +633,7 @@ def _project_surveyed_world_pixel(
         deployed.get("yaw_deg"),
         deployed.get("roll_deg"),
     ]
+    deployed_fov = deployed.get("fov_deg")
     yaw_error = abs(
         (float(deployed_rotation[1]) - float(rotation[1]) + 180.0)
         % 360.0
@@ -656,6 +659,9 @@ def _project_surveyed_world_pixel(
         or abs(float(deployed_rotation[0]) - float(rotation[0])) > 1e-6
         or yaw_error > 1e-6
         or abs(float(deployed_rotation[2]) - float(rotation[2])) > 1e-6
+        or not _finite(deployed_fov)
+        or not _finite(baseline.get("fov_deg"))
+        or abs(float(deployed_fov) - float(baseline["fov_deg"])) > 1e-6
         or not _finite(deployment_base.get("pitch_deg"))
         or abs(
             float(deployment_base["pitch_deg"])
@@ -666,6 +672,11 @@ def _project_surveyed_world_pixel(
         or abs(
             float(deployment_base["roll_deg"])
             - expected_base["roll_deg"]
+        ) > 1e-6
+        or not _finite(deployment_base.get("fov_deg"))
+        or abs(
+            float(deployment_base["fov_deg"])
+            - expected_base["fov_deg"]
         ) > 1e-6
     ):
         raise ReviewedLocalizationError("static_reprojection_extrinsics_invalid")

@@ -3,11 +3,17 @@
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from digital_twin_bridge.reviewed_localization import (
     canonical_object_sha256,
     seal_authenticated_artifact,
+)
+from digital_twin_bridge.twin_camera_rig import (
+    absolute_twin_model,
+    heading_to_carla_yaw,
+    horizontal_fov_deg,
 )
 from tests.test_aggregate_twin_calibration_manifests import (
     fixture as aggregate_fixture,
@@ -74,16 +80,27 @@ def build_reviewed_static_calibration(
         manifest["ue5_map_opendrive_sha256"] = opendrive_sha256
         manifest["projection"]["map_name"] = map_name
         manifest["projection"]["opendrive_sha256"] = opendrive_sha256
-        manifest["baseline"]["location"] = [0.0, 0.0, 0.0]
-        manifest["baseline"]["pitch_deg"] = 0.0
-        manifest["baseline"]["yaw_deg"] = 0.0
-        manifest["baseline"]["roll_deg"] = 0.0
+        anchor = [0.0, 0.0, 0.0]
+        base = {
+            "pitch_deg": float(camera["pitch_deg"]),
+            "yaw_deg": heading_to_carla_yaw(
+                float(camera["heading_deg"]), float(camera["yaw_deg"])
+            ),
+            "roll_deg": float(camera.get("roll_deg", 0.0)),
+            "fov_deg": horizontal_fov_deg(camera["intrinsics"]),
+        }
+        baseline = absolute_twin_model(
+            anchor, base, camera.get("twin_pose") or {}
+        )
+        manifest["baseline"]["location"] = baseline["location"]
+        manifest["baseline"]["pitch_deg"] = baseline["pitch_deg"]
+        manifest["baseline"]["yaw_deg"] = baseline["yaw_deg"]
+        manifest["baseline"]["roll_deg"] = baseline["roll_deg"]
+        manifest["baseline"]["fov_deg"] = baseline["fov_deg"]
         manifest["baseline"]["cx"] = camera["intrinsics"]["cx"]
         manifest["baseline"]["cy"] = camera["intrinsics"]["cy"]
-        manifest["deployment_model"]["anchor_location"] = [0.0, 0.0, 0.0]
-        manifest["deployment_model"]["base"]["pitch_deg"] = 0.0
-        manifest["deployment_model"]["base"]["yaw_deg"] = 0.0
-        manifest["deployment_model"]["base"]["roll_deg"] = 0.0
+        manifest["deployment_model"]["anchor_location"] = anchor
+        manifest["deployment_model"]["base"].update(base)
         manifest["intrinsics_calibration"]["resolution"] = [width, height]
         manifest["intrinsics_calibration"]["camera_matrix"] = copy.deepcopy(
             camera["intrinsics_calibration"]["camera_matrix"]
@@ -96,11 +113,33 @@ def build_reviewed_static_calibration(
         cx = float(camera["intrinsics"]["cx"])
         cy = float(camera["intrinsics"]["cy"])
 
+        pitch = math.radians(baseline["pitch_deg"])
+        yaw = math.radians(baseline["yaw_deg"])
+        roll = math.radians(baseline["roll_deg"])
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cyaw, syaw = math.cos(yaw), math.sin(yaw)
+        cr, sr = math.cos(roll), math.sin(roll)
+        forward_axis = (cp * cyaw, cp * syaw, sp)
+        zero_roll_right = (-syaw, cyaw, 0.0)
+        zero_roll_up = (-sp * cyaw, -sp * syaw, cp)
+        right_axis = tuple(
+            cr * zero_roll_right[index] - sr * zero_roll_up[index]
+            for index in range(3)
+        )
+        up_axis = tuple(
+            sr * zero_roll_right[index] + cr * zero_roll_up[index]
+            for index in range(3)
+        )
+
         def world_for_pixel(pixel, depth=20.0):
+            normalized_x = (float(pixel[0]) - cx) / fx
+            normalized_y = (float(pixel[1]) - cy) / fy
             return [
-                depth,
-                (float(pixel[0]) - cx) * depth / fx,
-                -(float(pixel[1]) - cy) * depth / fy,
+                baseline["location"][index]
+                + depth * forward_axis[index]
+                + depth * normalized_x * right_axis[index]
+                - depth * normalized_y * up_axis[index]
+                for index in range(3)
             ]
 
         for feature in manifest["features"]:

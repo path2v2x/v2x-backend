@@ -1,5 +1,6 @@
 """Adversarial contract and strict reviewed-placement tests."""
 
+import copy
 import hashlib
 import json
 import math
@@ -27,6 +28,10 @@ from digital_twin_bridge.reviewed_localization import (
     validate_contract,
 )
 from digital_twin_bridge.twin_sync import TwinSync
+from digital_twin_bridge.twin_camera_rig import (
+    absolute_twin_model,
+    horizontal_fov_deg,
+)
 from tests.conftest import MockBlueprint
 from tests.reviewed_calibration_fixture import build_reviewed_static_calibration
 
@@ -359,12 +364,13 @@ def test_static_reprojection_exact_binary64_boundaries_fail_just_over():
         "baseline": {
             "location": [0.0, 0.0, 0.0],
             "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
+            "fov_deg": horizontal_fov_deg(camera["intrinsics"]),
         },
         "deployment_model": {
             "anchor_location": [0.0, 0.0, 0.0],
             "base": {
                 "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
-                "fov_deg": 65.0,
+                "fov_deg": horizontal_fov_deg(camera["intrinsics"]),
             },
         },
         "intrinsics_calibration": {
@@ -441,6 +447,7 @@ def test_static_reprojection_round_trips_nonzero_active_twin_pose():
             "pitch_offset_deg": 2.0,
             "yaw_offset_deg": 3.0,
             "roll_offset_deg": 1.0,
+            "fov_offset_deg": 4.0,
         },
         "intrinsics": {
             "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
@@ -455,9 +462,8 @@ def test_static_reprojection_round_trips_nonzero_active_twin_pose():
     anchor = [10.0, 20.0, 8.0]
     base = {
         "pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
-        "fov_deg": 65.0,
+        "fov_deg": horizontal_fov_deg(camera["intrinsics"]),
     }
-    from digital_twin_bridge.twin_camera_rig import absolute_twin_model
 
     baseline = absolute_twin_model(anchor, base, camera["twin_pose"])
     pitch = math.radians(baseline["pitch_deg"])
@@ -480,11 +486,30 @@ def test_static_reprojection_round_trips_nonzero_active_twin_pose():
         [640.0, 480.0]
     )
 
-    manifest["deployment_model"]["base"]["yaw_deg"] = 1.0
-    with pytest.raises(
-        ReviewedLocalizationError, match="static_reprojection_extrinsics_invalid"
+    for mutator in (
+        lambda candidate_manifest, _candidate_camera: candidate_manifest[
+            "deployment_model"
+        ]["base"].update(yaw_deg=1.0),
+        lambda candidate_manifest, _candidate_camera: candidate_manifest[
+            "deployment_model"
+        ]["base"].update(fov_deg=99.0),
+        lambda _candidate_manifest, candidate_camera: candidate_camera[
+            "twin_pose"
+        ].update(fov_offset_deg=99.0),
+        lambda _candidate_manifest, candidate_camera: candidate_camera[
+            "twin_pose"
+        ].update(yaw_offset_deg=99.0),
     ):
-        _project_surveyed_world_pixel(world, manifest, camera)
+        candidate_manifest = copy.deepcopy(manifest)
+        candidate_camera = copy.deepcopy(camera)
+        mutator(candidate_manifest, candidate_camera)
+        with pytest.raises(
+            ReviewedLocalizationError,
+            match="static_reprojection_extrinsics_invalid",
+        ):
+            _project_surveyed_world_pixel(
+                world, candidate_manifest, candidate_camera
+            )
 
 
 def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_world):
@@ -535,7 +560,15 @@ def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_w
             "yaw_deg": 0.0,
             "heading_deg": 90.0,
             "roll_deg": 0.0,
-            "twin_pose": {},
+            "twin_pose": {
+                "forward_offset_m": 1.5,
+                "right_offset_m": -0.4,
+                "height_offset_m": 0.7,
+                "pitch_offset_deg": 2.0,
+                "yaw_offset_deg": 3.0,
+                "roll_offset_deg": 1.0,
+                "fov_offset_deg": 4.0,
+            },
             "intrinsics": {
                 "width": 1280, "height": 960,
                 "fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 480.0,
@@ -1055,19 +1088,51 @@ def test_spawn_and_tick_require_exact_selected_blueprint_type(mock_world):
     assert drifted.status()["objects"][0]["actor_present"] is False
 
 
-def test_update_reverifies_selected_blueprint_after_pose_mutation(mock_world):
+@pytest.mark.parametrize("drift", ["type", "dimensions", "pose"])
+def test_status_readback_rejects_actor_integrity_drift(mock_world, drift):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+    if drift == "type":
+        actor.type_id = "vehicle.replaced-before-readback"
+    elif drift == "dimensions":
+        actor.bounding_box.extent.x = 9.0
+    else:
+        actor._transform.location.x += 0.5
+        actor._transform.rotation.roll = 1.0
+
+    status = sync.status()["objects"][0]
+
+    assert status["tracked_actor_id"] == actor.id
+    assert status["actor_id"] is None
+    assert status["actor_present"] is False
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_reason"),
+    [
+        ("type", "active_blueprint_type_mismatch"),
+        ("dimensions", "active_blueprint_dimensions_mismatch"),
+    ],
+)
+def test_update_reverifies_actor_integrity_after_pose_mutation(
+    mock_world, drift, expected_reason
+):
     sync = strict_sync(mock_world)
     first = detection()
     sync._apply([first])
     actor = mock_world.get_actor(next(iter(sync.actor_ids())))
     original_set_transform = actor.set_transform
 
-    def replace_type_during_update(transform):
+    def drift_actor_during_update(transform):
         original_set_transform(transform)
         if abs(transform.location.x - 11.0) < 1e-9:
-            actor.type_id = "vehicle.replaced-during-update"
+            if drift == "type":
+                actor.type_id = "vehicle.replaced-during-update"
+            else:
+                actor.bounding_box.extent.x = 9.0
 
-    actor.set_transform = replace_type_during_update
+    actor.set_transform = drift_actor_during_update
     sync._apply([detection(
         camera_id="ch2", sample_index=1, seconds=1,
         position={"x": 11.0, "y": 20.0, "z": 1.25},
@@ -1078,9 +1143,30 @@ def test_update_reverifies_selected_blueprint_after_pose_mutation(mock_world):
     assert status["trajectory_sample_index"] == 0
     assert status["actor_present"] is False
     assert status["actor_quarantined"] is True
-    assert sync.status()["strict_rejections"][
-        "active_blueprint_type_mismatch"
-    ] == 1
+    assert sync.status()["strict_rejections"][expected_reason] == 1
+
+
+def test_update_commits_the_dimensions_that_passed_post_move_readback(mock_world):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor = mock_world.get_actor(next(iter(sync.actor_ids())))
+    original_set_transform = actor.set_transform
+
+    def change_dimensions_during_update(transform):
+        original_set_transform(transform)
+        if abs(transform.location.x - 11.0) < 1e-9:
+            actor.bounding_box.extent.x = 2.4
+
+    actor.set_transform = change_dimensions_during_update
+    sync._apply([detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )])
+
+    status = sync.status()["objects"][0]
+    assert status["actor_present"] is True
+    assert status["trajectory_sample_index"] == 1
+    assert status["actual_actor_dimensions_m"]["length"] == pytest.approx(4.8)
 
 
 def test_failed_provisional_destroy_is_quarantined_not_present(mock_world):
@@ -1194,6 +1280,33 @@ def test_cleanup_failure_retains_ownership_and_surfaces_status(mock_world, failu
         "track_cleanup:destroy_"
     )
     assert status["objects"][0]["tracked_actor_id"] == actor_id
+    assert status["objects"][0]["actor_present"] is False
+    assert status["objects"][0]["actor_quarantined"] is True
+    assert status["objects"][0]["quarantined_reason"] == "track_cleanup"
+
+
+def test_cleanup_actor_lookup_exception_is_quarantined_not_present(mock_world):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor_id = next(iter(sync.actor_ids()))
+    original_get_actor = mock_world.get_actor
+    calls = 0
+
+    def fail_first_lookup(requested_actor_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected cleanup lookup failure")
+        return original_get_actor(requested_actor_id)
+
+    mock_world.get_actor = fail_first_lookup
+    sync.stop()
+
+    status = sync.status()
+    assert sync.actor_ids() == {actor_id}
+    assert status["cleanup_failures"]["global_car_reviewed"] == (
+        "actor_lookup_failed"
+    )
     assert status["objects"][0]["actor_present"] is False
     assert status["objects"][0]["actor_quarantined"] is True
     assert status["objects"][0]["quarantined_reason"] == "track_cleanup"
