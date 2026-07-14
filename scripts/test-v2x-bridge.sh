@@ -1,8 +1,14 @@
 #!/bin/bash -p
+[[ ${BASH_SOURCE[0]} == "$0" ]] || \
+  : "${V2X_BRIDGE_RUNNER_DIRECT_EXECUTION_REQUIRED:?execute test-v2x-bridge.sh directly}"
 set -euo pipefail
 
 if [[ $- != *p* ]]; then
   echo "runner must be executed directly with privileged Bash startup isolation" >&2
+  exit 2
+fi
+if [[ -n $(declare -F) ]]; then
+  echo "predeclared shell functions are not accepted" >&2
   exit 2
 fi
 if [[ -n ${BASH_ENV:-} || -n ${ENV:-} ]]; then
@@ -37,7 +43,13 @@ if (( $# != 0 )); then
   exit 2
 fi
 
-repo_root="$(cd "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+runner_path="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")"
+runner_suffix="/scripts/test-v2x-bridge.sh"
+if [[ $runner_path != *"$runner_suffix" ]]; then
+  echo "runner path does not match the tracked repository layout" >&2
+  exit 2
+fi
+repo_root="${runner_path%"$runner_suffix"}"
 bridge_dir="$repo_root/apps/bridge"
 carla_python="/home/path/V2XCarla/carla-venv-310/bin/python"
 map_lidar_python="/home/path/V2XCarla/geospatial-venv/bin/python"

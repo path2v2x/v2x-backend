@@ -14,10 +14,51 @@ path_output="$(mktemp)"
 function_output="$(mktemp)"
 python_output="$(mktemp)"
 loader_output="$(mktemp)"
+source_output="$(mktemp)"
+privileged_source_output="$(mktemp)"
 fake_bin="$(mktemp -d)"
 python_injection="$(mktemp -d)"
+attacker_tree="$(mktemp -d)"
 rm -f "$fake_marker"
-trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output"; rm -rf "$fake_bin" "$python_injection"' EXIT
+trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output" "$source_output" "$privileged_source_output"; rm -rf "$fake_bin" "$python_injection" "$attacker_tree"' EXIT
+
+if /bin/bash -c 'source "$1"' bash "$runner" >"$source_output" 2>&1; then
+  echo "runner accepted ordinary source execution" >&2
+  exit 1
+fi
+grep -F "execute test-v2x-bridge.sh directly" "$source_output" >/dev/null
+if grep -F "[bridge]" "$source_output" >/dev/null; then
+  echo "sourced runner started a test lane" >&2
+  exit 1
+fi
+
+mkdir -p "$attacker_tree/apps/bridge"
+cat >"$attacker_tree/apps/bridge/pytest.py" <<EOF
+from pathlib import Path
+Path('$fake_marker').touch()
+print('collected 550 items')
+print('550 passed')
+print('collected 97 items')
+print('97 passed')
+EOF
+if ATTACKER_TREE="$attacker_tree" RUNNER="$runner" /bin/bash -p -c '
+  pwd() { printf "%s\\n" "$ATTACKER_TREE"; }
+  source "$RUNNER"
+' >"$privileged_source_output" 2>&1; then
+  echo "runner accepted privileged source execution with a forged function" >&2
+  exit 1
+fi
+if [[ -e "$fake_marker" ]]; then
+  echo "sourced runner executed attacker-controlled pytest" >&2
+  exit 1
+fi
+grep -F "execute test-v2x-bridge.sh directly" \
+  "$privileged_source_output" >/dev/null
+if grep -E "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "$privileged_source_output" >/dev/null; then
+  echo "privileged sourced runner forged or started a test lane" >&2
+  exit 1
+fi
 
 cat >"$fake_python" <<EOF
 #!/usr/bin/env bash

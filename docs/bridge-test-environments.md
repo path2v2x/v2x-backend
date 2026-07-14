@@ -23,6 +23,10 @@ file is executed in full by the second lane. The second lane also fixes every
 thread-control variable required by the tracked lock.
 
 Execute the runner directly; invoking it through another shell is rejected.
+The first executable line compares `BASH_SOURCE[0]` with `$0`, before calling
+any overrideable command, and source-mode execution fails immediately. The
+runner also rejects every predeclared shell function and resolves its tracked
+path with absolute `/usr/bin/readlink -f`, never a dispatchable `pwd` function.
 Its absolute privileged-Bash shebang prevents `BASH_ENV` startup sourcing and
 function import. It additionally rejects `BASH_ENV`, `ENV`, surviving
 `BASH_FUNC_*` payloads, or a `PATH` that resolves `env` anywhere except
