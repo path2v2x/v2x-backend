@@ -6,6 +6,78 @@ This folder provisions the `v2x-backend` data plane in **`us-west-1`**:
 - Read API: HTTP API -> `v2x-backend-read`
 - Private state bucket for digital twin state + snapshots
 
+## Calibration evidence AWS prerequisites
+
+`provision-calibration-evidence-prerequisites.sh` is the deployment-as-code
+gate for the IAM, immutable audit, CloudTrail, and EventBridge resources needed
+before the separate calibration evidence bucket can be created. It is fixed to
+account `147229569658`, region `us-west-1`, and UE5-only managed tags. It never
+creates or changes the evidence bucket itself.
+
+The default is a read-only plan. Supply an explicit same-account IAM user or
+role as the future trust principal; the script never infers trust from the
+current caller and rejects root, wildcard, STS-session, or cross-account
+principals. A plan performs full discovery, fails closed on AccessDenied, and
+prints and optionally saves canonical current-state, desired-state, and later
+canary-interface JSON with independent SHA-256 hashes.
+
+```bash
+# Read-only plan. This makes no AWS changes.
+AWS_PROFILE=path AWS_REGION=us-west-1 PLAN_ONLY=true \
+TRUST_PRINCIPAL_ARN=arn:aws:iam::147229569658:user/<explicit-user> \
+PLAN_OUTPUT_DIR=/tmp/v2x-calibration-prerequisites-plan \
+  ./provision-calibration-evidence-prerequisites.sh
+
+# Apply is intentionally shown only as the exact reviewed transaction. Never
+# substitute unreviewed hashes, a different trust principal, or weaker strings.
+AWS_PROFILE=path AWS_REGION=us-west-1 PLAN_ONLY=false \
+TRUST_PRINCIPAL_ARN=arn:aws:iam::147229569658:user/<explicit-user> \
+TRUST_PRINCIPAL_ARN_CONFIRM=arn:aws:iam::147229569658:user/<explicit-user> \
+EXPECTED_CURRENT_STATE_HASH=<reviewed-current-sha256> \
+EXPECTED_DESIRED_STATE_HASH=<reviewed-desired-sha256> \
+ACKNOWLEDGED_FOREIGN_POLICY_SHA256S=<exact-comma-separated-reviewed-set> \
+CONFIRM_PREREQUISITES=CONFIGURE_CALIBRATION_EVIDENCE_PREREQUISITES \
+CONFIRM_COMPLIANCE_AUDIT=CREATE_COMPLIANCE_LOCKED_CALIBRATION_AUDIT_LOG \
+  ./provision-calibration-evidence-prerequisites.sh
+```
+
+Apply additionally requires an empty blocker list, exact acknowledgment of
+every preserved foreign audit-bucket `Allow`, a mode-0700/mode-0600 rollback
+bundle, and a conditionally created SSM concurrency lock. An existing lock is
+never cleared automatically as stale. The transaction creates the audit bucket
+with Object Lock at creation, applies a 365-day COMPLIANCE default, denies
+deletion and retention mutation, reconciles the least-privilege writer and
+read-only planner roles, configures the fixed single-region write-only trail,
+and sends integrity-control mutation events to a dedicated 365-day CloudWatch
+log group. The CloudWatch Logs resource policy follows the AWS-documented
+`events.amazonaws.com` plus `delivery.logs.amazonaws.com` delivery principals
+and scopes them to that exact log group; the later gate must prove a fixed-rule
+event actually arrives because Logs delivery does not support reliable
+per-rule `SourceArn` scoping. It then performs bounded exact readback before
+releasing its own lock. The audit bucket and locked objects are retained during
+rollback.
+
+After bootstrap, assume `V2XCalibrationEvidencePlanner` and require two stable
+plans through that role. Then run `provision-calibration-evidence-store.sh` in
+plan mode as a separate reviewed gate. The generated
+`later-canary-interface.json` defines—but does not execute—the subsequent
+locked canary proof: an explicit 90-day-or-longer COMPLIANCE write, exact
+content/version/retention readback, matching writer-session `PutObject` data
+event, EventBridge rule-fire log readback, and CloudTrail digest validation.
+The writer policy rejects explicit non-COMPLIANCE or sub-90-day headers; its
+`IfExists` form is required so multipart part/completion requests—which do not
+carry Object Lock headers—can finish. Therefore explicit headers plus final
+retention readback remain a hard canary acceptance gate. The canary interface
+also requires a separately approved read-only audit verifier with exact access
+to `AWSLogs/147229569658/*`; neither the writer nor planner is silently
+broadened for that later proof. Real holdouts remain out of scope.
+
+Deterministic mocked safety tests are available at:
+
+```bash
+./tests/test-calibration-evidence-prerequisites.sh
+```
+
 ## Calibration evidence store
 
 `provision-calibration-evidence-store.sh` plans or creates the separate
