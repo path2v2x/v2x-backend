@@ -38,6 +38,7 @@ import signal
 import shutil
 import stat
 import sys
+import threading
 import uuid
 
 import cv2
@@ -91,6 +92,8 @@ MAXIMUM_CONTACT_RESIDUAL_SPEED_AT_REFERENCE_PX_PER_SECOND = 160.0
 MAXIMUM_CONTACT_RESIDUAL_ACCELERATION_AT_REFERENCE_PX_PER_SECOND2 = 1000.0
 STAGING_OWNER_MARKER = ".v2x-dense-track-staging-owner.json"
 HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+PUBLICATION_CONTRACTS = {}
+PUBLICATION_CONTRACTS_LOCK = threading.Lock()
 
 
 class DenseTrackError(RuntimeError):
@@ -373,6 +376,7 @@ def invocation_staging_directory(output):
     staged_fd = None
     owned_identity = None
     body_completed = False
+    return_boundary_verified = False
     state = {"cleanup_started": False, "received": None}
 
     def interrupt(signum, _frame):
@@ -442,6 +446,23 @@ def invocation_staging_directory(output):
         signal.pthread_sigmask(signal.SIG_BLOCK, handled)
         if staged is not None and parent_fd is not None and owned_identity is not None:
             try:
+                return_boundary_error = None
+                with PUBLICATION_CONTRACTS_LOCK:
+                    publication_contract = PUBLICATION_CONTRACTS.pop(
+                        owned_identity, None
+                    )
+                if body_completed:
+                    if publication_contract is None:
+                        return_boundary_error = DenseTrackError(
+                            "dense-track return publication contract is missing"
+                        )
+                    else:
+                        try:
+                            verify_published_tree(output, publication_contract)
+                        except DenseTrackError as exc:
+                            return_boundary_error = exc
+                        else:
+                            return_boundary_verified = True
                 try:
                     active = os.stat(
                         staged.name, dir_fd=parent_fd, follow_symlinks=False
@@ -461,19 +482,30 @@ def invocation_staging_directory(output):
                 published_is_owned = published is not None and (
                     published.st_dev, published.st_ino
                 ) == owned_identity
-                if body_completed and published_is_owned:
+                if return_boundary_verified and published_is_owned:
                     # The body atomically published this exact pinned stage.
                     # A recreated temporary name is foreign and must survive;
                     # never scan the parent for the inode now valid at output.
                     pass
-                elif active_is_owned or active_is_foreign or not body_completed:
+                elif (
+                    active_is_owned
+                    or active_is_foreign
+                    or not body_completed
+                    or return_boundary_error is not None
+                ):
                     quarantined = quarantine_owned_staging(
                         parent_fd, staged.name, owned_identity
                     )
-                    if quarantined is None and (active_is_owned or not body_completed):
+                    if quarantined is None and (
+                        active_is_owned
+                        or not body_completed
+                        or return_boundary_error is not None
+                    ):
                         raise DenseTrackError(
                             "owned staging directory could not be quarantined"
                         )
+                if return_boundary_error is not None:
+                    cleanup_error = return_boundary_error
             except (OSError, DenseTrackError) as exc:
                 cleanup_error = exc
         try:
@@ -486,6 +518,8 @@ def invocation_staging_directory(output):
                 os.close(parent_fd)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         if cleanup_error is not None:
+            if isinstance(cleanup_error, DenseTrackError):
+                raise cleanup_error
             raise DenseTrackError(
                 f"failed to quarantine invocation staging directory {staged}"
             ) from cleanup_error
@@ -1743,6 +1777,13 @@ def publish_staged_tree(staged, output):
         verify_published_tree(output, contract)
         fsync_directory(Path(output).parent)
         verify_published_tree(output, contract)
+        with PUBLICATION_CONTRACTS_LOCK:
+            identity = contract["root_identity"]
+            if identity in PUBLICATION_CONTRACTS:
+                raise DenseTrackError(
+                    "dense-track publication contract identity is duplicated"
+                )
+            PUBLICATION_CONTRACTS[identity] = contract
     except (DenseTrackError, StaticCaptureError, OSError) as exc:
         remove_failed_publication(output, contract)
         if isinstance(exc, StaticCaptureError):

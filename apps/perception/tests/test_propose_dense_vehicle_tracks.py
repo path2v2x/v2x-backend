@@ -1101,6 +1101,47 @@ def test_successful_publish_preserves_foreign_recreated_stage_and_verified_outpu
     assert list(tmp_path.glob(f".{output.name}.staging-quarantine-*")) == []
 
 
+def test_return_boundary_replacement_fails_preserves_foreign_and_quarantines_owned(
+    tmp_path, monkeypatch
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    original_publish = tracks.publish_staged_tree
+    owned_moved = tmp_path / "owned-published-tree-moved-before-return"
+
+    def publish_then_replace_output(staged, output):
+        original_publish(staged, output)
+        Path(output).rename(owned_moved)
+        Path(output).mkdir()
+        (Path(output) / "foreign.txt").write_text("foreign-owner\n")
+
+    monkeypatch.setattr(tracks, "publish_staged_tree", publish_then_replace_output)
+    output = tmp_path / "output"
+    with pytest.raises(
+        tracks.DenseTrackError, match="publication root was replaced"
+    ):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
+        )
+
+    assert (output / "foreign.txt").read_text() == "foreign-owner\n"
+    assert not owned_moved.exists()
+    quarantines = list(tmp_path.glob(f".{output.name}.staging-quarantine-*"))
+    assert len(quarantines) == 1
+    report = json.loads((quarantines[0] / "report.json").read_text())
+    assert report["acceptance_eligible"] is False
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
 def test_subprocess_interrupt_removes_only_its_owned_staging_directory(
     tmp_path, termination_signal
