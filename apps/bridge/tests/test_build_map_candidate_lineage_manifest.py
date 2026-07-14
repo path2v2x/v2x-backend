@@ -106,6 +106,19 @@ def test_candidate_ids_are_independent_of_repeated_argument_order(inputs):
     ]
 
 
+def test_complete_package_inventory_rejects_omitted_rrdata_or_material(inputs):
+    inputs.material_file = inputs.material_file[:1]
+    with pytest.raises(lineage.LineageError, match="inventory is incomplete"):
+        lineage.build(inputs)
+    inputs.material_file = [
+        str(Path(inputs.package_root) / "Richmond.fbm" / "a.png"),
+        str(Path(inputs.package_root) / "Richmond.fbm" / "nested" / "b.png"),
+    ]
+    inputs.rrdata_xml = []
+    with pytest.raises(lineage.LineageError, match="inventory is incomplete"):
+        lineage.build(inputs)
+
+
 def test_publish_is_exclusive_no_replace_and_fsyncs_complete_json(inputs):
     report = lineage.build(inputs)
     lineage.publish_no_replace(inputs.output, report)
@@ -121,7 +134,6 @@ def test_rejects_final_and_parent_symlinks(inputs, tmp_path):
     inputs.material_file = [str(final_link)]
     with pytest.raises(lineage.LineageError, match="symbolic-link"):
         lineage.build(inputs)
-
     inputs.material_file = [str(real)]
     package_link = tmp_path / "package-link"
     package_link.symlink_to(Path(inputs.package_root), target_is_directory=True)
@@ -130,6 +142,27 @@ def test_rejects_final_and_parent_symlinks(inputs, tmp_path):
     with pytest.raises(lineage.LineageError, match="symbolic-link"):
         lineage.build(inputs)
 
+
+def test_read_rejects_ancestor_replacement_after_open(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    package = parent / "package"
+    target = write(package / "artifact.bin", b"original-bytes")
+    original_read = lineage.os.read
+    replaced = False
+
+    def replacing_read(descriptor, count):
+        nonlocal replaced
+        value = original_read(descriptor, count)
+        if not replaced:
+            replaced = True
+            package.rename(parent / "package-old")
+            package.mkdir()
+            (package / "artifact.bin").write_bytes(b"replacement")
+        return value
+
+    monkeypatch.setattr(lineage.os, "read", replacing_read)
+    with pytest.raises(lineage.LineageError, match="absolute path ancestry changed"):
+        lineage.read_input(str(target), "raced_artifact")
 
 def test_rejects_hardlinks_duplicate_paths_and_outside_package(inputs, tmp_path):
     source = Path(inputs.material_file[0])
@@ -222,6 +255,13 @@ def test_topology_digest_binds_road_marks_objects_lanes_and_junction_lane_links(
     without_lane_links = with_lane_links.replace(b'<laneLink from="-1" to="-1"/>', b"")
     assert lineage.summarize_xodr(with_lane_links, "with")["topology_sha256"] != lineage.summarize_xodr(
         without_lane_links, "without"
+    )["topology_sha256"]
+    lane_successor = baseline.replace(
+        b'<lane id="-1">', b'<lane id="-1"><link><successor id="-1"/></link>'
+    )
+    changed_successor = lane_successor.replace(b'<successor id="-1"', b'<successor id="-2"')
+    assert lineage.summarize_xodr(lane_successor, "successor-a")["topology_sha256"] != lineage.summarize_xodr(
+        changed_successor, "successor-b"
     )["topology_sha256"]
 
 

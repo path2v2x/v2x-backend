@@ -60,6 +60,28 @@ def require_no_follow_support() -> None:
         raise LineageError("platform lacks required no-follow directory semantics")
 
 
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_dev, value.st_ino, value.st_mode
+
+
+def _walk_directory_no_follow(path: Path) -> tuple[int, list[tuple[int, int, int]]]:
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    descriptor = os.open("/", directory_flags)
+    identities = [_directory_identity(os.fstat(descriptor))]
+    try:
+        for component in path.parts[1:]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            identities.append(_directory_identity(os.fstat(descriptor)))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, identities
+
+
 def _validate_path_text(path: Path) -> None:
     text = str(path)
     if not path.is_absolute() or unicodedata.normalize("NFC", text) != text:
@@ -79,18 +101,8 @@ def read_input(path_value: str, label: str) -> tuple[bytes, dict]:
     path = Path(path_value)
     _validate_path_text(path)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
-    directory_flags = (
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        | os.O_DIRECTORY | os.O_NOFOLLOW
-    )
-    directory_descriptor = os.open("/", directory_flags)
+    directory_descriptor, ancestor_identities = _walk_directory_no_follow(path.parent)
     try:
-        for component in path.parts[1:-1]:
-            next_descriptor = os.open(
-                component, directory_flags, dir_fd=directory_descriptor
-            )
-            os.close(directory_descriptor)
-            directory_descriptor = next_descriptor
         descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
     except OSError as exc:
         os.close(directory_descriptor)
@@ -120,6 +132,18 @@ def read_input(path_value: str, label: str) -> tuple[bytes, dict]:
             raise LineageError(f"{label} path changed while being read") from exc
         if _identity(before) != _identity(after) or _identity(before) != _identity(at_path):
             raise LineageError(f"{label} changed while being read")
+        try:
+            fresh_parent, fresh_ancestors = _walk_directory_no_follow(path.parent)
+            try:
+                fresh_final = os.stat(
+                    path.name, dir_fd=fresh_parent, follow_symlinks=False
+                )
+            finally:
+                os.close(fresh_parent)
+        except OSError as exc:
+            raise LineageError(f"{label} absolute path ancestry changed while being read") from exc
+        if fresh_ancestors != ancestor_identities or _identity(fresh_final) != _identity(before):
+            raise LineageError(f"{label} absolute path ancestry changed while being read")
     finally:
         os.close(descriptor)
         os.close(directory_descriptor)
@@ -130,6 +154,49 @@ def read_input(path_value: str, label: str) -> tuple[bytes, dict]:
         "bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
+
+
+def inventory_package_tree(package_root: Path) -> dict:
+    """Return the complete regular-file inventory through held no-follow dirfds."""
+    require_no_follow_support()
+    root_descriptor, root_ancestors = _walk_directory_no_follow(package_root)
+    files: list[str] = []
+    directories: list[str] = []
+
+    def recurse(descriptor: int, prefix: str) -> None:
+        for name in sorted(os.listdir(descriptor)):
+            if name in {".", ".."} or "/" in name or unicodedata.normalize("NFC", name) != name:
+                raise LineageError("package contains a forbidden entry name")
+            value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            relative = f"{prefix}/{name}" if prefix else name
+            if stat.S_ISLNK(value.st_mode):
+                raise LineageError("package inventory contains a symbolic link")
+            if stat.S_ISDIR(value.st_mode):
+                child = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                directories.append(relative)
+                try:
+                    recurse(child, relative)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(value.st_mode) and value.st_nlink == 1:
+                files.append(relative)
+            else:
+                raise LineageError("package inventory contains a non-regular or hard-linked file")
+
+    try:
+        recurse(root_descriptor, "")
+    finally:
+        os.close(root_descriptor)
+    fresh_root, fresh_ancestors = _walk_directory_no_follow(package_root)
+    os.close(fresh_root)
+    if fresh_ancestors != root_ancestors:
+        raise LineageError("package root ancestry changed during inventory")
+    return {"files": sorted(files), "directories": sorted(directories)}
 
 
 def _local_name(tag: str) -> str:
@@ -158,6 +225,7 @@ def summarize_xodr(content: bytes, label: str) -> dict:
     projection = root.findtext("./header/geoReference")
     projection = projection.strip() if projection else None
     lane_records = []
+    lane_link_records = []
     road_mark_records = []
     object_records = []
     for road in roads:
@@ -177,6 +245,14 @@ def summarize_xodr(content: bytes, label: str) -> dict:
                         road_id, section_s, side, lane_id,
                         lane.get("type") or "", lane.get("level") or "",
                     ))
+                    for link_kind in ("predecessor", "successor"):
+                        for link in lane.findall(f"./link/{link_kind}"):
+                            linked_id = link.get("id")
+                            if linked_id is None or linked_id == "":
+                                raise LineageError(f"{label} contains a lane link with blank ID")
+                            lane_link_records.append((
+                                road_id, section_s, side, lane_id, link_kind, linked_id,
+                            ))
                     for mark in lane.findall("roadMark"):
                         children = tuple(
                             sorted(
@@ -228,6 +304,7 @@ def summarize_xodr(content: bytes, label: str) -> dict:
         "junction_connections": sorted(junction_connections),
         "junction_lane_links": sorted(junction_lane_links),
         "lanes": sorted(lane_records),
+        "lane_predecessor_successor_links": sorted(lane_link_records),
         "road_marks": sorted(road_mark_records),
         "objects": sorted(object_records),
     }
@@ -350,11 +427,17 @@ def build(args: argparse.Namespace) -> dict:
 
     def package_label(prefix: str, value: str) -> str:
         path = Path(value)
+        _validate_path_text(path)
         try:
             relative = path.relative_to(package_root)
         except ValueError as exc:
             raise LineageError("recovered artifact is outside package root") from exc
         return f"{prefix}:{relative.as_posix()}"
+
+    for prefix, value in (
+        ("fbx", args.fbx), ("old_xodr", args.old_xodr), ("geojson", args.geojson)
+    ):
+        package_label(prefix, value)
 
     recovered = [
         artifact(args.fbx, "recovered_fbx", "fbx"),
@@ -374,6 +457,23 @@ def build(args: argparse.Namespace) -> dict:
     paths = [item["path"] for item in recovered + live]
     if len(set(labels)) != len(labels) or len(set(paths)) != len(paths):
         raise LineageError("artifacts must have unique labels and paths")
+    package_inventory = inventory_package_tree(package_root)
+    supplied_package_paths = sorted(
+        str(Path(item["path"]).relative_to(package_root).as_posix()) for item in recovered
+    )
+    if package_inventory["files"] != supplied_package_paths:
+        missing = sorted(set(package_inventory["files"]) - set(supplied_package_paths))
+        extra = sorted(set(supplied_package_paths) - set(package_inventory["files"]))
+        raise LineageError(
+            f"recovered package inventory is incomplete or inconsistent; missing={missing} extra={extra}"
+        )
+    inventory_contract = {
+        "files": package_inventory["files"],
+        "directories": package_inventory["directories"],
+    }
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(inventory_contract, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     old_summary = recovered[1]["summary"]
     live_summary = live[0]["summary"]
     fbx_identity = recovered[0]
@@ -426,7 +526,11 @@ def build(args: argparse.Namespace) -> dict:
             "required_resolution": "reviewed provenance must explain 222/29 versus 208/32 and select a versioned target fingerprint",
         },
         "recovered_material_dependency_graph": {
-            "status": "frozen_inputs_completeness_unreviewed",
+            "status": "complete_package_inventory_frozen_dependency_edges_unreviewed",
+            "package_inventory_sha256": inventory_sha256,
+            "package_file_count": len(package_inventory["files"]),
+            "package_directory_count": len(package_inventory["directories"]),
+            "complete_package_paths": package_inventory["files"],
             "rrdata_xml_labels": sorted(
                 item["label"] for item in recovered if item["label"].startswith("rrdata_xml:")
             ),
