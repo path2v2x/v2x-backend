@@ -49,10 +49,12 @@ PY
 echo "[bridge] CARLA Python 3.10 lane"
 (
   cd "$bridge_dir"
-  env \
+  env -u PYTEST_ADDOPTS \
     PYTHONWARNINGS=error \
     PYTHONPATH="$bridge_dir" \
     "$carla_python" -m pytest \
+      -o addopts= \
+      -W error \
       tests \
       --ignore=tests/test_register_map_to_lidar.py
 )
@@ -60,7 +62,7 @@ echo "[bridge] CARLA Python 3.10 lane"
 echo "[bridge] pinned map/LiDAR Python 3.12 lane"
 (
   cd "$bridge_dir"
-  env \
+  env -u PYTEST_ADDOPTS \
     PYTHONWARNINGS=error \
     PYTHONPATH="$bridge_dir" \
     MKL_NUM_THREADS=1 \
@@ -69,5 +71,8 @@ echo "[bridge] pinned map/LiDAR Python 3.12 lane"
     OPENBLAS_CORETYPE=Haswell \
     OPENBLAS_NUM_THREADS=1 \
     VECLIB_MAXIMUM_THREADS=1 \
-    "$map_lidar_python" -m pytest tests/test_register_map_to_lidar.py
+    "$map_lidar_python" -m pytest \
+      -o addopts= \
+      -W error \
+      tests/test_register_map_to_lidar.py
 )

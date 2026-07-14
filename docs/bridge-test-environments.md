@@ -13,10 +13,19 @@ are incompatible:
 - `test_register_map_to_lidar.py` runs with the deterministic Python 3.12
   environment bound by `apps/bridge/tools/map_lidar_toolchain_lock.json`.
 
-Both lanes promote every warning to an error. The runner accepts no pytest
-selectors, so its `--ignore` in the first lane does not skip coverage: the
-excluded registration file is executed in full by the second lane. The second
-lane also fixes every thread-control variable required by the tracked lock.
+Both lanes promote every warning to an error. The runner clears
+`PYTEST_ADDOPTS`, overrides configured `addopts`, and accepts no pytest
+selectors, so external or positional options cannot weaken collection. Its
+`--ignore` in the first lane does not skip coverage: the excluded registration
+file is executed in full by the second lane. The second lane also fixes every
+thread-control variable required by the tracked lock.
+
+The tracked adversarial check combines hostile `--collect-only`, `--ignore`,
+and `-k` values and requires the complete 550-test and 97-test lane totals:
+
+```bash
+scripts/tests/test-v2x-bridge-runner.sh
+```
 
 On the Path PC the defaults are:
 
