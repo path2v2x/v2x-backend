@@ -916,6 +916,43 @@ def test_staged_tamper_during_final_fsync_cannot_publish(tmp_path, monkeypatch):
     assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
 
 
+def test_staged_tamper_inside_atomic_publish_fails_removes_output_and_cleans(
+    tmp_path, monkeypatch
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    original_publish = tracks.atomic_publish_directory
+    tampered = False
+
+    def tamper_immediately_before_rename(staged, output):
+        nonlocal tampered
+        artifact = next((Path(staged) / "masks").rglob("*.png"))
+        artifact.write_bytes(artifact.read_bytes() + b"post-verification-tamper")
+        tampered = True
+        return original_publish(staged, output)
+
+    monkeypatch.setattr(
+        tracks, "atomic_publish_directory", tamper_immediately_before_rename
+    )
+    output = tmp_path / "output"
+    with pytest.raises(tracks.DenseTrackError, match="changed during publication"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
+        )
+    assert tampered is True
+    assert not output.exists()
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
 def test_subprocess_interrupt_removes_only_its_owned_staging_directory(
     tmp_path, termination_signal

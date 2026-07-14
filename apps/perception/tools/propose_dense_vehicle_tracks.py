@@ -33,6 +33,7 @@ from pathlib import Path
 import platform
 import signal
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -1354,6 +1355,180 @@ def verify_staged_publication(
         raise DenseTrackError("dense-track checksum manifest verification failed")
 
 
+def stable_file_fields(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def pin_publication_tree(root):
+    """Pin every staged inode and byte digest across the directory rename."""
+    root = Path(root)
+    try:
+        root_metadata = root.lstat()
+    except OSError as exc:
+        raise DenseTrackError("dense-track staging root cannot be pinned") from exc
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise DenseTrackError("dense-track staging root is not a directory")
+    records = {}
+    directories = {}
+    try:
+        candidates = sorted(root.rglob("*"))
+    except OSError as exc:
+        raise DenseTrackError("dense-track staging tree cannot be enumerated") from exc
+    for path in candidates:
+        try:
+            before = path.lstat()
+        except OSError as exc:
+            raise DenseTrackError("dense-track staging entry cannot be pinned") from exc
+        if stat.S_ISDIR(before.st_mode):
+            directories[path.relative_to(root).as_posix()] = stable_file_fields(before)
+            continue
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise DenseTrackError(
+                "dense-track staging tree contains a non-regular or linked artifact"
+            )
+        relative = path.relative_to(root).as_posix()
+        try:
+            digest = sha256_file(path)
+            after = path.lstat()
+        except OSError as exc:
+            raise DenseTrackError("dense-track staging artifact cannot be pinned") from exc
+        if stable_file_fields(before) != stable_file_fields(after):
+            raise DenseTrackError("dense-track staging artifact changed while pinned")
+        records[relative] = {
+            "fields": stable_file_fields(after),
+            "sha256": digest,
+        }
+    if "report.json" not in records or "SHA256SUMS" not in records:
+        raise DenseTrackError("dense-track staging publication contract is incomplete")
+    return {
+        "root_identity": (root_metadata.st_dev, root_metadata.st_ino),
+        "directories": directories,
+        "files": records,
+    }
+
+
+def verify_published_tree(root, contract):
+    """Reopen the caller-visible tree and prove it is the pinned staged tree."""
+    root = Path(root)
+    try:
+        root_before = root.lstat()
+    except OSError as exc:
+        raise DenseTrackError("dense-track publication is unavailable") from exc
+    if (
+        not stat.S_ISDIR(root_before.st_mode)
+        or (root_before.st_dev, root_before.st_ino) != contract["root_identity"]
+    ):
+        raise DenseTrackError("dense-track publication root was replaced")
+    try:
+        candidates = sorted(root.rglob("*"))
+    except OSError as exc:
+        raise DenseTrackError("dense-track publication cannot be enumerated") from exc
+    actual_paths = set()
+    actual_directories = set()
+    for path in candidates:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise DenseTrackError("dense-track published entry is unavailable") from exc
+        if stat.S_ISDIR(metadata.st_mode):
+            relative = path.relative_to(root).as_posix()
+            actual_directories.add(relative)
+            if stable_file_fields(metadata) != contract["directories"].get(relative):
+                raise DenseTrackError("dense-track directory changed during publication")
+            continue
+        relative = path.relative_to(root).as_posix()
+        actual_paths.add(relative)
+        record = contract["files"].get(relative)
+        if (
+            record is None
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stable_file_fields(metadata) != record["fields"]
+        ):
+            raise DenseTrackError("dense-track artifact changed during publication")
+        try:
+            digest = sha256_file(path)
+            after = path.lstat()
+        except OSError as exc:
+            raise DenseTrackError("dense-track published artifact is unreadable") from exc
+        if (
+            stable_file_fields(metadata) != stable_file_fields(after)
+            or digest != record["sha256"]
+        ):
+            raise DenseTrackError("dense-track artifact changed during publication")
+    if actual_paths != set(contract["files"]):
+        raise DenseTrackError("dense-track publication tree changed during publication")
+    if actual_directories != set(contract["directories"]):
+        raise DenseTrackError("dense-track directory tree changed during publication")
+    try:
+        root_after = root.lstat()
+        final_entries = {
+            path.relative_to(root).as_posix(): stable_file_fields(path.lstat())
+            for path in root.rglob("*")
+        }
+    except OSError as exc:
+        raise DenseTrackError("dense-track publication changed during final verification") from exc
+    if (
+        (root_after.st_dev, root_after.st_ino) != contract["root_identity"]
+        or set(final_entries)
+        != set(contract["files"]) | set(contract["directories"])
+        or any(
+            final_entries[relative] != record["fields"]
+            for relative, record in contract["files"].items()
+        )
+        or any(
+            final_entries[relative] != fields
+            for relative, fields in contract["directories"].items()
+        )
+    ):
+        raise DenseTrackError("dense-track publication changed during final verification")
+
+
+def remove_failed_publication(output, root_identity):
+    output = Path(output)
+    try:
+        metadata = output.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DenseTrackError("failed dense-track publication cannot be inspected") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != root_identity
+    ):
+        # Never remove a path that is not the exact staging directory this
+        # invocation published.  The caller still receives the original
+        # publication failure, while a concurrent owner's path is preserved.
+        return
+    try:
+        shutil.rmtree(output)
+        fsync_directory(output.parent)
+    except OSError as exc:
+        raise DenseTrackError("failed dense-track publication cannot be removed") from exc
+
+
+def publish_staged_tree(staged, output):
+    contract = pin_publication_tree(staged)
+    try:
+        atomic_publish_directory(staged, output)
+        verify_published_tree(output, contract)
+        fsync_directory(Path(output).parent)
+        verify_published_tree(output, contract)
+    except (DenseTrackError, StaticCaptureError) as exc:
+        remove_failed_publication(output, contract["root_identity"])
+        if isinstance(exc, StaticCaptureError):
+            raise DenseTrackError("atomic dense-track publication failed") from exc
+        raise
+
+
 def make_review_sheet(entries, columns=4, tile_width=480, tile_height=390):
     rows = max(1, math.ceil(len(entries) / columns))
     sheet = np.full((rows * tile_height, columns * tile_width, 3), 28, dtype=np.uint8)
@@ -1737,8 +1912,7 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
             verify_staged_publication(
                 staged, bound_snapshot_tree, sequences, report_sha256
             )
-            atomic_publish_directory(staged, output)
-            fsync_directory(output.parent)
+            publish_staged_tree(staged, output)
         except StaticCaptureError as exc:
             raise DenseTrackError("atomic dense-track publication failed") from exc
     return output
