@@ -156,6 +156,7 @@ release_lock() {
   rm -f "${error}"
   LOCK_CLAIMED=false
   LOCK_RELEASE_STATE="confirmed_absent"
+  echo "Apply lock release state: confirmed_absent"
 }
 
 cleanup() {

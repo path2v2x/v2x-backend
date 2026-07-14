@@ -320,6 +320,7 @@ case "${service}:${operation}" in
     mutate
     value="$(arg --value "$@")"
     if (set -o noclobber; printf '%s' "${value}" >"${STATE}/lock") 2>/dev/null; then
+      cp "${STATE}/lock" "${STATE}/lock-claimed"
       echo 'LOCK-CLAIMED' >>"${LOG}"
       sleep "${MOCK_LOCK_HOLD_SECONDS:-0}"
       if [[ "${MOCK_POST_LOCK_DRIFT:-false}" == "true" ]]; then : >"${STATE}/bucket-${EVIDENCE}.exists"; fi
@@ -331,6 +332,8 @@ case "${service}:${operation}" in
     if [[ "${MOCK_RELEASE_DELETE_FAILURE:-false}" == "true" ]]; then error AccessDenied; fi
     if [[ "${MOCK_RELEASE_VERIFY_FAILURE:-false}" == "true" ]]; then
       : >"${STATE}/lock-delete-attempted"
+      echo '{}'
+    elif [[ "${MOCK_RELEASE_STILL_PRESENT:-false}" == "true" ]]; then
       echo '{}'
     else
       rm -f "${STATE}/lock"
@@ -466,6 +469,11 @@ PATH="${MOCK_BIN}:${PATH}" MOCK_AWS_STATE="${apply_state}" MOCK_AWS_LOG="${apply
   BACKUP_ROOT="${backup_root}" VERIFY_ATTEMPTS=1 VERIFY_DELAY_SECONDS=0 \
   "${SCRIPT}" >"${TMP}/apply-output.log" 2>&1 || { cat "${TMP}/apply-output.log" >&2; fail "mocked apply"; }
 grep -q 'Calibration evidence AWS prerequisites verified' "${TMP}/apply-output.log" || fail "apply verification message"
+grep -q '^Apply lock release state: confirmed_absent$' "${TMP}/apply-output.log" ||
+  fail "apply confirmed-absent release state missing"
+confirmed_line="$(grep -n '^Apply lock release state: confirmed_absent$' "${TMP}/apply-output.log" | cut -d: -f1)"
+verified_line="$(grep -n '^Calibration evidence AWS prerequisites verified\.$' "${TMP}/apply-output.log" | cut -d: -f1)"
+(( confirmed_line < verified_line )) || fail "confirmed-absent state was not emitted before verified banner"
 [[ ! -e "${apply_state}/lock" ]] || fail "owned lock was not released"
 ! grep -Eq '^MUTATE s3api .*v2x-calibration-evidence-147229569658-us-west-1' "${apply_log}" || fail "prerequisite apply mutated evidence bucket"
 bundle="$(find "${backup_root}" -mindepth 1 -maxdepth 1 -type d | head -n1)"
@@ -493,6 +501,8 @@ PATH="${MOCK_BIN}:${PATH}" MOCK_AWS_STATE="${apply_state}" MOCK_AWS_LOG="${apply
   "${SCRIPT}" >"${TMP}/idempotent-apply.log" 2>&1 || { cat "${TMP}/idempotent-apply.log" >&2; fail "idempotent apply"; }
 grep -q '^MUTATE iam update-assume-role-policy' "${apply_log}" || fail "idempotent role update path not exercised"
 grep -q '^MUTATE cloudtrail update-trail' "${apply_log}" || fail "idempotent trail update path not exercised"
+grep -q '^Apply lock release state: confirmed_absent$' "${TMP}/idempotent-apply.log" ||
+  fail "idempotent apply confirmed-absent state missing"
 
 # Restore fixture: drift every captured mutable document, then reconcile it from
 # the rollback bundle using update/put/tag operations only (never deletion).
@@ -571,6 +581,8 @@ PATH="${MOCK_BIN}:${PATH}" MOCK_AWS_STATE="${TMP}/foreign-state" MOCK_AWS_LOG="$
   BACKUP_ROOT="${TMP}/foreign-backups" VERIFY_ATTEMPTS=1 VERIFY_DELAY_SECONDS=0 \
   "${SCRIPT}" >"${TMP}/foreign-ack.log" 2>&1 || { cat "${TMP}/foreign-ack.log" >&2; fail "acknowledged foreign Allow apply"; }
 grep -q 'Calibration evidence AWS prerequisites verified' "${TMP}/foreign-ack.log" || fail "acknowledged foreign apply verification"
+grep -q '^Apply lock release state: confirmed_absent$' "${TMP}/foreign-ack.log" ||
+  fail "acknowledged foreign apply confirmed-absent state missing"
 
 # Concurrency fixture: one apply claims the conditional lock; the second cannot mutate.
 con_state="${TMP}/con-state"; con_plan="${TMP}/con-plan"; con_log="${TMP}/con.log"
@@ -592,6 +604,8 @@ if env "${apply_env[@]}" "${SCRIPT}" >"${TMP}/con-second.log" 2>&1; then
   fail "second concurrent apply unexpectedly succeeded"
 fi
 wait "${first_pid}" || { cat "${TMP}/con-first.log" >&2; fail "first concurrent apply"; }
+grep -q '^Apply lock release state: confirmed_absent$' "${TMP}/con-first.log" ||
+  fail "concurrent winner confirmed-absent state missing"
 put_locks="$(grep -c '^MUTATE ssm put-parameter' "${con_log}" || true)"
 claimed_locks="$(grep -c '^LOCK-CLAIMED$' "${con_log}" || true)"
 assert_eq "${put_locks}" 2 "both concurrent claimants reached the conditional SSM API"
@@ -624,7 +638,7 @@ grep -q '^MUTATE ssm put-parameter$' "${drift_log}" || fail "post-lock drift did
 
 # Lock release is part of acceptance: every ambiguous read/delete/absence or
 # ownership change fails nonzero, suppresses success, and retains safety state.
-for release_case in get_failure ownership_change delete_failure verify_failure; do
+for release_case in get_failure ownership_change delete_failure verify_failure still_present; do
   release_state="${TMP}/release-${release_case}-state"
   release_plan="${TMP}/release-${release_case}-plan"
   release_log="${TMP}/release-${release_case}.log"
@@ -637,6 +651,7 @@ for release_case in get_failure ownership_change delete_failure verify_failure; 
     ownership_change) release_flag=(MOCK_RELEASE_OWNERSHIP_CHANGE=true) ;;
     delete_failure) release_flag=(MOCK_RELEASE_DELETE_FAILURE=true) ;;
     verify_failure) release_flag=(MOCK_RELEASE_VERIFY_FAILURE=true) ;;
+    still_present) release_flag=(MOCK_RELEASE_STILL_PRESENT=true) ;;
   esac
   if env PATH="${MOCK_BIN}:${PATH}" MOCK_AWS_STATE="${release_state}" MOCK_AWS_LOG="${release_log}" \
     "${release_flag[@]}" AWS_BIN=aws AWS_REGION=us-west-1 PLAN_ONLY=false \
@@ -671,6 +686,16 @@ for release_case in get_failure ownership_change delete_failure verify_failure; 
         "${TMP}/release-${release_case}-output.log" || fail "verification failure misstated existence"
       grep -q 'accept only ParameterNotFound as cleared' \
         "${TMP}/release-${release_case}-output.log" || fail "verification failure omitted exact read gate"
+      ;;
+    still_present)
+      grep -q 'Release state: delete_accepted_still_present' \
+        "${TMP}/release-${release_case}-output.log" || fail "surviving lock omitted still-present state"
+      grep -q 'an exact read proved the parameter still exists' \
+        "${TMP}/release-${release_case}-output.log" || fail "surviving lock omitted exact existence proof"
+      grep -q 'review the current Parameter.Value and rollback bundle' \
+        "${TMP}/release-${release_case}-output.log" || fail "surviving lock omitted recovery gate"
+      cmp -s "${release_state}/lock" "${release_state}/lock-claimed" ||
+        fail "surviving lock did not retain the exact originally claimed value"
       ;;
   esac
 done
