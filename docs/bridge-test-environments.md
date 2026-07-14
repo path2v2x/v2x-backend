@@ -45,7 +45,7 @@ with `-S`, preventing `site`, `.pth`, `sitecustomize`, and `usercustomize`
 startup execution; each lane receives only its hard-bound package roots.
 
 The tracked adversarial check combines hostile `--collect-only`, `--ignore`,
-and `-k` values and requires the complete 620-test and 97-test lane totals:
+and `-k` values and requires the complete 690-test and 97-test lane totals:
 
 ```bash
 scripts/tests/test-v2x-bridge-runner.sh
