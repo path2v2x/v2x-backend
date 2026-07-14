@@ -16,10 +16,11 @@ to a content-addressed staged input before inference.  Original file identity
 and hashes are checked again before publication; the staged copies are also
 rehash-verified so a published proposal is self-contained and reproducible.
 
-SIGINT and SIGTERM remove only this invocation's exact staging directory.
-SIGKILL cannot be handled and can leave that directory behind.  Later runs do
-not sweep similarly named directories: an operator must prove the owning
-process is gone and the final output is absent before removing an orphan.
+SIGINT and SIGTERM atomically move only this invocation's exact staging inode
+out of the active staging namespace into a private quarantine.  SIGKILL cannot
+be handled and can leave the active directory behind.  Later runs do not sweep
+either kind of directory: an operator must prove the owning process is gone
+and the final output is absent before removing an orphan or quarantine.
 """
 
 import argparse
@@ -37,7 +38,6 @@ import signal
 import shutil
 import stat
 import sys
-import tempfile
 import uuid
 
 import cv2
@@ -285,6 +285,79 @@ def fsync_directory_tree(root):
         fsync_directory(directory)
 
 
+def quarantine_owned_staging(parent_fd, staged_name, owned_identity):
+    """Move the exact owned stage out of its active name without deleting races."""
+    names = [staged_name]
+    try:
+        names.extend(name for name in os.listdir(parent_fd) if name != staged_name)
+    except OSError as exc:
+        raise DenseTrackError("owned staging directory cannot be enumerated") from exc
+    seen = set()
+    for name in names:
+        if (
+            name in seen
+            or not isinstance(name, str)
+            or "/" in name
+            or name in {"", ".", ".."}
+        ):
+            continue
+        seen.add(name)
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise DenseTrackError("owned staging candidate cannot be inspected") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != owned_identity
+        ):
+            continue
+        for _attempt in range(100):
+            output_stem = staged_name.split(".tmp-", 1)[0].lstrip(".")
+            quarantine_name = (
+                f".{output_stem}.staging-quarantine-{uuid.uuid4().hex}"
+            )
+            try:
+                rename_noreplace_at(parent_fd, name, quarantine_name)
+                break
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                quarantine_name = None
+                break
+        else:
+            raise DenseTrackError("staging quarantine name space is exhausted")
+        if quarantine_name is None:
+            continue
+        quarantined = os.stat(
+            quarantine_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (quarantined.st_dev, quarantined.st_ino) != owned_identity:
+            # A foreign replacement won between inspection and rename.  Put it
+            # back without replacement when possible; otherwise preserve it in
+            # quarantine.  Never delete either foreign path.
+            try:
+                rename_noreplace_at(parent_fd, quarantine_name, name)
+            except FileExistsError:
+                pass
+            continue
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        quarantine_fd = os.open(quarantine_name, flags, dir_fd=parent_fd)
+        try:
+            pinned = os.fstat(quarantine_fd)
+            if (pinned.st_dev, pinned.st_ino) != owned_identity:
+                raise DenseTrackError("owned staging quarantine was replaced")
+            os.fchmod(quarantine_fd, stat.S_IRWXU)
+            os.fsync(quarantine_fd)
+        finally:
+            os.close(quarantine_fd)
+        os.fsync(parent_fd)
+        return quarantine_name
+    return None
+
+
 @contextmanager
 def invocation_staging_directory(output):
     """Yield one owned staging directory with scoped, cleanup-safe signals."""
@@ -296,6 +369,10 @@ def invocation_staging_directory(output):
     previous_handlers = {}
     staged = None
     marker = None
+    parent_fd = None
+    staged_fd = None
+    owned_identity = None
+    body_completed = False
     state = {"cleanup_started": False, "received": None}
 
     def interrupt(signum, _frame):
@@ -318,9 +395,30 @@ def invocation_staging_directory(output):
             raise DenseTrackError(
                 "scoped staging signal handlers require the Python main thread"
             ) from exc
-        staged = Path(tempfile.mkdtemp(
-            prefix=f".{output.name}.tmp-", dir=output.parent
-        ))
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(output.parent, directory_flags)
+        for _attempt in range(100):
+            staged_name = f".{output.name}.tmp-{uuid.uuid4().hex}"
+            try:
+                os.mkdir(staged_name, mode=0o700, dir_fd=parent_fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise DenseTrackError("staging directory name space is exhausted")
+        staged = output.parent / staged_name
+        before_open = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
+        staged_fd = os.open(staged_name, directory_flags, dir_fd=parent_fd)
+        staged_metadata = os.fstat(staged_fd)
+        owned_identity = (staged_metadata.st_dev, staged_metadata.st_ino)
+        after_open = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(before_open.st_mode)
+            or stable_file_fields(before_open) != stable_file_fields(staged_metadata)
+            or stable_file_fields(before_open) != stable_file_fields(after_open)
+        ):
+            raise DenseTrackError("owned staging directory changed while it was pinned")
         marker = staged / STAGING_OWNER_MARKER
         write_text_exclusive(
             marker,
@@ -338,23 +436,44 @@ def invocation_staging_directory(output):
         # The try/finally is active before pending signals are deliverable.
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         yield staged, marker
+        body_completed = True
     finally:
         state["cleanup_started"] = True
         signal.pthread_sigmask(signal.SIG_BLOCK, handled)
-        if staged is not None and staged.exists():
+        if staged is not None and parent_fd is not None and owned_identity is not None:
             try:
-                # Never search for or sweep other similarly named directories.
-                shutil.rmtree(staged)
-            except OSError as exc:
+                try:
+                    active = os.stat(
+                        staged.name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    active = None
+                active_is_owned = active is not None and (
+                    active.st_dev, active.st_ino
+                ) == owned_identity
+                active_is_foreign = active is not None and not active_is_owned
+                if active_is_owned or active_is_foreign or not body_completed:
+                    quarantined = quarantine_owned_staging(
+                        parent_fd, staged.name, owned_identity
+                    )
+                    if quarantined is None and (active_is_owned or not body_completed):
+                        raise DenseTrackError(
+                            "owned staging directory could not be quarantined"
+                        )
+            except (OSError, DenseTrackError) as exc:
                 cleanup_error = exc
         try:
             for handled_signal, previous_handler in previous_handlers.items():
                 signal.signal(handled_signal, previous_handler)
         finally:
+            if staged_fd is not None:
+                os.close(staged_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         if cleanup_error is not None:
             raise DenseTrackError(
-                f"failed to remove invocation staging directory {staged}"
+                f"failed to quarantine invocation staging directory {staged}"
             ) from cleanup_error
 
 

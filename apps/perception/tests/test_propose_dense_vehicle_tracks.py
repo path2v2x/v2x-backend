@@ -981,7 +981,7 @@ def test_parent_fsync_failure_quarantines_unverified_publication(tmp_path, monke
             output, model_factory=lambda _path: Model(), image_size=1280,
         )
     assert not output.exists()
-    quarantines = list(tmp_path.glob(f".{output.name}.failed-*"))
+    quarantines = list(tmp_path.glob(f".{output.name}.staging-quarantine-*"))
     assert len(quarantines) == 1
     assert quarantines[0].stat().st_mode & 0o077 == 0
     assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
@@ -1027,9 +1027,34 @@ def test_cleanup_swap_preserves_and_restores_foreign_output(tmp_path, monkeypatc
         )
     assert cleanup_swap_done is True
     assert (output / "foreign.txt").read_text() == "foreign-owner\n"
-    assert detached_owned.is_dir()
+    assert not detached_owned.exists()
     assert list(tmp_path.glob(f".{output.name}.failed-*")) == []
+    assert len(list(tmp_path.glob(f".{output.name}.staging-quarantine-*"))) == 1
     assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
+def test_staging_context_preserves_foreign_replacement_and_quarantines_owned_stage(
+    tmp_path,
+):
+    output = tmp_path / "output"
+    owned_aside = tmp_path / "owned-stage-moved-aside"
+    staged_path = None
+
+    with pytest.raises(tracks.DenseTrackError, match="injected body failure"):
+        with tracks.invocation_staging_directory(output) as (staged, _marker):
+            staged_path = staged
+            staged.rename(owned_aside)
+            staged.mkdir()
+            (staged / "foreign.txt").write_text("foreign-owner\n")
+            raise tracks.DenseTrackError("injected body failure")
+
+    assert staged_path is not None
+    assert (staged_path / "foreign.txt").read_text() == "foreign-owner\n"
+    assert not owned_aside.exists()
+    quarantines = list(tmp_path.glob(".*.staging-quarantine-*"))
+    assert len(quarantines) == 1
+    owner = json.loads((quarantines[0] / tracks.STAGING_OWNER_MARKER).read_text())
+    assert owner["staging_directory"] == str(staged_path.resolve())
 
 
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
