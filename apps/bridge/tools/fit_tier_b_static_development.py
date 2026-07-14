@@ -57,6 +57,8 @@ CONDITION_MAX = 1e8
 MIN_MULTISTARTS = 8
 JACOBIAN_STEP = 1e-5
 EPOCH_STABILITY_MAX_SPAN_Z = 0.25
+SPLIT_NEAR_DUPLICATE_IMAGE_PX = 0.05
+SPLIT_NEAR_DUPLICATE_DIRECTION_RAD = 1e-6
 
 
 class DevelopmentFitError(ValueError):
@@ -434,10 +436,38 @@ def _polylines_overlap(left: np.ndarray, right: np.ndarray, threshold: float = 0
 
 
 def _polylines_adjacent(left: np.ndarray, right: np.ndarray, threshold: float = 0.05) -> bool:
-    """Reject split boundaries made by cutting one physical polyline at an endpoint."""
+    """Reject any split contact, including endpoint-to-interior and segment crossings."""
     left = np.asarray(left, dtype=float)
     right = np.asarray(right, dtype=float)
-    return bool(np.min(np.linalg.norm(left[[0, -1], None] - right[None, [0, -1]], axis=2)) < threshold)
+    return any(
+        _segment_segment_distance(left[index], left[index + 1], right[other], right[other + 1])
+        < threshold
+        for index in range(len(left) - 1) for other in range(len(right) - 1)
+    )
+
+
+def _segment_segment_distance(p0: np.ndarray, p1: np.ndarray,
+                              q0: np.ndarray, q1: np.ndarray) -> float:
+    """Exact minimum Euclidean distance between two finite nondegenerate 3-D segments."""
+    u, v = p1 - p0, q1 - q0
+    w = p0 - q0
+    a, b, c = float(u @ u), float(u @ v), float(v @ v)
+    d, e = float(u @ w), float(v @ w)
+    if a <= 1e-18 or c <= 1e-18:
+        raise DevelopmentFitError("world polyline contains a degenerate segment")
+    candidates = [
+        (0.0, float(np.clip(e / c, 0.0, 1.0))),
+        (1.0, float(np.clip((e + b) / c, 0.0, 1.0))),
+        (float(np.clip(-d / a, 0.0, 1.0)), 0.0),
+        (float(np.clip((b - d) / a, 0.0, 1.0)), 1.0),
+    ]
+    determinant = a * c - b * b
+    if determinant > 1e-18:
+        s = (b * e - c * d) / determinant
+        t = (a * e - b * d) / determinant
+        if 0.0 <= s <= 1.0 and 0.0 <= t <= 1.0:
+            candidates.append((s, t))
+    return min(float(np.linalg.norm(w + s * u - t * v)) for s, t in candidates)
 
 
 def _canonical_direction(value: np.ndarray) -> np.ndarray:
@@ -447,23 +477,57 @@ def _canonical_direction(value: np.ndarray) -> np.ndarray:
     return value if first > 0 else -value
 
 
+def _reference_line(line: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Transform a native-image homogeneous line onto the 1280x960 gauge."""
+    result = np.asarray((line[0] * width / 1280.0,
+                         line[1] * height / 960.0, line[2]), dtype=float)
+    result /= np.linalg.norm(result[:2])
+    if result[1] < 0 or (result[1] == 0 and result[0] < 0):
+        result = -result
+    return result
+
+
+def _reference_line_distance(left: tuple[str, dict], right: tuple[str, dict],
+                             cameras: dict) -> float:
+    left_camera, left_item = left
+    right_camera, right_item = right
+    first = _reference_line(left_item["real_line"], cameras[left_camera]["width"],
+                            cameras[left_camera]["height"])
+    second = _reference_line(right_item["real_line"], cameras[right_camera]["width"],
+                             cameras[right_camera]["height"])
+    residual = _horizon_residual(first, second, {"width": 1280, "height": 960})
+    return float(np.max(np.abs(residual)))
+
+
+def _direction_angle(left: np.ndarray, right: np.ndarray) -> float:
+    first = _canonical_direction(left)
+    second = _canonical_direction(right)
+    return float(math.acos(float(np.clip(np.dot(first, second), -1.0, 1.0))))
+
+
 def _validate_directional_split_isolation(cameras: dict) -> None:
     """Reject renamed directional/image-line copies across the frozen split."""
-    fit_horizons = [item for camera in cameras.values() for item in camera["horizons"]
-                    if item["split"] == "fit"]
-    dev_horizons = [item for camera in cameras.values() for item in camera["horizons"]
-                    if item["split"] == "development"]
-    if any(np.allclose(left["real_line"], right["real_line"], atol=1e-9, rtol=0)
+    fit_horizons = [(camera_id, item) for camera_id, camera in cameras.items()
+                    for item in camera["horizons"] if item["split"] == "fit"]
+    dev_horizons = [(camera_id, item) for camera_id, camera in cameras.items()
+                    for item in camera["horizons"] if item["split"] == "development"]
+    if any(_reference_line_distance(left, right, cameras)
+           <= SPLIT_NEAR_DUPLICATE_IMAGE_PX
            for left in fit_horizons for right in dev_horizons):
         raise DevelopmentFitError("horizon fingerprint crosses camera fit/development splits")
-    fit_vanishing = [item for camera in cameras.values() for item in camera["vanishing"]
-                     if item["split"] == "fit"]
-    dev_vanishing = [item for camera in cameras.values() for item in camera["vanishing"]
-                     if item["split"] == "development"]
-    if any(np.allclose(_canonical_direction(left["world_direction"]),
-                       _canonical_direction(right["world_direction"]), atol=1e-9, rtol=0)
-           and np.allclose(left["real_uv"], right["real_uv"], atol=1e-9, rtol=0)
-           for left in fit_vanishing for right in dev_vanishing):
+    fit_vanishing = [(camera_id, item) for camera_id, camera in cameras.items()
+                     for item in camera["vanishing"] if item["split"] == "fit"]
+    dev_vanishing = [(camera_id, item) for camera_id, camera in cameras.items()
+                     for item in camera["vanishing"] if item["split"] == "development"]
+    if any(
+        _direction_angle(left[1]["world_direction"], right[1]["world_direction"])
+        <= SPLIT_NEAR_DUPLICATE_DIRECTION_RAD
+        and np.linalg.norm(
+            left[1]["real_uv"] * _reference_scale(cameras[left[0]])
+            - right[1]["real_uv"] * _reference_scale(cameras[right[0]])
+        ) <= SPLIT_NEAR_DUPLICATE_IMAGE_PX
+        for left in fit_vanishing for right in dev_vanishing
+    ):
         raise DevelopmentFitError("vanishing fingerprint crosses camera fit/development splits")
 
 
@@ -958,6 +1022,11 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         "map": model["map"], "cameras_json": model["cameras_json"],
         "parameterization": {"per_camera": list(PARAMETER_NAMES), "dimension": 28,
                              "global_site_se2_parameter": False, "scales": SCALES.tolist()},
+        "split_isolation_thresholds": {
+            "reference_image_width": 1280, "reference_image_height": 960,
+            "near_duplicate_image_px": SPLIT_NEAR_DUPLICATE_IMAGE_PX,
+            "near_duplicate_direction_rad": SPLIT_NEAR_DUPLICATE_DIRECTION_RAD,
+        },
         "optimizer": {
             "seed": seed, "requested_multistarts": starts, "starts": len(seeds),
             "minimum_multistarts": MIN_MULTISTARTS, "initial_normalized_starts": [

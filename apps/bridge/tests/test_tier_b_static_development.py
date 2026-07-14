@@ -408,3 +408,83 @@ def test_directional_fingerprints_and_global_feature_clusters(tmp_path):
     ]
     with pytest.raises(fitter.DevelopmentFitError, match="polyline geometry crosses camera"):
         fitter.validate_document(document, digest)
+
+
+@pytest.mark.parametrize("offset,rejected", [(1e-8, True), (0.049, True), (0.051, False)])
+def test_horizon_near_duplicate_reference_pixel_boundary(tmp_path, offset, rejected):
+    document, _truths, digest = synthetic_document(tmp_path)
+    fit = next(item for item in document["cameras"]["ch1"]["horizons"]
+               if item["split"] == "fit")
+    development = next(item for item in document["cameras"]["ch2"]["horizons"]
+                       if item["split"] == "development")
+    development["real_line"] = copy.deepcopy(fit["real_line"])
+    development["real_line"][2] += offset
+    if rejected:
+        with pytest.raises(fitter.DevelopmentFitError, match="horizon fingerprint"):
+            fitter.validate_document(document, digest)
+    else:
+        fitter.validate_document(document, digest)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_global_polyline_endpoint_to_interior_contact_is_rejected(tmp_path, reverse):
+    document, _truths, digest = synthetic_document(tmp_path)
+    fit = next(item for item in document["cameras"]["ch1"]["polylines"]
+               if item["split"] == "fit")
+    development = next(item for item in document["cameras"]["ch2"]["polylines"]
+                       if item["split"] == "development")
+    fit_vertices = np.asarray(fit["world_vertices"], dtype=float)
+    point = fit_vertices[-1]
+    tangent = fit_vertices[-1] - fit_vertices[-2]
+    perpendicular = np.cross(tangent, np.asarray((0.0, 0.0, 1.0)))
+    perpendicular /= np.linalg.norm(perpendicular)
+    if reverse:
+        fit["world_vertices"] = [
+            (point - perpendicular).tolist(), point.tolist(),
+            (point + perpendicular).tolist(),
+        ]
+        development["world_vertices"] = [
+            point.tolist(), (point + tangent).tolist(),
+            (point + 2 * tangent).tolist(),
+        ]
+    else:
+        development["world_vertices"] = [
+            (point - perpendicular).tolist(), point.tolist(),
+            (point + perpendicular).tolist(),
+        ]
+    with pytest.raises(fitter.DevelopmentFitError, match="adjacent polyline"):
+        fitter.validate_document(document, digest)
+
+
+def _rotate_direction(value, radians):
+    value = np.asarray(value, dtype=float)
+    value /= np.linalg.norm(value)
+    trial = np.asarray((0.0, 0.0, 1.0))
+    if abs(np.dot(value, trial)) > 0.9:
+        trial = np.asarray((0.0, 1.0, 0.0))
+    orthogonal = trial - np.dot(value, trial) * value
+    orthogonal /= np.linalg.norm(orthogonal)
+    return (math.cos(radians) * value + math.sin(radians) * orthogonal).tolist()
+
+
+@pytest.mark.parametrize(
+    "pixel_offset,angle_rad,rejected",
+    [(1e-8, 1e-8, True), (0.049, 0.9e-6, True),
+     (0.051, 0.9e-6, False), (0.049, 1.1e-6, False)],
+)
+def test_vanishing_near_duplicate_pixel_and_angular_boundaries(
+    tmp_path, pixel_offset, angle_rad, rejected
+):
+    document, _truths, digest = synthetic_document(tmp_path)
+    fit = next(item for item in document["cameras"]["ch1"]["vanishing"]
+               if item["split"] == "fit")
+    development = next(item for item in document["cameras"]["ch2"]["vanishing"]
+                       if item["split"] == "development")
+    development["world_direction"] = _rotate_direction(fit["world_direction"], angle_rad)
+    development["real_uv"] = copy.deepcopy(fit["real_uv"])
+    development["real_uv"][0] += pixel_offset
+    if rejected:
+        with pytest.raises(fitter.DevelopmentFitError, match="vanishing fingerprint"):
+            fitter.validate_document(document, digest)
+    else:
+        fitter.validate_document(document, digest)
