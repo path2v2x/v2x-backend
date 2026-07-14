@@ -60,7 +60,7 @@ def synthetic_document(tmp_path: Path):
             for index in range(count):
                 name = f"{camera_id}-{split}-{index}"
                 frame = binding(tmp_path / f"{name}.bin", name.encode())
-                members = [hashlib.sha256(f"{name}-raw".encode()).hexdigest()]
+                members = [binding(tmp_path / f"{name}-raw.bin", f"{name}-raw".encode())]
                 epochs.append({"id": name, "split": split, "frame": frame,
                                "median_members": members})
         points, polylines, horizons, vanishing = [], [], [], []
@@ -102,6 +102,8 @@ def synthetic_document(tmp_path: Path):
                     "uncertainty_px": 1.0,
                 })
             horizon = ground_horizon_line(truth, width, height)
+            if split == "development":
+                horizon = horizon.copy(); horizon[2] += 0.25
             horizons.append({
                 "id": f"{camera_id}-{split}-horizon", "physical_feature_id": f"{camera_id}-{split}-horizon-feature",
                 "epoch_id": epoch_ids[0], "split": split,
@@ -111,6 +113,8 @@ def synthetic_document(tmp_path: Path):
             for index, local_direction in enumerate(((1.0, .3, .05), (1.0, -.25, .1))):
                 direction = rotation @ np.asarray(local_direction)
                 pixel = project_direction(direction, truth, width, height)
+                if split == "development":
+                    pixel = pixel + np.asarray((0.25, 0.0))
                 vanishing.append({
                     "id": f"{camera_id}-{split}-vanish-{index}",
                     "physical_feature_id": f"{camera_id}-{split}-vanish-feature-{index}",
@@ -148,13 +152,27 @@ def test_projection_and_production_pose_round_trip():
 def test_schema_and_synthetic_independent_translation_recovery(tmp_path):
     document, truths, digest = synthetic_document(tmp_path)
     model = fitter.validate_document(document, digest)
-    report = fitter.solve(model, starts=1, max_nfev=40)
+    report = fitter.solve(model, starts=8, max_nfev=40)
     assert report["parameterization"]["dimension"] == 28
     assert report["parameterization"]["global_site_se2_parameter"] is False
     assert report["data_jacobian"]["rank"] == 28
     assert report["data_jacobian"]["condition"] <= 1e8
     assert report["holdout_consumed"] is False
     assert report["release_eligible"] is False
+    assert report["basin_evidence_sufficient"] is True
+    assert report["epoch_stability"]["status"] == "PASS"
+    assert report["optimizer"]["max_nfev"] == 40
+    assert len(report["optimizer"]["initial_normalized_starts"]) == 9
+    assert set(report["runtime_identity"]) == {
+        "python", "implementation", "python_executable", "python_executable_sha256",
+        "platform", "numpy", "scipy"
+    }
+    assert report["reproducibility_complete"] is False
+    assert report["development_gate_passed"] is False
+    for epochs in report["input_bindings"]["epochs"].values():
+        for epoch in epochs.values():
+            assert epoch["median_members"]
+            assert set(epoch["median_members"][0]) == {"path", "sha256", "bytes"}
     for camera_id, truth in truths.items():
         fitted = np.asarray(list(report["cameras"][camera_id]["absolute_parameters"].values()))
         assert fitted == pytest.approx(truth, abs=2e-3)
@@ -275,6 +293,21 @@ def test_fov_bounds_intersect_physical_interval(tmp_path):
     lower, upper = fitter._normalized_bounds(model)
     assert 2.0 + lower[6] * fitter.SCALES[6] > 1.0
     assert 2.0 + upper[6] * fitter.SCALES[6] < 179.0
+    values, success, reason, iterations = fitter._refine(model, lower.copy(), lower, upper, 1)
+    assert np.isfinite(values).all()
+    assert isinstance(success, bool) and reason in {
+        "normalized_step_converged", "iteration_limit", "no_objective_progress",
+        "singular_normal_equations",
+    }
+    assert iterations == 1
+
+
+def test_multistart_minimum_is_mandatory(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    model = fitter.validate_document(document, digest)
+    for starts in (0, -1, 7):
+        with pytest.raises(fitter.DevelopmentFitError, match="at least 8"):
+            fitter.solve(model, starts=starts, max_nfev=1)
 
 
 def test_cross_camera_geometry_and_config_drift_are_rejected(tmp_path):
@@ -304,6 +337,61 @@ def test_cross_camera_cross_kind_and_polyline_containment_are_rejected(tmp_path)
     development_point["world_xyz"] = ((endpoints[0] + endpoints[1]) / 2.0).tolist()
     with pytest.raises(fitter.DevelopmentFitError, match="polyline geometry crosses camera"):
         fitter.validate_document(document, digest)
+
+    adjacent = tmp_path / "adjacent"
+    adjacent.mkdir()
+    document, _truths, digest = synthetic_document(adjacent)
+    fit_line = next(item for item in document["cameras"]["ch1"]["polylines"]
+                    if item["split"] == "fit")
+    development_line = next(item for item in document["cameras"]["ch2"]["polylines"]
+                            if item["split"] == "development")
+    vertices = np.asarray(fit_line["world_vertices"])
+    delta = vertices[-1] - vertices[-2]
+    development_line["world_vertices"] = [
+        vertices[-1].tolist(), (vertices[-1] + delta).tolist(),
+        (vertices[-1] + 2 * delta).tolist(),
+    ]
+    with pytest.raises(fitter.DevelopmentFitError, match="adjacent polyline"):
+        fitter.validate_document(document, digest)
+
+
+def test_directional_fingerprints_and_global_feature_clusters(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    fit_horizon = next(item for item in document["cameras"]["ch1"]["horizons"]
+                       if item["split"] == "fit")
+    development_horizon = next(item for item in document["cameras"]["ch2"]["horizons"]
+                               if item["split"] == "development")
+    development_horizon["real_line"] = copy.deepcopy(fit_horizon["real_line"])
+    with pytest.raises(fitter.DevelopmentFitError, match="horizon fingerprint"):
+        fitter.validate_document(document, digest)
+
+    direction_root = tmp_path / "direction"
+    direction_root.mkdir()
+    document, _truths, digest = synthetic_document(direction_root)
+    fit = next(item for item in document["cameras"]["ch1"]["vanishing"]
+               if item["split"] == "fit")
+    development = next(item for item in document["cameras"]["ch2"]["vanishing"]
+                       if item["split"] == "development")
+    development["world_direction"] = copy.deepcopy(fit["world_direction"])
+    development["real_uv"] = copy.deepcopy(fit["real_uv"])
+    with pytest.raises(fitter.DevelopmentFitError, match="vanishing fingerprint"):
+        fitter.validate_document(document, digest)
+
+    cluster_root = tmp_path / "cluster"
+    cluster_root.mkdir()
+    document, _truths, digest = synthetic_document(cluster_root)
+    model = fitter.validate_document(document, digest)
+    camera = model["cameras"]["ch1"]
+    point = next(item for item in camera["points"] if item["split"] == "fit")
+    line = next(item for item in camera["polylines"] if item["split"] == "fit")
+    line["physical_feature_id"] = point["physical_feature_id"]
+    _residual, weights = fitter.residual_vector(np.zeros(28), model, "fit", return_weights=True)
+    unique_features = {
+        item["physical_feature_id"] for value in model["cameras"].values()
+        for kind in ("points", "polylines", "horizons", "vanishing")
+        for item in value[kind] if item["split"] == "fit"
+    }
+    assert weights.sum() == pytest.approx(len(unique_features))
 
     contained = tmp_path / "contained"
     contained.mkdir()

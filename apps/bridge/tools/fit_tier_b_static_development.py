@@ -8,6 +8,7 @@ CARLA, rejects every holdout input, and can never emit a release decision.
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import hashlib
@@ -15,8 +16,12 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
+import sys
 import tempfile
 from typing import Iterable
+
+from importlib import metadata
 
 import numpy as np
 
@@ -34,8 +39,8 @@ from digital_twin_bridge.twin_camera_rig import (
 )
 
 
-SCHEMA = "v2x-tier-b-static-development-manifest/v1"
-OUTPUT_SCHEMA = "v2x-tier-b-static-development-fit/v1"
+SCHEMA = "v2x-tier-b-static-development-manifest/v2"
+OUTPUT_SCHEMA = "v2x-tier-b-static-development-fit/v2"
 CAMERAS = ("ch1", "ch2", "ch3", "ch4")
 SPLITS = ("fit", "development")
 CLASSES = ("road_edge", "lane_paint", "crosswalk_paint")
@@ -49,6 +54,9 @@ BASIN_NEIGHBORHOOD_Z = np.full(28, 0.25)
 POINT_GATES = {"rmse_px": 10.0, "p95_px": 16.0, "max_px": 24.0}
 ROAD_GATES = {"rmse_px": 6.0, "max_px": 12.0}
 CONDITION_MAX = 1e8
+MIN_MULTISTARTS = 8
+JACOBIAN_STEP = 1e-5
+EPOCH_STABILITY_MAX_SPAN_Z = 0.25
 
 
 class DevelopmentFitError(ValueError):
@@ -246,18 +254,27 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
             if not isinstance(epoch_id, str) or not epoch_id or epoch_id in epochs or split not in SPLITS:
                 raise DevelopmentFitError(f"{camera_id} epoch ID or split is invalid")
             frame = _binding(epoch["frame"], f"{camera_id} {epoch_id} frame", roots)
-            members = epoch["median_members"]
-            if not isinstance(members, list) or not members or any(
-                not isinstance(item, str) or len(item) != 64 for item in members
-            ):
+            members_value = epoch["median_members"]
+            if not isinstance(members_value, list) or not members_value:
                 raise DevelopmentFitError(f"{camera_id} temporal median members are invalid")
-            hashes = {frame["sha256"], *members}
+            members = [
+                _binding(item, f"{camera_id} {epoch_id} median member {index}", roots)
+                for index, item in enumerate(members_value)
+            ]
+            member_hashes = [item["sha256"] for item in members]
+            if len(set(member_hashes)) != len(member_hashes):
+                raise DevelopmentFitError(f"{camera_id} temporal median members are duplicated")
+            hashes = {frame["sha256"], *member_hashes}
             if raw_hashes_by_split[split] & hashes:
                 raise DevelopmentFitError(f"{camera_id} duplicates a frame within {split}")
             raw_hashes_by_split[split].update(hashes)
             for digest in hashes:
                 global_frame_splits[digest].add(split)
-            epochs[epoch_id] = {"split": split, "frame": frame, "median_members": sorted(members)}
+            epochs[epoch_id] = {
+                "split": split,
+                "frame": frame,
+                "median_members": sorted(members, key=lambda item: (item["sha256"], item["path"])),
+            }
         if raw_hashes_by_split["fit"] & raw_hashes_by_split["development"]:
             raise DevelopmentFitError(f"{camera_id} temporal median crosses splits")
         seen_ids: set[str] = set()
@@ -337,6 +354,7 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
     if any(len(splits) != 1 for splits in global_frame_splits.values()):
         raise DevelopmentFitError("raw frame hashes cross fit/development splits")
     _validate_geometry_split_isolation(cameras)
+    _validate_directional_split_isolation(cameras)
     return {
         "manifest_sha256": manifest_sha256,
         "map": {"candidate_id": map_value["candidate_id"], "opendrive": artifacts["opendrive"],
@@ -382,6 +400,9 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
     if any(_polylines_overlap(left["world_vertices"], right["world_vertices"])
            for _left_camera, left in fit_lines for _right_camera, right in dev_lines):
         raise DevelopmentFitError("polyline geometry crosses camera fit/development splits")
+    if any(_polylines_adjacent(left["world_vertices"], right["world_vertices"])
+           for _left_camera, left in fit_lines for _right_camera, right in dev_lines):
+        raise DevelopmentFitError("adjacent polyline geometry crosses camera fit/development splits")
     if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
            for _camera, point in dev_points for _line_camera, line in fit_lines):
         raise DevelopmentFitError("fit polyline geometry crosses camera into a development point")
@@ -410,6 +431,40 @@ def _polylines_overlap(left: np.ndarray, right: np.ndarray, threshold: float = 0
     left_to_right = max(_point_polyline_distance(point, right) for point in left_samples)
     right_to_left = max(_point_polyline_distance(point, left) for point in right_samples)
     return left_to_right < threshold or right_to_left < threshold
+
+
+def _polylines_adjacent(left: np.ndarray, right: np.ndarray, threshold: float = 0.05) -> bool:
+    """Reject split boundaries made by cutting one physical polyline at an endpoint."""
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    return bool(np.min(np.linalg.norm(left[[0, -1], None] - right[None, [0, -1]], axis=2)) < threshold)
+
+
+def _canonical_direction(value: np.ndarray) -> np.ndarray:
+    value = np.asarray(value, dtype=float)
+    value = value / np.linalg.norm(value)
+    first = next((item for item in value if abs(item) > 1e-12), 1.0)
+    return value if first > 0 else -value
+
+
+def _validate_directional_split_isolation(cameras: dict) -> None:
+    """Reject renamed directional/image-line copies across the frozen split."""
+    fit_horizons = [item for camera in cameras.values() for item in camera["horizons"]
+                    if item["split"] == "fit"]
+    dev_horizons = [item for camera in cameras.values() for item in camera["horizons"]
+                    if item["split"] == "development"]
+    if any(np.allclose(left["real_line"], right["real_line"], atol=1e-9, rtol=0)
+           for left in fit_horizons for right in dev_horizons):
+        raise DevelopmentFitError("horizon fingerprint crosses camera fit/development splits")
+    fit_vanishing = [item for camera in cameras.values() for item in camera["vanishing"]
+                     if item["split"] == "fit"]
+    dev_vanishing = [item for camera in cameras.values() for item in camera["vanishing"]
+                     if item["split"] == "development"]
+    if any(np.allclose(_canonical_direction(left["world_direction"]),
+                       _canonical_direction(right["world_direction"]), atol=1e-9, rtol=0)
+           and np.allclose(left["real_uv"], right["real_uv"], atol=1e-9, rtol=0)
+           for left in fit_vanishing for right in dev_vanishing):
+        raise DevelopmentFitError("vanishing fingerprint crosses camera fit/development splits")
 
 
 def _resample_world_polyline(vertices: np.ndarray, count: int = 16) -> np.ndarray:
@@ -529,7 +584,7 @@ def residual_vector(parameters_z: np.ndarray, model: dict, split: str, *, return
         for kind in ("points", "polylines", "horizons", "vanishing"):
             for item in camera[kind]:
                 if item["split"] == split:
-                    cluster_counts[(camera_id, kind, item["physical_feature_id"])] += 1
+                    cluster_counts[item["physical_feature_id"]] += 1
     for camera_id in CAMERAS:
         camera, params = model["cameras"][camera_id], absolute[camera_id]
         scale = _reference_scale(camera)
@@ -541,7 +596,7 @@ def residual_vector(parameters_z: np.ndarray, model: dict, split: str, *, return
                     predicted, depth = project_world(item["world_xyz"][None, :], params, camera["width"], camera["height"])
                     residual = (predicted[0] - item["real_uv"]) * scale / item["uncertainty_px"]
                     if depth[0] <= 0.1 or not np.isfinite(residual).all():
-                        residual = np.full(2, 100.0)
+                        residual = np.full(2, 100.0 / item["uncertainty_px"])
                 elif kind == "polylines":
                     residual = _polyline_residual(item, params, camera)
                 elif kind == "horizons":
@@ -551,8 +606,8 @@ def residual_vector(parameters_z: np.ndarray, model: dict, split: str, *, return
                     predicted = project_direction(item["world_direction"], params, camera["width"], camera["height"])
                     residual = (predicted - item["real_uv"]) * scale / item["uncertainty_px"]
                     if not np.isfinite(residual).all():
-                        residual = np.full(2, 100.0)
-                count = cluster_counts[(camera_id, kind, item["physical_feature_id"])]
+                        residual = np.full(2, 100.0 / item["uncertainty_px"])
+                count = cluster_counts[item["physical_feature_id"]]
                 values.extend(residual.tolist())
                 cluster_weights.extend([1.0 / (count * max(1, len(residual)))] * len(residual))
     raw = np.asarray(values, dtype=float)
@@ -562,14 +617,27 @@ def residual_vector(parameters_z: np.ndarray, model: dict, split: str, *, return
     return raw * np.sqrt(weights)
 
 
-def _jacobian(function, values: np.ndarray, step=1e-5) -> np.ndarray:
+def _jacobian(function, values: np.ndarray, step=JACOBIAN_STEP,
+              lower: np.ndarray | None = None,
+              upper: np.ndarray | None = None) -> np.ndarray:
     base = function(values)
     result = np.empty((len(base), len(values)))
     for index in range(len(values)):
-        left, right = values.copy(), values.copy()
-        left[index] -= step
-        right[index] += step
-        result[:, index] = (function(right) - function(left)) / (2 * step)
+        can_left = lower is None or values[index] - step >= lower[index]
+        can_right = upper is None or values[index] + step <= upper[index]
+        if can_left and can_right:
+            left, right = values.copy(), values.copy()
+            left[index] -= step
+            right[index] += step
+            result[:, index] = (function(right) - function(left)) / (2 * step)
+        elif can_right:
+            right = values.copy(); right[index] += step
+            result[:, index] = (function(right) - base) / step
+        elif can_left:
+            left = values.copy(); left[index] -= step
+            result[:, index] = (base - function(left)) / step
+        else:
+            raise DevelopmentFitError(f"parameter {index} has no finite-difference interval")
     return result
 
 
@@ -695,7 +763,8 @@ def _refine(model: dict, start: np.ndarray, lower: np.ndarray, upper: np.ndarray
     for _iteration in range(max_iterations):
         residual, cluster = residual_vector(values, model, "fit", return_weights=True)
         jacobian = _jacobian(
-            lambda z: residual_vector(z, model, "fit", return_weights=True)[0], values
+            lambda z: residual_vector(z, model, "fit", return_weights=True)[0], values,
+            lower=lower, upper=upper,
         )
         robust = np.minimum(1.0, 1.0 / np.maximum(np.abs(residual), 1e-12))
         weights = cluster * robust
@@ -746,7 +815,88 @@ def _normalized_bounds(model: dict) -> tuple[np.ndarray, np.ndarray]:
     return lower, upper
 
 
+def _epoch_row_pass(row: dict) -> bool:
+    def point_pass(value):
+        return (value["rmse_px"] <= POINT_GATES["rmse_px"]
+                and value["p95_px"] <= POINT_GATES["p95_px"]
+                and value["max_px"] <= POINT_GATES["max_px"])
+    def road_pass(value):
+        return (value["rmse_px"] <= ROAD_GATES["rmse_px"]
+                and value["max_px"] <= ROAD_GATES["max_px"])
+    return ("points" in row and "roads" in row and point_pass(row["points"])
+            and road_pass(row["roads"])
+            and all(point_pass(value) for key, value in row.items()
+                    if key in {"horizons", "vanishing"}))
+
+
+def _epoch_stability(model: dict, best_z: np.ndarray, lower: np.ndarray,
+                     upper: np.ndarray, max_nfev: int) -> dict:
+    """Leave out each fit epoch and require stable, predictive refits."""
+    rows = []
+    estimates = {camera_id: [] for camera_id in CAMERAS}
+    for camera_index, camera_id in enumerate(CAMERAS):
+        fit_epochs = sorted(
+            epoch_id for epoch_id, epoch in model["cameras"][camera_id]["epochs"].items()
+            if epoch["split"] == "fit"
+        )
+        if len(fit_epochs) < 3:
+            return {"status": "INSUFFICIENT", "passed": False,
+                    "reason": f"{camera_id} has fewer than three fit epochs", "refits": rows}
+        for epoch_id in fit_epochs:
+            reduced = copy.deepcopy(model)
+            camera = reduced["cameras"][camera_id]
+            for kind in ("points", "polylines", "horizons", "vanishing"):
+                camera[kind] = [item for item in camera[kind]
+                                if not (item["split"] == "fit" and item["epoch_id"] == epoch_id)]
+            values, success, reason, iterations = _refine(
+                reduced, best_z, lower, upper, max_nfev
+            )
+            omitted = _errors(model, values, "fit")[camera_id]["epochs"].get(epoch_id, {})
+            predictive_passed = _epoch_row_pass(omitted)
+            estimates[camera_id].append(values[camera_index * 7:(camera_index + 1) * 7].copy())
+            rows.append({
+                "camera_id": camera_id, "omitted_epoch_id": epoch_id,
+                "success": success, "convergence_reason": reason,
+                "iterations": iterations, "predictive_gate_passed": predictive_passed,
+                "normalized_parameters": values.tolist(),
+            })
+    intervals = {}
+    stable = all(row["success"] and row["predictive_gate_passed"] for row in rows)
+    for camera_index, camera_id in enumerate(CAMERAS):
+        values = np.asarray(estimates[camera_id])
+        low = np.quantile(values, 0.025, axis=0)
+        high = np.quantile(values, 0.975, axis=0)
+        full = best_z[camera_index * 7:(camera_index + 1) * 7]
+        span = high - low
+        contains = bool(np.all(full >= low - 1e-8) and np.all(full <= high + 1e-8))
+        span_passed = bool(np.all(span <= EPOCH_STABILITY_MAX_SPAN_Z))
+        stable = stable and contains and span_passed
+        intervals[camera_id] = {
+            "parameter_names": list(PARAMETER_NAMES),
+            "normalized_p2_5": low.tolist(), "normalized_p97_5": high.tolist(),
+            "normalized_span": span.tolist(),
+            "max_normalized_span": EPOCH_STABILITY_MAX_SPAN_Z,
+            "full_fit_inside_interval": contains, "span_gate_passed": span_passed,
+        }
+    return {"status": "PASS" if stable else "FAIL", "passed": bool(stable),
+            "method": "leave_one_fit_epoch_out_empirical_95_percent_interval",
+            "refits": rows, "intervals": intervals}
+
+
+def _package_version(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "not-installed"
+
+
 def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
+    if not isinstance(starts, int) or starts < MIN_MULTISTARTS:
+        raise DevelopmentFitError(
+            f"at least {MIN_MULTISTARTS} pre-registered multistarts plus the zero seed are required"
+        )
+    if not isinstance(max_nfev, int) or max_nfev < 1:
+        raise DevelopmentFitError("max_nfev must be a positive integer")
     lower, upper = _normalized_bounds(model)
     seeds = [np.zeros(28), *_low_discrepancy_starts(lower, upper, starts, seed)]
     candidates = []
@@ -764,7 +914,8 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         })
     candidates.sort(key=lambda item: item["fit_loss"])
     best = _select_fit_candidate(candidates)
-    jacobian = _jacobian(lambda z: residual_vector(z, model, "fit"), best["z"])
+    jacobian = _jacobian(lambda z: residual_vector(z, model, "fit"), best["z"],
+                         lower=lower, upper=upper)
     singular = np.linalg.svd(jacobian, compute_uv=False)
     tolerance = max(jacobian.shape) * np.finfo(float).eps * singular[0]
     rank = int(np.count_nonzero(singular > tolerance))
@@ -774,11 +925,15 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
     fit_metrics = _errors(model, best["z"], "fit")
     development_metrics = _errors(model, best["z"], "development")
     basin_failed = competing_basin(candidates)
+    basin_evidence_sufficient = len(candidates) >= MIN_MULTISTARTS + 1
     development_gate = all(item["gates_passed"] for item in development_metrics.values())
     fit_gate = all(item["gates_passed"] for item in fit_metrics.values())
+    epoch_stability = _epoch_stability(model, best["z"], lower, upper, max_nfev)
+    reproducibility_complete = isinstance(model.get("manifest"), dict)
     passed = (
         best["success"] and rank == 28 and condition <= CONDITION_MAX and not boundary_hits
-        and not basin_failed and fit_gate and development_gate
+        and basin_evidence_sufficient and not basin_failed and fit_gate and development_gate
+        and epoch_stability["passed"] and reproducibility_complete
     )
     absolute = _absolute(best["z"], model)
     cameras = {}
@@ -803,7 +958,37 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         "map": model["map"], "cameras_json": model["cameras_json"],
         "parameterization": {"per_camera": list(PARAMETER_NAMES), "dimension": 28,
                              "global_site_se2_parameter": False, "scales": SCALES.tolist()},
-        "optimizer": {"seed": seed, "starts": len(seeds), "loss": "huber", "f_scale": 1.0},
+        "optimizer": {
+            "seed": seed, "requested_multistarts": starts, "starts": len(seeds),
+            "minimum_multistarts": MIN_MULTISTARTS, "initial_normalized_starts": [
+                np.asarray(item).tolist() for item in seeds
+            ],
+            "max_nfev": max_nfev, "loss": "clustered_huber", "f_scale": 1.0,
+            "finite_difference_step": JACOBIAN_STEP,
+            "finite_difference_method": "bound_aware_central_or_one_sided",
+        },
+        "runtime_identity": {
+            "python": sys.version, "implementation": platform.python_implementation(),
+            "python_executable": sys.executable,
+            "python_executable_sha256": _sha256(Path(sys.executable).resolve()),
+            "platform": platform.platform(), "numpy": np.__version__,
+            "scipy": _package_version("scipy"),
+        },
+        "input_bindings": {
+            "manifest": model.get("manifest"),
+            "map": model["map"], "cameras_json": model["cameras_json"],
+            "epochs": {
+                camera_id: {
+                    epoch_id: {
+                        "split": epoch["split"], "frame": epoch["frame"],
+                        "median_members": epoch["median_members"],
+                    }
+                    for epoch_id, epoch in sorted(model["cameras"][camera_id]["epochs"].items())
+                }
+                for camera_id in CAMERAS
+            },
+        },
+        "reproducibility_complete": reproducibility_complete,
         "code_identity": {
             "fitter_sha256": _sha256(Path(__file__).resolve()),
             "projection_sha256": _sha256(Path(project_world.__code__.co_filename).resolve()),
@@ -812,6 +997,8 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         "data_jacobian": {"rank": rank, "required_rank": 28, "condition": condition,
                           "condition_max": CONDITION_MAX, "singular_values": singular.tolist()},
         "boundary_hits": boundary_hits, "competing_basin": basin_failed,
+        "basin_evidence_sufficient": basin_evidence_sufficient,
+        "epoch_stability": epoch_stability,
         "development_gate_passed": passed,
         "candidate_losses": [{key: (value.tolist() if key == "z" else value) for key, value in item.items()} for item in candidates],
         "cameras": cameras,
@@ -829,11 +1016,17 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, default=20260714)
     parser.add_argument("--starts", type=int, default=8)
     args = parser.parse_args(argv)
+    if args.starts < MIN_MULTISTARTS:
+        parser.error(f"--starts must be at least {MIN_MULTISTARTS}")
     roots = tuple(Path(value).resolve(strict=False) for value in (*DEFAULT_FORBIDDEN_ROOTS, *args.forbidden_root))
     manifest_path = _absolute_path(args.manifest, "manifest", roots)
     raw = manifest_path.read_bytes()
     document = json.loads(raw)
     model = validate_document(document, hashlib.sha256(raw).hexdigest(), args.forbidden_root)
+    model["manifest"] = {
+        "path": str(manifest_path), "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
     report = solve(model, seed=args.seed, starts=args.starts)
     output = _absolute_path(args.output, "output", roots)
     if output.exists():
