@@ -456,6 +456,46 @@ def test_global_polyline_endpoint_to_interior_contact_is_rejected(tmp_path, reve
         fitter.validate_document(document, digest)
 
 
+def test_segment_distance_interior_crossing_is_exact():
+    assert fitter._segment_segment_distance(
+        np.asarray((-8.0, 0.0, 0.0)), np.asarray((8.0, 0.0, 0.0)),
+        np.asarray((0.0, -8.0, 0.0)), np.asarray((0.0, 8.0, 0.0)),
+    ) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_global_polyline_interior_crossing_is_rejected(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    fit = next(item for item in document["cameras"]["ch1"]["polylines"]
+               if item["split"] == "fit")
+    development = next(item for item in document["cameras"]["ch2"]["polylines"]
+                       if item["split"] == "development")
+    vertices = np.asarray(fit["world_vertices"], dtype=float)
+    midpoint = (vertices[-2] + vertices[-1]) / 2.0
+    perpendicular = np.cross(vertices[-1] - vertices[-2], np.asarray((0.0, 0.0, 1.0)))
+    perpendicular /= np.linalg.norm(perpendicular)
+    development["world_vertices"] = [
+        (midpoint - 2.0 * perpendicular).tolist(),
+        (midpoint + 2.0 * perpendicular).tolist(),
+        (midpoint + 4.0 * perpendicular).tolist(),
+    ]
+    with pytest.raises(fitter.DevelopmentFitError, match="adjacent polyline"):
+        fitter.validate_document(document, digest)
+
+
+def test_out_of_frame_horizon_and_zero_vanishing_direction_are_rejected(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    document["cameras"]["ch1"]["horizons"][0]["real_line"] = [0.0, 1.0, 1.0]
+    with pytest.raises(fitter.DevelopmentFitError, match="horizon does not cross"):
+        fitter.validate_document(document, digest)
+
+    direction_root = tmp_path / "invalid-direction"
+    direction_root.mkdir()
+    document, _truths, digest = synthetic_document(direction_root)
+    document["cameras"]["ch1"]["vanishing"][0]["world_direction"] = [0.0, 0.0, 0.0]
+    with pytest.raises(fitter.DevelopmentFitError, match="vanishing direction is degenerate"):
+        fitter.validate_document(document, digest)
+
+
 def _rotate_direction(value, radians):
     value = np.asarray(value, dtype=float)
     value /= np.linalg.norm(value)

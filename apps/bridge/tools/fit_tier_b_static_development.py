@@ -59,6 +59,8 @@ JACOBIAN_STEP = 1e-5
 EPOCH_STABILITY_MAX_SPAN_Z = 0.25
 SPLIT_NEAR_DUPLICATE_IMAGE_PX = 0.05
 SPLIT_NEAR_DUPLICATE_DIRECTION_RAD = 1e-6
+SPLIT_POINT_WORLD_DISTANCE_M = 1e-6
+SPLIT_POLYLINE_WORLD_DISTANCE_M = 0.05
 
 
 class DevelopmentFitError(ValueError):
@@ -160,6 +162,23 @@ def _line(value: object, label: str) -> np.ndarray:
     if line[1] < 0 or (line[1] == 0 and line[0] < 0):
         line = -line
     return line
+
+
+def _line_image_points(line: np.ndarray, width: int, height: int) -> np.ndarray:
+    candidates = []
+    a, b, c = line
+    if abs(b) > 1e-12:
+        candidates.extend(((0.0, -c / b),
+                           (width - 1.0, -(a * (width - 1.0) + c) / b)))
+    if abs(a) > 1e-12:
+        candidates.extend(((-c / a, 0.0),
+                           (-(b * (height - 1.0) + c) / a, height - 1.0)))
+    valid = [item for item in candidates
+             if -1e-6 <= item[0] <= width - 1 + 1e-6
+             and -1e-6 <= item[1] <= height - 1 + 1e-6]
+    if len(valid) < 2:
+        return np.empty((0, 2))
+    return np.asarray(valid[:2], dtype=float)
 
 
 def validate_document(document: object, manifest_sha256: str, extra_forbidden=()) -> dict:
@@ -326,9 +345,12 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
             uncertainty = float(item.get("uncertainty_px", 0))
             if not math.isfinite(uncertainty) or uncertainty <= 0:
                 raise DevelopmentFitError(f"{camera_id} horizon uncertainty is invalid")
+            real_line = _line(item.get("real_line"), item_id)
+            if len(_line_image_points(real_line, width, height)) != 2:
+                raise DevelopmentFitError(f"{camera_id} horizon does not cross the native image")
             observations["horizons"].append({
                 "id": item_id, "physical_feature_id": feature_id, "epoch_id": item["epoch_id"],
-                "split": split, "real_line": _line(item.get("real_line"), item_id),
+                "split": split, "real_line": real_line,
                 "uncertainty_px": uncertainty,
             })
         for item in value.get("vanishing", []):
@@ -338,9 +360,12 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
             uncertainty = float(item.get("uncertainty_px", 0))
             if not math.isfinite(uncertainty) or uncertainty <= 0:
                 raise DevelopmentFitError(f"{camera_id} vanishing uncertainty is invalid")
+            world_direction = _finite_vector(item.get("world_direction"), 3, item_id)
+            if np.linalg.norm(world_direction) <= 1e-12:
+                raise DevelopmentFitError(f"{camera_id} vanishing direction is degenerate")
             observations["vanishing"].append({
                 "id": item_id, "physical_feature_id": feature_id, "epoch_id": item["epoch_id"],
-                "split": split, "world_direction": _finite_vector(item.get("world_direction"), 3, item_id),
+                "split": split, "world_direction": world_direction,
                 "real_uv": _pixel(item.get("real_uv"), width, height, item_id),
                 "uncertainty_px": uncertainty,
             })
@@ -371,7 +396,8 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
         fit_points = [item for item in camera["points"] if item["split"] == "fit"]
         dev_points = [item for item in camera["points"] if item["split"] == "development"]
         for left in fit_points:
-            if any(np.linalg.norm(left["world_xyz"] - right["world_xyz"]) < 1e-6
+            if any(np.linalg.norm(left["world_xyz"] - right["world_xyz"])
+                   < SPLIT_POINT_WORLD_DISTANCE_M
                    for right in dev_points):
                 raise DevelopmentFitError(f"{camera_id} copies a point across fit/development")
         fit_lines = [item for item in camera["polylines"] if item["split"] == "fit"]
@@ -381,11 +407,13 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
                 if _polylines_overlap(left["world_vertices"], right["world_vertices"]):
                     raise DevelopmentFitError(f"{camera_id} copies/resamples a polyline across fit/development")
         for point in dev_points:
-            if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+            if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"])
+                   < SPLIT_POLYLINE_WORLD_DISTANCE_M
                    for line in fit_lines):
                 raise DevelopmentFitError(f"{camera_id} reuses fit polyline geometry as a development point")
         for point in fit_points:
-            if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+            if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"])
+                   < SPLIT_POLYLINE_WORLD_DISTANCE_M
                    for line in dev_lines):
                 raise DevelopmentFitError(f"{camera_id} reuses fit point geometry as a development polyline")
     fit_points = [(camera_id, item) for camera_id, camera in cameras.items()
@@ -396,7 +424,8 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
                  for item in camera["polylines"] if item["split"] == "fit"]
     dev_lines = [(camera_id, item) for camera_id, camera in cameras.items()
                  for item in camera["polylines"] if item["split"] == "development"]
-    if any(np.linalg.norm(left[1]["world_xyz"] - right[1]["world_xyz"]) < 1e-6
+    if any(np.linalg.norm(left[1]["world_xyz"] - right[1]["world_xyz"])
+           < SPLIT_POINT_WORLD_DISTANCE_M
            for left in fit_points for right in dev_points):
         raise DevelopmentFitError("point geometry crosses camera fit/development splits")
     if any(_polylines_overlap(left["world_vertices"], right["world_vertices"])
@@ -405,10 +434,12 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
     if any(_polylines_adjacent(left["world_vertices"], right["world_vertices"])
            for _left_camera, left in fit_lines for _right_camera, right in dev_lines):
         raise DevelopmentFitError("adjacent polyline geometry crosses camera fit/development splits")
-    if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+    if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"])
+           < SPLIT_POLYLINE_WORLD_DISTANCE_M
            for _camera, point in dev_points for _line_camera, line in fit_lines):
         raise DevelopmentFitError("fit polyline geometry crosses camera into a development point")
-    if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+    if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"])
+           < SPLIT_POLYLINE_WORLD_DISTANCE_M
            for _camera, point in fit_points for _line_camera, line in dev_lines):
         raise DevelopmentFitError("fit point geometry crosses camera into a development polyline")
 
@@ -426,7 +457,8 @@ def _point_polyline_distance(point: np.ndarray, vertices: np.ndarray) -> float:
     return float(np.min(np.linalg.norm(closest - point, axis=1)))
 
 
-def _polylines_overlap(left: np.ndarray, right: np.ndarray, threshold: float = 0.05) -> bool:
+def _polylines_overlap(left: np.ndarray, right: np.ndarray,
+                       threshold: float = SPLIT_POLYLINE_WORLD_DISTANCE_M) -> bool:
     """Reject containment or copying in either directed polyline distance."""
     left_samples = _resample_world_polyline(left)
     right_samples = _resample_world_polyline(right)
@@ -435,7 +467,8 @@ def _polylines_overlap(left: np.ndarray, right: np.ndarray, threshold: float = 0
     return left_to_right < threshold or right_to_left < threshold
 
 
-def _polylines_adjacent(left: np.ndarray, right: np.ndarray, threshold: float = 0.05) -> bool:
+def _polylines_adjacent(left: np.ndarray, right: np.ndarray,
+                        threshold: float = SPLIT_POLYLINE_WORLD_DISTANCE_M) -> bool:
     """Reject any split contact, including endpoint-to-interior and segment crossings."""
     left = np.asarray(left, dtype=float)
     right = np.asarray(right, dtype=float)
@@ -593,19 +626,8 @@ def _reference_scale(camera: dict) -> np.ndarray:
 def _horizon_residual(predicted: np.ndarray, observed: np.ndarray, camera: dict) -> np.ndarray:
     """Symmetric homogeneous point-to-line distances without slope division."""
     width, height = camera["width"], camera["height"]
-    def points(line):
-        candidates = []
-        a, b, c = line
-        if abs(b) > 1e-12:
-            candidates.extend(((0.0, -c / b), (width - 1.0, -(a * (width - 1.0) + c) / b)))
-        if abs(a) > 1e-12:
-            candidates.extend(((-c / a, 0.0), (-(b * (height - 1.0) + c) / a, height - 1.0)))
-        valid = [item for item in candidates if -1e-6 <= item[0] <= width - 1 + 1e-6
-                 and -1e-6 <= item[1] <= height - 1 + 1e-6]
-        if len(valid) < 2:
-            return np.empty((0, 2))
-        return np.asarray(valid[:2], dtype=float)
-    predicted_points, observed_points = points(predicted), points(observed)
+    predicted_points = _line_image_points(predicted, width, height)
+    observed_points = _line_image_points(observed, width, height)
     if len(predicted_points) != 2 or len(observed_points) != 2:
         return np.full(4, 100.0)
     scale = _reference_scale(camera)
@@ -1026,6 +1048,8 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
             "reference_image_width": 1280, "reference_image_height": 960,
             "near_duplicate_image_px": SPLIT_NEAR_DUPLICATE_IMAGE_PX,
             "near_duplicate_direction_rad": SPLIT_NEAR_DUPLICATE_DIRECTION_RAD,
+            "point_world_distance_m": SPLIT_POINT_WORLD_DISTANCE_M,
+            "polyline_world_distance_m": SPLIT_POLYLINE_WORLD_DISTANCE_M,
         },
         "optimizer": {
             "seed": seed, "requested_multistarts": starts, "starts": len(seeds),
