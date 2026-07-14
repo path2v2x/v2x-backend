@@ -61,6 +61,7 @@ SPLIT_NEAR_DUPLICATE_IMAGE_PX = 0.05
 SPLIT_NEAR_DUPLICATE_DIRECTION_RAD = 1e-6
 SPLIT_POINT_WORLD_DISTANCE_M = 1e-6
 SPLIT_POLYLINE_WORLD_DISTANCE_M = 0.05
+MIN_HORIZON_CHORD_PX = 2.0
 
 
 class DevelopmentFitError(ValueError):
@@ -173,12 +174,27 @@ def _line_image_points(line: np.ndarray, width: int, height: int) -> np.ndarray:
     if abs(a) > 1e-12:
         candidates.extend(((-c / a, 0.0),
                            (-(b * (height - 1.0) + c) / a, height - 1.0)))
-    valid = [item for item in candidates
-             if -1e-6 <= item[0] <= width - 1 + 1e-6
-             and -1e-6 <= item[1] <= height - 1 + 1e-6]
+    valid = []
+    for item in candidates:
+        if (-1e-6 <= item[0] <= width - 1 + 1e-6
+                and -1e-6 <= item[1] <= height - 1 + 1e-6
+                and all(np.linalg.norm(np.asarray(item) - np.asarray(prior)) > 1e-6
+                        for prior in valid)):
+            valid.append(item)
     if len(valid) < 2:
         return np.empty((0, 2))
-    return np.asarray(valid[:2], dtype=float)
+    pairs = [
+        (float(np.linalg.norm(np.asarray(valid[left]) - np.asarray(valid[right]))),
+         valid[left], valid[right])
+        for left in range(len(valid)) for right in range(left + 1, len(valid))
+    ]
+    distance, first, second = max(pairs, key=lambda item: item[0])
+    midpoint = (np.asarray(first) + np.asarray(second)) / 2.0
+    if (distance < MIN_HORIZON_CHORD_PX
+            or not (1e-6 < midpoint[0] < width - 1 - 1e-6
+                    and 1e-6 < midpoint[1] < height - 1 - 1e-6)):
+        return np.empty((0, 2))
+    return np.asarray((first, second), dtype=float)
 
 
 def validate_document(document: object, manifest_sha256: str, extra_forbidden=()) -> dict:
@@ -1050,6 +1066,7 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
             "near_duplicate_direction_rad": SPLIT_NEAR_DUPLICATE_DIRECTION_RAD,
             "point_world_distance_m": SPLIT_POINT_WORLD_DISTANCE_M,
             "polyline_world_distance_m": SPLIT_POLYLINE_WORLD_DISTANCE_M,
+            "minimum_horizon_chord_px": MIN_HORIZON_CHORD_PX,
         },
         "optimizer": {
             "seed": seed, "requested_multistarts": starts, "starts": len(seeds),

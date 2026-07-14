@@ -496,6 +496,22 @@ def test_out_of_frame_horizon_and_zero_vanishing_direction_are_rejected(tmp_path
         fitter.validate_document(document, digest)
 
 
+@pytest.mark.parametrize("line", ([1.0, 1.0, 0.0], [1.0, 0.0, 0.0]))
+def test_corner_only_and_edge_coincident_horizons_are_rejected(tmp_path, line):
+    document, _truths, digest = synthetic_document(tmp_path)
+    document["cameras"]["ch1"]["horizons"][0]["real_line"] = list(line)
+    with pytest.raises(fitter.DevelopmentFitError, match="horizon does not cross"):
+        fitter.validate_document(document, digest)
+
+
+def test_line_image_points_are_distinct_and_cross_the_interior():
+    assert fitter._line_image_points(np.asarray((1.0, 1.0, 0.0)), 1280, 960).shape == (0, 2)
+    assert fitter._line_image_points(np.asarray((1.0, 0.0, 0.0)), 1280, 960).shape == (0, 2)
+    points = fitter._line_image_points(np.asarray((0.0, 1.0, -480.0)), 1280, 960)
+    assert points.shape == (2, 2)
+    assert np.linalg.norm(points[0] - points[1]) >= fitter.MIN_HORIZON_CHORD_PX
+
+
 def _rotate_direction(value, radians):
     value = np.asarray(value, dtype=float)
     value /= np.linalg.norm(value)
