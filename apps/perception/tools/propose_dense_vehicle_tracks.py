@@ -482,6 +482,11 @@ def invocation_staging_directory(output):
                 published_is_owned = published is not None and (
                     published.st_dev, published.st_ino
                 ) == owned_identity
+                if return_boundary_verified and not published_is_owned:
+                    return_boundary_verified = False
+                    return_boundary_error = DenseTrackError(
+                        "dense-track publication changed after return verification"
+                    )
                 if return_boundary_verified and published_is_owned:
                     # The body atomically published this exact pinned stage.
                     # A recreated temporary name is foreign and must survive;

@@ -1142,6 +1142,72 @@ def test_return_boundary_replacement_fails_preserves_foreign_and_quarantines_own
     assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
 
 
+@pytest.mark.parametrize("recreate_active_stage", [False, True])
+def test_swap_after_return_verify_before_output_stat_never_returns_foreign(
+    tmp_path, monkeypatch, recreate_active_stage
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    output = tmp_path / "output"
+    owned_moved = tmp_path / "owned-moved-after-return-verification"
+    original_publish = tracks.publish_staged_tree
+    original_verify = tracks.verify_published_tree
+    staged_path = None
+    verify_count = 0
+
+    def capture_staged_path(staged, destination):
+        nonlocal staged_path
+        staged_path = Path(staged)
+        return original_publish(staged, destination)
+
+    def swap_after_third_verify(root, contract):
+        nonlocal verify_count
+        result = original_verify(root, contract)
+        verify_count += 1
+        if verify_count == 3:
+            Path(root).rename(owned_moved)
+            Path(root).mkdir()
+            (Path(root) / "foreign-output.txt").write_text("foreign-output\n")
+            if recreate_active_stage:
+                assert staged_path is not None
+                staged_path.mkdir()
+                (staged_path / "foreign-stage.txt").write_text("foreign-stage\n")
+        return result
+
+    monkeypatch.setattr(tracks, "publish_staged_tree", capture_staged_path)
+    monkeypatch.setattr(tracks, "verify_published_tree", swap_after_third_verify)
+    with pytest.raises(
+        tracks.DenseTrackError, match="changed after return verification"
+    ):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
+        )
+
+    assert verify_count == 3
+    assert (output / "foreign-output.txt").read_text() == "foreign-output\n"
+    assert not owned_moved.exists()
+    quarantines = list(tmp_path.glob(f".{output.name}.staging-quarantine-*"))
+    assert len(quarantines) == 1
+    assert json.loads((quarantines[0] / "report.json").read_text())[
+        "acceptance_eligible"
+    ] is False
+    if recreate_active_stage:
+        assert staged_path is not None
+        assert (staged_path / "foreign-stage.txt").read_text() == "foreign-stage\n"
+    else:
+        assert staged_path is not None
+        assert not staged_path.exists()
+
+
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
 def test_subprocess_interrupt_removes_only_its_owned_staging_directory(
     tmp_path, termination_signal
