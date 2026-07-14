@@ -2169,10 +2169,70 @@ def _pdf_ascii_padding_only(content: bytes) -> bool:
             if value != ord("\t") and not 0x20 <= value <= 0x7E:
                 return False
             index += 1
+        if index == len(content):
+            return False
     return True
 
 
-def _validate_pdf_container_boundary(content: bytes, label: str) -> None:
+def _read_terminal_pdf_object(
+    content: bytes, reader, offset: int, label: str,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[object, int]:
+    """Parse one indirect object and return its trusted ``endobj`` boundary."""
+    from pypdf.generic import read_object
+
+    stream = io.BytesIO(content)
+    stream.seek(offset)
+    object_identity = reader.read_object_header(stream)
+    if expected_identity is not None and object_identity != expected_identity:
+        raise RegistrationError(
+            f"{label} terminal PDF object does not match its cross-reference entry"
+        )
+    parsed = read_object(stream, reader)
+
+    marker = stream.tell()
+    while marker < len(content) and content[marker] in b" \t\f\r\n":
+        marker += 1
+    while marker < len(content) and content[marker] == ord("%"):
+        line_end = marker + 1
+        while line_end < len(content) and content[line_end] not in b"\r\n":
+            value = content[line_end]
+            if value != ord("\t") and not 0x20 <= value <= 0x7E:
+                raise RegistrationError(
+                    f"{label} terminal PDF object has non-printable lexical padding"
+                )
+            line_end += 1
+        if line_end == len(content):
+            raise RegistrationError(f"{label} terminal PDF object is not closed")
+        marker = line_end
+        while marker < len(content) and content[marker] in b" \t\f\r\n":
+            marker += 1
+    if content[marker:marker + len(b"endobj")] != b"endobj":
+        raise RegistrationError(f"{label} terminal PDF object is not closed")
+    return parsed, marker + len(b"endobj")
+
+
+def _read_final_pdf_trailer_end(
+    content: bytes, reader, xref_offset: int, label: str,
+) -> int:
+    """Strictly reparse the final classic xref table and its trailer."""
+    from pypdf._utils import read_non_whitespace
+    from pypdf.generic import read_object
+
+    stream = io.BytesIO(content)
+    # PdfReader has already consumed the leading ``x`` when it dispatches to
+    # this parser, whose first required token is therefore ``ref``.
+    stream.seek(xref_offset + 1)
+    reader._read_standard_xref_table(stream)
+    read_non_whitespace(stream)
+    stream.seek(-1, 1)
+    trailer = read_object(stream, reader)
+    if not hasattr(trailer, "get") or trailer.get("/Size") is None:
+        raise RegistrationError(f"{label} final PDF trailer dictionary is invalid")
+    return stream.tell()
+
+
+def _validate_pdf_container_boundary(content: bytes, label: str, reader) -> None:
     tail = re.search(
         rb"startxref[ \t\f\r\n]+([0-9]+)[ \t\f\r\n]+%%EOF[ \t\f\r\n]*\Z",
         content,
@@ -2183,18 +2243,49 @@ def _validate_pdf_container_boundary(content: bytes, label: str) -> None:
     if not 0 < xref_offset < tail.start():
         raise RegistrationError(f"{label} final PDF cross-reference offset is invalid")
     target = content[xref_offset:]
-    if not (
-        target.startswith(b"xref")
-        or re.match(
-            rb"[1-9][0-9]*[ \t\f\r\n]+[0-9]+[ \t\f\r\n]+obj(?:[ \t\f\r\n]|<<)",
-            target,
-        )
-    ):
+    xref_table = re.match(rb"xref(?:[ \t\f\r\n])", target) is not None
+    xref_stream = re.match(
+        rb"[1-9][0-9]*[ \t\f\r\n]+[0-9]+[ \t\f\r\n]+obj(?:[ \t\f\r\n]|<<)",
+        target,
+    ) is not None
+    if not (xref_table or xref_stream):
         raise RegistrationError(f"{label} startxref does not name a PDF xref section")
 
-    final_object_end = content.rfind(b"endobj", 0, xref_offset)
-    if final_object_end < 0 or not _pdf_ascii_padding_only(
-        content[final_object_end + len(b"endobj"):xref_offset]
+    if xref_table:
+        candidates = [
+            (offset, object_number, generation)
+            for generation, entries in reader.xref.items()
+            for object_number, offset in entries.items()
+            if 0 < offset < xref_offset
+        ]
+        if not candidates:
+            raise RegistrationError(f"{label} has no terminal cross-referenced PDF object")
+        object_offset, object_number, generation = max(candidates)
+        _, terminal_object_end = _read_terminal_pdf_object(
+            content,
+            reader,
+            object_offset,
+            label,
+            expected_identity=(object_number, generation),
+        )
+        trailer_end = _read_final_pdf_trailer_end(
+            content, reader, xref_offset, label
+        )
+        padding_ranges = (
+            content[terminal_object_end:xref_offset],
+            content[trailer_end:tail.start()],
+        )
+    else:
+        parsed_xref, terminal_object_end = _read_terminal_pdf_object(
+            content, reader, xref_offset, label
+        )
+        if not hasattr(parsed_xref, "get") or str(parsed_xref.get("/Type")) != "/XRef":
+            raise RegistrationError(f"{label} startxref object is not an xref stream")
+        padding_ranges = (content[terminal_object_end:tail.start()],)
+
+    if any(
+        not padding or not _pdf_ascii_padding_only(padding)
+        for padding in padding_ranges
     ):
         raise RegistrationError(
             f"{label} contains foreign/polyglot bytes before the final PDF xref"
@@ -2241,7 +2332,6 @@ def _strict_pdf_evidence(content: bytes, label: str) -> dict:
         or b"startxref" not in content
     ):
         raise RegistrationError(f"{label} is not a complete bounded PDF document")
-    _validate_pdf_container_boundary(content, label)
     try:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
@@ -2259,6 +2349,7 @@ def _strict_pdf_evidence(content: bytes, label: str) -> dict:
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
             reader = PdfReader(io.BytesIO(content), strict=True)
+            _validate_pdf_container_boundary(content, label, reader)
             if reader.is_encrypted:
                 raise RegistrationError(f"{label} is encrypted")
             trailer = reader.trailer

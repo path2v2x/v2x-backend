@@ -358,6 +358,15 @@ def insert_before_final_pdf_xref(content, payload):
     return content[:xref_offset] + payload + content[xref_offset:match.start()] + replacement
 
 
+def insert_before_final_pdf_startxref(content, payload):
+    match = re.search(
+        rb"startxref[ \t\r\n]+[0-9]+[ \t\r\n]+%%EOF[ \t\r\n]*\Z",
+        content,
+    )
+    assert match is not None
+    return content[:match.start()] + payload + content[match.start():]
+
+
 def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive_hash="opendrive",
                          corrupt_summary=False):
     from pyproj import CRS
@@ -2216,7 +2225,37 @@ def test_zip_archive_inserted_before_pdf_xref_is_rejected(tmp_path):
         tool._strict_pdf_evidence(content, "before-xref polyglot")
 
 
-def test_ordinary_pdf_and_ascii_pre_xref_comment_remain_valid(tmp_path):
+def test_foreign_bytes_ending_in_fake_endobj_before_pdf_xref_are_rejected(tmp_path):
+    from pypdf import PdfReader
+
+    pdf = tmp_path / "fake-endobj-boundary.pdf"
+    write_valid_pdf(pdf, "Fake endobj boundary regression")
+    content = insert_before_final_pdf_xref(
+        pdf.read_bytes(), b"\x00foreign-payload\xffendobj\n"
+    )
+
+    assert len(PdfReader(io.BytesIO(content), strict=True).pages) == 1
+    assert not zipfile.is_zipfile(io.BytesIO(content))
+    with pytest.raises(tool.RegistrationError, match="foreign|polyglot"):
+        tool._strict_pdf_evidence(content, "fake endobj boundary")
+
+
+def test_foreign_bytes_between_pdf_trailer_and_startxref_are_rejected(tmp_path):
+    from pypdf import PdfReader
+
+    pdf = tmp_path / "after-trailer-payload.pdf"
+    write_valid_pdf(pdf, "After trailer boundary regression")
+    content = insert_before_final_pdf_startxref(
+        pdf.read_bytes(), b"\x00foreign-payload\xffendobj\n"
+    )
+
+    assert len(PdfReader(io.BytesIO(content), strict=True).pages) == 1
+    assert not zipfile.is_zipfile(io.BytesIO(content))
+    with pytest.raises(tool.RegistrationError, match="foreign|polyglot"):
+        tool._strict_pdf_evidence(content, "after trailer boundary")
+
+
+def test_ordinary_pdf_and_ascii_boundary_comments_remain_valid(tmp_path):
     ordinary = tmp_path / "ordinary.pdf"
     write_valid_pdf(ordinary, "Ordinary retained authority PDF")
     ordinary_result = tool._strict_pdf_evidence(ordinary.read_bytes(), "ordinary PDF")
@@ -2230,6 +2269,16 @@ def test_ordinary_pdf_and_ascii_pre_xref_comment_remain_valid(tmp_path):
     commented_result = tool._strict_pdf_evidence(commented.read_bytes(), "commented PDF")
     assert commented_result["page_count"] == 1
     assert commented_result["encrypted"] is False
+
+    trailer_commented = tmp_path / "ordinary-trailer-commented.pdf"
+    trailer_commented.write_bytes(insert_before_final_pdf_startxref(
+        ordinary.read_bytes(), b"\n% ordinary printable trailer comment\n"
+    ))
+    trailer_result = tool._strict_pdf_evidence(
+        trailer_commented.read_bytes(), "trailer-commented PDF"
+    )
+    assert trailer_result["page_count"] == 1
+    assert trailer_result["encrypted"] is False
 
 
 def test_valid_pdf_with_embedded_attachment_is_rejected(tmp_path):
