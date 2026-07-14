@@ -24,7 +24,7 @@ thread-control variable required by the tracked lock.
 
 Execute the runner directly; invoking it through another shell is rejected.
 The first executable line compares `BASH_SOURCE[0]` with `$0`, before calling
-any overrideable command, and source-mode execution fails immediately. The
+any other command, and unconditionally returns failure in source mode. The
 runner also rejects every predeclared shell function and resolves its tracked
 path with absolute `/usr/bin/readlink -f`, never a dispatchable `pwd` function.
 Its absolute privileged-Bash shebang prevents `BASH_ENV` startup sourcing and

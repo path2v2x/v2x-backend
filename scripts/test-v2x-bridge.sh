@@ -1,6 +1,5 @@
 #!/bin/bash -p
-[[ ${BASH_SOURCE[0]} == "$0" ]] || \
-  : "${V2X_BRIDGE_RUNNER_DIRECT_EXECUTION_REQUIRED:?execute test-v2x-bridge.sh directly}"
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 2
 set -euo pipefail
 
 if [[ $- != *p* ]]; then

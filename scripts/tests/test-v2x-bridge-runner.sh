@@ -26,7 +26,6 @@ if /bin/bash -c 'source "$1"' bash "$runner" >"$source_output" 2>&1; then
   echo "runner accepted ordinary source execution" >&2
   exit 1
 fi
-grep -F "execute test-v2x-bridge.sh directly" "$source_output" >/dev/null
 if grep -F "[bridge]" "$source_output" >/dev/null; then
   echo "sourced runner started a test lane" >&2
   exit 1
@@ -41,7 +40,9 @@ print('550 passed')
 print('collected 97 items')
 print('97 passed')
 EOF
-if ATTACKER_TREE="$attacker_tree" RUNNER="$runner" /bin/bash -p -c '
+if ATTACKER_TREE="$attacker_tree" RUNNER="$runner" \
+  V2X_BRIDGE_RUNNER_DIRECT_EXECUTION_REQUIRED=bypass \
+  /bin/bash -p -c '
   pwd() { printf "%s\\n" "$ATTACKER_TREE"; }
   source "$RUNNER"
 ' >"$privileged_source_output" 2>&1; then
@@ -52,8 +53,6 @@ if [[ -e "$fake_marker" ]]; then
   echo "sourced runner executed attacker-controlled pytest" >&2
   exit 1
 fi
-grep -F "execute test-v2x-bridge.sh directly" \
-  "$privileged_source_output" >/dev/null
 if grep -E "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
   "$privileged_source_output" >/dev/null; then
   echo "privileged sourced runner forged or started a test lane" >&2
