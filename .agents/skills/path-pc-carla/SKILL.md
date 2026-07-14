@@ -40,9 +40,15 @@ statements below.
   Only 417/421 are within the 150 ms temporal gate and only 3/421 persisted
   boxes apply to the selected frame under the 50 ms identity tolerance, so the
   persisted boxes are not geometry truth. YOLO11m exact-frame redetection finds
-  a matching proposal for 334/421 events; this is neither reviewed correctness
-  nor twin-placement proof. A stronger hash-pinned YOLO11x comparison is still
-  running and must retain disagreement/false-positive accounting.
+  a matching proposal for 334/421 events; hash-pinned YOLO11x finds 355/421.
+  Their conservative 0.60-IoU/full-visibility/contact-agreement gate retains
+  consensus on only 210/421. Sixty-five events have no vehicle proposal from
+  either model. Twenty-eight of those belong to one stationary ch2 production
+  track whose 73-frame/73-second dense window visibly contains no car, proving
+  that production event existence cannot be treated as vehicle truth. These
+  development results are neither independently reviewed correctness nor
+  twin-placement proof; retain the full disagreement and false-positive
+  accounting.
 - At the read-only live check, all four local perception cameras remain in
   `reconnecting` state because the external Kinesis producers stopped together.
   The local service must not be restarted as a substitute for restoring those
