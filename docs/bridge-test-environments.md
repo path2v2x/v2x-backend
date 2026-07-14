@@ -14,8 +14,10 @@ are incompatible:
   environment bound by `apps/bridge/tools/map_lidar_toolchain_lock.json`.
 
 Both lanes promote every warning to an error. The runner clears
-`PYTEST_ADDOPTS`, overrides configured `addopts`, and accepts no pytest
-selectors, so external or positional options cannot weaken collection. Its
+`PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, overrides configured `addopts`, disables
+third-party plugin autoload, explicitly loads pytest-asyncio, and accepts no
+pytest selectors, so external or positional options cannot weaken collection.
+Repository `conftest.py` files and pytest's internal plugins remain active. Its
 `--ignore` in the first lane does not skip coverage: the excluded registration
 file is executed in full by the second lane. The second lane also fixes every
 thread-control variable required by the tracked lock.
@@ -27,15 +29,17 @@ and `-k` values and requires the complete 550-test and 97-test lane totals:
 scripts/tests/test-v2x-bridge-runner.sh
 ```
 
-On the Path PC the defaults are:
+On the Path PC the hard-bound interpreter paths are:
 
 ```text
-CARLA_PYTHON=/home/path/V2XCarla/carla-venv-310/bin/python
-MAP_LIDAR_PYTHON=/home/path/V2XCarla/geospatial-venv/bin/python
+/home/path/V2XCarla/carla-venv-310/bin/python
+/home/path/V2XCarla/geospatial-venv/bin/python
 ```
 
-The interpreters can be overridden with those environment variables, but the
-runner rejects the wrong Python version or a missing dependency. At the
-2026-07-14 inspection, `/mnt/v2x-ue5/venvs/geospatial` contained the numerical
-toolchain but lacked `pypdf`, `pytest`, and `pytest-asyncio`, so it is not a
-complete test environment and correctly fails the preflight if selected.
+Those interpreter paths are hard-bound for acceptance. The runner rejects
+inherited `CARLA_PYTHON` or `MAP_LIDAR_PYTHON` variables rather than executing
+an untrusted override. It also rejects the wrong Python version or a missing
+dependency at either canonical path. At the 2026-07-14 inspection,
+`/mnt/v2x-ue5/venvs/geospatial` contained the numerical toolchain but lacked
+`pypdf`, `pytest`, and `pytest-asyncio`, so it is not an acceptance test
+environment.
