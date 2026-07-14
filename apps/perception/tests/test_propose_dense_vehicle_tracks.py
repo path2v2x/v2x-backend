@@ -196,8 +196,23 @@ def test_retained_track_mask_is_largest_component_inside_bbox():
         )
 
     Result.boxes.id = np.asarray([7.0])
+
+    Box.xyxy = np.asarray([[20.0, 20.0, 80.0, 80.0], [1.0, 1.0, 2.0, 2.0]])
+    with pytest.raises(tracks.DenseTrackError, match="bbox.*exactly 4"):
+        tracks.model_instances_from_result(
+            Result(), np.zeros((100, 100, 3), dtype=np.uint8)
+        )
+    Box.xyxy = np.asarray([[20.0, 20.0, 80.0, 80.0]])
+
+    mask[30, 30] = 1.1
+    with pytest.raises(tracks.DenseTrackError, match=r"masks.*outside \[0, 1\]"):
+        tracks.model_instances_from_result(
+            Result(), np.zeros((100, 100, 3), dtype=np.uint8)
+        )
+    mask[30, 30] = 1.0
     for malformed_class in (
-        np.asarray([2.5]), np.asarray([np.nan]), np.asarray([2, 3]), np.asarray([999])
+        np.asarray([2.5]), np.asarray([np.nan]), np.asarray([2, 3]),
+        np.asarray([999]), np.asarray([True]), np.asarray(["2"]),
     ):
         Box.cls = malformed_class
         with pytest.raises(tracks.DenseTrackError, match="class"):
@@ -207,7 +222,8 @@ def test_retained_track_mask_is_largest_component_inside_bbox():
     Box.cls = np.asarray([2])
 
     for malformed_confidence in (
-        np.asarray([np.nan]), np.asarray([0.9, 0.8]), np.asarray([1.1])
+        np.asarray([np.nan]), np.asarray([0.9, 0.8]), np.asarray([1.1]),
+        np.asarray([True]), np.asarray(["0.9"]),
     ):
         Box.conf = malformed_confidence
         with pytest.raises(tracks.DenseTrackError, match="confidence"):
@@ -217,7 +233,8 @@ def test_retained_track_mask_is_largest_component_inside_bbox():
     Box.conf = np.asarray([0.95])
 
     for malformed_ids in (
-        np.asarray([np.nan]), np.asarray([7.0, 8.0]), np.asarray([-1.0])
+        np.asarray([np.nan]), np.asarray([7.0, 8.0]), np.asarray([-1.0]),
+        np.asarray([True]), np.asarray(["7"]),
     ):
         Result.boxes.id = malformed_ids
         with pytest.raises(tracks.DenseTrackError, match="tracking ID|tracker ID"):
@@ -826,6 +843,74 @@ def test_staged_input_snapshot_mutation_during_inference_fails_and_cleans(
         tracks.propose(
             [fixture["capture"]], fixture["consensus"], fixture["models"][0],
             output, model_factory=factory, image_size=1280,
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
+def test_staged_output_mutation_after_initial_verification_fails_and_cleans(
+    tmp_path, monkeypatch
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    original_revalidate = tracks.revalidate_source_files
+    revalidation_count = 0
+
+    def tamper_before_final_artifact_verification(bindings):
+        nonlocal revalidation_count
+        revalidation_count += 1
+        if revalidation_count == 2:
+            stage = next(tmp_path.glob(".output.tmp-*"))
+            artifact = next((stage / "masks").rglob("*.png"))
+            artifact.write_bytes(artifact.read_bytes() + b"tampered")
+        return original_revalidate(bindings)
+
+    monkeypatch.setattr(
+        tracks, "revalidate_source_files",
+        tamper_before_final_artifact_verification,
+    )
+    output = tmp_path / "output"
+    with pytest.raises(tracks.DenseTrackError, match="artifact hash binding failed"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
+        )
+    assert not output.exists()
+    assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []
+
+
+def test_staged_tamper_during_final_fsync_cannot_publish(tmp_path, monkeypatch):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    original_fsync = tracks.fsync_directory_tree
+
+    def tamper_after_fsync(stage):
+        original_fsync(stage)
+        artifact = next((Path(stage) / "masks").rglob("*.png"))
+        artifact.write_bytes(artifact.read_bytes() + b"tampered")
+
+    monkeypatch.setattr(tracks, "fsync_directory_tree", tamper_after_fsync)
+    output = tmp_path / "output"
+    with pytest.raises(tracks.DenseTrackError, match="artifact hash binding failed"):
+        tracks.propose(
+            [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+            output, model_factory=lambda _path: Model(), image_size=1280,
         )
     assert not output.exists()
     assert list(tmp_path.glob(f".{output.name}.tmp-*")) == []

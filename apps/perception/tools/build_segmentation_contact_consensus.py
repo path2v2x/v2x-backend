@@ -80,17 +80,25 @@ def mask_iou(left, right):
     return 0.0 if union == 0 else float(np.logical_and(left, right).sum() / union)
 
 
-def finite_pixel(value):
-    return (
-        isinstance(value, list)
-        and len(value) == 2
-        and all(
+def validated_pixel(value, frame, bbox, label):
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not all(
             isinstance(item, (int, float))
             and not isinstance(item, bool)
             and math.isfinite(float(item))
             for item in value
         )
-    )
+    ):
+        raise ConsensusError(f"{label} contact proposal pixel is invalid")
+    x, y = map(float, value)
+    if not (0.0 <= x < float(frame["width"]) and 0.0 <= y < float(frame["height"])):
+        raise ConsensusError(f"{label} contact proposal pixel is outside the frame")
+    x1, y1, x2, y2 = bbox
+    if not (x1 <= x <= x2 and y1 <= y <= y2):
+        raise ConsensusError(f"{label} contact proposal pixel is outside its bbox")
+    return np.asarray([x, y], dtype=float)
 
 
 def valid_frame(frame):
@@ -185,14 +193,16 @@ def consensus_event(event_id, left, right):
         mask_agreement = mask_iou(
             load_mask(left, left_frame), load_mask(right, right_frame)
         )
+        if not math.isfinite(mask_agreement) or not 0.0 <= mask_agreement <= 1.0:
+            raise ConsensusError("mask IoU is outside [0, 1]")
         if mask_agreement < MINIMUM_MASK_IOU:
             reasons.append("mask_iou_below_gate")
-        left_pixel = left_proposal.get("pixel")
-        right_pixel = right_proposal.get("pixel")
-        if not finite_pixel(left_pixel) or not finite_pixel(right_pixel):
-            raise ConsensusError("contact proposal pixel is invalid")
-        left_pixel = np.asarray(left_pixel, dtype=float)
-        right_pixel = np.asarray(right_pixel, dtype=float)
+        left_pixel = validated_pixel(
+            left_proposal.get("pixel"), left_frame, left_bbox, "left model"
+        )
+        right_pixel = validated_pixel(
+            right_proposal.get("pixel"), right_frame, right_bbox, "right model"
+        )
         contact_disagreement = np.abs(left_pixel - right_pixel)
         if np.any(contact_disagreement > contact_gate):
             reasons.append("contact_disagreement_above_gate")

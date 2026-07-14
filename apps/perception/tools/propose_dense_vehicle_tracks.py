@@ -829,6 +829,8 @@ def exact_numeric_scalars(value, expected_count, label):
         if hasattr(value, "detach"):
             value = value.detach().cpu().numpy()
         array = np.asarray(value)
+        if array.dtype.kind not in "iuf":
+            raise DenseTrackError(f"{label} must contain only numeric scalars")
         if array.size != expected_count:
             raise DenseTrackError(
                 f"{label} must contain exactly {expected_count} scalar values"
@@ -849,7 +851,10 @@ def model_instances_from_result(result, image):
     if result.masks is None:
         raise DenseTrackError("tracking model returned boxes without masks")
     ids = result.boxes.id
-    masks = result.masks.data.detach().cpu().numpy()
+    try:
+        masks = np.asarray(result.masks.data.detach().cpu().numpy())
+    except (TypeError, ValueError) as exc:
+        raise DenseTrackError("tracking masks are malformed") from exc
     height, width = image.shape[:2]
     box_count = len(result.boxes)
     boxes = list(result.boxes)
@@ -857,6 +862,10 @@ def model_instances_from_result(result, image):
         raise DenseTrackError("tracking boxes have inconsistent cardinality")
     if masks.ndim != 3 or masks.shape[0] != box_count:
         raise DenseTrackError("tracking masks are not ordered one-for-one with boxes")
+    if masks.dtype.kind not in "iuf":
+        raise DenseTrackError("tracking masks must contain only numeric scalars")
+    if not np.isfinite(masks).all() or np.any(masks < 0.0) or np.any(masks > 1.0):
+        raise DenseTrackError("tracking masks contain values outside [0, 1]")
     id_values = (
         None
         if ids is None
@@ -896,7 +905,7 @@ def model_instances_from_result(result, image):
             raise DenseTrackError("tracking model returned an invalid mask plane")
         if mask.shape != (height, width):
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-        bbox = [float(value) for value in box.xyxy[0].tolist()]
+        bbox = exact_numeric_scalars(box.xyxy, 4, "tracking bbox")
         try:
             validate_bbox(bbox, width, height)
         except (ContactProposalError, TypeError, ValueError) as exc:
@@ -1269,6 +1278,82 @@ def verify_output_artifacts(staged_root, sequences):
                 raise DenseTrackError("dense-track output artifact hash binding failed")
 
 
+def verify_staged_publication(
+    staged_root, bound_snapshot_tree, sequences, expected_report_sha256
+):
+    staged_root = Path(staged_root).resolve()
+    verify_bound_input_snapshots(staged_root, bound_snapshot_tree)
+    verify_output_artifacts(staged_root, sequences)
+    report_path = staged_root / "report.json"
+    if (
+        not valid_sha256(expected_report_sha256)
+        or not report_path.is_file()
+        or sha256_file(report_path) != expected_report_sha256
+    ):
+        raise DenseTrackError("dense-track report changed before publication")
+
+    expected_paths = {"report.json"}
+
+    def collect_bound_paths(item):
+        if isinstance(item, dict):
+            if {"source_path", "path", "sha256", "byte_count"} <= set(item):
+                expected_paths.add(item["path"])
+            for nested in item.values():
+                collect_bound_paths(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                collect_bound_paths(nested)
+
+    collect_bound_paths(bound_snapshot_tree)
+    for sequence in sequences:
+        descriptors = [sequence.get("review_sheet")]
+        descriptors.extend(frame.get("mask") for frame in sequence.get("frames", []))
+        expected_paths.update(
+            descriptor["path"] for descriptor in descriptors if descriptor is not None
+        )
+
+    actual_paths = {
+        path.relative_to(staged_root).as_posix()
+        for path in staged_root.rglob("*")
+        if path.is_file() and path.name != "SHA256SUMS"
+    }
+    if actual_paths != expected_paths:
+        raise DenseTrackError("dense-track staging tree contains unexpected artifacts")
+
+    manifest_path = staged_root / "SHA256SUMS"
+    try:
+        lines = manifest_path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DenseTrackError("dense-track checksum manifest is unreadable") from exc
+    manifest = {}
+    for line in lines:
+        parts = line.split("  ", 1)
+        if len(parts) != 2:
+            raise DenseTrackError("dense-track checksum manifest is malformed")
+        digest, relative = parts
+        if (
+            not valid_sha256(digest)
+            or not relative
+            or Path(relative).is_absolute()
+            or relative in manifest
+        ):
+            raise DenseTrackError("dense-track checksum manifest is malformed")
+        path = (staged_root / relative).resolve()
+        try:
+            path.relative_to(staged_root)
+        except ValueError as exc:
+            raise DenseTrackError("dense-track checksum path escapes staging") from exc
+        manifest[relative] = digest
+    if set(manifest) != expected_paths:
+        raise DenseTrackError("dense-track checksum manifest is incomplete")
+    if any(
+        not (staged_root / relative).is_file()
+        or sha256_file(staged_root / relative) != digest
+        for relative, digest in manifest.items()
+    ):
+        raise DenseTrackError("dense-track checksum manifest verification failed")
+
+
 def make_review_sheet(entries, columns=4, tile_width=480, tile_height=390):
     rows = max(1, math.ceil(len(entries) / columns))
     sheet = np.full((rows * tile_height, columns * tile_width, 3), 28, dtype=np.uint8)
@@ -1637,8 +1722,10 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
                 "dense track report",
             )
+            report_sha256 = sha256_file(report_path)
             verify_bound_input_snapshots(staged, bound_snapshot_tree)
             revalidate_source_files(source_bindings)
+            verify_output_artifacts(staged, sequences)
             owner_marker.unlink()
             fsync_directory(staged)
             write_text_exclusive(staged / "SHA256SUMS", "".join(
@@ -1646,6 +1733,10 @@ def propose(capture_reports, consensus_path, model_path, output_directory, *,
                 for path in sorted(item for item in staged.rglob("*") if item.is_file())
             ), "dense track checksum manifest")
             fsync_directory_tree(staged)
+            revalidate_source_files(source_bindings)
+            verify_staged_publication(
+                staged, bound_snapshot_tree, sequences, report_sha256
+            )
             atomic_publish_directory(staged, output)
             fsync_directory(output.parent)
         except StaticCaptureError as exc:

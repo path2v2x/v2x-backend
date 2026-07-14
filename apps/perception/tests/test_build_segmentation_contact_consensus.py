@@ -170,6 +170,36 @@ def test_consensus_rejects_nonfinite_or_out_of_range_iou(
         module.build(left, right)
 
 
+@pytest.mark.parametrize(
+    "pixel,error",
+    [
+        ([-1, 79], "outside the frame"),
+        ([160, 79], "outside the frame"),
+        ([20, 79], "outside its bbox"),
+    ],
+)
+def test_consensus_rejects_out_of_frame_or_bbox_contact_pixels(
+    tmp_path, pixel, error
+):
+    left = proposal(tmp_path, "left", "a" * 64, pixel)
+    right = proposal(tmp_path, "right", "b" * 64, pixel)
+
+    with pytest.raises(module.ConsensusError, match=error):
+        module.build(left, right)
+
+
+@pytest.mark.parametrize("bad_iou", [float("nan"), float("inf"), -0.1, 1.1])
+def test_consensus_rejects_nonfinite_or_out_of_range_mask_iou(
+    tmp_path, monkeypatch, bad_iou
+):
+    left = proposal(tmp_path, "left", "a" * 64, [80, 79])
+    right = proposal(tmp_path, "right", "b" * 64, [81, 78.5], shift=1)
+    monkeypatch.setattr(module, "mask_iou", lambda *_args: bad_iou)
+
+    with pytest.raises(module.ConsensusError, match="mask IoU"):
+        module.build(left, right)
+
+
 def test_consensus_rejects_silently_shrunk_capture_denominator(tmp_path):
     left = proposal(tmp_path, "left", "a" * 64, [80, 79])
     right = proposal(tmp_path, "right", "b" * 64, [81, 78.5], shift=1)
