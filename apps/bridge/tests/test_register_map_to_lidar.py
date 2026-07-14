@@ -3,11 +3,14 @@ import copy
 import csv
 from datetime import datetime, timedelta, timezone
 import importlib.util
+import io
 import json
 import logging
 import math
 from pathlib import Path
+import re
 import threading
+import zipfile
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -341,6 +344,18 @@ def write_valid_pdf(path, title, *, encrypted=False):
     with path.open("wb") as stream:
         writer.write(stream)
     assert path.stat().st_size >= tool.MIN_AUTHORITY_PDF_BYTES
+
+
+def insert_before_final_pdf_xref(content, payload):
+    match = re.search(
+        rb"startxref[ \t\r\n]+([0-9]+)[ \t\r\n]+%%EOF[ \t\r\n]*\Z",
+        content,
+    )
+    assert match is not None
+    xref_offset = int(match.group(1))
+    assert content[xref_offset:xref_offset + 4] == b"xref"
+    replacement = b"startxref\n" + str(xref_offset + len(payload)).encode() + b"\n%%EOF\n"
+    return content[:xref_offset] + payload + content[xref_offset:match.start()] + replacement
 
 
 def write_current_survey(tmp_path, geometry, geometry_hash="geometry", opendrive_hash="opendrive",
@@ -2178,6 +2193,76 @@ def test_strict_pdf_parser_warning_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(pypdf, "PdfReader", warning_reader)
     with pytest.raises(tool.RegistrationError, match="parser warnings"):
         tool._strict_pdf_evidence(pdf.read_bytes(), "warning fixture")
+
+
+def test_zip_archive_inserted_before_pdf_xref_is_rejected(tmp_path):
+    from pypdf import PdfReader
+
+    pdf = tmp_path / "before-xref-polyglot.pdf"
+    write_valid_pdf(pdf, "Before-xref polyglot regression")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as writer:
+        writer.writestr("conflicting-authority.txt", b"different authority bytes")
+    # The newline keeps the shifted xref at a legal PDF token boundary while
+    # remaining valid trailing data to ZIP's end-of-central-directory record.
+    content = insert_before_final_pdf_xref(pdf.read_bytes(), archive.getvalue() + b"\n")
+    pdf.write_bytes(content)
+
+    assert content.startswith(b"%PDF-")
+    assert content.rstrip().endswith(b"%%EOF")
+    assert len(PdfReader(io.BytesIO(content), strict=True).pages) == 1
+    assert zipfile.is_zipfile(io.BytesIO(content))
+    with pytest.raises(tool.RegistrationError, match="foreign|polyglot|archive"):
+        tool._strict_pdf_evidence(content, "before-xref polyglot")
+
+
+def test_ordinary_pdf_and_ascii_pre_xref_comment_remain_valid(tmp_path):
+    ordinary = tmp_path / "ordinary.pdf"
+    write_valid_pdf(ordinary, "Ordinary retained authority PDF")
+    ordinary_result = tool._strict_pdf_evidence(ordinary.read_bytes(), "ordinary PDF")
+    assert ordinary_result["page_count"] == 1
+    assert ordinary_result["encrypted"] is False
+
+    commented = tmp_path / "ordinary-commented.pdf"
+    commented.write_bytes(insert_before_final_pdf_xref(
+        ordinary.read_bytes(), b"\n% ordinary printable retained-evidence comment\n"
+    ))
+    commented_result = tool._strict_pdf_evidence(commented.read_bytes(), "commented PDF")
+    assert commented_result["page_count"] == 1
+    assert commented_result["encrypted"] is False
+
+
+def test_valid_pdf_with_embedded_attachment_is_rejected(tmp_path):
+    from pypdf import PdfWriter
+
+    pdf = tmp_path / "embedded-attachment.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_metadata({
+        "/Title": "Attachment rejection",
+        "/Subject": "retained-evidence-" * 400,
+    })
+    writer.add_attachment("conflicting-authority.bin", b"different authority bytes")
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+
+    assert pdf.stat().st_size >= tool.MIN_AUTHORITY_PDF_BYTES
+    with pytest.raises(tool.RegistrationError, match="embedded foreign payloads"):
+        tool._strict_pdf_evidence(pdf.read_bytes(), "attachment PDF")
+
+
+def test_unexpected_strict_pdf_parser_exception_is_controlled(tmp_path, monkeypatch):
+    import pypdf
+
+    pdf = tmp_path / "unexpected-parser-failure.pdf"
+    write_valid_pdf(pdf, "Unexpected parser failure")
+
+    def failed_reader(*_args, **_kwargs):
+        raise RuntimeError("synthetic parser implementation failure")
+
+    monkeypatch.setattr(pypdf, "PdfReader", failed_reader)
+    with pytest.raises(tool.RegistrationError, match="failed strict PDF parsing"):
+        tool._strict_pdf_evidence(pdf.read_bytes(), "parser failure fixture")
 
 
 def test_survey_authority_detached_signature_tamper_fails(tmp_path):

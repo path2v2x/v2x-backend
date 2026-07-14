@@ -31,6 +31,7 @@ import sys
 import warnings
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, urlparse
+import zipfile
 
 # Import numerical libraries only after establishing deterministic single-thread
 # defaults. Explicit non-1 caller values are rejected by the toolchain gate.
@@ -2152,6 +2153,85 @@ def _validate_survey_crs(block: dict, horizontal_epsg: int | None,
     }
 
 
+def _pdf_ascii_padding_only(content: bytes) -> bool:
+    """Accept only PDF whitespace and printable comments between objects/xref."""
+    index = 0
+    while index < len(content):
+        value = content[index]
+        if value in b" \t\f\r\n":
+            index += 1
+            continue
+        if value != ord("%"):
+            return False
+        index += 1
+        while index < len(content) and content[index] not in b"\r\n":
+            value = content[index]
+            if value != ord("\t") and not 0x20 <= value <= 0x7E:
+                return False
+            index += 1
+    return True
+
+
+def _validate_pdf_container_boundary(content: bytes, label: str) -> None:
+    tail = re.search(
+        rb"startxref[ \t\f\r\n]+([0-9]+)[ \t\f\r\n]+%%EOF[ \t\f\r\n]*\Z",
+        content,
+    )
+    if tail is None:
+        raise RegistrationError(f"{label} has no exact final PDF cross-reference boundary")
+    xref_offset = int(tail.group(1))
+    if not 0 < xref_offset < tail.start():
+        raise RegistrationError(f"{label} final PDF cross-reference offset is invalid")
+    target = content[xref_offset:]
+    if not (
+        target.startswith(b"xref")
+        or re.match(
+            rb"[1-9][0-9]*[ \t\f\r\n]+[0-9]+[ \t\f\r\n]+obj(?:[ \t\f\r\n]|<<)",
+            target,
+        )
+    ):
+        raise RegistrationError(f"{label} startxref does not name a PDF xref section")
+
+    final_object_end = content.rfind(b"endobj", 0, xref_offset)
+    if final_object_end < 0 or not _pdf_ascii_padding_only(
+        content[final_object_end + len(b"endobj"):xref_offset]
+    ):
+        raise RegistrationError(
+            f"{label} contains foreign/polyglot bytes before the final PDF xref"
+        )
+
+    # ZIP readers intentionally accept leading and trailing bytes.  Detecting a
+    # second successful whole-file interpretation is therefore required in
+    # addition to checking PDF lexical padding around the final xref.
+    if zipfile.is_zipfile(io.BytesIO(content)):
+        raise RegistrationError(f"{label} is also a parseable ZIP archive")
+
+
+def _pdf_has_embedded_payloads(root, pages: list) -> bool:
+    def resolved(value):
+        return value.get_object() if hasattr(value, "get_object") else value
+
+    if root.get("/AF") is not None or root.get("/Collection") is not None:
+        return True
+    names = resolved(root.get("/Names"))
+    if isinstance(names, dict) and names.get("/EmbeddedFiles") is not None:
+        return True
+    for page in pages:
+        if page.get("/AF") is not None:
+            return True
+        annotations = resolved(page.get("/Annots"))
+        if annotations is None:
+            continue
+        for reference in annotations:
+            annotation = resolved(reference)
+            if isinstance(annotation, dict) and (
+                str(annotation.get("/Subtype")) == "/FileAttachment"
+                or annotation.get("/FS") is not None
+            ):
+                return True
+    return False
+
+
 def _strict_pdf_evidence(content: bytes, label: str) -> dict:
     if (
         len(content) < MIN_AUTHORITY_PDF_BYTES
@@ -2161,6 +2241,7 @@ def _strict_pdf_evidence(content: bytes, label: str) -> dict:
         or b"startxref" not in content
     ):
         raise RegistrationError(f"{label} is not a complete bounded PDF document")
+    _validate_pdf_container_boundary(content, label)
     try:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
@@ -2190,10 +2271,16 @@ def _strict_pdf_evidence(content: bytes, label: str) -> dict:
             pages = list(reader.pages)
             if not pages or any(str(page.get("/Type")) != "/Page" for page in pages):
                 raise RegistrationError(f"{label} has no valid PDF page tree")
+            if _pdf_has_embedded_payloads(root, pages):
+                raise RegistrationError(f"{label} contains embedded foreign payloads")
             recorded = list(captured)
     except RegistrationError:
         raise
     except (PdfReadError, OSError, TypeError, ValueError, KeyError) as exc:
+        raise RegistrationError(f"{label} failed strict PDF parsing") from exc
+    except Exception as exc:
+        # Parser/library failures must remain controlled audit failures rather
+        # than escaping the deliverable-validation boundary in a new type.
         raise RegistrationError(f"{label} failed strict PDF parsing") from exc
     finally:
         pdf_logger.removeHandler(handler)
@@ -2209,6 +2296,8 @@ def _strict_pdf_evidence(content: bytes, label: str) -> dict:
         "xref_sections": len(reader.xref),
         "object_stream_entries": len(reader.xref_objStm),
         "encrypted": False,
+        "container_ambiguity_checked": True,
+        "embedded_payloads": False,
     }
 
 
