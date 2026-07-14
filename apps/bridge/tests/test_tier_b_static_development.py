@@ -1,0 +1,208 @@
+import copy
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from digital_twin_bridge.camera_projection import (
+    ground_horizon_line,
+    production_round_trip,
+    project_direction,
+    project_world,
+    rotation_matrix,
+)
+from tools import fit_tier_b_static_development as fitter
+
+
+def binding(path: Path, payload: bytes) -> dict:
+    path.write_bytes(payload)
+    return {"path": str(path), "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def synthetic_document(tmp_path: Path):
+    opendrive = binding(tmp_path / "map.xodr", b"<OpenDRIVE/>")
+    cameras_json = binding(tmp_path / "cameras.json", b'{"cameras":[]}')
+    document = {
+        "schema": fitter.SCHEMA,
+        "acceptance_eligible": False,
+        "coordinate_gauge": "carla_map_exact_no_global_se2",
+        "splits": ["fit", "development"],
+        "forbidden_roots": [str(tmp_path / "sealed-holdout")],
+        "map": {"candidate_id": "richmond-test", "opendrive": opendrive,
+                "topology_sha256": "a" * 64},
+        "cameras_json": cameras_json,
+        "cameras": {},
+    }
+    truths = {}
+    for camera_index, camera_id in enumerate(fitter.CAMERAS):
+        width, height = 1280, 960
+        baseline = np.asarray((camera_index * 20.0, camera_index * 3.0, 7.0,
+                               -12.0, camera_index * 18.0, 1.0, 88.0))
+        delta = np.asarray((0.12 * (camera_index + 1), -0.08 * camera_index,
+                            0.05, 0.25, -0.18, 0.08, 0.35))
+        truth = baseline + delta
+        truths[camera_id] = truth
+        epochs = []
+        for split, count in (("fit", 3), ("development", 1)):
+            for index in range(count):
+                name = f"{camera_id}-{split}-{index}"
+                frame = binding(tmp_path / f"{name}.bin", name.encode())
+                members = [hashlib.sha256(f"{name}-raw".encode()).hexdigest()]
+                epochs.append({"id": name, "split": split, "frame": frame,
+                               "median_members": members})
+        points, polylines, horizons, vanishing = [], [], [], []
+        rotation = rotation_matrix(*truth[3:6])
+        for split, count in (("fit", 8), ("development", 4)):
+            epoch_ids = [item["id"] for item in epochs if item["split"] == split]
+            split_shift = 0.0 if split == "fit" else 2.0
+            local_points = []
+            for index in range(count):
+                depth = 18.0 + 5.0 * (index % 4) + index + split_shift
+                side = (-1 if index % 2 == 0 else 1) * (11.0 + 2.0 * (index % 3))
+                vertical = (-6.0 if (index // 2) % 2 == 0 else 5.5)
+                local_points.append((depth, side, vertical))
+            world = (rotation @ np.asarray(local_points).T).T + truth[:3]
+            uv, depth = project_world(world, truth, width, height)
+            assert np.all(depth > 0)
+            for index, (xyz, pixel) in enumerate(zip(world, uv)):
+                points.append({
+                    "id": f"{camera_id}-{split}-point-{index}",
+                    "physical_feature_id": f"{camera_id}-{split}-landmark-{index}",
+                    "epoch_id": epoch_ids[index % len(epoch_ids)], "split": split,
+                    "provenance": "manually_verified_unique", "real_uv": pixel.tolist(),
+                    "world_xyz": xyz.tolist(), "uncertainty_px": 1.0,
+                })
+            for class_index, feature_class in enumerate(fitter.CLASSES):
+                local = np.asarray([
+                    (20 + 4 * class_index + split_shift, -5 + 4 * class_index, -2.0),
+                    (27 + 4 * class_index + split_shift, -1 + 4 * class_index, -1.7),
+                    (34 + 4 * class_index + split_shift, 3 + 4 * class_index, -1.4),
+                ])
+                line_world = (rotation @ local.T).T + truth[:3]
+                line_uv, _ = project_world(line_world, truth, width, height)
+                polylines.append({
+                    "id": f"{camera_id}-{split}-line-{class_index}",
+                    "physical_feature_id": f"{camera_id}-{split}-line-feature-{class_index}",
+                    "epoch_id": epoch_ids[class_index % len(epoch_ids)], "split": split,
+                    "provenance": "manually_traced_geometry", "class": feature_class,
+                    "real_vertices": line_uv.tolist(), "world_vertices": line_world.tolist(),
+                    "uncertainty_px": 1.0,
+                })
+            horizon = ground_horizon_line(truth, width, height)
+            horizons.append({
+                "id": f"{camera_id}-{split}-horizon", "physical_feature_id": f"{camera_id}-{split}-horizon-feature",
+                "epoch_id": epoch_ids[0], "split": split,
+                "provenance": "manually_traced_geometry", "real_line": horizon.tolist(),
+                "uncertainty_px": 1.0,
+            })
+            for index, local_direction in enumerate(((1.0, .3, .05), (1.0, -.25, .1))):
+                direction = rotation @ np.asarray(local_direction)
+                pixel = project_direction(direction, truth, width, height)
+                vanishing.append({
+                    "id": f"{camera_id}-{split}-vanish-{index}",
+                    "physical_feature_id": f"{camera_id}-{split}-vanish-feature-{index}",
+                    "epoch_id": epoch_ids[index % len(epoch_ids)], "split": split,
+                    "provenance": "manually_verified_unique", "world_direction": direction.tolist(),
+                    "real_uv": pixel.tolist(), "uncertainty_px": 1.0,
+                })
+        document["cameras"][camera_id] = {
+            "width": width, "height": height, "baseline": baseline.tolist(),
+            "anchor_location": baseline[:3].tolist(),
+            "production_base": {"pitch_deg": baseline[3], "yaw_deg": baseline[4],
+                                "roll_deg": baseline[5], "fov_deg": baseline[6]},
+            "epochs": epochs, "points": points, "polylines": polylines,
+            "horizons": horizons, "vanishing": vanishing,
+        }
+    raw = json.dumps(document, sort_keys=True).encode()
+    return document, truths, hashlib.sha256(raw).hexdigest()
+
+
+def test_projection_and_production_pose_round_trip():
+    absolute = np.asarray((10.4, -2.3, 8.1, -17.0, 42.0, 1.5, 87.5))
+    base = {"pitch_deg": -15.0, "yaw_deg": 40.0, "roll_deg": 1.0, "fov_deg": 88.0}
+    pose, recovered = production_round_trip((10.0, -2.0, 8.0), base, absolute)
+    assert recovered == pytest.approx(absolute, abs=1e-10)
+    assert set(pose) == {"forward_offset_m", "right_offset_m", "height_offset_m",
+                         "pitch_offset_deg", "yaw_offset_deg", "roll_offset_deg", "fov_offset_deg"}
+
+
+def test_schema_and_synthetic_independent_translation_recovery(tmp_path):
+    document, truths, digest = synthetic_document(tmp_path)
+    model = fitter.validate_document(document, digest)
+    report = fitter.solve(model, starts=1, max_nfev=40)
+    assert report["parameterization"]["dimension"] == 28
+    assert report["parameterization"]["global_site_se2_parameter"] is False
+    assert report["data_jacobian"]["rank"] == 28
+    assert report["data_jacobian"]["condition"] <= 1e8
+    assert report["holdout_consumed"] is False
+    assert report["release_eligible"] is False
+    for camera_id, truth in truths.items():
+        fitted = np.asarray(list(report["cameras"][camera_id]["absolute_parameters"].values()))
+        assert fitted == pytest.approx(truth, abs=2e-3)
+    translations = [tuple(report["cameras"][key]["absolute_parameters"][name]
+                          for name in fitter.PARAMETER_NAMES[:3]) for key in fitter.CAMERAS]
+    assert len(set(translations)) == 4
+
+
+@pytest.mark.parametrize("mutation,error", [
+    ("gauge", "CARLA map gauge"),
+    ("split", "holdout"),
+    ("cross_split", "cross fit/development"),
+    ("degenerate", "point coverage"),
+])
+def test_fail_closed_schema_split_and_degeneracy(tmp_path, mutation, error):
+    document, _truths, digest = synthetic_document(tmp_path)
+    if mutation == "gauge":
+        document["coordinate_gauge"] = "fitted_global_se2"
+    elif mutation == "split":
+        document["splits"] = ["fit", "holdout"]
+    elif mutation == "cross_split":
+        camera = document["cameras"]["ch1"]
+        camera["points"][-1]["physical_feature_id"] = camera["points"][0]["physical_feature_id"]
+    else:
+        for point in document["cameras"]["ch1"]["points"]:
+            if point["split"] == "fit":
+                point["real_uv"] = [640.0, 480.0]
+    with pytest.raises(fitter.DevelopmentFitError, match=error):
+        fitter.validate_document(document, digest)
+
+
+def test_forbidden_root_rejected_before_artifact_read(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    sealed = tmp_path / "sealed-holdout"
+    sealed.mkdir()
+    forbidden = sealed / "never-read.xodr"
+    document["map"]["opendrive"] = {"path": str(forbidden), "sha256": "0" * 64}
+    with pytest.raises(fitter.DevelopmentFitError, match="forbidden"):
+        fitter.validate_document(document, digest)
+    assert not forbidden.exists()
+
+
+def test_rank_and_bound_and_competing_basin_fail_closed(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    model = fitter.validate_document(document, digest)
+    z = np.zeros(28)
+    assert fitter.competing_basin([
+        {"z": z, "development_loss": 100.0},
+        {"z": z + 0.5, "development_loss": 101.9},
+    ]) is True
+    assert fitter.competing_basin([
+        {"z": z, "development_loss": 100.0},
+        {"z": z + 0.5, "development_loss": 102.1},
+    ]) is False
+    lower = np.tile(fitter.LOWER_DELTA / fitter.SCALES, 4)
+    upper = np.tile(fitter.UPPER_DELTA / fitter.SCALES, 4)
+    assert fitter._boundary_hits(lower, lower, upper) == [
+        f"{camera}:{name}" for camera in fitter.CAMERAS for name in fitter.PARAMETER_NAMES
+    ]
+    # Removing camera-specific directional factors makes the normalized data
+    # Jacobian incapable of certifying the complete 28-parameter model.
+    broken = copy.deepcopy(model)
+    broken["cameras"]["ch4"]["points"] = broken["cameras"]["ch4"]["points"][:1]
+    broken["cameras"]["ch4"]["polylines"] = []
+    broken["cameras"]["ch4"]["horizons"] = []
+    broken["cameras"]["ch4"]["vanishing"] = []
+    jacobian = fitter._jacobian(lambda value: fitter.residual_vector(value, broken, "fit"), z)
+    assert np.linalg.matrix_rank(jacobian) < 28
