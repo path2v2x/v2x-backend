@@ -1,12 +1,14 @@
 #!/bin/bash -p
-[[ ${BASH_SOURCE[0]} == "$0" ]] || return 2
+/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I \
+  "${BASH_SOURCE[0]%/*}/verify-v2x-bridge-runner-process.py" \
+  || /bin/kill -KILL "$$"
 set -euo pipefail
 
 if [[ $- != *p* ]]; then
   echo "runner must be executed directly with privileged Bash startup isolation" >&2
   exit 2
 fi
-if [[ -n $(declare -F) ]]; then
+if [[ -n $(builtin declare -F) ]]; then
   echo "predeclared shell functions are not accepted" >&2
   exit 2
 fi
@@ -116,7 +118,6 @@ PY
 
 echo "[bridge] CARLA Python 3.10 lane"
 (
-  cd "$bridge_dir"
   /usr/bin/env -i \
     HOME=/home/path \
     LANG=C.UTF-8 \
@@ -130,13 +131,13 @@ echo "[bridge] CARLA Python 3.10 lane"
       -o addopts= \
       -W error \
       -p pytest_asyncio.plugin \
-      tests \
-      --ignore=tests/test_register_map_to_lidar.py
+      --rootdir="$bridge_dir" \
+      "$bridge_dir/tests" \
+      --ignore="$bridge_dir/tests/test_register_map_to_lidar.py"
 )
 
 echo "[bridge] pinned map/LiDAR Python 3.12 lane"
 (
-  cd "$bridge_dir"
   /usr/bin/env -i \
     HOME=/home/path \
     LANG=C.UTF-8 \
@@ -156,5 +157,6 @@ echo "[bridge] pinned map/LiDAR Python 3.12 lane"
       -o addopts= \
       -W error \
       -p pytest_asyncio.plugin \
-      tests/test_register_map_to_lidar.py
+      --rootdir="$bridge_dir" \
+      "$bridge_dir/tests/test_register_map_to_lidar.py"
 )

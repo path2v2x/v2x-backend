@@ -23,10 +23,14 @@ file is executed in full by the second lane. The second lane also fixes every
 thread-control variable required by the tracked lock.
 
 Execute the runner directly; invoking it through another shell is rejected.
-The first executable line compares `BASH_SOURCE[0]` with `$0`, before calling
-any other command, and unconditionally returns failure in source mode. The
-runner also rejects every predeclared shell function and resolves its tracked
-path with absolute `/usr/bin/readlink -f`, never a dispatchable `pwd` function.
+The first executable command launches an isolated absolute Python verifier.
+It reads the parent process through `/proc` and requires exactly `/bin/bash`,
+`-p`, and this tracked runner as the sole script argument; `bash -c`, source
+mode, extra arguments, a different executable, or a different resolved script
+path terminates the isolated runner before repository discovery or test lanes.
+The runner then enumerates functions with `builtin declare -F` and rejects every
+predeclared function. Pytest receives absolute root/test paths, so the runner
+does not dispatch `cd` or `pwd` while selecting either lane.
 Its absolute privileged-Bash shebang prevents `BASH_ENV` startup sourcing and
 function import. It additionally rejects `BASH_ENV`, `ENV`, surviving
 `BASH_FUNC_*` payloads, or a `PATH` that resolves `env` anywhere except

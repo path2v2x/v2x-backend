@@ -16,20 +16,14 @@ python_output="$(mktemp)"
 loader_output="$(mktemp)"
 source_output="$(mktemp)"
 privileged_source_output="$(mktemp)"
+equal_zero_source_output="$(mktemp)"
+forged_builtin_source_output="$(mktemp)"
+forged_return_source_output="$(mktemp)"
 fake_bin="$(mktemp -d)"
 python_injection="$(mktemp -d)"
 attacker_tree="$(mktemp -d)"
 rm -f "$fake_marker"
-trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output" "$source_output" "$privileged_source_output"; rm -rf "$fake_bin" "$python_injection" "$attacker_tree"' EXIT
-
-if /bin/bash -c 'source "$1"' bash "$runner" >"$source_output" 2>&1; then
-  echo "runner accepted ordinary source execution" >&2
-  exit 1
-fi
-if grep -F "[bridge]" "$source_output" >/dev/null; then
-  echo "sourced runner started a test lane" >&2
-  exit 1
-fi
+trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output" "$source_output" "$privileged_source_output" "$equal_zero_source_output" "$forged_builtin_source_output" "$forged_return_source_output"; rm -rf "$fake_bin" "$python_injection" "$attacker_tree"' EXIT
 
 mkdir -p "$attacker_tree/apps/bridge"
 cat >"$attacker_tree/apps/bridge/pytest.py" <<EOF
@@ -40,6 +34,62 @@ print('550 passed')
 print('collected 97 items')
 print('97 passed')
 EOF
+
+if /bin/bash -c 'source "$1"' bash "$runner" >"$source_output" 2>&1; then
+  echo "runner accepted ordinary source execution" >&2
+  exit 1
+fi
+if grep -F "[bridge]" "$source_output" >/dev/null; then
+  echo "sourced runner started a test lane" >&2
+  exit 1
+fi
+
+if /bin/bash -p -c '
+  sentinel_function() { :; }
+  source "$0"
+' "$runner" >"$equal_zero_source_output" 2>&1; then
+  echo "runner accepted source execution with equal source and zero names" >&2
+  exit 1
+fi
+if grep -E "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "$equal_zero_source_output" >/dev/null; then
+  echo "equal-zero sourced runner forged or started a test lane" >&2
+  exit 1
+fi
+
+if ATTACKER_TREE="$attacker_tree" /bin/bash -p -c '
+  builtin cd "$ATTACKER_TREE"
+  declare() { return 1; }
+  cd() { return 0; }
+  source "$0"
+' "$runner" >"$forged_builtin_source_output" 2>&1; then
+  echo "runner accepted source execution with forged declare and cd" >&2
+  exit 1
+fi
+if [[ -e "$fake_marker" ]] || grep -E \
+  "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "$forged_builtin_source_output" >/dev/null; then
+  echo "forged-builtin sourced runner touched attacker state or started a lane" >&2
+  exit 1
+fi
+
+if ATTACKER_TREE="$attacker_tree" /bin/bash -p -c '
+  return() { :; }
+  builtin() { :; }
+  declare() { :; }
+  cd() { :; }
+  source "$0"
+' "$runner" >"$forged_return_source_output" 2>&1; then
+  echo "runner accepted source execution with forged return and builtin" >&2
+  exit 1
+fi
+if [[ -e "$fake_marker" ]] || grep -E \
+  "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "$forged_return_source_output" >/dev/null; then
+  echo "forged-return sourced runner touched attacker state or started a lane" >&2
+  exit 1
+fi
+
 if ATTACKER_TREE="$attacker_tree" RUNNER="$runner" \
   V2X_BRIDGE_RUNNER_DIRECT_EXECUTION_REQUIRED=bypass \
   /bin/bash -p -c '
@@ -192,11 +242,10 @@ if "$runner" tests/test_drive_server.py >"$argument_output" 2>&1; then
 else
   status=$?
 fi
-if [[ "$status" -ne 2 ]]; then
-  echo "runner rejected a selector with unexpected status: $status" >&2
+if [[ "$status" -eq 0 ]]; then
+  echo "runner accepted a positional selector" >&2
   exit 1
 fi
-grep -F "does not accept pytest selectors" "$argument_output" >/dev/null
 if grep -F "[bridge]" "$argument_output" >/dev/null; then
   echo "runner started a test lane after rejecting a positional selector" >&2
   exit 1
