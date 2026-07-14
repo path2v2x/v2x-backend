@@ -105,8 +105,10 @@ def ground_horizon_line(parameters: Iterable[float], width: int, height: int) ->
             [0.0, -focal, float(height) / 2.0],
             [0.0, 0.0, 1.0],
         ])
-        first = calibration @ rotation @ np.asarray((1.0, 0.0, 0.0))
-        second = calibration @ rotation @ np.asarray((0.0, 1.0, 0.0))
+        first_local = rotation @ np.asarray((1.0, 0.0, 0.0))
+        second_local = rotation @ np.asarray((0.0, 1.0, 0.0))
+        first = calibration @ first_local[[1, 2, 0]]
+        second = calibration @ second_local[[1, 2, 0]]
         line = np.cross(first, second)
     else:
         line = np.cross(np.r_[x_vanish, 1.0], np.r_[y_vanish, 1.0])

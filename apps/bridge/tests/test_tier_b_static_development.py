@@ -23,7 +23,9 @@ def binding(path: Path, payload: bytes) -> dict:
 
 def synthetic_document(tmp_path: Path):
     opendrive = binding(tmp_path / "map.xodr", b"<OpenDRIVE/>")
-    cameras_json = binding(tmp_path / "cameras.json", b'{"cameras":[]}')
+    topology = binding(tmp_path / "topology.json", b'{"roads":222,"junctions":29}')
+    cameras_path = tmp_path / "cameras.json"
+    cameras_json = binding(cameras_path, b'{"cameras":[]}')
     document = {
         "schema": fitter.SCHEMA,
         "acceptance_eligible": False,
@@ -31,11 +33,12 @@ def synthetic_document(tmp_path: Path):
         "splits": ["fit", "development"],
         "forbidden_roots": [str(tmp_path / "sealed-holdout")],
         "map": {"candidate_id": "richmond-test", "opendrive": opendrive,
-                "topology_sha256": "a" * 64},
+                "topology": topology},
         "cameras_json": cameras_json,
         "cameras": {},
     }
     truths = {}
+    configured_cameras = []
     for camera_index, camera_id in enumerate(fitter.CAMERAS):
         width, height = 1280, 960
         baseline = np.asarray((camera_index * 20.0, camera_index * 3.0, 7.0,
@@ -44,6 +47,13 @@ def synthetic_document(tmp_path: Path):
                             0.05, 0.25, -0.18, 0.08, 0.35))
         truth = baseline + delta
         truths[camera_id] = truth
+        focal = (width / 2.0) / np.tan(np.radians(baseline[6]) / 2.0)
+        configured_cameras.append({
+            "id": camera_id, "pitch_deg": baseline[3], "heading_deg": baseline[4] + 90.0,
+            "yaw_deg": 0.0, "roll_deg": baseline[5],
+            "intrinsics": {"width": width, "height": height, "fx": focal, "fy": focal,
+                           "cx": width / 2.0, "cy": height / 2.0},
+        })
         epochs = []
         for split, count in (("fit", 3), ("development", 1)):
             for index in range(count):
@@ -115,6 +125,8 @@ def synthetic_document(tmp_path: Path):
             "epochs": epochs, "points": points, "polylines": polylines,
             "horizons": horizons, "vanishing": vanishing,
         }
+    cameras_payload = json.dumps({"cameras": configured_cameras}, sort_keys=True).encode()
+    document["cameras_json"] = binding(cameras_path, cameras_payload)
     raw = json.dumps(document, sort_keys=True).encode()
     return document, truths, hashlib.sha256(raw).hexdigest()
 
@@ -126,6 +138,10 @@ def test_projection_and_production_pose_round_trip():
     assert recovered == pytest.approx(absolute, abs=1e-10)
     assert set(pose) == {"forward_offset_m", "right_offset_m", "height_offset_m",
                          "pitch_offset_deg", "yaw_offset_deg", "roll_offset_deg", "fov_offset_deg"}
+    near_sideways = np.asarray((0.0, 0.0, 7.0, -10.0, 90.0, 2.0, 88.0))
+    horizon = ground_horizon_line(near_sideways, 1280, 960)
+    assert np.isfinite(horizon).all()
+    assert np.linalg.norm(horizon[:2]) == pytest.approx(1.0)
 
 
 def test_schema_and_synthetic_independent_translation_recovery(tmp_path):
@@ -185,12 +201,12 @@ def test_rank_and_bound_and_competing_basin_fail_closed(tmp_path):
     model = fitter.validate_document(document, digest)
     z = np.zeros(28)
     assert fitter.competing_basin([
-        {"z": z, "development_loss": 100.0},
-        {"z": z + 0.5, "development_loss": 101.9},
+        {"z": z, "fit_loss": 1.0, "development_loss": 100.0},
+        {"z": z + 0.5, "fit_loss": 1.1, "development_loss": 101.9},
     ]) is True
     assert fitter.competing_basin([
-        {"z": z, "development_loss": 100.0},
-        {"z": z + 0.5, "development_loss": 102.1},
+        {"z": z, "fit_loss": 1.0, "development_loss": 100.0},
+        {"z": z + 0.5, "fit_loss": 1.1, "development_loss": 102.1},
     ]) is False
     lower = np.tile(fitter.LOWER_DELTA / fitter.SCALES, 4)
     upper = np.tile(fitter.UPPER_DELTA / fitter.SCALES, 4)
@@ -206,3 +222,57 @@ def test_rank_and_bound_and_competing_basin_fail_closed(tmp_path):
     broken["cameras"]["ch4"]["vanishing"] = []
     jacobian = fitter._jacobian(lambda value: fitter.residual_vector(value, broken, "fit"), z)
     assert np.linalg.matrix_rank(jacobian) < 28
+    lower = np.tile(fitter.LOWER_DELTA / fitter.SCALES, 4)
+    upper = np.tile(fitter.UPPER_DELTA / fitter.SCALES, 4)
+    _values, success, reason, iterations = fitter._refine(model, z, lower, upper, 0)
+    assert (success, reason, iterations) == (False, "iteration_limit", 0)
+
+
+def test_invalid_polyline_has_constant_residual_dimension(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    model = fitter.validate_document(document, digest)
+    item = model["cameras"]["ch1"]["polylines"][0]
+    valid = fitter._polyline_residual(item, model["cameras"]["ch1"]["baseline"], model["cameras"]["ch1"])
+    behind = model["cameras"]["ch1"]["baseline"].copy()
+    behind[4] += 180.0
+    invalid = fitter._polyline_residual(item, behind, model["cameras"]["ch1"])
+    assert valid.shape == invalid.shape == (32,)
+
+
+def test_multistart_is_deterministic_and_axis_stratified():
+    lower, upper = np.zeros(28), np.ones(28)
+    first = np.asarray(fitter._low_discrepancy_starts(lower, upper, 8, 42))
+    second = np.asarray(fitter._low_discrepancy_starts(lower, upper, 8, 42))
+    assert first == pytest.approx(second)
+    for axis in range(28):
+        assert sorted(np.floor(first[:, axis] * 8).astype(int)) == list(range(8))
+    selected = fitter._select_fit_candidate([
+        {"fit_loss": 2.0, "development_loss": 0.0},
+        {"fit_loss": 1.0, "development_loss": 100.0},
+    ])
+    assert selected["fit_loss"] == 1.0
+
+
+def test_fov_bounds_intersect_physical_interval(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    model = fitter.validate_document(document, digest)
+    model["cameras"]["ch1"]["baseline"][6] = 2.0
+    lower, upper = fitter._normalized_bounds(model)
+    assert 2.0 + lower[6] * fitter.SCALES[6] > 1.0
+    assert 2.0 + upper[6] * fitter.SCALES[6] < 179.0
+
+
+def test_cross_camera_geometry_and_config_drift_are_rejected(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    document["cameras"]["ch2"]["points"][-1]["world_xyz"] = copy.deepcopy(
+        document["cameras"]["ch1"]["points"][0]["world_xyz"]
+    )
+    with pytest.raises(fitter.DevelopmentFitError, match="crosses camera"):
+        fitter.validate_document(document, digest)
+
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    document, _truths, digest = synthetic_document(config_root)
+    document["cameras"]["ch1"]["production_base"]["yaw_deg"] += 0.1
+    with pytest.raises(fitter.DevelopmentFitError, match="disagrees with cameras JSON"):
+        fitter.validate_document(document, digest)

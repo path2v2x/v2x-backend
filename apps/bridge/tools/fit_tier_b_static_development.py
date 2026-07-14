@@ -27,6 +27,11 @@ from digital_twin_bridge.camera_projection import (
     project_direction,
     project_world,
 )
+from digital_twin_bridge.twin_camera_rig import (
+    absolute_twin_model,
+    heading_to_carla_yaw,
+    horizontal_fov_deg,
+)
 
 
 SCHEMA = "v2x-tier-b-static-development-manifest/v1"
@@ -169,22 +174,24 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
         raise DevelopmentFitError("forbidden roots are required")
     map_value = document.get("map")
     if not isinstance(map_value, dict) or set(map_value) != {
-        "candidate_id", "opendrive", "topology_sha256"
+        "candidate_id", "opendrive", "topology"
     }:
         raise DevelopmentFitError("map binding is invalid")
     if not isinstance(map_value["candidate_id"], str) or not map_value["candidate_id"]:
         raise DevelopmentFitError("map candidate ID is missing")
-    if not isinstance(map_value["topology_sha256"], str) or len(map_value["topology_sha256"]) != 64:
-        raise DevelopmentFitError("map topology hash is invalid")
     artifacts = {
         "opendrive": _binding(map_value["opendrive"], "OpenDRIVE", roots),
+        "topology": _binding(map_value["topology"], "topology summary", roots),
         "cameras_json": _binding(document.get("cameras_json"), "cameras JSON", roots),
     }
+    config = json.loads(Path(artifacts["cameras_json"]["path"]).read_bytes())
+    configured_cameras = {item.get("id"): item for item in config.get("cameras", [])}
     cameras_value = document.get("cameras")
     if not isinstance(cameras_value, dict) or tuple(sorted(cameras_value)) != CAMERAS:
         raise DevelopmentFitError("manifest must contain exactly ch1/ch2/ch3/ch4")
     cameras = {}
     global_feature_splits: dict[str, set[str]] = defaultdict(set)
+    global_frame_splits: dict[str, set[str]] = defaultdict(set)
     for camera_id in CAMERAS:
         value = cameras_value[camera_id]
         if not isinstance(value, dict):
@@ -200,6 +207,33 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
         if not isinstance(base, dict) or set(base) != {"pitch_deg", "yaw_deg", "roll_deg", "fov_deg"}:
             raise DevelopmentFitError(f"{camera_id} production base is invalid")
         _finite_vector(list(base.values()), 4, f"{camera_id} production base")
+        configured = configured_cameras.get(camera_id)
+        if not isinstance(configured, dict):
+            raise DevelopmentFitError(f"{camera_id} is absent from cameras JSON")
+        intrinsics = configured.get("intrinsics") or {}
+        if int(intrinsics.get("width", 0)) != width or int(intrinsics.get("height", 0)) != height:
+            raise DevelopmentFitError(f"{camera_id} dimensions disagree with cameras JSON")
+        expected_base = {
+            "pitch_deg": float(configured.get("pitch_deg")),
+            "yaw_deg": heading_to_carla_yaw(
+                float(configured.get("heading_deg")), float(configured.get("yaw_deg"))
+            ),
+            "roll_deg": float(configured.get("roll_deg", 0.0)),
+            "fov_deg": horizontal_fov_deg(intrinsics),
+        }
+        if any(not math.isclose(float(base[key]), expected_base[key], abs_tol=1e-9, rel_tol=0)
+               for key in expected_base):
+            raise DevelopmentFitError(f"{camera_id} production base disagrees with cameras JSON")
+        expected_absolute = absolute_twin_model(
+            anchor, expected_base, configured.get("twin_pose") or {}
+        )
+        expected_baseline = np.asarray([
+            *expected_absolute["location"], expected_absolute["pitch_deg"],
+            expected_absolute["yaw_deg"], expected_absolute["roll_deg"],
+            expected_absolute["fov_deg"],
+        ])
+        if not np.allclose(baseline, expected_baseline, atol=1e-9, rtol=0):
+            raise DevelopmentFitError(f"{camera_id} baseline disagrees with cameras JSON and anchor")
         epochs_value = value.get("epochs")
         if not isinstance(epochs_value, list):
             raise DevelopmentFitError(f"{camera_id} epochs are missing")
@@ -221,6 +255,8 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
             if raw_hashes_by_split[split] & hashes:
                 raise DevelopmentFitError(f"{camera_id} duplicates a frame within {split}")
             raw_hashes_by_split[split].update(hashes)
+            for digest in hashes:
+                global_frame_splits[digest].add(split)
             epochs[epoch_id] = {"split": split, "frame": frame, "median_members": sorted(members)}
         if raw_hashes_by_split["fit"] & raw_hashes_by_split["development"]:
             raise DevelopmentFitError(f"{camera_id} temporal median crosses splits")
@@ -229,7 +265,7 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
         for item in value.get("points", []):
             item_id, feature_id = _identity(item, seen_ids, f"{camera_id} point")
             split = _split(item, epochs, f"{camera_id} point {item_id}")
-            global_feature_splits[f"point:{feature_id}"].add(split)
+            global_feature_splits[feature_id].add(split)
             uncertainty = float(item.get("uncertainty_px", 0))
             if not math.isfinite(uncertainty) or uncertainty <= 0:
                 raise DevelopmentFitError(f"{camera_id} point uncertainty is invalid")
@@ -242,7 +278,7 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
         for item in value.get("polylines", []):
             item_id, feature_id = _identity(item, seen_ids, f"{camera_id} polyline")
             split = _split(item, epochs, f"{camera_id} polyline {item_id}")
-            global_feature_splits[f"polyline:{feature_id}"].add(split)
+            global_feature_splits[feature_id].add(split)
             feature_class = item.get("class")
             if feature_class not in CLASSES:
                 raise DevelopmentFitError(f"{camera_id} polyline class is invalid")
@@ -267,7 +303,7 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
         for item in value.get("horizons", []):
             item_id, feature_id = _identity(item, seen_ids, f"{camera_id} horizon")
             split = _split(item, epochs, f"{camera_id} horizon {item_id}")
-            global_feature_splits[f"horizon:{feature_id}"].add(split)
+            global_feature_splits[feature_id].add(split)
             uncertainty = float(item.get("uncertainty_px", 0))
             if not math.isfinite(uncertainty) or uncertainty <= 0:
                 raise DevelopmentFitError(f"{camera_id} horizon uncertainty is invalid")
@@ -279,7 +315,7 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
         for item in value.get("vanishing", []):
             item_id, feature_id = _identity(item, seen_ids, f"{camera_id} vanishing")
             split = _split(item, epochs, f"{camera_id} vanishing {item_id}")
-            global_feature_splits[f"vanishing:{feature_id}"].add(split)
+            global_feature_splits[feature_id].add(split)
             uncertainty = float(item.get("uncertainty_px", 0))
             if not math.isfinite(uncertainty) or uncertainty <= 0:
                 raise DevelopmentFitError(f"{camera_id} vanishing uncertainty is invalid")
@@ -298,9 +334,13 @@ def validate_document(document: object, manifest_sha256: str, extra_forbidden=()
     conflicts = sorted(key for key, splits in global_feature_splits.items() if len(splits) != 1)
     if conflicts:
         raise DevelopmentFitError(f"physical features cross fit/development splits: {conflicts}")
+    if any(len(splits) != 1 for splits in global_frame_splits.values()):
+        raise DevelopmentFitError("raw frame hashes cross fit/development splits")
     _validate_geometry_split_isolation(cameras)
     return {
-        "manifest_sha256": manifest_sha256, "map": {**map_value, "opendrive": artifacts["opendrive"]},
+        "manifest_sha256": manifest_sha256,
+        "map": {"candidate_id": map_value["candidate_id"], "opendrive": artifacts["opendrive"],
+                "topology": artifacts["topology"]},
         "cameras_json": artifacts["cameras_json"], "cameras": cameras,
     }
 
@@ -323,6 +363,29 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
                 distance = np.linalg.norm(left_samples[:, None] - right_samples[None, :], axis=2)
                 if max(np.max(np.min(distance, axis=1)), np.max(np.min(distance, axis=0))) < 0.05:
                     raise DevelopmentFitError(f"{camera_id} copies/resamples a polyline across fit/development")
+        for point in dev_points:
+            if any(np.min(np.linalg.norm(_resample_world_polyline(line["world_vertices"]) - point["world_xyz"], axis=1)) < 0.05 for line in fit_lines):
+                raise DevelopmentFitError(f"{camera_id} reuses fit polyline geometry as a development point")
+        for point in fit_points:
+            if any(np.min(np.linalg.norm(_resample_world_polyline(line["world_vertices"]) - point["world_xyz"], axis=1)) < 0.05 for line in dev_lines):
+                raise DevelopmentFitError(f"{camera_id} reuses fit point geometry as a development polyline")
+    fit_points = [(camera_id, item) for camera_id, camera in cameras.items()
+                  for item in camera["points"] if item["split"] == "fit"]
+    dev_points = [(camera_id, item) for camera_id, camera in cameras.items()
+                  for item in camera["points"] if item["split"] == "development"]
+    fit_lines = [(camera_id, item) for camera_id, camera in cameras.items()
+                 for item in camera["polylines"] if item["split"] == "fit"]
+    dev_lines = [(camera_id, item) for camera_id, camera in cameras.items()
+                 for item in camera["polylines"] if item["split"] == "development"]
+    if any(np.linalg.norm(left[1]["world_xyz"] - right[1]["world_xyz"]) < 1e-6
+           for left in fit_points for right in dev_points):
+        raise DevelopmentFitError("point geometry crosses camera fit/development splits")
+    if any(max(np.max(np.min(distance, axis=1)), np.max(np.min(distance, axis=0))) < 0.05
+           for _left_camera, left in fit_lines for _right_camera, right in dev_lines
+           for distance in [np.linalg.norm(
+               _resample_world_polyline(left["world_vertices"])[:, None]
+               - _resample_world_polyline(right["world_vertices"])[None, :], axis=2)]) :
+        raise DevelopmentFitError("polyline geometry crosses camera fit/development splits")
 
 
 def _resample_world_polyline(vertices: np.ndarray, count: int = 16) -> np.ndarray:
@@ -384,10 +447,35 @@ def _reference_scale(camera: dict) -> np.ndarray:
     return np.asarray((1280.0 / camera["width"], 960.0 / camera["height"]))
 
 
+def _horizon_residual(predicted: np.ndarray, observed: np.ndarray, camera: dict) -> np.ndarray:
+    """Symmetric homogeneous point-to-line distances without slope division."""
+    width, height = camera["width"], camera["height"]
+    def points(line):
+        candidates = []
+        a, b, c = line
+        if abs(b) > 1e-12:
+            candidates.extend(((0.0, -c / b), (width - 1.0, -(a * (width - 1.0) + c) / b)))
+        if abs(a) > 1e-12:
+            candidates.extend(((-c / a, 0.0), (-(b * (height - 1.0) + c) / a, height - 1.0)))
+        valid = [item for item in candidates if -1e-6 <= item[0] <= width - 1 + 1e-6
+                 and -1e-6 <= item[1] <= height - 1 + 1e-6]
+        if len(valid) < 2:
+            return np.empty((0, 2))
+        return np.asarray(valid[:2], dtype=float)
+    predicted_points, observed_points = points(predicted), points(observed)
+    if len(predicted_points) != 2 or len(observed_points) != 2:
+        return np.full(4, 100.0)
+    scale = _reference_scale(camera)
+    forward = np.abs(np.c_[observed_points, np.ones(2)] @ predicted) * np.mean(scale)
+    reverse = np.abs(np.c_[predicted_points, np.ones(2)] @ observed) * np.mean(scale)
+    result = np.r_[forward, reverse]
+    return result if np.isfinite(result).all() else np.full(4, 100.0)
+
+
 def _polyline_residual(item: dict, params: np.ndarray, camera: dict) -> np.ndarray:
     projected, depth = project_world(item["world_vertices"], params, camera["width"], camera["height"])
     if np.any(depth <= 0.1) or not np.isfinite(projected).all():
-        return np.full(2 * len(item["real_vertices"]), 100.0)
+        return np.full(32, 100.0)
     scale = _reference_scale(camera)
     predicted = _resample_polyline(projected * scale)
     observed = _resample_polyline(item["real_vertices"] * scale)
@@ -408,9 +496,9 @@ def _resample_polyline(vertices: np.ndarray, count: int = 16) -> np.ndarray:
     ])
 
 
-def residual_vector(parameters_z: np.ndarray, model: dict, split: str) -> np.ndarray:
+def residual_vector(parameters_z: np.ndarray, model: dict, split: str, *, return_weights=False):
     absolute = _absolute(np.asarray(parameters_z, dtype=float), model)
-    values = []
+    values, cluster_weights = [], []
     cluster_counts = Counter()
     for camera_id in CAMERAS:
         camera = model["cameras"][camera_id]
@@ -434,18 +522,20 @@ def residual_vector(parameters_z: np.ndarray, model: dict, split: str) -> np.nda
                     residual = _polyline_residual(item, params, camera)
                 elif kind == "horizons":
                     predicted = ground_horizon_line(params, camera["width"], camera["height"])
-                    xs = np.asarray((0.0, camera["width"] - 1.0))
-                    observed_y = -(item["real_line"][0] * xs + item["real_line"][2]) / item["real_line"][1]
-                    predicted_y = -(predicted[0] * xs + predicted[2]) / predicted[1]
-                    residual = (predicted_y - observed_y) * scale[1] / item["uncertainty_px"]
+                    residual = _horizon_residual(predicted, item["real_line"], camera) / item["uncertainty_px"]
                 else:
                     predicted = project_direction(item["world_direction"], params, camera["width"], camera["height"])
                     residual = (predicted - item["real_uv"]) * scale / item["uncertainty_px"]
                     if not np.isfinite(residual).all():
                         residual = np.full(2, 100.0)
                 count = cluster_counts[(camera_id, kind, item["physical_feature_id"])]
-                values.extend((residual / math.sqrt(count * max(1, len(residual)))).tolist())
-    return np.asarray(values, dtype=float)
+                values.extend(residual.tolist())
+                cluster_weights.extend([1.0 / (count * max(1, len(residual)))] * len(residual))
+    raw = np.asarray(values, dtype=float)
+    weights = np.asarray(cluster_weights, dtype=float)
+    if return_weights:
+        return raw, weights
+    return raw * np.sqrt(weights)
 
 
 def _jacobian(function, values: np.ndarray, step=1e-5) -> np.ndarray:
@@ -462,7 +552,7 @@ def _jacobian(function, values: np.ndarray, step=1e-5) -> np.ndarray:
 def competing_basin(solutions: list[dict], relative=0.02) -> bool:
     if len(solutions) < 2:
         return False
-    ranked = sorted(solutions, key=lambda item: item["development_loss"])
+    ranked = sorted(solutions, key=lambda item: item["fit_loss"])
     best = ranked[0]
     ceiling = best["development_loss"] + relative * max(abs(best["development_loss"]), 1e-12)
     return any(
@@ -470,6 +560,11 @@ def competing_basin(solutions: list[dict], relative=0.02) -> bool:
         and np.any(np.abs(item["z"] - best["z"]) > BASIN_NEIGHBORHOOD_Z)
         for item in ranked[1:]
     )
+
+
+def _select_fit_candidate(candidates: list[dict]) -> dict:
+    """Select parameters without consulting development observations."""
+    return min(candidates, key=lambda item: item["fit_loss"])
 
 
 def _errors(model: dict, z: np.ndarray, split: str) -> dict:
@@ -499,10 +594,7 @@ def _errors(model: dict, z: np.ndarray, split: str) -> dict:
             if item["split"] != split:
                 continue
             predicted = ground_horizon_line(params, camera["width"], camera["height"])
-            xs = np.asarray((0.0, camera["width"] - 1.0))
-            observed_y = -(item["real_line"][0] * xs + item["real_line"][2]) / item["real_line"][1]
-            predicted_y = -(predicted[0] * xs + predicted[2]) / predicted[1]
-            row = np.abs((predicted_y - observed_y) * scale[1])
+            row = np.abs(_horizon_residual(predicted, item["real_line"], camera))
             horizon_rows.extend(row); by_epoch[item["epoch_id"]]["horizons"].extend(row)
         for item in camera["vanishing"]:
             if item["split"] != split:
@@ -547,51 +639,56 @@ def _huber_objective(residual: np.ndarray) -> float:
     return float(np.mean(np.where(absolute <= 1.0, 0.5 * residual**2, absolute - 0.5)))
 
 
+def _clustered_huber_objective(residual: np.ndarray, weights: np.ndarray) -> float:
+    absolute = np.abs(residual)
+    loss = np.where(absolute <= 1.0, 0.5 * residual**2, absolute - 0.5)
+    return float(np.sum(weights * loss) / np.sum(weights))
+
+
 def _low_discrepancy_starts(lower: np.ndarray, upper: np.ndarray, count: int, seed: int):
-    primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43,
-              47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107)
-    shifts = np.random.default_rng(seed).random(len(lower))
-    def radical(index, base):
-        value, factor = 0.0, 1.0 / base
-        while index:
-            index, digit = divmod(index, base)
-            value += digit * factor; factor /= base
-        return value
-    return [
-        lower + np.asarray([(radical(index, base) + shifts[axis]) % 1.0
-                            for axis, base in enumerate(primes)]) * (upper - lower)
-        for index in range(1, count + 1)
-    ]
+    if count <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    unit = np.empty((count, len(lower)))
+    for axis in range(len(lower)):
+        unit[:, axis] = (rng.permutation(count) + rng.random(count)) / count
+    return [lower + row * (upper - lower) for row in unit]
 
 
 def _refine(model: dict, start: np.ndarray, lower: np.ndarray, upper: np.ndarray,
-            max_iterations: int) -> tuple[np.ndarray, bool]:
+            max_iterations: int) -> tuple[np.ndarray, bool, str, int]:
     values = np.clip(np.asarray(start, dtype=float), lower, upper)
     damping = 1e-3
     for _iteration in range(max_iterations):
-        residual = residual_vector(values, model, "fit")
-        jacobian = _jacobian(lambda z: residual_vector(z, model, "fit"), values)
-        weights = np.minimum(1.0, 1.0 / np.maximum(np.abs(residual), 1e-12))
+        residual, cluster = residual_vector(values, model, "fit", return_weights=True)
+        jacobian = _jacobian(
+            lambda z: residual_vector(z, model, "fit", return_weights=True)[0], values
+        )
+        robust = np.minimum(1.0, 1.0 / np.maximum(np.abs(residual), 1e-12))
+        weights = cluster * robust
         weighted_jacobian = jacobian * np.sqrt(weights)[:, None]
         weighted_residual = residual * np.sqrt(weights)
         system = weighted_jacobian.T @ weighted_jacobian + damping * np.eye(len(values))
         try:
             delta = np.linalg.solve(system, -(weighted_jacobian.T @ weighted_residual))
         except np.linalg.LinAlgError:
-            return values, False
+            return values, False, "singular_normal_equations", _iteration + 1
         if float(np.linalg.norm(delta)) < 1e-8:
-            return values, True
-        objective = _huber_objective(residual)
+            return values, True, "normalized_step_converged", _iteration + 1
+        objective = _clustered_huber_objective(residual, cluster)
         accepted = False
         for fraction in (1.0, 0.5, 0.25, 0.125, 0.0625):
             candidate = np.clip(values + fraction * delta, lower, upper)
-            if _huber_objective(residual_vector(candidate, model, "fit")) < objective:
+            candidate_residual, candidate_cluster = residual_vector(
+                candidate, model, "fit", return_weights=True
+            )
+            if _clustered_huber_objective(candidate_residual, candidate_cluster) < objective:
                 values = candidate; damping = max(1e-9, damping * 0.5); accepted = True; break
         if not accepted:
             damping = min(1e9, damping * 10.0)
             if damping >= 1e8:
-                return values, False
-    return values, True
+                return values, False, "no_objective_progress", _iteration + 1
+    return values, False, "iteration_limit", max_iterations
 
 
 def _boundary_hits(values: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> list[str]:
@@ -602,22 +699,38 @@ def _boundary_hits(values: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> 
     ]
 
 
-def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
+def _normalized_bounds(model: dict) -> tuple[np.ndarray, np.ndarray]:
     lower = np.tile(LOWER_DELTA / SCALES, 4)
     upper = np.tile(UPPER_DELTA / SCALES, 4)
+    fov_index = PARAMETER_NAMES.index("fov_deg")
+    for camera_index, camera_id in enumerate(CAMERAS):
+        baseline_fov = model["cameras"][camera_id]["baseline"][fov_index]
+        index = camera_index * 7 + fov_index
+        lower[index] = max(lower[index], (1.0 + 1e-6 - baseline_fov) / SCALES[fov_index])
+        upper[index] = min(upper[index], (179.0 - 1e-6 - baseline_fov) / SCALES[fov_index])
+        if lower[index] >= upper[index]:
+            raise DevelopmentFitError(f"{camera_id} has no physically valid FOV search interval")
+    return lower, upper
+
+
+def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
+    lower, upper = _normalized_bounds(model)
     seeds = [np.zeros(28), *_low_discrepancy_starts(lower, upper, starts, seed)]
     candidates = []
     for start in seeds:
-        values, success = _refine(model, start, lower, upper, max_nfev)
-        fit = residual_vector(values, model, "fit")
-        development = residual_vector(values, model, "development")
+        values, success, reason, iterations = _refine(model, start, lower, upper, max_nfev)
+        fit, fit_weights = residual_vector(values, model, "fit", return_weights=True)
+        development, development_weights = residual_vector(
+            values, model, "development", return_weights=True
+        )
         candidates.append({
-            "z": values, "success": success,
-            "fit_loss": float(np.mean(fit**2)),
-            "development_loss": float(np.mean(development**2)),
+            "z": values, "success": success, "convergence_reason": reason,
+            "iterations": iterations,
+            "fit_loss": _clustered_huber_objective(fit, fit_weights),
+            "development_loss": _clustered_huber_objective(development, development_weights),
         })
-    candidates.sort(key=lambda item: (item["development_loss"], item["fit_loss"]))
-    best = candidates[0]
+    candidates.sort(key=lambda item: item["fit_loss"])
+    best = _select_fit_candidate(candidates)
     jacobian = _jacobian(lambda z: residual_vector(z, model, "fit"), best["z"])
     singular = np.linalg.svd(jacobian, compute_uv=False)
     tolerance = max(jacobian.shape) * np.finfo(float).eps * singular[0]
@@ -658,6 +771,10 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         "parameterization": {"per_camera": list(PARAMETER_NAMES), "dimension": 28,
                              "global_site_se2_parameter": False, "scales": SCALES.tolist()},
         "optimizer": {"seed": seed, "starts": len(seeds), "loss": "huber", "f_scale": 1.0},
+        "code_identity": {
+            "fitter_sha256": _sha256(Path(__file__).resolve()),
+            "projection_sha256": _sha256(Path(project_world.__code__.co_filename).resolve()),
+        },
         "data_jacobian": {"rank": rank, "required_rank": 28, "condition": condition,
                           "condition_max": CONDITION_MAX, "singular_values": singular.tolist()},
         "boundary_hits": boundary_hits, "competing_basin": basin_failed,
@@ -665,6 +782,7 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         "candidate_losses": [{key: (value.tolist() if key == "z" else value) for key, value in item.items()} for item in candidates],
         "cameras": cameras,
         "limitations": ["development_only_no_sealed_holdout", "map_relative_not_surveyed_world_accuracy",
+                        "world_geometry_is_manifest_asserted_not_derived_from_hashed_opendrive",
                         "candidate_requires_isolated_ue5_rerender_and_visual_veto"],
     }
 
