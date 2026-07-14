@@ -162,6 +162,11 @@ def inventory_package_tree(package_root: Path) -> dict:
     root_descriptor, root_ancestors = _walk_directory_no_follow(package_root)
     files: list[str] = []
     directories: list[str] = []
+    file_records: list[dict] = []
+    held_directories: list[tuple[int, tuple[int, ...]]] = [
+        (root_descriptor, _identity(os.fstat(root_descriptor)))
+    ]
+    held_files: list[tuple[int, tuple[int, ...]]] = []
 
     def recurse(descriptor: int, prefix: str) -> None:
         for name in sorted(os.listdir(descriptor)):
@@ -179,24 +184,67 @@ def inventory_package_tree(package_root: Path) -> dict:
                     dir_fd=descriptor,
                 )
                 directories.append(relative)
-                try:
-                    recurse(child, relative)
-                finally:
-                    os.close(child)
+                held_directories.append((child, _identity(os.fstat(child))))
+                recurse(child, relative)
             elif stat.S_ISREG(value.st_mode) and value.st_nlink == 1:
+                file_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                opened = os.fstat(file_descriptor)
+                if _identity(opened) != _identity(value):
+                    os.close(file_descriptor)
+                    raise LineageError("package file changed while inventory opened it")
+                remaining = opened.st_size
+                digest = hashlib.sha256()
+                while remaining:
+                    chunk = os.read(file_descriptor, min(CHUNK_BYTES, remaining))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if remaining or os.read(file_descriptor, 1):
+                    os.close(file_descriptor)
+                    raise LineageError("package file changed size during inventory")
+                after = os.fstat(file_descriptor)
+                if _identity(after) != _identity(opened):
+                    os.close(file_descriptor)
+                    raise LineageError("package file changed during inventory")
+                held_files.append((file_descriptor, _identity(opened)))
                 files.append(relative)
+                file_records.append({
+                    "path": relative,
+                    "bytes": opened.st_size,
+                    "sha256": digest.hexdigest(),
+                })
             else:
                 raise LineageError("package inventory contains a non-regular or hard-linked file")
 
     try:
         recurse(root_descriptor, "")
+        if any(_identity(os.fstat(fd)) != identity for fd, identity in held_files):
+            raise LineageError("package file identity changed before inventory completed")
+        if any(_identity(os.fstat(fd)) != identity for fd, identity in held_directories):
+            raise LineageError("package directory identity changed before inventory completed")
+        fresh_root, fresh_ancestors = _walk_directory_no_follow(package_root)
+        try:
+            if fresh_ancestors != root_ancestors:
+                raise LineageError("package root ancestry changed during inventory")
+            if _identity(os.fstat(fresh_root)) != held_directories[0][1]:
+                raise LineageError("package root identity changed during inventory")
+        finally:
+            os.close(fresh_root)
+        return {
+            "files": sorted(files),
+            "directories": sorted(directories),
+            "file_records": sorted(file_records, key=lambda item: item["path"]),
+        }
     finally:
-        os.close(root_descriptor)
-    fresh_root, fresh_ancestors = _walk_directory_no_follow(package_root)
-    os.close(fresh_root)
-    if fresh_ancestors != root_ancestors:
-        raise LineageError("package root ancestry changed during inventory")
-    return {"files": sorted(files), "directories": sorted(directories)}
+        for descriptor, _identity_value in held_files:
+            os.close(descriptor)
+        for descriptor, _identity_value in reversed(held_directories):
+            os.close(descriptor)
 
 
 def _local_name(tag: str) -> str:
@@ -421,7 +469,7 @@ def candidate_id(name: str, artifacts: list[dict]) -> str:
     return f"{name}-sha256-{digest}"
 
 
-def build(args: argparse.Namespace) -> dict:
+def _build_snapshot(args: argparse.Namespace) -> dict:
     package_root = Path(args.package_root)
     _validate_path_text(package_root)
 
@@ -467,8 +515,18 @@ def build(args: argparse.Namespace) -> dict:
         raise LineageError(
             f"recovered package inventory is incomplete or inconsistent; missing={missing} extra={extra}"
         )
+    artifact_by_relative_path = {
+        str(Path(item["path"]).relative_to(package_root).as_posix()): item
+        for item in recovered
+    }
+    for record in package_inventory["file_records"]:
+        item = artifact_by_relative_path[record["path"]]
+        if item["bytes"] != record["bytes"] or item["sha256"] != record["sha256"]:
+            raise LineageError(
+                "recovered artifact hash differs from terminal package inventory snapshot"
+            )
     inventory_contract = {
-        "files": package_inventory["files"],
+        "file_records": package_inventory["file_records"],
         "directories": package_inventory["directories"],
     }
     inventory_sha256 = hashlib.sha256(
@@ -552,6 +610,30 @@ def build(args: argparse.Namespace) -> dict:
             "tier_a_absolute_world_truth_remains_unavailable",
         ],
     }
+
+
+def _snapshot_comparison_bytes(report: dict) -> bytes:
+    comparable = dict(report)
+    comparable.pop("created_at_utc", None)
+    return json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode()
+
+
+def build(args: argparse.Namespace) -> dict:
+    """Require two identical complete reads and return the terminal snapshot.
+
+    A complete pass reopens and hashes every supplied artifact and recursively
+    inventories the package through no-follow dirfds. Comparing two complete
+    passes catches replacement of an already-read nested directory or file
+    during a later inventory step; candidate IDs and the returned report bind
+    only the second, coherent terminal snapshot.
+    """
+    first = _build_snapshot(args)
+    second = _build_snapshot(args)
+    if _snapshot_comparison_bytes(first) != _snapshot_comparison_bytes(second):
+        raise LineageError(
+            "recovered package snapshot changed between complete no-follow passes"
+        )
+    return second
 
 
 def publish_no_replace(path_value: str, report: dict) -> None:

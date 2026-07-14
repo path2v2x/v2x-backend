@@ -164,6 +164,32 @@ def test_read_rejects_ancestor_replacement_after_open(tmp_path, monkeypatch):
     with pytest.raises(lineage.LineageError, match="absolute path ancestry changed"):
         lineage.read_input(str(target), "raced_artifact")
 
+
+def test_build_rejects_nested_material_directory_replacement_during_inventory(
+    inputs, monkeypatch,
+):
+    material_directory = Path(inputs.package_root) / "Richmond.fbm"
+    original_listdir = lineage.os.listdir
+    replaced = False
+
+    def replacing_listdir(descriptor):
+        nonlocal replaced
+        values = original_listdir(descriptor)
+        try:
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            return values
+        if not replaced and opened_path == material_directory:
+            replaced = True
+            material_directory.rename(Path(inputs.package_root).parent / "Richmond.fbm-old")
+            write(material_directory / "a.png", b"attacker-replacement")
+            write(material_directory / "nested" / "b.png", b"png-b")
+        return values
+
+    monkeypatch.setattr(lineage.os, "listdir", replacing_listdir)
+    with pytest.raises(lineage.LineageError, match="directory identity changed before inventory completed"):
+        lineage.build(inputs)
+
 def test_rejects_hardlinks_duplicate_paths_and_outside_package(inputs, tmp_path):
     source = Path(inputs.material_file[0])
     hardlink = source.with_name("hardlink.png")
