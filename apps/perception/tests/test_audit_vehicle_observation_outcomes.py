@@ -740,6 +740,48 @@ def test_signed_receipt_deleted_before_build_returns_prevents_publication(tmp_pa
     assert not output.exists()
 
 
+def test_signed_receipt_deleted_after_build_returns_prevents_publication(tmp_path):
+    fixture = AuditFixture(tmp_path, count=1, accepted=0, unavailable=1)
+    receipt = fixture.root / fixture.receipt_descriptors["event-0"][0]["path"]
+    output = tmp_path / "audit.json"
+    report = fixture.build()
+
+    receipt.unlink()
+
+    assert_error(
+        "evidence_replaced",
+        lambda: audit.write_report_exclusive(output, report),
+    )
+    assert not output.exists()
+
+
+def test_signed_receipt_deleted_after_output_link_prevents_publication(
+    tmp_path, monkeypatch
+):
+    fixture = AuditFixture(tmp_path, count=1, accepted=0, unavailable=1)
+    receipt = fixture.root / fixture.receipt_descriptors["event-0"][0]["path"]
+    output = tmp_path / "audit.json"
+    report = fixture.build()
+    original_link = audit.os.link
+    linked = False
+
+    def deleting_link(source, destination, *args, **kwargs):
+        nonlocal linked
+        result = original_link(source, destination, *args, **kwargs)
+        receipt.unlink()
+        linked = True
+        return result
+
+    monkeypatch.setattr(audit.os, "link", deleting_link)
+
+    assert_error(
+        "evidence_replaced",
+        lambda: audit.write_report_exclusive(output, report),
+    )
+    assert linked is True
+    assert not output.exists()
+
+
 def test_non_nfc_evidence_path_is_rejected(tmp_path):
     fixture = AuditFixture(tmp_path, count=1, accepted=0)
     fixture.rows[0]["evidence"][0]["path"] = "evidence/e\u0301.json"
@@ -908,6 +950,46 @@ def test_publication_directory_replacement_cannot_substitute_different_bytes(
         return result
 
     monkeypatch.setattr(audit.os, "link", replacing_link)
+
+    assert_error(
+        "output_directory_replaced",
+        lambda: audit.write_report_exclusive(
+            output, {"schema": audit.REPORT_SCHEMA, "marker": "trusted"}
+        ),
+    )
+    assert replaced is True
+    assert output.read_bytes() == substitute
+    assert not (displaced / output.name).exists()
+
+
+def test_publication_directory_replacement_after_pre_fsync_check_cannot_substitute_bytes(
+    tmp_path, monkeypatch
+):
+    publication = tmp_path / "publication"
+    publication.mkdir()
+    displaced = tmp_path / "displaced"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    output = publication / "audit.json"
+    substitute = b'{"marker":"attacker-substitute"}\n'
+    (replacement / output.name).write_bytes(substitute)
+    original_stat = audit.os.stat
+    replaced = False
+
+    def replacing_stat(path, *args, **kwargs):
+        nonlocal replaced
+        result = original_stat(path, *args, **kwargs)
+        if (
+            not replaced
+            and Path(path) == output
+            and kwargs.get("dir_fd") is None
+        ):
+            publication.rename(displaced)
+            replacement.rename(publication)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(audit.os, "stat", replacing_stat)
 
     assert_error(
         "output_directory_replaced",

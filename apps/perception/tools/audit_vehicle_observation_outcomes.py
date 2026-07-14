@@ -798,21 +798,73 @@ class RetainedEvidenceStore:
         for relative, record in sorted(self._resources.items()):
             pure = PurePosixPath(relative)
             parent_fd = self._open_parent(pure, f"snapshot:{relative}")
+            file_fd = None
             try:
-                current = os.stat(pure.name, dir_fd=parent_fd, follow_symlinks=False)
+                parent_before = os.fstat(parent_fd)
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                file_fd = os.open(pure.name, flags, dir_fd=parent_fd)
+                before = os.fstat(file_fd)
+                path_before = os.stat(
+                    pure.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                expected = (
+                    record["device"],
+                    record["inode"],
+                    record["size"],
+                    record["mtime_ns"],
+                    record["ctime_ns"],
+                )
+                actual = (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or not stat.S_ISREG(path_before.st_mode)
+                    or before.st_nlink != 1
+                    or path_before.st_nlink != 1
+                    or actual != expected
+                    or _stable_file_fields(before) != _stable_file_fields(path_before)
+                ):
+                    fail("evidence_replaced", f"{relative} changed before snapshot publication")
+
+                digest = hashlib.sha256()
+                total = 0
+                while True:
+                    chunk = os.read(file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total += len(chunk)
+
+                after = os.fstat(file_fd)
+                path_after = os.stat(
+                    pure.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                parent_after = os.fstat(parent_fd)
             except OSError as exc:
-                raise OutcomeAuditError("evidence_replaced", f"{relative} disappeared before snapshot") from exc
+                raise OutcomeAuditError(
+                    "evidence_replaced", f"{relative} disappeared before snapshot"
+                ) from exc
             finally:
+                if file_fd is not None:
+                    os.close(file_fd)
                 os.close(parent_fd)
-            expected = (
-                record["device"], record["inode"], record["size"],
-                record["mtime_ns"], record["ctime_ns"],
-            )
-            actual = (
-                current.st_dev, current.st_ino, current.st_size,
-                current.st_mtime_ns, current.st_ctime_ns,
-            )
-            if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or actual != expected:
+            if (
+                _stable_file_fields(before) != _stable_file_fields(after)
+                or _stable_file_fields(before) != _stable_file_fields(path_after)
+                or _stable_directory_fields(parent_before)
+                != _stable_directory_fields(parent_after)
+                or total != record["size"]
+                or digest.hexdigest() != record["sha256"]
+            ):
                 fail("evidence_replaced", f"{relative} changed before snapshot publication")
 
     def snapshot(self):
@@ -834,6 +886,30 @@ class RetainedEvidenceStore:
         }
         body["canonical_sha256"] = sha256_bytes(canonical_json_bytes(body))
         return body
+
+
+class AuditReport(dict):
+    """A report whose retained-evidence guard remains live through publication."""
+
+    def __init__(self, value, evidence_store):
+        super().__init__(value)
+        self._evidence_store = evidence_store
+
+    def verify_evidence_current(self):
+        if self._evidence_store is None:
+            fail("evidence_guard_closed", "audit report evidence guard is no longer active")
+        self._evidence_store.verify_current()
+
+    def close_evidence(self):
+        if self._evidence_store is not None:
+            self._evidence_store.close()
+            self._evidence_store = None
+
+    def __del__(self):
+        try:
+            self.close_evidence()
+        except Exception:
+            pass
 
 
 def _verify_signature(key, raw, signature, label):
@@ -1396,7 +1472,8 @@ def build_report(
         fail("authority_not_configured", "retained root and signed audit authority are required")
     if not isinstance(pinned_keys, dict) or not pinned_keys:
         fail("pinned_key_missing", "the pinned key allowlist is empty")
-    with RetainedEvidenceStore(retained_root) as store:
+    store = RetainedEvidenceStore(retained_root)
+    try:
         ledger = load_ledger(store, ledger_dir)
         outcomes = load_outcome_rows(store, outcomes_path, ledger["observations"])
         authority = load_authority(
@@ -1437,10 +1514,23 @@ def build_report(
         # path immediately before returning so evidence removed in that interval
         # cannot produce a publishable report.
         store.verify_current()
-        return report
+        guarded_report = AuditReport(report, store)
+        store = None
+        return guarded_report
+    finally:
+        if store is not None:
+            store.close()
 
 
 def write_report_exclusive(path, report):
+    try:
+        return _write_report_exclusive(path, report)
+    finally:
+        if isinstance(report, AuditReport):
+            report.close_evidence()
+
+
+def _write_report_exclusive(path, report):
     original = Path(path).expanduser().absolute()
     if os.path.lexists(original):
         fail("output_exists", "audit output already exists")
@@ -1459,6 +1549,8 @@ def write_report_exclusive(path, report):
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = None
     published_descriptor = None
+    returned_directory_fd = None
+    returned_descriptor = None
     temporary_name = None
     directory_fd = None
     published_identity = None
@@ -1508,6 +1600,12 @@ def write_report_exclusive(path, report):
             remaining = remaining[written:]
         os.fsync(descriptor)
         temporary_metadata = os.fstat(descriptor)
+
+        # Do not make the staged report visible if evidence changed while the
+        # payload was serialized and written.  The later post-fsync check also
+        # covers changes racing with or following the no-replace link.
+        if isinstance(report, AuditReport):
+            report.verify_evidence_current()
 
         try:
             os.link(
@@ -1568,12 +1666,104 @@ def write_report_exclusive(path, report):
         if (current_path.st_dev, current_path.st_ino) != published_identity:
             fail("output_replaced", "audit output path does not name the staged report")
         os.fsync(directory_fd)
+
+        # Reopen the directory through the pathname that will be returned and
+        # descriptor-verify the final inode and bytes after fsync.  The earlier
+        # checks protect the pinned publication directory; these checks also
+        # prove that the caller-visible pathname still reaches that directory.
+        returned_directory_fd = os.open(parent, flags)
+        returned_directory_metadata = os.fstat(returned_directory_fd)
+        if (
+            not stat.S_ISDIR(returned_directory_metadata.st_mode)
+            or (returned_directory_metadata.st_dev, returned_directory_metadata.st_ino)
+            != directory_identity
+        ):
+            fail(
+                "output_directory_replaced",
+                "audit output directory changed after publication fsync",
+            )
+        returned_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=returned_directory_fd,
+        )
+        returned_before = os.fstat(returned_descriptor)
+        returned_path_before = os.stat(
+            path.name, dir_fd=returned_directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(returned_before.st_mode)
+            or returned_before.st_nlink != 1
+            or (returned_before.st_dev, returned_before.st_ino) != published_identity
+            or returned_before.st_size != len(payload)
+            or _stable_file_fields(returned_before)
+            != _stable_file_fields(returned_path_before)
+        ):
+            fail("output_replaced", "returned audit output is not the staged report")
+        returned_digest = hashlib.sha256()
+        returned_total = 0
+        while True:
+            chunk = os.read(returned_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            returned_digest.update(chunk)
+            returned_total += len(chunk)
+        returned_after = os.fstat(returned_descriptor)
+        returned_path_after = os.stat(
+            path.name, dir_fd=returned_directory_fd, follow_symlinks=False
+        )
+        final_parent = os.stat(parent, follow_symlinks=False)
+        final_path = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(final_parent.st_mode)
+            or (final_parent.st_dev, final_parent.st_ino) != directory_identity
+        ):
+            fail(
+                "output_directory_replaced",
+                "audit output directory changed during final publication verification",
+            )
+        if (
+            _stable_file_fields(returned_before) != _stable_file_fields(returned_after)
+            or _stable_file_fields(returned_before)
+            != _stable_file_fields(returned_path_after)
+            or _stable_file_fields(returned_before) != _stable_file_fields(final_path)
+            or returned_total != len(payload)
+            or returned_digest.hexdigest() != expected_digest
+        ):
+            fail("output_replaced", "returned audit output bytes changed after fsync")
+
+        # Keep every exact retained input present and byte-identical through the
+        # publication boundary.  Only lightweight output identity checks follow
+        # this final full evidence re-read so neither side has a long unchecked
+        # interval before success.
+        if isinstance(report, AuditReport):
+            report.verify_evidence_current()
+        final_descriptor = os.fstat(returned_descriptor)
+        final_parent = os.stat(parent, follow_symlinks=False)
+        final_path = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(final_parent.st_mode)
+            or (final_parent.st_dev, final_parent.st_ino) != directory_identity
+        ):
+            fail(
+                "output_directory_replaced",
+                "audit output directory changed after final evidence verification",
+            )
+        if (
+            _stable_file_fields(returned_before) != _stable_file_fields(final_descriptor)
+            or _stable_file_fields(returned_before) != _stable_file_fields(final_path)
+        ):
+            fail("output_replaced", "audit output changed after final evidence verification")
         publication_succeeded = True
     except OutcomeAuditError:
         raise
     except (OSError, TypeError, ValueError) as exc:
         raise OutcomeAuditError("output_unwritable", "audit output could not be published") from exc
     finally:
+        if returned_descriptor is not None:
+            os.close(returned_descriptor)
+        if returned_directory_fd is not None:
+            os.close(returned_directory_fd)
         if published_descriptor is not None:
             os.close(published_descriptor)
         if descriptor is not None:
