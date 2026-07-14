@@ -5,6 +5,9 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
+
+from PIL import Image
 
 from digital_twin_bridge.reviewed_localization import (
     canonical_object_sha256,
@@ -14,11 +17,16 @@ from digital_twin_bridge.twin_camera_rig import (
     absolute_twin_model,
     heading_to_carla_yaw,
     horizontal_fov_deg,
+    twin_horizontal_fov_deg,
 )
 from tests.test_aggregate_twin_calibration_manifests import (
     fixture as aggregate_fixture,
 )
 from tools.aggregate_twin_calibration_manifests import aggregate_site_manifests
+from tools.build_twin_calibration_manifest import (
+    build_deployment_model,
+    offline_depth_pixel_to_world,
+)
 
 
 def _write_json(path, value):
@@ -76,6 +84,53 @@ def build_reviewed_static_calibration(
         manifest["cameras_file_sha256"] = cameras_sha256
         manifest["camera_config_sha256"] = canonical_object_sha256(camera)
         manifest["source_artifacts"]["cameras_file"] = cameras_identity
+
+        real_identity = manifest["source_artifacts"]["real_frame"]
+        real_path = Path(real_identity["path"])
+        with Image.open(real_path) as source:
+            resized = source.convert("RGB").resize((width, height))
+            resized.save(real_path, "PNG")
+        real_raw = real_path.read_bytes()
+        real_identity.update(
+            sha256=hashlib.sha256(real_raw).hexdigest(),
+            size_bytes=len(real_raw),
+        )
+        manifest["source_frame_sha256"] = real_identity["sha256"]
+
+        calibration = camera["intrinsics_calibration"]
+        artifact_path = Path(calibration["artifact_path"]).resolve()
+        artifact_raw = artifact_path.read_bytes()
+        manifest["intrinsics_calibration"] = {
+            "method": calibration["method"],
+            "artifact_sha256": hashlib.sha256(artifact_raw).hexdigest(),
+            "image_count": calibration["image_count"],
+            "source_images_sha256": copy.deepcopy(
+                calibration["source_images_sha256"]
+            ),
+            "rms_reprojection_error_px": calibration[
+                "rms_reprojection_error_px"
+            ],
+            "resolution": copy.deepcopy(calibration["resolution"]),
+            "camera_matrix": copy.deepcopy(calibration["camera_matrix"]),
+            "distortion": copy.deepcopy(calibration["distortion"]),
+        }
+        manifest["source_artifacts"]["intrinsics_artifact"] = {
+            "path": str(artifact_path),
+            "sha256": hashlib.sha256(artifact_raw).hexdigest(),
+            "size_bytes": len(artifact_raw),
+        }
+        source_identities = []
+        for source_path_value in calibration["source_image_paths"]:
+            source_path = Path(source_path_value).resolve()
+            source_raw = source_path.read_bytes()
+            source_identities.append({
+                "path": str(source_path),
+                "sha256": hashlib.sha256(source_raw).hexdigest(),
+                "size_bytes": len(source_raw),
+            })
+        manifest["source_artifacts"][
+            "intrinsics_source_images"
+        ] = source_identities
         manifest["ue5_map"] = map_name
         manifest["ue5_map_opendrive_sha256"] = opendrive_sha256
         manifest["projection"]["map_name"] = map_name
@@ -99,59 +154,108 @@ def build_reviewed_static_calibration(
         manifest["baseline"]["fov_deg"] = baseline["fov_deg"]
         manifest["baseline"]["cx"] = camera["intrinsics"]["cx"]
         manifest["baseline"]["cy"] = camera["intrinsics"]["cy"]
-        manifest["deployment_model"]["anchor_location"] = anchor
-        manifest["deployment_model"]["base"].update(base)
-        manifest["intrinsics_calibration"]["resolution"] = [width, height]
-        manifest["intrinsics_calibration"]["camera_matrix"] = copy.deepcopy(
-            camera["intrinsics_calibration"]["camera_matrix"]
+        manifest["deployment_model"] = build_deployment_model(
+            camera,
+            SimpleNamespace(
+                location=SimpleNamespace(
+                    x=baseline["location"][0],
+                    y=baseline["location"][1],
+                    z=baseline["location"][2],
+                ),
+                rotation=SimpleNamespace(
+                    pitch=baseline["pitch_deg"],
+                    yaw=baseline["yaw_deg"],
+                    roll=baseline["roll_deg"],
+                ),
+            ),
         )
-        manifest["intrinsics_calibration"]["distortion"] = copy.deepcopy(
-            camera["intrinsics_calibration"]["distortion"]
+        depth_width = int(manifest["depth_frame"]["width"])
+        depth_height = int(manifest["depth_frame"]["height"])
+        twin_focal = (depth_width / 2.0) / math.tan(
+            math.radians(twin_horizontal_fov_deg(camera)) / 2.0
         )
         fx = float(camera["intrinsics"]["fx"])
         fy = float(camera["intrinsics"]["fy"])
         cx = float(camera["intrinsics"]["cx"])
         cy = float(camera["intrinsics"]["cy"])
 
-        pitch = math.radians(baseline["pitch_deg"])
-        yaw = math.radians(baseline["yaw_deg"])
-        roll = math.radians(baseline["roll_deg"])
-        cp, sp = math.cos(pitch), math.sin(pitch)
-        cyaw, syaw = math.cos(yaw), math.sin(yaw)
-        cr, sr = math.cos(roll), math.sin(roll)
-        forward_axis = (cp * cyaw, cp * syaw, sp)
-        zero_roll_right = (-syaw, cyaw, 0.0)
-        zero_roll_up = (-sp * cyaw, -sp * syaw, cp)
-        right_axis = tuple(
-            cr * zero_roll_right[index] - sr * zero_roll_up[index]
-            for index in range(3)
-        )
-        up_axis = tuple(
-            sr * zero_roll_right[index] + cr * zero_roll_up[index]
-            for index in range(3)
-        )
-
-        def world_for_pixel(pixel, depth=20.0):
-            normalized_x = (float(pixel[0]) - cx) / fx
-            normalized_y = (float(pixel[1]) - cy) / fy
+        def twin_pixel_for_real(pixel):
             return [
-                baseline["location"][index]
-                + depth * forward_axis[index]
-                + depth * normalized_x * right_axis[index]
-                - depth * normalized_y * up_axis[index]
-                for index in range(3)
+                depth_width / 2.0 + (float(pixel[0]) - cx) / fx * twin_focal,
+                depth_height / 2.0 + (float(pixel[1]) - cy) / fy * twin_focal,
             ]
 
         for feature in manifest["features"]:
             if feature["type"] == "point":
-                projected_world = world_for_pixel(feature["image"])
+                feature["twin"] = twin_pixel_for_real(feature["image"])
+            else:
+                feature["twin_polyline"] = [
+                    twin_pixel_for_real(pixel)
+                    for pixel in feature["image_polyline"]
+                ]
+        for feature in manifest["features"]:
+            if feature["type"] == "point":
+                projected_world = offline_depth_pixel_to_world(
+                    manifest["baseline"],
+                    feature["twin"][0],
+                    feature["twin"][1],
+                    feature["depth_neighborhood"]["center_depth_m"],
+                    baseline["fov_deg"],
+                    depth_width,
+                    depth_height,
+                )
                 feature["world"] = projected_world
                 feature["surveyed_world"] = projected_world
             else:
                 feature["world"] = [
-                    world_for_pixel(pixel)
-                    for pixel in feature["image_polyline"]
+                    offline_depth_pixel_to_world(
+                        manifest["baseline"],
+                        pixel[0],
+                        pixel[1],
+                        neighborhood["center_depth_m"],
+                        baseline["fov_deg"],
+                        depth_width,
+                        depth_height,
+                    )
+                    for pixel, neighborhood in zip(
+                        feature["twin_polyline"],
+                        feature["depth_neighborhoods"],
+                    )
                 ]
+
+        annotation_identity = manifest["source_artifacts"]["annotations"]
+        annotation_path = Path(annotation_identity["path"])
+        annotation = json.loads(annotation_path.read_text())
+        annotation["real_frame_sha256"] = real_identity["sha256"]
+        annotation["cameras_file_sha256"] = cameras_sha256
+        points = {point["id"]: point for point in annotation["points"]}
+        roads = {road["id"]: road for road in annotation["roads"]}
+        for feature in manifest["features"]:
+            target = (
+                points[feature["id"]]
+                if feature["type"] == "point"
+                else roads[feature["id"]]
+            )
+            for key in (
+                (
+                    "global_landmark_id", "surveyed_world", "split",
+                    "provenance", "category", "description", "twin", "image",
+                    "survey_record_sha256", "survey_record_path",
+                )
+                if feature["type"] == "point"
+                else (
+                    "split", "provenance", "category", "description",
+                    "twin_polyline", "image_polyline",
+                )
+            ):
+                target[key] = copy.deepcopy(feature[key])
+        annotation_raw = json.dumps(annotation, sort_keys=True).encode()
+        annotation_path.write_bytes(annotation_raw)
+        annotation_identity.update(
+            sha256=hashlib.sha256(annotation_raw).hexdigest(),
+            size_bytes=len(annotation_raw),
+        )
+        manifest["annotation_sha256"] = annotation_identity["sha256"]
         _write_json(manifest_path, manifest)
     landmark_world = {}
     for manifest_path in manifest_paths:

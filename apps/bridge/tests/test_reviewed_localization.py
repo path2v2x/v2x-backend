@@ -518,9 +518,10 @@ def test_runtime_context_verifies_intrinsics_file_and_opendrive(tmp_path, mock_w
     source_paths = []
     hashes = []
     for index in range(12):
-        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        image = np.zeros((960, 1280, 3), dtype=np.uint8)
         image[:, :, 0] = index * 17
-        image[index % 24:index % 24 + 8, :, 1] = 255
+        stripe_start = index * 60
+        image[stripe_start:stripe_start + 48, :, 1] = 255
         source_path = tmp_path / f"intrinsics-source-{index}.png"
         assert cv2.imwrite(str(source_path), image)
         source_paths.append(str(source_path))

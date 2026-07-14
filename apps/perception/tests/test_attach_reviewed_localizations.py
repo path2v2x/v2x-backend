@@ -82,9 +82,10 @@ def measured_camera(tmp_path, camera_id):
     hashes = []
     source_paths = []
     for index in range(12):
-        image = np.zeros((24, 32, 3), dtype=np.uint8)
+        image = np.zeros((960, 1280, 3), dtype=np.uint8)
         image[:, :, 0] = index * 17
-        image[:, index % 24:index % 24 + 8, 1] = 255
+        stripe_start = index * 80
+        image[:, stripe_start:stripe_start + 64, 1] = 255
         source_path = tmp_path / f"{camera_id}-intrinsics-source-{index}.png"
         assert cv2.imwrite(str(source_path), image)
         source_paths.append(str(source_path))
