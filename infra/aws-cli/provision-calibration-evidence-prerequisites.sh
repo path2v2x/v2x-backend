@@ -78,6 +78,7 @@ DESIRED="${WORKDIR}/desired.json"
 CANARY_INTERFACE="${WORKDIR}/later-canary-interface.json"
 LOCK_CLAIMED=false
 LOCK_TOKEN=""
+PRELOCK_CURRENT="${WORKDIR}/current-prelock.json"
 
 aws_cli() {
   "${AWS_BIN}" --region "${AWS_REGION}" "$@"
@@ -137,11 +138,17 @@ release_lock() {
 
 cleanup() {
   local status=$?
-  release_lock || true
+  if [[ "${LOCK_CLAIMED}" == "true" ]]; then
+    echo "ERROR: apply did not complete; retaining the owned SSM apply lock for manual recovery review" >&2
+    echo "Rollback bundle: ${ROLLBACK_BUNDLE:-not-created}" >&2
+    echo "Recovery gate: compare the lock token and rollback bundle with fresh plan-only state; clear the exact lock only in a separately reviewed manual action" >&2
+  fi
   rm -rf "${WORKDIR}"
   exit "${status}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 discover_identity() {
   aws_cli sts get-caller-identity --output json >"${DISCOVERY_DIR}/identity.json"
@@ -504,9 +511,12 @@ generate_policy_documents() {
 
 generate_monitoring_documents() {
   jq -nS --arg evidence "${EVIDENCE_BUCKET}" --arg audit "${AUDIT_BUCKET}" \
-    --arg trail "${TRAIL_NAME}" \
+    --arg trail "${TRAIL_NAME}" --arg writer "${WRITER_ROLE_NAME}" \
+    --arg planner "${PLANNER_ROLE_NAME}" --arg rule "${RULE_NAME}" \
+    --arg log_group "${LOG_GROUP_NAME}" --arg log_policy "${LOG_RESOURCE_POLICY_NAME}" \
+    --arg lock_name "${APPLY_LOCK_NAME}" \
     --arg trail_arn "arn:aws:cloudtrail:${AWS_REGION}:${EXPECTED_ACCOUNT_ID}:trail/${TRAIL_NAME}" '{
-    source:["aws.cloudtrail","aws.s3"],
+    source:["aws.cloudtrail","aws.s3","aws.iam","aws.events","aws.logs","aws.ssm"],
     "$or":[
       {detail:{eventSource:["cloudtrail.amazonaws.com"],
         eventName:["StopLogging","DeleteTrail","UpdateTrail"],
@@ -519,7 +529,23 @@ generate_monitoring_documents() {
           "DeleteBucketEncryption","PutPublicAccessBlock","DeletePublicAccessBlock",
           "PutBucketOwnershipControls","DeleteBucketOwnershipControls","PutBucketTagging","DeleteBucketTagging",
           "DeleteBucket","PutBucketAcl","PutBucketReplication","DeleteBucketReplication"],
-        requestParameters:{bucketName:[$evidence,$audit]}}}
+        requestParameters:{bucketName:[$evidence,$audit]}}},
+      {detail:{eventSource:["iam.amazonaws.com"],
+        eventName:["UpdateAssumeRolePolicy","PutRolePolicy","DeleteRolePolicy","AttachRolePolicy",
+          "DetachRolePolicy","DeleteRole","TagRole","UntagRole","PutRolePermissionsBoundary",
+          "DeleteRolePermissionsBoundary"],requestParameters:{roleName:[$writer,$planner]}}},
+      {detail:{eventSource:["events.amazonaws.com"],
+        eventName:["PutRule","DisableRule","EnableRule","DeleteRule","TagResource","UntagResource"],
+        requestParameters:{name:[$rule]}}},
+      {detail:{eventSource:["events.amazonaws.com"],
+        eventName:["PutTargets","RemoveTargets"],requestParameters:{rule:[$rule]}}},
+      {detail:{eventSource:["logs.amazonaws.com"],
+        eventName:["DeleteLogGroup","PutRetentionPolicy","DeleteRetentionPolicy","TagResource","UntagResource"],
+        requestParameters:{logGroupName:[$log_group]}}},
+      {detail:{eventSource:["logs.amazonaws.com"],
+        eventName:["PutResourcePolicy","DeleteResourcePolicy"],requestParameters:{policyName:[$log_policy]}}},
+      {detail:{eventSource:["ssm.amazonaws.com"],eventName:["PutParameter","DeleteParameter"],
+        requestParameters:{name:[$lock_name]}}}
     ]}' >"${GENERATED_DIR}/event-pattern.json"
 
   jq -nS --arg prefix "arn:aws:s3:::${EVIDENCE_BUCKET}/" '[{
@@ -538,6 +564,15 @@ generate_monitoring_documents() {
 generate_desired() {
   generate_policy_documents
   generate_monitoring_documents
+
+  jq -nS --slurpfile current "${CURRENT}" '
+    ($current[0].resources.audit_bucket.object_lock.ObjectLockConfiguration.Rule.DefaultRetention // null) as $r |
+    {ObjectLockEnabled:"Enabled",Rule:{DefaultRetention:
+      (if (($r.Mode // "") == "COMPLIANCE") and
+          (((($r.Days // 0) | type) == "number" and ($r.Days // 0) >= 365) or
+           ((($r.Years // 0) | type) == "number" and ($r.Years // 0) >= 1))
+       then $r else {Mode:"COMPLIANCE",Days:365} end)}}' \
+    >"${GENERATED_DIR}/audit-object-lock.json"
 
   managed_tags_array "$(jq -c '.resources.audit_bucket.tags // []' "${CURRENT}")" \
     calibration-evidence-audit "${GENERATED_DIR}/audit-tags.json"
@@ -566,6 +601,7 @@ generate_desired() {
     --slurpfile selectors "${GENERATED_DIR}/event-selectors.json" \
     --slurpfile pattern "${GENERATED_DIR}/event-pattern.json" \
     --slurpfile log_policy "${GENERATED_DIR}/log-resource-policy.json" \
+    --slurpfile audit_object_lock "${GENERATED_DIR}/audit-object-lock.json" \
     --slurpfile audit_tags "${GENERATED_DIR}/audit-tags.json" \
     --slurpfile writer_tags "${GENERATED_DIR}/writer-tags.json" \
     --slurpfile planner_tags "${GENERATED_DIR}/planner-tags.json" \
@@ -585,6 +621,9 @@ generate_desired() {
       (if ($c.resources.audit_bucket.exists and
           (($c.resources.audit_bucket.object_lock.ObjectLockConfiguration.ObjectLockEnabled // "") != "Enabled"))
         then "existing audit bucket was not created with Object Lock" else empty end),
+      (if ($c.resources.audit_bucket.exists and
+          (($c.resources.audit_bucket.object_lock.ObjectLockConfiguration.Rule.DefaultRetention.Mode // "COMPLIANCE") != "COMPLIANCE"))
+        then "existing audit bucket default retention is not COMPLIANCE" else empty end),
       (if (($c.resources.audit_bucket.lifecycle.Rules // []) | length) > 0 and
           (($c.resources.audit_bucket.lifecycle.Rules // []) != [managed_rule])
         then "existing audit lifecycle is not the exact abort-only managed rule" else empty end),
@@ -592,10 +631,18 @@ generate_desired() {
           (($c.resources.writer_role.inline_policy_names - [$writer_policy_name] | length) > 0 or
            ($c.resources.writer_role.attached_managed_policies | length) > 0))
         then "writer role has foreign inline or attached policies" else empty end),
+      (if ($c.resources.writer_role.exists and (($c.resources.writer_role.role.Path // "") != "/"))
+        then "writer role has a non-root IAM path" else empty end),
+      (if ($c.resources.writer_role.exists and (($c.resources.writer_role.role.PermissionsBoundary // null) != null))
+        then "writer role has a permissions boundary" else empty end),
       (if ($c.resources.planner_role.exists and
           (($c.resources.planner_role.inline_policy_names - [$planner_policy_name] | length) > 0 or
            ($c.resources.planner_role.attached_managed_policies | length) > 0))
         then "planner role has foreign inline or attached policies" else empty end),
+      (if ($c.resources.planner_role.exists and (($c.resources.planner_role.role.Path // "") != "/"))
+        then "planner role has a non-root IAM path" else empty end),
+      (if ($c.resources.planner_role.exists and (($c.resources.planner_role.role.PermissionsBoundary // null) != null))
+        then "planner role has a permissions boundary" else empty end),
       (if ($c.resources.trail.exists and (($c.resources.trail.trail.HomeRegion // $region) != $region))
         then "existing trail has a foreign home region" else empty end),
       (if (($c.resources.event_rule.targets // []) | map(select(.Id != $target_id)) | length) > 0
@@ -614,7 +661,7 @@ generate_desired() {
          versioning:{Status:"Enabled"},ownership:"BucketOwnerEnforced",
          encryption:{Rules:[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:"AES256"},BucketKeyEnabled:false}]},
          public_access:{BlockPublicAcls:true,IgnorePublicAcls:true,BlockPublicPolicy:true,RestrictPublicBuckets:true},
-         object_lock:{ObjectLockEnabled:"Enabled",Rule:{DefaultRetention:{Mode:"COMPLIANCE",Days:365}}},
+         object_lock:$audit_object_lock[0],
          policy:$audit_policy[0],tags:$audit_tags[0],lifecycle:{Rules:[managed_rule]}},
        writer_role:{name:$writer_name,arn:("arn:aws:iam::"+$account+":role/"+$writer_name),
          trust:$trust_policy[0],inline_policy_name:$writer_policy_name,
@@ -638,6 +685,10 @@ generate_desired() {
          log_resource_policy:{name:$log_policy_name,document:$log_policy[0],
            scope:"exact-log-group",documented_delivery_principals:true,
            acceptance_requires_rule_fire_readback:true},
+         integrity_monitoring:{durable_management_events_recorded_by_cloudtrail:true,
+           covered_controls:["audit-and-evidence-buckets","cloudtrail","writer-and-planner-iam-roles",
+             "eventbridge-rule-and-targets","cloudwatch-log-group-and-resource-policy","ssm-apply-lock"],
+           self_monitoring_limitation:"The guarded EventBridge rule or its CloudWatch destination can be disabled before it delivers its own mutation event; CloudTrail audit-bucket history remains the durable record, and independent external notification is required before closeout."},
          external_human_notification:{required_before_closeout:true,status:"yellow-pending-product-decision"}}
      },
      next_gate:{script:"provision-calibration-evidence-store.sh",mode:"plan-only",
@@ -760,6 +811,29 @@ claim_apply_lock() {
   LOCK_CLAIMED=true
 }
 
+verify_preapply_state_unchanged() {
+  local expected_hash="$1" owned_value postlock_hash
+  if ! owned_value="$(aws_cli ssm get-parameter --name "${APPLY_LOCK_NAME}" \
+      --query 'Parameter.Value' --output text 2>/dev/null)" || [[ "${owned_value}" != "${LOCK_TOKEN}" ]]; then
+    echo "Owned SSM apply lock could not be read back exactly; refusing all resource mutation" >&2
+    return 1
+  fi
+  rm -rf "${DISCOVERY_DIR}"
+  mkdir -p "${DISCOVERY_DIR}"
+  discover_all
+  jq -S --slurpfile prelock "${PRELOCK_CURRENT}" \
+    '.resources.apply_lock = $prelock[0].resources.apply_lock' "${CURRENT}" \
+    >"${WORKDIR}/current-postlock-normalized.json"
+  postlock_hash="$(sha256sum "${WORKDIR}/current-postlock-normalized.json" | awk '{print $1}')"
+  install -m 0600 "${PRELOCK_CURRENT}" "${CURRENT}"
+  if [[ "${postlock_hash}" != "${expected_hash}" ]]; then
+    echo "AWS state changed after planning and before the first resource mutation" >&2
+    echo "Expected pre-lock current state hash: ${expected_hash}" >&2
+    echo "Observed normalized post-lock state hash: ${postlock_hash}" >&2
+    return 1
+  fi
+}
+
 apply_audit_bucket() {
   if [[ "$(jq -r '.resources.audit_bucket.exists' "${CURRENT}")" == "false" ]]; then
     aws_cli s3api create-bucket --bucket "${AUDIT_BUCKET}" --object-lock-enabled-for-bucket \
@@ -776,8 +850,7 @@ apply_audit_bucket() {
       '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":false}]}' >/dev/null
   aws_s3api put-bucket-versioning --bucket "${AUDIT_BUCKET}" --versioning-configuration Status=Enabled >/dev/null
   aws_s3api put-object-lock-configuration --bucket "${AUDIT_BUCKET}" \
-    --object-lock-configuration \
-      '{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"COMPLIANCE","Days":365}}}' >/dev/null
+    --object-lock-configuration "file://${GENERATED_DIR}/audit-object-lock.json" >/dev/null
   aws_s3api put-bucket-policy --bucket "${AUDIT_BUCKET}" \
     --policy "file://${GENERATED_DIR}/audit-policy.json" >/dev/null
   jq -nS --slurpfile tags "${GENERATED_DIR}/audit-tags.json" '{TagSet:$tags[0]}' \
@@ -877,10 +950,16 @@ verify_actual_state() {
     ($a.resources.audit_bucket.tags == $d.resources.audit_bucket.tags) and
     ($a.resources.audit_bucket.lifecycle.Rules == $d.resources.audit_bucket.lifecycle.Rules) and
     ($a.resources.writer_role.exists == true) and
+    ($a.resources.writer_role.role.Arn == $d.resources.writer_role.arn) and
+    ($a.resources.writer_role.role.Path == "/") and
+    (($a.resources.writer_role.role.PermissionsBoundary // null) == null) and
     ($a.resources.writer_role.role.AssumeRolePolicyDocument == $d.resources.writer_role.trust) and
     ($a.resources.writer_role.managed_inline_policy.PolicyDocument == $d.resources.writer_role.inline_policy) and
     ($a.resources.writer_role.tags == $d.resources.writer_role.tags) and
     ($a.resources.planner_role.exists == true) and
+    ($a.resources.planner_role.role.Arn == $d.resources.planner_role.arn) and
+    ($a.resources.planner_role.role.Path == "/") and
+    (($a.resources.planner_role.role.PermissionsBoundary // null) == null) and
     ($a.resources.planner_role.role.AssumeRolePolicyDocument == $d.resources.planner_role.trust) and
     ($a.resources.planner_role.managed_inline_policy.PolicyDocument == $d.resources.planner_role.inline_policy) and
     ($a.resources.planner_role.tags == $d.resources.planner_role.tags) and
@@ -978,7 +1057,9 @@ fi
 validate_foreign_policy_acknowledgments || exit 5
 
 create_rollback_bundle "${CURRENT_STATE_HASH}" "${DESIRED_STATE_HASH}"
+install -m 0600 "${CURRENT}" "${PRELOCK_CURRENT}"
 claim_apply_lock "${CURRENT_STATE_HASH}" "${DESIRED_STATE_HASH}"
+verify_preapply_state_unchanged "${CURRENT_STATE_HASH}"
 apply_audit_bucket
 apply_role "${WRITER_ROLE_NAME}" "${WRITER_POLICY_NAME}" writer_role \
   "${GENERATED_DIR}/writer-tags.json" "${GENERATED_DIR}/writer-policy.json"

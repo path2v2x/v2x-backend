@@ -64,7 +64,7 @@ case "${service}:${operation}" in
     bucket="$(arg --bucket "$@")"
     if [[ "${SCENARIO}" == access_denied ]]; then error AccessDenied; fi
     if [[ -f "${STATE}/bucket-${bucket}.exists" ]] ||
-       [[ "${SCENARIO}" =~ ^(foreign_allow|foreign_deny_unsafe|no_object_lock|wrong_lifecycle)$ && "${bucket}" == "${AUDIT}" ]]; then exit 0; fi
+       [[ "${SCENARIO}" =~ ^(foreign_allow|foreign_deny_unsafe|no_object_lock|wrong_lifecycle|stronger_lock|governance_lock)$ && "${bucket}" == "${AUDIT}" ]]; then exit 0; fi
     error 404
     ;;
   s3api:create-bucket)
@@ -93,6 +93,14 @@ case "${service}:${operation}" in
     ;;
   s3api:get-object-lock-configuration)
     if [[ "${SCENARIO}" == no_object_lock ]]; then error ObjectLockConfigurationNotFoundError; fi
+    if [[ "${SCENARIO}" == stronger_lock ]]; then
+      echo '{"ObjectLockConfiguration":{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"COMPLIANCE","Days":730}}}}'
+      exit 0
+    fi
+    if [[ "${SCENARIO}" == governance_lock ]]; then
+      echo '{"ObjectLockConfiguration":{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"GOVERNANCE","Days":730}}}}'
+      exit 0
+    fi
     echo '{"ObjectLockConfiguration":{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"COMPLIANCE","Days":365}}}}'
     ;;
   s3api:get-bucket-policy)
@@ -122,7 +130,7 @@ case "${service}:${operation}" in
       cat "${STATE}/bucket-${bucket}-lifecycle.json"
     elif [[ "${SCENARIO}" == wrong_lifecycle && "${bucket}" == "${AUDIT}" ]]; then
       echo '{"Rules":[{"ID":"DeleteAuditLogs","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":1}}]}'
-    elif [[ "${SCENARIO}" =~ ^(foreign_allow|foreign_deny_unsafe|no_object_lock)$ && "${bucket}" == "${AUDIT}" ]]; then
+    elif [[ "${SCENARIO}" =~ ^(foreign_allow|foreign_deny_unsafe|no_object_lock|stronger_lock|governance_lock)$ && "${bucket}" == "${AUDIT}" ]]; then
       echo '{"Rules":[{"ID":"AbortIncompleteCalibrationAuditUploads","Status":"Enabled","Filter":{"Prefix":""},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
     else error NoSuchLifecycleConfiguration; fi
     ;;
@@ -144,16 +152,23 @@ case "${service}:${operation}" in
 
   iam:get-role)
     role="$(arg --role-name "$@")"
-    if [[ ! -f "${STATE}/role-${role}-trust.json" && "${SCENARIO}" == role_attached && "${role}" == *Writer ]]; then
+    if [[ ! -f "${STATE}/role-${role}-trust.json" && "${SCENARIO}" =~ ^(role_attached|role_bad_path|role_boundary)$ && "${role}" == *Writer ]]; then
       jq -n '{Version:"2012-10-17",Statement:[{Effect:"Deny",Principal:"*",Action:"sts:AssumeRole"}]}' \
         >"${STATE}/role-${role}-trust.json"
     fi
     [[ -f "${STATE}/role-${role}-trust.json" ]] || error NoSuchEntity
-    jq -n --arg role "${role}" --arg account "${ACCOUNT}" \
+    role_path=/
+    boundary=null
+    if [[ "${SCENARIO}" == role_bad_path && "${role}" == *Writer ]]; then role_path=/service-role/; fi
+    if [[ "${SCENARIO}" == role_boundary && "${role}" == *Writer ]]; then
+      boundary='{"PermissionsBoundaryType":"Policy","PermissionsBoundaryArn":"arn:aws:iam::147229569658:policy/Restricted"}'
+    fi
+    jq -n --arg role "${role}" --arg account "${ACCOUNT}" --arg path "${role_path}" \
+      --argjson boundary "${boundary}" \
       --slurpfile trust "${STATE}/role-${role}-trust.json" \
-      '{Role:{Path:"/",RoleName:$role,Arn:("arn:aws:iam::"+$account+":role/"+$role),
+      '{Role:{Path:$path,RoleName:$role,Arn:("arn:aws:iam::"+$account+":role"+$path+$role),
         Description:"V2X UE5 calibration evidence deployment-as-code role",MaxSessionDuration:3600,
-        AssumeRolePolicyDocument:$trust[0]}}'
+        AssumeRolePolicyDocument:$trust[0],PermissionsBoundary:$boundary}}'
     ;;
   iam:list-role-policies)
     role="$(arg --role-name "$@")"
@@ -298,6 +313,7 @@ case "${service}:${operation}" in
     if (set -o noclobber; printf '%s' "${value}" >"${STATE}/lock") 2>/dev/null; then
       echo 'LOCK-CLAIMED' >>"${LOG}"
       sleep "${MOCK_LOCK_HOLD_SECONDS:-0}"
+      if [[ "${MOCK_POST_LOCK_DRIFT:-false}" == "true" ]]; then : >"${STATE}/bucket-${EVIDENCE}.exists"; fi
       echo '{"Version":1}'
     else error ParameterAlreadyExists; fi
     ;;
@@ -342,10 +358,20 @@ jq -e '
   .resources.trail.event_selectors[0].DataResources==[{Type:"AWS::S3::Object",Values:["arn:aws:s3:::v2x-calibration-evidence-147229569658-us-west-1/"]}] and
   (.resources.monitoring.rule.event_pattern["$or"][0].detail.requestParameters.name | length)==2 and
   (.resources.monitoring.rule.event_pattern["$or"][1].detail.requestParameters.trailName | length)==2 and
+  any(.resources.monitoring.rule.event_pattern["$or"][];
+    .detail.eventSource==["iam.amazonaws.com"] and (.detail.requestParameters.roleName | length)==2) and
+  any(.resources.monitoring.rule.event_pattern["$or"][];
+    .detail.eventSource==["events.amazonaws.com"] and .detail.eventName==["PutTargets","RemoveTargets"]) and
+  any(.resources.monitoring.rule.event_pattern["$or"][];
+    .detail.eventSource==["logs.amazonaws.com"] and ((.detail.eventName | index("DeleteLogGroup")) != null)) and
+  any(.resources.monitoring.rule.event_pattern["$or"][];
+    .detail.eventSource==["ssm.amazonaws.com"] and .detail.eventName==["PutParameter","DeleteParameter"]) and
   (.resources.monitoring.log_resource_policy.document.Statement[0].Principal.Service | sort)==["delivery.logs.amazonaws.com","events.amazonaws.com"] and
   (.resources.monitoring.log_resource_policy.document.Statement[0] | has("Condition") | not) and
   .resources.monitoring.log_group.retention_days==365 and
   .resources.monitoring.external_human_notification.status=="yellow-pending-product-decision" and
+  .resources.monitoring.integrity_monitoring.durable_management_events_recorded_by_cloudtrail and
+  (.resources.monitoring.integrity_monitoring.self_monitoring_limitation | contains("can be disabled")) and
   ([.resources.audit_bucket.tags[],.resources.writer_role.tags[],.resources.planner_role.tags[],
     .resources.trail.tags[],.resources.monitoring.rule.tags[]] | map(select(.Key=="ue-runtime" and .Value=="ue5-only")) | length)==5
 ' "${TMP}/plan-a/desired.json" >/dev/null || fail "desired policy/lifecycle/tag/trail shape"
@@ -380,6 +406,20 @@ jq -e '.apply_blockers | index("existing audit lifecycle is not the exact abort-
 run_plan "${TMP}/attached-state" "${TMP}/attached-plan" "${TMP}/attached.log" role_attached
 jq -e '.apply_blockers | index("writer role has foreign inline or attached policies") != null' \
   "${TMP}/attached-plan/desired.json" >/dev/null || fail "missing foreign role-policy blocker"
+run_plan "${TMP}/path-state" "${TMP}/path-plan" "${TMP}/path.log" role_bad_path
+jq -e '.apply_blockers | index("writer role has a non-root IAM path") != null' \
+  "${TMP}/path-plan/desired.json" >/dev/null || fail "missing role-path blocker"
+run_plan "${TMP}/boundary-state" "${TMP}/boundary-plan" "${TMP}/boundary.log" role_boundary
+jq -e '.apply_blockers | index("writer role has a permissions boundary") != null' \
+  "${TMP}/boundary-plan/desired.json" >/dev/null || fail "missing role-boundary blocker"
+run_plan "${TMP}/strong-lock-state" "${TMP}/strong-lock-plan" "${TMP}/strong-lock.log" stronger_lock
+jq -e '
+  .apply_blockers == [] and
+  .resources.audit_bucket.object_lock.Rule.DefaultRetention == {Mode:"COMPLIANCE",Days:730}
+' "${TMP}/strong-lock-plan/desired.json" >/dev/null || fail "stronger COMPLIANCE retention was not preserved"
+run_plan "${TMP}/governance-lock-state" "${TMP}/governance-lock-plan" "${TMP}/governance-lock.log" governance_lock
+jq -e '.apply_blockers | index("existing audit bucket default retention is not COMPLIANCE") != null' \
+  "${TMP}/governance-lock-plan/desired.json" >/dev/null || fail "missing GOVERNANCE retention blocker"
 
 # A foreign Allow is preserved, hash-bound, and requires the exact acknowledgment.
 run_plan "${TMP}/foreign-state" "${TMP}/foreign-plan" "${TMP}/foreign.log" foreign_allow
@@ -540,5 +580,29 @@ claimed_locks="$(grep -c '^LOCK-CLAIMED$' "${con_log}" || true)"
 assert_eq "${put_locks}" 2 "both concurrent claimants reached the conditional SSM API"
 assert_eq "${claimed_locks}" 1 "only one conditional lock claimant succeeded"
 grep -q 'Conditional SSM apply-lock claim failed' "${TMP}/con-second.log" || fail "concurrent blocker diagnostic"
+
+# Drift after the conditional claim fails before the first non-lock resource
+# mutation and deliberately retains the owned lock for reviewed recovery.
+drift_state="${TMP}/postlock-drift-state"; drift_plan="${TMP}/postlock-drift-plan"; drift_log="${TMP}/postlock-drift.log"
+run_plan "${drift_state}" "${drift_plan}" "${drift_log}"
+drift_current="$(hash_file "${drift_plan}/current.json")"
+drift_desired="$(hash_file "${drift_plan}/desired.json")"
+if PATH="${MOCK_BIN}:${PATH}" MOCK_AWS_STATE="${drift_state}" MOCK_AWS_LOG="${drift_log}" \
+  MOCK_POST_LOCK_DRIFT=true AWS_BIN=aws AWS_REGION=us-west-1 PLAN_ONLY=false \
+  TRUST_PRINCIPAL_ARN="${TRUST}" TRUST_PRINCIPAL_ARN_CONFIRM="${TRUST}" \
+  EXPECTED_CURRENT_STATE_HASH="${drift_current}" EXPECTED_DESIRED_STATE_HASH="${drift_desired}" \
+  CONFIRM_PREREQUISITES=CONFIGURE_CALIBRATION_EVIDENCE_PREREQUISITES \
+  CONFIRM_COMPLIANCE_AUDIT=CREATE_COMPLIANCE_LOCKED_CALIBRATION_AUDIT_LOG \
+  BACKUP_ROOT="${TMP}/postlock-drift-backups" VERIFY_ATTEMPTS=1 VERIFY_DELAY_SECONDS=0 \
+  "${SCRIPT}" >"${TMP}/postlock-drift-output.log" 2>&1; then
+  fail "post-lock drift apply unexpectedly succeeded"
+fi
+[[ -f "${drift_state}/lock" ]] || fail "failed apply did not retain its owned SSM lock"
+grep -q 'AWS state changed after planning and before the first resource mutation' \
+  "${TMP}/postlock-drift-output.log" || fail "post-lock drift diagnostic missing"
+grep -q 'retaining the owned SSM apply lock for manual recovery review' \
+  "${TMP}/postlock-drift-output.log" || fail "failed-lock recovery diagnostic missing"
+assert_eq "$(grep -c '^MUTATE ' "${drift_log}" || true)" 1 "post-lock drift mutated more than its SSM lock"
+grep -q '^MUTATE ssm put-parameter$' "${drift_log}" || fail "post-lock drift did not claim only the SSM lock"
 
 echo "PASS: calibration evidence prerequisite provisioner mocked tests"

@@ -44,12 +44,25 @@ CONFIRM_COMPLIANCE_AUDIT=CREATE_COMPLIANCE_LOCKED_CALIBRATION_AUDIT_LOG \
 Apply additionally requires an empty blocker list, exact acknowledgment of
 every preserved foreign audit-bucket `Allow`, a mode-0700/mode-0600 rollback
 bundle, and a conditionally created SSM concurrency lock. An existing lock is
-never cleared automatically as stale. The transaction creates the audit bucket
+never cleared automatically as stale. After claiming its lock, the transaction
+re-reads and hashes the normalized current state before its first non-lock
+mutation. A failed, interrupted, or non-convergent apply deliberately retains
+its owned lock and prints the rollback bundle plus the manual recovery gate;
+only exact successful readback clears it. Never clear a failed lock until a
+separate review has compared its token and rollback bundle with a fresh
+plan-only state. The transaction creates the audit bucket
 with Object Lock at creation, applies a 365-day COMPLIANCE default, denies
 deletion and retention mutation, reconciles the least-privilege writer and
 read-only planner roles, configures the fixed single-region write-only trail,
 and sends integrity-control mutation events to a dedicated 365-day CloudWatch
-log group. The CloudWatch Logs resource policy follows the AWS-documented
+log group. Existing stronger COMPLIANCE defaults are preserved rather than
+reduced. Existing managed IAM roles with a non-root path or any permissions
+boundary fail closed. The monitoring pattern covers the fixed buckets, trail,
+IAM roles, EventBridge controls, CloudWatch Logs controls, and SSM apply lock.
+CloudTrail remains the durable management-event record: the EventBridge rule or
+its log destination cannot guarantee delivery of an event that disables that
+same path, so an independent external human notification remains required
+before closeout. The CloudWatch Logs resource policy follows the AWS-documented
 `events.amazonaws.com` plus `delivery.logs.amazonaws.com` delivery principals
 and scopes them to that exact log group; the later gate must prove a fixed-rule
 event actually arrives because Logs delivery does not support reliable
