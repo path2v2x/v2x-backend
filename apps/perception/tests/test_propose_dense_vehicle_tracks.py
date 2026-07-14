@@ -1057,6 +1057,50 @@ def test_staging_context_preserves_foreign_replacement_and_quarantines_owned_sta
     assert owner["staging_directory"] == str(staged_path.resolve())
 
 
+def test_successful_publish_preserves_foreign_recreated_stage_and_verified_output(
+    tmp_path, monkeypatch
+):
+    fixture = write_bound_pipeline_fixture(tmp_path)
+    instance = _valid_track_instance()
+    monkeypatch.setattr(
+        tracks, "model_instances_from_result", lambda _result, _image: [instance]
+    )
+
+    class Model:
+        def track(self, *_args, **_kwargs):
+            return [object()]
+
+    original_publish = tracks.publish_staged_tree
+    recreated_stage = None
+    published_identity = None
+
+    def publish_then_recreate_foreign_stage(staged, output):
+        nonlocal recreated_stage, published_identity
+        original_publish(staged, output)
+        published = Path(output).stat()
+        published_identity = (published.st_dev, published.st_ino)
+        recreated_stage = Path(staged)
+        recreated_stage.mkdir()
+        (recreated_stage / "foreign.txt").write_text("foreign-owner\n")
+
+    monkeypatch.setattr(
+        tracks, "publish_staged_tree", publish_then_recreate_foreign_stage
+    )
+    output = tmp_path / "output"
+    result = tracks.propose(
+        [fixture["capture"]], fixture["consensus"], fixture["models"][0],
+        output, model_factory=lambda _path: Model(), image_size=1280,
+    )
+
+    current = output.stat()
+    assert result == output
+    assert (current.st_dev, current.st_ino) == published_identity
+    assert json.loads((output / "report.json").read_text())["acceptance_eligible"] is False
+    assert recreated_stage is not None
+    assert (recreated_stage / "foreign.txt").read_text() == "foreign-owner\n"
+    assert list(tmp_path.glob(f".{output.name}.staging-quarantine-*")) == []
+
+
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
 def test_subprocess_interrupt_removes_only_its_owned_staging_directory(
     tmp_path, termination_signal

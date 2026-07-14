@@ -452,7 +452,21 @@ def invocation_staging_directory(output):
                     active.st_dev, active.st_ino
                 ) == owned_identity
                 active_is_foreign = active is not None and not active_is_owned
-                if active_is_owned or active_is_foreign or not body_completed:
+                try:
+                    published = os.stat(
+                        output.name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    published = None
+                published_is_owned = published is not None and (
+                    published.st_dev, published.st_ino
+                ) == owned_identity
+                if body_completed and published_is_owned:
+                    # The body atomically published this exact pinned stage.
+                    # A recreated temporary name is foreign and must survive;
+                    # never scan the parent for the inode now valid at output.
+                    pass
+                elif active_is_owned or active_is_foreign or not body_completed:
                     quarantined = quarantine_owned_staging(
                         parent_fd, staged.name, owned_identity
                     )
