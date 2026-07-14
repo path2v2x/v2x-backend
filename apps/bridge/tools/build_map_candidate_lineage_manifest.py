@@ -192,26 +192,29 @@ def inventory_package_tree(package_root: Path) -> dict:
                     os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
                     dir_fd=descriptor,
                 )
-                opened = os.fstat(file_descriptor)
-                if _identity(opened) != _identity(value):
-                    os.close(file_descriptor)
-                    raise LineageError("package file changed while inventory opened it")
-                remaining = opened.st_size
-                digest = hashlib.sha256()
-                while remaining:
-                    chunk = os.read(file_descriptor, min(CHUNK_BYTES, remaining))
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    remaining -= len(chunk)
-                if remaining or os.read(file_descriptor, 1):
-                    os.close(file_descriptor)
-                    raise LineageError("package file changed size during inventory")
-                after = os.fstat(file_descriptor)
-                if _identity(after) != _identity(opened):
-                    os.close(file_descriptor)
-                    raise LineageError("package file changed during inventory")
-                held_files.append((file_descriptor, _identity(opened)))
+                transferred = False
+                try:
+                    opened = os.fstat(file_descriptor)
+                    if _identity(opened) != _identity(value):
+                        raise LineageError("package file changed while inventory opened it")
+                    remaining = opened.st_size
+                    digest = hashlib.sha256()
+                    while remaining:
+                        chunk = os.read(file_descriptor, min(CHUNK_BYTES, remaining))
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    if remaining or os.read(file_descriptor, 1):
+                        raise LineageError("package file changed size during inventory")
+                    after = os.fstat(file_descriptor)
+                    if _identity(after) != _identity(opened):
+                        raise LineageError("package file changed during inventory")
+                    held_files.append((file_descriptor, _identity(opened)))
+                    transferred = True
+                finally:
+                    if not transferred:
+                        os.close(file_descriptor)
                 files.append(relative)
                 file_records.append({
                     "path": relative,

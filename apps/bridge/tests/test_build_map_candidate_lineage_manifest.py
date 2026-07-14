@@ -190,6 +190,71 @@ def test_build_rejects_nested_material_directory_replacement_during_inventory(
     with pytest.raises(lineage.LineageError, match="directory identity changed before inventory completed"):
         lineage.build(inputs)
 
+
+def _open_fd_count():
+    return len(os.listdir("/proc/self/fd"))
+
+
+def _descriptor_path(descriptor):
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+    except OSError:
+        return None
+
+
+def test_inventory_closes_nested_file_fd_when_read_raises(tmp_path, monkeypatch):
+    root = tmp_path / "package"
+    target = write(root / "nested" / "artifact.bin", b"payload")
+    original_read = lineage.os.read
+    baseline = _open_fd_count()
+
+    def failing_read(descriptor, count):
+        if _descriptor_path(descriptor) == target:
+            raise OSError("injected read failure")
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr(lineage.os, "read", failing_read)
+    with pytest.raises(OSError, match="injected read failure"):
+        lineage.inventory_package_tree(root)
+    assert _open_fd_count() == baseline
+
+
+def test_inventory_closes_nested_file_fd_when_fstat_raises(tmp_path, monkeypatch):
+    root = tmp_path / "package"
+    target = write(root / "nested" / "artifact.bin", b"payload")
+    original_fstat = lineage.os.fstat
+    baseline = _open_fd_count()
+    injected = False
+
+    def failing_fstat(descriptor):
+        nonlocal injected
+        if not injected and _descriptor_path(descriptor) == target:
+            injected = True
+            raise OSError("injected fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(lineage.os, "fstat", failing_fstat)
+    with pytest.raises(OSError, match="injected fstat failure"):
+        lineage.inventory_package_tree(root)
+    assert _open_fd_count() == baseline
+
+
+def test_inventory_closes_nested_file_fd_when_hash_update_raises(tmp_path, monkeypatch):
+    root = tmp_path / "package"
+    write(root / "nested" / "artifact.bin", b"payload")
+    original_sha256 = lineage.hashlib.sha256
+    baseline = _open_fd_count()
+
+    class FailingDigest:
+        def update(self, _chunk):
+            raise RuntimeError("injected hash failure")
+
+    monkeypatch.setattr(lineage.hashlib, "sha256", lambda *args, **kwargs: FailingDigest())
+    with pytest.raises(RuntimeError, match="injected hash failure"):
+        lineage.inventory_package_tree(root)
+    monkeypatch.setattr(lineage.hashlib, "sha256", original_sha256)
+    assert _open_fd_count() == baseline
+
 def test_rejects_hardlinks_duplicate_paths_and_outside_package(inputs, tmp_path):
     source = Path(inputs.material_file[0])
     hardlink = source.with_name("hardlink.png")
