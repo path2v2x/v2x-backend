@@ -8,8 +8,16 @@ argument_output="$(mktemp)"
 override_output="$(mktemp)"
 fake_python="$(mktemp)"
 fake_marker="$(mktemp)"
+hook_file="$(mktemp)"
+hook_output="$(mktemp)"
+path_output="$(mktemp)"
+function_output="$(mktemp)"
+python_output="$(mktemp)"
+loader_output="$(mktemp)"
+fake_bin="$(mktemp -d)"
+python_injection="$(mktemp -d)"
 rm -f "$fake_marker"
-trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker"' EXIT
+trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output"; rm -rf "$fake_bin" "$python_injection"' EXIT
 
 cat >"$fake_python" <<EOF
 #!/usr/bin/env bash
@@ -17,6 +25,109 @@ touch '$fake_marker'
 exit 99
 EOF
 chmod +x "$fake_python"
+
+cat >"$hook_file" <<EOF
+touch '$fake_marker'
+env() { printf 'forged lane output\\n'; }
+EOF
+
+if BASH_ENV="$hook_file" ENV="$hook_file" "$runner" >"$hook_output" 2>&1; then
+  echo "runner accepted shell startup hooks" >&2
+  exit 1
+else
+  status=$?
+fi
+if [[ "$status" -ne 2 ]] || [[ -e "$fake_marker" ]]; then
+  echo "runner sourced a shell hook or returned an unexpected status" >&2
+  exit 1
+fi
+grep -F "startup hooks are not accepted" "$hook_output" >/dev/null
+if grep -F "[bridge]" "$hook_output" >/dev/null; then
+  echo "runner started a lane after rejecting shell startup hooks" >&2
+  exit 1
+fi
+
+cat >"$fake_bin/env" <<EOF
+#!/bin/sh
+touch '$fake_marker'
+printf 'forged lane output\\n'
+exit 0
+EOF
+chmod +x "$fake_bin/env"
+if PATH="$fake_bin:/usr/bin:/bin" "$runner" >"$path_output" 2>&1; then
+  echo "runner accepted a PATH-controlled env executable" >&2
+  exit 1
+else
+  status=$?
+fi
+if [[ "$status" -ne 2 ]] || [[ -e "$fake_marker" ]]; then
+  echo "runner executed a PATH-controlled env or returned an unexpected status" >&2
+  exit 1
+fi
+grep -F "trusted system location" "$path_output" >/dev/null
+if grep -F "[bridge]" "$path_output" >/dev/null; then
+  echo "runner started a lane after rejecting hostile PATH" >&2
+  exit 1
+fi
+
+if /usr/bin/env \
+  "BASH_FUNC_env%%=() { touch '$fake_marker'; }" \
+  "$runner" >"$function_output" 2>&1; then
+  echo "runner accepted an inherited shell function payload" >&2
+  exit 1
+else
+  status=$?
+fi
+if [[ "$status" -ne 2 ]] || [[ -e "$fake_marker" ]]; then
+  echo "runner imported a shell function or returned an unexpected status" >&2
+  exit 1
+fi
+grep -F "inherited shell functions are not accepted" "$function_output" >/dev/null
+if grep -F "[bridge]" "$function_output" >/dev/null; then
+  echo "runner started a lane after rejecting inherited functions" >&2
+  exit 1
+fi
+
+cat >"$python_injection/sitecustomize.py" <<EOF
+from pathlib import Path
+Path('$fake_marker').touch()
+EOF
+if PYTHONPATH="$python_injection" PYTHONHOME="$python_injection" \
+  PYTHONOPTIMIZE=1 PYTHONWARNINGS=ignore \
+  "$runner" >"$python_output" 2>&1; then
+  echo "runner accepted inherited Python bootstrap controls" >&2
+  exit 1
+else
+  status=$?
+fi
+if [[ "$status" -ne 2 ]] || [[ -e "$fake_marker" ]]; then
+  echo "runner loaded sitecustomize or returned an unexpected status" >&2
+  exit 1
+fi
+grep -F "inherited Python and loader controls are not accepted" \
+  "$python_output" >/dev/null
+if grep -F "[bridge]" "$python_output" >/dev/null; then
+  echo "runner started a lane after rejecting Python bootstrap controls" >&2
+  exit 1
+fi
+
+if LD_LIBRARY_PATH="$fake_bin" LD_PRELOAD=/v2x/nonexistent/hostile.so \
+  "$runner" >"$loader_output" 2>&1; then
+  echo "runner accepted inherited loader controls" >&2
+  exit 1
+else
+  status=$?
+fi
+if [[ "$status" -ne 2 ]]; then
+  echo "runner rejected loader controls with unexpected status: $status" >&2
+  exit 1
+fi
+grep -F "inherited Python and loader controls are not accepted" \
+  "$loader_output" >/dev/null
+if grep -F "[bridge]" "$loader_output" >/dev/null; then
+  echo "runner started a lane after rejecting loader controls" >&2
+  exit 1
+fi
 
 if CARLA_PYTHON="$fake_python" MAP_LIDAR_PYTHON="$fake_python" \
   "$runner" >"$override_output" 2>&1; then

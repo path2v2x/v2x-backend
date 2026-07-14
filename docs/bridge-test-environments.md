@@ -22,6 +22,18 @@ Repository `conftest.py` files and pytest's internal plugins remain active. Its
 file is executed in full by the second lane. The second lane also fixes every
 thread-control variable required by the tracked lock.
 
+Execute the runner directly; invoking it through another shell is rejected.
+Its absolute privileged-Bash shebang prevents `BASH_ENV` startup sourcing and
+function import. It additionally rejects `BASH_ENV`, `ENV`, surviving
+`BASH_FUNC_*` payloads, or a `PATH` that resolves `env` anywhere except
+`/usr/bin/env`, then replaces `PATH` with `/usr/bin:/bin` before external work.
+It rejects inherited Python startup, path, optimization, warning, debugging,
+user-site, and native-loader controls. Every Python preflight and test lane then
+runs under `env -i` with only the documented home, locale, canonical path,
+no-user-site/safe-path controls, and lane-specific variables. Python also runs
+with `-S`, preventing `site`, `.pth`, `sitecustomize`, and `usercustomize`
+startup execution; each lane receives only its hard-bound package roots.
+
 The tracked adversarial check combines hostile `--collect-only`, `--ignore`,
 and `-k` values and requires the complete 550-test and 97-test lane totals:
 
