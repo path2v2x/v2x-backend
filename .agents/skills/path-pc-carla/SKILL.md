@@ -7,6 +7,59 @@ description: Operate and diagnose the Path PC CARLA/V2X stack at path@100.72.252
 
 Treat this file as an operating procedure, not proof of current state. Re-run the read-only baseline before every intervention.
 
+## Newest strict-calibration execution state
+
+Observed through 2026-07-14 17:00 UTC; verify rather than assume. These items
+override older calibration candidate, test-total, evidence, and next-gate
+statements below.
+
+- The clean integration worktree
+  `/home/path/.codex/worktrees/v2x-strict-calibration-integration` is at
+  `97cc334`. It includes the reviewed proposal-only static fitter, fail-closed
+  recovered/deployed OpenDRIVE topology correspondence, and Tier-B dynamic C0
+  evidence contracts. The combined locked suites pass 690/690 under the CARLA
+  Python 3.10 environment and 97/97 under the pinned map/LiDAR Python 3.12
+  environment; the hostile runner harness also passes. These are source gates,
+  not calibration, placement, deployment, or same-car acceptance.
+- Map selection remains blocked. The recovered 222-road/29-junction map and
+  deployed 208-road/32-junction map are structurally different. Topology
+  correspondence is conservative and proposal-only; it cannot establish
+  authoring/export provenance, select a candidate, or authorize scoring.
+- The static manifest builder candidate is clean and passes its focused and
+  locked suites, but it has no exact Fable verdict and is not integrated. Its
+  current deterministic deficit records zero independently adjudicated static
+  annotations and missing source-inventory/reviewer-ledger contracts. Never
+  relabel diagnostic matcher, CSV, or inverse-render artifacts to fill that
+  deficit.
+- A sanitized 24-hour development snapshot frozen at
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260714T164410Z-past24h-development-corpus/20260714T164430Z`
+  contains 1,799 detections, including 421 trusted schema-V2 vehicle events
+  across ch1-ch4. All 421 nearest retained frames were recovered read-only from
+  Kinesis into the sibling `20260714T164410Z-past24h-trusted-vehicle-frames`
+  bundle with unique event IDs and one bound camera-config/snapshot identity.
+  Only 417/421 are within the 150 ms temporal gate and only 3/421 persisted
+  boxes apply to the selected frame under the 50 ms identity tolerance, so the
+  persisted boxes are not geometry truth. YOLO11m exact-frame redetection finds
+  a matching proposal for 334/421 events; this is neither reviewed correctness
+  nor twin-placement proof. A stronger hash-pinned YOLO11x comparison is still
+  running and must retain disagreement/false-positive accounting.
+- At the read-only live check, all four local perception cameras remain in
+  `reconnecting` state because the external Kinesis producers stopped together.
+  The local service must not be restarted as a substitute for restoring those
+  producers. Historical ON_DEMAND retrieval remains usable for development,
+  but live four-feed, recency, and cross-camera same-car gates all fail.
+- Claude CLI currently reports `loggedIn=false`; no Anthropic API/OAuth
+  credential is present in the process environment or authorized agent vault.
+  Any source lane requiring the mandatory exact Fable review must remain
+  uncommitted or unintegrated until authentication is restored. Never replace
+  that gate with a different model or claim a Fable pass from a session-limit
+  or authentication failure.
+- The sealed holdout remains no-view. Do not list, hash, decode, sample, or use
+  any content beneath
+  `/home/path/V2XCarla/v2x-evidence/calibration/20260713T192217Z-untouched-holdout-candidate-vault`
+  before parameter freeze and the single authorized evaluation. UE6 remains a
+  separate task and runtime namespace and must not enter V2X evidence or gates.
+
 ## Newest perception release chronology
 
 Observed through 2026-07-13 18:37 UTC; verify rather than assume. These items
