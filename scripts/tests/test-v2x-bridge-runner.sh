@@ -19,11 +19,12 @@ privileged_source_output="$(mktemp)"
 equal_zero_source_output="$(mktemp)"
 forged_builtin_source_output="$(mktemp)"
 forged_return_source_output="$(mktemp)"
+symlink_source_output="$(mktemp)"
 fake_bin="$(mktemp -d)"
 python_injection="$(mktemp -d)"
 attacker_tree="$(mktemp -d)"
 rm -f "$fake_marker"
-trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output" "$source_output" "$privileged_source_output" "$equal_zero_source_output" "$forged_builtin_source_output" "$forged_return_source_output"; rm -rf "$fake_bin" "$python_injection" "$attacker_tree"' EXIT
+trap 'rm -f "$output" "$argument_output" "$override_output" "$fake_python" "$fake_marker" "$hook_file" "$hook_output" "$path_output" "$function_output" "$python_output" "$loader_output" "$source_output" "$privileged_source_output" "$equal_zero_source_output" "$forged_builtin_source_output" "$forged_return_source_output" "$symlink_source_output"; rm -rf "$fake_bin" "$python_injection" "$attacker_tree"' EXIT
 
 mkdir -p "$attacker_tree/apps/bridge"
 cat >"$attacker_tree/apps/bridge/pytest.py" <<EOF
@@ -34,6 +35,29 @@ print('550 passed')
 print('collected 97 items')
 print('97 passed')
 EOF
+
+ln -s "$runner" "$attacker_tree/test-v2x-bridge.sh"
+cat >"$attacker_tree/verify-v2x-bridge-runner-process.py" <<EOF
+from pathlib import Path
+Path('$fake_marker').touch()
+raise SystemExit(0)
+EOF
+if /bin/bash -p -c '
+  return() { :; }
+  builtin() { :; }
+  declare() { :; }
+  cd() { :; }
+  source "$0"
+' "$attacker_tree/test-v2x-bridge.sh" >"$symlink_source_output" 2>&1; then
+  echo "runner accepted sourced attacker-directory symlink execution" >&2
+  exit 1
+fi
+if [[ -e "$fake_marker" ]] || grep -E \
+  "collected (550|97) items|550 passed|97 passed|\[bridge\]" \
+  "$symlink_source_output" >/dev/null; then
+  echo "symlink-sourced runner used attacker verifier or started a lane" >&2
+  exit 1
+fi
 
 if /bin/bash -c 'source "$1"' bash "$runner" >"$source_output" 2>&1; then
   echo "runner accepted ordinary source execution" >&2

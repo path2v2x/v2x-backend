@@ -1,6 +1,8 @@
 #!/bin/bash -p
+canonical_runner="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" \
+  || /bin/kill -KILL "$$"
 /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I \
-  "${BASH_SOURCE[0]%/*}/verify-v2x-bridge-runner-process.py" \
+  "${canonical_runner%/*}/verify-v2x-bridge-runner-process.py" \
   || /bin/kill -KILL "$$"
 set -euo pipefail
 
@@ -44,7 +46,7 @@ if (( $# != 0 )); then
   exit 2
 fi
 
-runner_path="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")"
+runner_path="$canonical_runner"
 runner_suffix="/scripts/test-v2x-bridge.sh"
 if [[ $runner_path != *"$runner_suffix" ]]; then
   echo "runner path does not match the tracked repository layout" >&2

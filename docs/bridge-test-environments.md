@@ -23,8 +23,10 @@ file is executed in full by the second lane. The second lane also fixes every
 thread-control variable required by the tracked lock.
 
 Execute the runner directly; invoking it through another shell is rejected.
-The first executable command launches an isolated absolute Python verifier.
-It reads the parent process through `/proc` and requires exactly `/bin/bash`,
+The first operation resolves the runner with absolute `/usr/bin/readlink -f`;
+the verifier path is derived only from that canonical directory, never from a
+symlink entry directory. The isolated absolute Python verifier then reads the
+parent process through `/proc` and requires exactly `/bin/bash`,
 `-p`, and this tracked runner as the sole script argument; `bash -c`, source
 mode, extra arguments, a different executable, or a different resolved script
 path terminates the isolated runner before repository discovery or test lanes.
