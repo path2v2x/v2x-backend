@@ -309,7 +309,8 @@ case "${service}:${operation}" in
           " $* " == *" --query "* ]]; then error AccessDenied; fi
     if [[ " $* " == *" --query "* && " $* " == *" --output text "* ]]; then
       if [[ -f "${STATE}/trail.logging" && "${MOCK_RELEASE_OWNERSHIP_CHANGE:-false}" == "true" ]]; then
-        echo '{"schema":"foreign-lock"}'
+        printf '%s' '{"schema":"foreign-lock"}' >"${STATE}/lock"
+        cat "${STATE}/lock"
       else
         cat "${STATE}/lock"
       fi
@@ -616,8 +617,8 @@ fi
 [[ -f "${drift_state}/lock" ]] || fail "failed apply did not retain its owned SSM lock"
 grep -q 'AWS state changed after planning and before the first resource mutation' \
   "${TMP}/postlock-drift-output.log" || fail "post-lock drift diagnostic missing"
-grep -q 'retaining the owned SSM apply lock for manual recovery review' \
-  "${TMP}/postlock-drift-output.log" || fail "failed-lock recovery diagnostic missing"
+grep -q 'Release state: owned' \
+  "${TMP}/postlock-drift-output.log" || fail "failed-lock owned-state diagnostic missing"
 assert_eq "$(grep -c '^MUTATE ' "${drift_log}" || true)" 1 "post-lock drift mutated more than its SSM lock"
 grep -q '^MUTATE ssm put-parameter$' "${drift_log}" || fail "post-lock drift did not claim only the SSM lock"
 
@@ -650,8 +651,28 @@ for release_case in get_failure ownership_change delete_failure verify_failure; 
   [[ -f "${release_state}/lock" ]] || fail "${release_case} did not retain lock safety state"
   ! grep -q 'Calibration evidence AWS prerequisites verified' \
     "${TMP}/release-${release_case}-output.log" || fail "${release_case} printed success banner"
-  grep -q 'retaining the owned SSM apply lock for manual recovery review' \
-    "${TMP}/release-${release_case}-output.log" || fail "${release_case} omitted recovery diagnostic"
+  case "${release_case}" in
+    get_failure|delete_failure)
+      grep -q 'Release state: owned' "${TMP}/release-${release_case}-output.log" ||
+        fail "${release_case} omitted owned-state diagnostic"
+      ;;
+    ownership_change)
+      grep -q 'Release state: ownership_lost' "${TMP}/release-${release_case}-output.log" ||
+        fail "ownership change omitted ownership_lost diagnostic"
+      grep -q 'does not claim it is owned or retained' "${TMP}/release-${release_case}-output.log" ||
+        fail "ownership change made an owned/retained claim"
+      assert_eq "$(<"${release_state}/lock")" '{"schema":"foreign-lock"}' \
+        "ownership change mock state"
+      ;;
+    verify_failure)
+      grep -q 'Release state: delete_accepted_unverified' \
+        "${TMP}/release-${release_case}-output.log" || fail "verification failure omitted delete-accepted state"
+      grep -q 'AWS accepted deletion but current parameter existence is unknown' \
+        "${TMP}/release-${release_case}-output.log" || fail "verification failure misstated existence"
+      grep -q 'accept only ParameterNotFound as cleared' \
+        "${TMP}/release-${release_case}-output.log" || fail "verification failure omitted exact read gate"
+      ;;
+  esac
 done
 
 echo "PASS: calibration evidence prerequisite provisioner mocked tests"

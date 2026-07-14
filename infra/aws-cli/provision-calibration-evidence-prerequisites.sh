@@ -78,6 +78,7 @@ DESIRED="${WORKDIR}/desired.json"
 CANARY_INTERFACE="${WORKDIR}/later-canary-interface.json"
 LOCK_CLAIMED=false
 LOCK_TOKEN=""
+LOCK_RELEASE_STATE="not_claimed"
 PRELOCK_CURRENT="${WORKDIR}/current-prelock.json"
 
 aws_cli() {
@@ -129,6 +130,7 @@ release_lock() {
   fi
   rm -f "${error}"
   if [[ "${current_value}" != "${LOCK_TOKEN}" ]]; then
+    LOCK_RELEASE_STATE="ownership_lost"
     echo "Apply lock ownership changed; refusing to clear it or report success" >&2
     return 1
   fi
@@ -138,9 +140,11 @@ release_lock() {
     echo "Unable to delete the owned apply lock; refusing to report success" >&2
     return 1
   fi
+  LOCK_RELEASE_STATE="delete_accepted_unverified"
   rm -f "${error}"
   if aws_cli ssm get-parameter --name "${APPLY_LOCK_NAME}" --output json \
       >"${WORKDIR}/lock-after-delete.json" 2>"${error}"; then
+    LOCK_RELEASE_STATE="delete_accepted_still_present"
     echo "Apply lock still exists after delete; refusing to report success" >&2
     return 1
   fi
@@ -151,15 +155,35 @@ release_lock() {
   fi
   rm -f "${error}"
   LOCK_CLAIMED=false
+  LOCK_RELEASE_STATE="confirmed_absent"
 }
 
 cleanup() {
   local status=$?
-  if [[ "${LOCK_CLAIMED}" == "true" ]]; then
-    echo "ERROR: apply did not complete; retaining the owned SSM apply lock for manual recovery review" >&2
-    echo "Rollback bundle: ${ROLLBACK_BUNDLE:-not-created}" >&2
-    echo "Recovery gate: compare the lock token and rollback bundle with fresh plan-only state; clear the exact lock only in a separately reviewed manual action" >&2
-  fi
+  case "${LOCK_RELEASE_STATE}" in
+    owned)
+      echo "ERROR: apply did not complete. Release state: owned (last exact read matched this process; deletion was not confirmed accepted or was not attempted)." >&2
+      echo "Rollback bundle: ${ROLLBACK_BUNDLE:-not-created}" >&2
+      echo "Recovery gate: read the exact Parameter.Value, compare its token and rollback bundle with fresh plan-only state, then clear only in a separately reviewed manual action." >&2
+      ;;
+    ownership_lost)
+      echo "ERROR: apply did not complete. Release state: ownership_lost; the parameter belongs to a different value and this process does not claim it is owned or retained." >&2
+      echo "Rollback bundle: ${ROLLBACK_BUNDLE:-not-created}" >&2
+      echo "Recovery gate: read and review the current Parameter.Value and its owning workflow; do not delete it as this process's lock." >&2
+      ;;
+    delete_accepted_unverified)
+      echo "ERROR: apply did not complete. Release state: delete_accepted_unverified; AWS accepted deletion but current parameter existence is unknown." >&2
+      echo "Rollback bundle: ${ROLLBACK_BUNDLE:-not-created}" >&2
+      echo "Recovery gate: obtain an exact ssm:GetParameter result; accept only ParameterNotFound as cleared, otherwise review the returned value before any manual action." >&2
+      ;;
+    delete_accepted_still_present)
+      echo "ERROR: apply did not complete. Release state: delete_accepted_still_present; AWS accepted deletion but an exact read proved the parameter still exists." >&2
+      echo "Rollback bundle: ${ROLLBACK_BUNDLE:-not-created}" >&2
+      echo "Recovery gate: review the current Parameter.Value and rollback bundle before any separately approved retry or manual deletion." >&2
+      ;;
+    not_claimed|confirmed_absent) ;;
+    *) echo "ERROR: unknown apply-lock release state ${LOCK_RELEASE_STATE}" >&2 ;;
+  esac
   rm -rf "${WORKDIR}"
   exit "${status}"
 }
@@ -826,6 +850,7 @@ claim_apply_lock() {
   fi
   rm -f "${error}"
   LOCK_CLAIMED=true
+  LOCK_RELEASE_STATE="owned"
 }
 
 verify_preapply_state_unchanged() {

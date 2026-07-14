@@ -54,7 +54,13 @@ plan-only state. Successful release itself is fail-closed: the script must read
 back the exact owned value, delete it, and then receive exact
 `ParameterNotFound`. A read error, ownership mismatch, delete error, surviving
 parameter, or ambiguous absence exits nonzero and suppresses the verified
-banner. The transaction creates the audit bucket
+banner. Failure diagnostics distinguish the last confirmed states: `owned`,
+`ownership_lost`, and `delete_accepted_unverified`; only `confirmed_absent` is
+reported as cleared. A successful read after deletion is separately reported as
+`delete_accepted_still_present`. In particular, an accepted delete followed by
+AccessDenied does not claim that the lock still exists—it requires a fresh exact
+`GetParameter` result, with only `ParameterNotFound` accepted. The transaction
+creates the audit bucket
 with Object Lock at creation, applies a 365-day COMPLIANCE default, denies
 deletion and retention mutation, reconciles the least-privilege writer and
 read-only planner roles, configures the fixed single-region write-only trail,
