@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -239,6 +240,20 @@ def test_invalid_polyline_has_constant_residual_dimension(tmp_path):
     assert valid.shape == invalid.shape == (32,)
 
 
+def test_invalid_polyline_is_fail_closed_even_with_tiny_uncertainty(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    model = fitter.validate_document(document, digest)
+    camera = model["cameras"]["ch1"]
+    for item in camera["polylines"]:
+        if item["split"] == "development":
+            item["uncertainty_px"] = 0.001
+    z = np.zeros(28)
+    z[4] = 180.0 / fitter.SCALES[4]
+    report = fitter._errors(model, z, "development")["ch1"]
+    assert report["roads"]["rmse_px"] == math.inf
+    assert report["gates_passed"] is False
+
+
 def test_multistart_is_deterministic_and_axis_stratified():
     lower, upper = np.zeros(28), np.ones(28)
     first = np.asarray(fitter._low_discrepancy_starts(lower, upper, 8, 42))
@@ -275,4 +290,33 @@ def test_cross_camera_geometry_and_config_drift_are_rejected(tmp_path):
     document, _truths, digest = synthetic_document(config_root)
     document["cameras"]["ch1"]["production_base"]["yaw_deg"] += 0.1
     with pytest.raises(fitter.DevelopmentFitError, match="disagrees with cameras JSON"):
+        fitter.validate_document(document, digest)
+
+
+def test_cross_camera_cross_kind_and_polyline_containment_are_rejected(tmp_path):
+    document, _truths, digest = synthetic_document(tmp_path)
+    fit_line = document["cameras"]["ch1"]["polylines"][0]
+    development_point = next(
+        item for item in document["cameras"]["ch2"]["points"]
+        if item["split"] == "development"
+    )
+    endpoints = np.asarray(fit_line["world_vertices"])
+    development_point["world_xyz"] = ((endpoints[0] + endpoints[1]) / 2.0).tolist()
+    with pytest.raises(fitter.DevelopmentFitError, match="polyline geometry crosses camera"):
+        fitter.validate_document(document, digest)
+
+    contained = tmp_path / "contained"
+    contained.mkdir()
+    document, _truths, digest = synthetic_document(contained)
+    fit_line = next(item for item in document["cameras"]["ch1"]["polylines"]
+                    if item["split"] == "fit")
+    development_line = next(item for item in document["cameras"]["ch2"]["polylines"]
+                            if item["split"] == "development")
+    vertices = np.asarray(fit_line["world_vertices"])
+    development_line["world_vertices"] = [
+        (vertices[0] * .75 + vertices[1] * .25).tolist(),
+        ((vertices[0] + vertices[1]) / 2.0).tolist(),
+        (vertices[0] * .25 + vertices[1] * .75).tolist(),
+    ]
+    with pytest.raises(fitter.DevelopmentFitError, match="polyline geometry crosses camera"):
         fitter.validate_document(document, digest)

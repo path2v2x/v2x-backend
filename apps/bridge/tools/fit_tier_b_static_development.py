@@ -357,17 +357,16 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
         fit_lines = [item for item in camera["polylines"] if item["split"] == "fit"]
         dev_lines = [item for item in camera["polylines"] if item["split"] == "development"]
         for left in fit_lines:
-            left_samples = _resample_world_polyline(left["world_vertices"])
             for right in dev_lines:
-                right_samples = _resample_world_polyline(right["world_vertices"])
-                distance = np.linalg.norm(left_samples[:, None] - right_samples[None, :], axis=2)
-                if max(np.max(np.min(distance, axis=1)), np.max(np.min(distance, axis=0))) < 0.05:
+                if _polylines_overlap(left["world_vertices"], right["world_vertices"]):
                     raise DevelopmentFitError(f"{camera_id} copies/resamples a polyline across fit/development")
         for point in dev_points:
-            if any(np.min(np.linalg.norm(_resample_world_polyline(line["world_vertices"]) - point["world_xyz"], axis=1)) < 0.05 for line in fit_lines):
+            if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+                   for line in fit_lines):
                 raise DevelopmentFitError(f"{camera_id} reuses fit polyline geometry as a development point")
         for point in fit_points:
-            if any(np.min(np.linalg.norm(_resample_world_polyline(line["world_vertices"]) - point["world_xyz"], axis=1)) < 0.05 for line in dev_lines):
+            if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+                   for line in dev_lines):
                 raise DevelopmentFitError(f"{camera_id} reuses fit point geometry as a development polyline")
     fit_points = [(camera_id, item) for camera_id, camera in cameras.items()
                   for item in camera["points"] if item["split"] == "fit"]
@@ -380,12 +379,37 @@ def _validate_geometry_split_isolation(cameras: dict) -> None:
     if any(np.linalg.norm(left[1]["world_xyz"] - right[1]["world_xyz"]) < 1e-6
            for left in fit_points for right in dev_points):
         raise DevelopmentFitError("point geometry crosses camera fit/development splits")
-    if any(max(np.max(np.min(distance, axis=1)), np.max(np.min(distance, axis=0))) < 0.05
-           for _left_camera, left in fit_lines for _right_camera, right in dev_lines
-           for distance in [np.linalg.norm(
-               _resample_world_polyline(left["world_vertices"])[:, None]
-               - _resample_world_polyline(right["world_vertices"])[None, :], axis=2)]) :
+    if any(_polylines_overlap(left["world_vertices"], right["world_vertices"])
+           for _left_camera, left in fit_lines for _right_camera, right in dev_lines):
         raise DevelopmentFitError("polyline geometry crosses camera fit/development splits")
+    if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+           for _camera, point in dev_points for _line_camera, line in fit_lines):
+        raise DevelopmentFitError("fit polyline geometry crosses camera into a development point")
+    if any(_point_polyline_distance(point["world_xyz"], line["world_vertices"]) < 0.05
+           for _camera, point in fit_points for _line_camera, line in dev_lines):
+        raise DevelopmentFitError("fit point geometry crosses camera into a development polyline")
+
+
+def _point_polyline_distance(point: np.ndarray, vertices: np.ndarray) -> float:
+    """Exact Euclidean distance from a point to a piecewise-linear polyline."""
+    point = np.asarray(point, dtype=float)
+    vertices = np.asarray(vertices, dtype=float)
+    starts, vectors = vertices[:-1], np.diff(vertices, axis=0)
+    lengths_squared = np.sum(vectors * vectors, axis=1)
+    if np.any(lengths_squared <= 1e-18):
+        raise DevelopmentFitError("world polyline contains a degenerate segment")
+    fractions = np.sum((point - starts) * vectors, axis=1) / lengths_squared
+    closest = starts + np.clip(fractions, 0.0, 1.0)[:, None] * vectors
+    return float(np.min(np.linalg.norm(closest - point, axis=1)))
+
+
+def _polylines_overlap(left: np.ndarray, right: np.ndarray, threshold: float = 0.05) -> bool:
+    """Reject containment or copying in either directed polyline distance."""
+    left_samples = _resample_world_polyline(left)
+    right_samples = _resample_world_polyline(right)
+    left_to_right = max(_point_polyline_distance(point, right) for point in left_samples)
+    right_to_left = max(_point_polyline_distance(point, left) for point in right_samples)
+    return left_to_right < threshold or right_to_left < threshold
 
 
 def _resample_world_polyline(vertices: np.ndarray, count: int = 16) -> np.ndarray:
@@ -475,7 +499,7 @@ def _horizon_residual(predicted: np.ndarray, observed: np.ndarray, camera: dict)
 def _polyline_residual(item: dict, params: np.ndarray, camera: dict) -> np.ndarray:
     projected, depth = project_world(item["world_vertices"], params, camera["width"], camera["height"])
     if np.any(depth <= 0.1) or not np.isfinite(projected).all():
-        return np.full(32, 100.0)
+        return np.full(32, 100.0 / item["uncertainty_px"])
     scale = _reference_scale(camera)
     predicted = _resample_polyline(projected * scale)
     observed = _resample_polyline(item["real_vertices"] * scale)
@@ -588,7 +612,13 @@ def _errors(model: dict, z: np.ndarray, split: str) -> dict:
         for item in camera["polylines"]:
             if item["split"] != split:
                 continue
-            row = np.abs(_polyline_residual(item, params, camera) * item["uncertainty_px"])
+            projected, depth = project_world(
+                item["world_vertices"], params, camera["width"], camera["height"]
+            )
+            if np.any(depth <= 0.1) or not np.isfinite(projected).all():
+                row = np.full(32, math.inf)
+            else:
+                row = np.abs(_polyline_residual(item, params, camera) * item["uncertainty_px"])
             road_rows.extend(row); by_epoch[item["epoch_id"]]["roads"].extend(row); by_class[item["class"]].extend(row)
         for item in camera["horizons"]:
             if item["split"] != split:
@@ -604,6 +634,9 @@ def _errors(model: dict, z: np.ndarray, split: str) -> dict:
             vanishing_rows.extend(row); by_epoch[item["epoch_id"]]["vanishing"].extend(row)
         def metrics(rows):
             values = np.asarray(rows, dtype=float)
+            if not np.isfinite(values).all():
+                return {"count": len(values), "rmse_px": math.inf,
+                        "p95_px": math.inf, "max_px": math.inf}
             return {"count": len(values), "rmse_px": float(np.sqrt(np.mean(values**2))),
                     "p95_px": float(np.quantile(values, .95)), "max_px": float(np.max(values))}
         points, roads = metrics(point_rows), metrics(road_rows)
@@ -774,6 +807,7 @@ def solve(model: dict, seed=20260714, starts=8, max_nfev=80) -> dict:
         "code_identity": {
             "fitter_sha256": _sha256(Path(__file__).resolve()),
             "projection_sha256": _sha256(Path(project_world.__code__.co_filename).resolve()),
+            "rig_sha256": _sha256(Path(absolute_twin_model.__code__.co_filename).resolve()),
         },
         "data_jacobian": {"rank": rank, "required_rank": 28, "condition": condition,
                           "condition_max": CONDITION_MAX, "singular_values": singular.tolist()},
