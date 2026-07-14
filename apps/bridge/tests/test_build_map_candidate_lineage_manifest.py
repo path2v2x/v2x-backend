@@ -202,6 +202,72 @@ def _descriptor_path(descriptor):
         return None
 
 
+def test_inventory_closes_root_fd_when_initial_ancestry_fstat_raises(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "package"
+    write(root / "artifact.bin", b"payload")
+    original_fstat = lineage.os.fstat
+    baseline = _open_fd_count()
+    injected = False
+
+    def failing_fstat(descriptor):
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise OSError("injected initial ancestry fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(lineage.os, "fstat", failing_fstat)
+    with pytest.raises(OSError, match="injected initial ancestry fstat failure"):
+        lineage.inventory_package_tree(root)
+    assert _open_fd_count() == baseline
+
+
+def test_inventory_closes_root_fd_when_postwalk_fstat_raises(tmp_path, monkeypatch):
+    root = tmp_path / "package"
+    write(root / "artifact.bin", b"payload")
+    original_fstat = lineage.os.fstat
+    baseline = _open_fd_count()
+    root_fstats = 0
+
+    def failing_fstat(descriptor):
+        nonlocal root_fstats
+        if _descriptor_path(descriptor) == root:
+            root_fstats += 1
+            if root_fstats == 2:
+                raise OSError("injected postwalk root fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(lineage.os, "fstat", failing_fstat)
+    with pytest.raises(OSError, match="injected postwalk root fstat failure"):
+        lineage.inventory_package_tree(root)
+    assert _open_fd_count() == baseline
+
+
+def test_inventory_closes_child_directory_fd_when_initial_fstat_raises(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "package"
+    child = root / "nested"
+    write(child / "artifact.bin", b"payload")
+    original_fstat = lineage.os.fstat
+    baseline = _open_fd_count()
+    injected = False
+
+    def failing_fstat(descriptor):
+        nonlocal injected
+        if not injected and _descriptor_path(descriptor) == child:
+            injected = True
+            raise OSError("injected child directory fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(lineage.os, "fstat", failing_fstat)
+    with pytest.raises(OSError, match="injected child directory fstat failure"):
+        lineage.inventory_package_tree(root)
+    assert _open_fd_count() == baseline
+
+
 def test_inventory_closes_nested_file_fd_when_read_raises(tmp_path, monkeypatch):
     root = tmp_path / "package"
     target = write(root / "nested" / "artifact.bin", b"payload")
@@ -317,6 +383,26 @@ def test_malformed_lane_topology_fails_with_lineage_error():
     )
     with pytest.raises(lineage.LineageError, match="duplicate lane ID"):
         lineage.summarize_xodr(duplicate, "duplicate")
+
+
+def test_blank_road_and_junction_lane_link_ids_fail_closed():
+    blank_road_link = xodr(1, 1).replace(
+        b"<link/>", b'<link><successor elementType="road"/></link>', 1
+    )
+    with pytest.raises(lineage.LineageError, match="road link with blank elementId"):
+        lineage.summarize_xodr(blank_road_link, "blank-road-link")
+
+    blank_from = xodr(1, 1).replace(
+        b'<junction id="0"/>',
+        b'<junction id="0"><connection id="c" incomingRoad="0" connectingRoad="0">'
+        b'<laneLink to="-1"/></connection></junction>',
+    )
+    with pytest.raises(lineage.LineageError, match="laneLink with blank from/to"):
+        lineage.summarize_xodr(blank_from, "blank-junction-from")
+
+    blank_to = blank_from.replace(b'<laneLink to="-1"/>', b'<laneLink from="-1"/>')
+    with pytest.raises(lineage.LineageError, match="laneLink with blank from/to"):
+        lineage.summarize_xodr(blank_to, "blank-junction-to")
 
 
 def test_cli_refuses_relative_input_and_relative_output(inputs, tmp_path):

@@ -69,13 +69,18 @@ def _walk_directory_no_follow(path: Path) -> tuple[int, list[tuple[int, int, int
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_DIRECTORY | os.O_NOFOLLOW
     )
     descriptor = os.open("/", directory_flags)
-    identities = [_directory_identity(os.fstat(descriptor))]
     try:
+        identities = [_directory_identity(os.fstat(descriptor))]
         for component in path.parts[1:]:
             next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+            try:
+                next_identity = _directory_identity(os.fstat(next_descriptor))
+            except BaseException:
+                os.close(next_descriptor)
+                raise
             os.close(descriptor)
             descriptor = next_descriptor
-            identities.append(_directory_identity(os.fstat(descriptor)))
+            identities.append(next_identity)
     except BaseException:
         os.close(descriptor)
         raise
@@ -160,11 +165,16 @@ def inventory_package_tree(package_root: Path) -> dict:
     """Return the complete regular-file inventory through held no-follow dirfds."""
     require_no_follow_support()
     root_descriptor, root_ancestors = _walk_directory_no_follow(package_root)
+    try:
+        root_identity = _identity(os.fstat(root_descriptor))
+    except BaseException:
+        os.close(root_descriptor)
+        raise
     files: list[str] = []
     directories: list[str] = []
     file_records: list[dict] = []
     held_directories: list[tuple[int, tuple[int, ...]]] = [
-        (root_descriptor, _identity(os.fstat(root_descriptor)))
+        (root_descriptor, root_identity)
     ]
     held_files: list[tuple[int, tuple[int, ...]]] = []
 
@@ -183,8 +193,13 @@ def inventory_package_tree(package_root: Path) -> dict:
                     | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=descriptor,
                 )
+                try:
+                    child_identity = _identity(os.fstat(child))
+                except BaseException:
+                    os.close(child)
+                    raise
                 directories.append(relative)
-                held_directories.append((child, _identity(os.fstat(child))))
+                held_directories.append((child, child_identity))
                 recurse(child, relative)
             elif stat.S_ISREG(value.st_mode) and value.st_nlink == 1:
                 file_descriptor = os.open(
@@ -335,23 +350,33 @@ def summarize_xodr(content: bytes, label: str) -> dict:
                 junction.get("id"), connection_id, connection.get("incomingRoad") or "",
                 connection.get("connectingRoad") or "", connection.get("contactPoint") or "",
             ))
-            junction_lane_links.extend(
-                (junction.get("id"), connection_id, link.get("from") or "", link.get("to") or "")
-                for link in connection.findall("laneLink")
-            )
+            for link in connection.findall("laneLink"):
+                from_id = link.get("from")
+                to_id = link.get("to")
+                if from_id is None or from_id == "" or to_id is None or to_id == "":
+                    raise LineageError(
+                        f"{label} contains a junction laneLink with blank from/to"
+                    )
+                junction_lane_links.append(
+                    (junction.get("id"), connection_id, from_id, to_id)
+                )
+    road_link_records = []
+    for road in roads:
+        for child in road.findall("./link/*"):
+            element_id = child.get("elementId")
+            if element_id is None or element_id == "":
+                raise LineageError(f"{label} contains a road link with blank elementId")
+            road_link_records.append((
+                road.get("id"), _local_name(child.tag), child.get("elementType") or "",
+                element_id, child.get("contactPoint") or "",
+            ))
     canonical_topology = {
         "road_ids": sorted(road_ids),
         "road_junction_membership": sorted(
             (road.get("id"), road.get("junction") or "") for road in roads
         ),
         "junction_ids": sorted(junction_ids),
-        "road_links": sorted(
-            (
-                road.get("id"), child.tag, child.get("elementType") or "",
-                child.get("elementId") or "", child.get("contactPoint") or "",
-            )
-            for road in roads for child in road.findall("./link/*")
-        ),
+        "road_links": sorted(road_link_records),
         "junction_connections": sorted(junction_connections),
         "junction_lane_links": sorted(junction_lane_links),
         "lanes": sorted(lane_records),
