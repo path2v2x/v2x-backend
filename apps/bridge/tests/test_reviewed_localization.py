@@ -1108,6 +1108,42 @@ def test_status_readback_rejects_actor_integrity_drift(mock_world, drift):
     assert status["actor_present"] is False
 
 
+def test_status_lookup_none_quarantines_and_blocks_later_update(mock_world):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor_id = next(iter(sync.actor_ids()))
+    actor = mock_world.get_actor(actor_id)
+    original_get_actor = mock_world.get_actor
+    calls = 0
+
+    def miss_first_lookup(requested_actor_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original_get_actor(requested_actor_id)
+
+    mock_world.get_actor = miss_first_lookup
+    missing = sync.status()["objects"][0]
+    assert missing["tracked_actor_id"] == actor_id
+    assert missing["actor_present"] is False
+    assert missing["actor_quarantined"] is True
+    assert missing["quarantined_reason"] == "strict_actor_vanished"
+    assert missing["cleanup_failure"] == "actor_lookup_missing"
+
+    second = detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )
+    sync._apply([second])
+    assert sync.actor_ids() == {actor_id}
+    assert sync.status()["objects"][0]["trajectory_sample_index"] == 0
+    assert sync.status()["strict_rejections"]["strict_cleanup_pending"] == 1
+
+    sync.stop()
+    assert actor.is_destroyed
+
+
 @pytest.mark.parametrize(
     ("drift", "expected_reason"),
     [
@@ -1222,6 +1258,88 @@ def test_update_actor_lookup_exception_stays_quarantined_after_recovery(
     assert actor.is_destroyed
     assert sync.actor_ids() == set()
     assert sync.status()["objects"] == []
+
+
+def test_update_actor_lookup_none_retains_ownership_and_blocks_respawn(
+    mock_world,
+):
+    sync = strict_sync(mock_world)
+    first = detection()
+    sync._apply([first])
+    actor_id = next(iter(sync.actor_ids()))
+    actor = mock_world.get_actor(actor_id)
+    original_get_actor = mock_world.get_actor
+    calls = 0
+
+    def miss_first_lookup(requested_actor_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original_get_actor(requested_actor_id)
+
+    mock_world.get_actor = miss_first_lookup
+    second = detection(
+        camera_id="ch2", sample_index=1, seconds=1,
+        position={"x": 11.0, "y": 20.0, "z": 1.25},
+    )
+    sync._apply([second])
+
+    status = sync.status()["objects"][0]
+    assert status["event_id"] == first["event_id"]
+    assert status["trajectory_sample_index"] == 0
+    assert status["tracked_actor_id"] == actor_id
+    assert status["actor_id"] is None
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert status["quarantined_reason"] == "strict_actor_vanished"
+    assert status["cleanup_failure"] == "actor_lookup_missing"
+    assert sync.status()["strict_rejections"]["strict_actor_vanished"] == 1
+
+    spawned_ids = {item.id for item in mock_world.get_actors()}
+    sync._apply([second])
+    blocked = sync.status()["objects"][0]
+    assert {item.id for item in mock_world.get_actors()} == spawned_ids
+    assert sync.actor_ids() == {actor_id}
+    assert blocked["trajectory_sample_index"] == 0
+    assert blocked["actor_present"] is False
+    assert blocked["actor_quarantined"] is True
+    assert sync.status()["strict_rejections"]["strict_cleanup_pending"] == 1
+
+    sync.stop()
+    assert actor.is_destroyed
+    assert sync.actor_ids() == set()
+    assert sync.status()["objects"] == []
+
+
+def test_tick_lookup_none_retains_owned_actor_until_cleanup(mock_world):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor_id = next(iter(sync.actor_ids()))
+    actor = mock_world.get_actor(actor_id)
+    original_get_actor = mock_world.get_actor
+    calls = 0
+
+    def miss_first_lookup(requested_actor_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original_get_actor(requested_actor_id)
+
+    mock_world.get_actor = miss_first_lookup
+    sync.tick()
+
+    status = sync.status()["objects"][0]
+    assert status["tracked_actor_id"] == actor_id
+    assert status["actor_present"] is False
+    assert status["actor_quarantined"] is True
+    assert status["quarantined_reason"] == "strict_actor_vanished"
+    assert status["cleanup_failure"] == "actor_lookup_missing"
+
+    sync.stop()
+    assert actor.is_destroyed
+    assert sync.actor_ids() == set()
 
 
 def test_failed_provisional_destroy_is_quarantined_not_present(mock_world):
@@ -1365,6 +1483,40 @@ def test_cleanup_actor_lookup_exception_is_quarantined_not_present(mock_world):
     assert status["objects"][0]["actor_present"] is False
     assert status["objects"][0]["actor_quarantined"] is True
     assert status["objects"][0]["quarantined_reason"] == "track_cleanup"
+
+
+def test_cleanup_actor_lookup_none_retains_ownership_until_reconciled(mock_world):
+    sync = strict_sync(mock_world)
+    sync._apply([detection()])
+    actor_id = next(iter(sync.actor_ids()))
+    actor = mock_world.get_actor(actor_id)
+    original_get_actor = mock_world.get_actor
+    calls = 0
+
+    def miss_first_lookup(requested_actor_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original_get_actor(requested_actor_id)
+
+    mock_world.get_actor = miss_first_lookup
+    sync.stop()
+
+    status = sync.status()
+    assert sync.actor_ids() == {actor_id}
+    assert status["cleanup_failures"]["global_car_reviewed"] == (
+        "actor_lookup_missing"
+    )
+    assert status["objects"][0]["tracked_actor_id"] == actor_id
+    assert status["objects"][0]["actor_present"] is False
+    assert status["objects"][0]["actor_quarantined"] is True
+    assert status["objects"][0]["quarantined_reason"] == "track_cleanup"
+
+    sync.clear()
+    assert actor.is_destroyed
+    assert sync.actor_ids() == set()
+    assert sync.status()["objects"] == []
 
 
 def test_blueprint_digest_is_stable_and_cleanup_is_unchanged(mock_world):

@@ -666,6 +666,15 @@ class TwinSync:
         track.quarantined_reason = reason
         self._destroy_owned_actor(track, actor, reason)
 
+    @staticmethod
+    def _quarantine_unresolved_actor(
+        track: TwinTrack, reason: str, cleanup_failure: str
+    ) -> None:
+        """Retain ownership when CARLA cannot currently resolve an actor ID."""
+        if track.quarantined_reason is None:
+            track.quarantined_reason = reason
+        track.cleanup_failure = cleanup_failure
+
     def _commit_detection_metadata(
         self,
         track: TwinTrack,
@@ -919,6 +928,8 @@ class TwinSync:
                         continue
                 else:
                     track.actor_id = actor.id
+                    track.cleanup_failure = None
+                    track.quarantined_reason = None
                     track.current = location
                     track.target = location
                 logger.info(
@@ -948,8 +959,11 @@ class TwinSync:
                         )
                         continue
                     if actor is None:
-                        track.actor_id = None
-                        self._reject_strict(det, "strict_actor_vanished")
+                        reason = "strict_actor_vanished"
+                        self._reject_strict(det, reason)
+                        self._quarantine_unresolved_actor(
+                            track, reason, "actor_lookup_missing"
+                        )
                         continue
                     integrity_reason, _actual_dimensions = self._strict_actor_integrity(
                         actor, reviewed
@@ -1041,14 +1055,30 @@ class TwinSync:
     def _despawn_stale(self, now: float) -> None:
         for object_id in list(self._tracks):
             track = self._tracks[object_id]
-            if now - track.last_seen <= self._despawn_after:
+            stale = now - track.last_seen > self._despawn_after
+            reconcile_quarantine = (
+                self._reviewed_placement != "strict"
+                and track.actor_id is not None
+                and (
+                    track.cleanup_failure is not None
+                    or track.quarantined_reason is not None
+                )
+            )
+            if not stale and not reconcile_quarantine:
                 continue
             if self._destroy_track(track):
                 del self._tracks[object_id]
-                logger.info("Twin despawn: %s (unseen for %.0fs)", object_id, now - track.last_seen)
+                if stale:
+                    logger.info(
+                        "Twin despawn: %s (unseen for %.0fs)",
+                        object_id,
+                        now - track.last_seen,
+                    )
+                else:
+                    logger.info("Twin quarantine reconciled: %s", object_id)
             else:
                 logger.error(
-                    "Twin despawn retained ownership for %s after cleanup failure",
+                    "Twin cleanup retained ownership for %s after failure",
                     object_id,
                 )
 
@@ -1059,9 +1089,13 @@ class TwinSync:
         try:
             actor = self._world.get_actor(track.actor_id)
             if actor is None:
-                track.actor_id = None
-                track.cleanup_failure = None
-                return True
+                if track.quarantined_reason is None:
+                    track.quarantined_reason = "track_cleanup"
+                track.cleanup_failure = "actor_lookup_missing"
+                logger.error(
+                    "Twin actor lookup returned no actor for %s", track.actor_id
+                )
+                return False
         except Exception:
             if track.quarantined_reason is None:
                 track.quarantined_reason = "track_cleanup"
@@ -1197,16 +1231,35 @@ class TwinSync:
 
         now = time.time()
         for track in self._tracks.values():
-            if track.actor_id is None or track.target is None:
+            if (
+                track.actor_id is None
+                or track.target is None
+                or track.quarantined_reason is not None
+            ):
                 continue
             if self._reviewed_placement == "strict":
-                actor = None
                 try:
                     actor = self._world.get_actor(track.actor_id)
-                    if actor is None:
-                        track.actor_id = None
-                        track.quarantined_reason = "strict_actor_vanished"
-                        continue
+                except Exception:
+                    reason = "strict_actor_lookup_failed"
+                    self._strict_rejections[reason] += 1
+                    self._quarantine_unresolved_actor(
+                        track, reason, "actor_lookup_failed"
+                    )
+                    logger.error(
+                        "Strict twin tick could not resolve %s",
+                        track.object_id,
+                        exc_info=True,
+                    )
+                    continue
+                if actor is None:
+                    reason = "strict_actor_vanished"
+                    self._strict_rejections[reason] += 1
+                    self._quarantine_unresolved_actor(
+                        track, reason, "actor_lookup_missing"
+                    )
+                    continue
+                try:
                     reviewed = track.reviewed_localization
                     if reviewed is None:
                         raise RuntimeError("strict track lacks accepted review")
@@ -1237,11 +1290,9 @@ class TwinSync:
                         raise RuntimeError("strict actor integrity mismatch")
                 except Exception:
                     self._strict_rejections["strict_tick_integrity_mismatch"] += 1
-                    track.quarantined_reason = "strict_tick_integrity_mismatch"
-                    if actor is not None:
-                        self._quarantine_actor(
-                            track, actor, "strict_tick_integrity_mismatch"
-                        )
+                    self._quarantine_actor(
+                        track, actor, "strict_tick_integrity_mismatch"
+                    )
                     logger.error(
                         "Strict twin tick quarantined %s after integrity mismatch",
                         track.object_id,
@@ -1262,14 +1313,36 @@ class TwinSync:
                 track.current = track.target
             try:
                 actor = self._world.get_actor(track.actor_id)
-                if actor is None:
-                    track.actor_id = None
-                    continue
+            except Exception:
+                self._quarantine_unresolved_actor(
+                    track, "actor_lookup_failed", "actor_lookup_failed"
+                )
+                logger.error(
+                    "Twin tick actor lookup failed for %s",
+                    track.object_id,
+                    exc_info=True,
+                )
+                continue
+            if actor is None:
+                self._quarantine_unresolved_actor(
+                    track,
+                    "actor_lookup_missing",
+                    "actor_lookup_missing",
+                )
+                continue
+            try:
                 actor.set_transform(
                     carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=track.yaw))
                 )
             except Exception:
-                logger.debug("Twin tick transform failed for %s", track.object_id)
+                self._quarantine_unresolved_actor(
+                    track, "actor_transform_failed", "actor_transform_failed"
+                )
+                logger.error(
+                    "Twin tick transform failed for %s",
+                    track.object_id,
+                    exc_info=True,
+                )
 
     def actor_ids(self) -> set:
         return {t.actor_id for t in self._tracks.values() if t.actor_id is not None}
@@ -1285,6 +1358,7 @@ class TwinSync:
         reference_to_actor_m = None
         readback_actual_dimensions = track.actual_dimensions_m
         if track.actor_id is not None:
+            actor = None
             try:
                 actor = self._world.get_actor(track.actor_id)
                 if actor is not None:
@@ -1342,8 +1416,34 @@ class TwinSync:
                             float(transform.location.y)
                             - float(track.raw_carla_location["y"]),
                         )
+                else:
+                    reason = (
+                        "strict_actor_vanished"
+                        if self._reviewed_placement == "strict"
+                        else "actor_lookup_missing"
+                    )
+                    self._quarantine_unresolved_actor(
+                        track, reason, "actor_lookup_missing"
+                    )
             except Exception:
                 actor_present = False
+                if actor is None:
+                    reason = (
+                        "strict_actor_lookup_failed"
+                        if self._reviewed_placement == "strict"
+                        else "actor_lookup_failed"
+                    )
+                    cleanup_failure = "actor_lookup_failed"
+                else:
+                    reason = (
+                        "strict_actor_readback_failed"
+                        if self._reviewed_placement == "strict"
+                        else "actor_readback_failed"
+                    )
+                    cleanup_failure = "actor_readback_failed"
+                self._quarantine_unresolved_actor(
+                    track, reason, cleanup_failure
+                )
                 logger.debug(
                     "Twin status transform unavailable for %s", track.object_id
                 )
@@ -1384,6 +1484,9 @@ class TwinSync:
             "actor_present": actor_present and transform_payload is not None,
             "actor_type": actor_type,
             "carla_transform": transform_payload,
+            "cleanup_failure": track.cleanup_failure,
+            "actor_quarantined": track.quarantined_reason is not None,
+            "quarantined_reason": track.quarantined_reason,
         }
         if self._reviewed_placement == "strict":
             reviewed = track.reviewed_localization
@@ -1428,9 +1531,6 @@ class TwinSync:
                     reviewed["blueprint"]["selected_blueprint_id"]
                     if reviewed else None
                 ),
-                "cleanup_failure": track.cleanup_failure,
-                "actor_quarantined": track.quarantined_reason is not None,
-                "quarantined_reason": track.quarantined_reason,
                 "placement_provenance": (
                     {
                         key: reviewed[key]
@@ -1472,17 +1572,17 @@ class TwinSync:
             "replay_supported": self.replay_supported,
             "replay_clock": _epoch_to_iso(clock) if clock is not None else None,
             "objects": objects,
+            "cleanup_failures": {
+                track.object_id: track.cleanup_failure
+                for track in self._tracks.values()
+                if track.cleanup_failure is not None
+            },
         }
         if self._reviewed_placement == "strict":
             payload.update({
                 "reviewed_placement_mode": "strict",
                 "strict_rejections": dict(sorted(self._strict_rejections.items())),
                 "recent_strict_rejections": list(self._recent_strict_rejections),
-                "cleanup_failures": {
-                    track.object_id: track.cleanup_failure
-                    for track in self._tracks.values()
-                    if track.cleanup_failure is not None
-                },
                 "strict_context": {
                     "map_name": self._reviewed_context.map_name,
                     "opendrive_sha256": self._reviewed_context.opendrive_sha256,
