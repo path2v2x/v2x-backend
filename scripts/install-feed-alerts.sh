@@ -45,10 +45,14 @@ install_file "$UNIT_SRC/v2x-feed-recovery.service" \
   /etc/systemd/system/v2x-feed-recovery.service
 install_file "$UNIT_SRC/v2x-feed-recovery.timer" \
   /etc/systemd/system/v2x-feed-recovery.timer
+install_file "$UNIT_SRC/v2x-daily-verify.service" \
+  /etc/systemd/system/v2x-daily-verify.service
+install_file "$UNIT_SRC/v2x-daily-verify.timer" \
+  /etc/systemd/system/v2x-daily-verify.timer
 
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now v2x-feed-recovery.timer
-echo "daemon-reload complete; v2x-feed-recovery.timer enabled."
+$SUDO systemctl enable --now v2x-feed-recovery.timer v2x-daily-verify.timer
+echo "daemon-reload complete; v2x-feed-recovery.timer and v2x-daily-verify.timer enabled."
 
 echo
 echo "Optional webhook: put V2X_ALERT_WEBHOOK_URL=https://... in /etc/v2x-alerts.env"
