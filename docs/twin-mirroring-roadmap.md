@@ -74,6 +74,15 @@ days, and alerting when it breaks.
   precheck execute unattended the moment M0 lands. Mutating gates (the
   PR 54 parity canary `--apply` run, the long upload watch) remain
   operator-initiated per the controlled deployment doctrine.
+  **FIRST BASELINE CAPTURED (2026-07-16, retroactively)** from 1,561
+  persisted schema-v2 records of the Jul 13→14 live-upload window via
+  `--historical` mode (`/detections/range` pagination): decode p50/p95/max
+  = 4.55/6.22/9.92 s; ingest ≈ 0 s (second-resolution timestamps); end
+  to end = 4.27/6.15/10.95 s. Evidence:
+  `v2x-evidence/perception/20260716T231007Z-historical-latency-baseline/`.
+  Consequence for M10: decode/transport alone exceeds a 5 s p95 twin
+  budget — the target needs transport work (shorter fragments or a
+  different consumer path), not just replacing the 5 s poller.
 
 ### Phase 2 — Localization accuracy ("confidently")
 
@@ -115,6 +124,12 @@ this phase lands, twin positions are unproven.
   vs twin render, plus replay correlation through the schema-v2 clocks.
   Exit: every staged event visibly mirrored within budget with stable
   identity; archived evidence bundle + screen recording.
+  NOTE (2026-07-16): KVS retention defaults to 24 h
+  (`provision-video-streams.sh`), which already expired the Jul 13–14
+  footage and blocked replay-correlation evidence for that window
+  (detections outlive video: DynamoDB TTL ≈ 7 days). Before M11, raise
+  `RETENTION_HOURS` (e.g. 168) so demo footage survives review — small
+  storage cost, run by an authorized principal.
 
 ### Phase 4 — Make it boring
 

@@ -17,6 +17,11 @@ Usage:
       [--health-url http://127.0.0.1:8090/health]
       [--api-base https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com]
       [--output baseline.json]
+
+Historical mode computes the same baseline retroactively from persisted
+detections via /detections/range (no live feeds or health required):
+  latency_baseline.py --historical \
+      --start 2026-07-13T17:00:00Z --end 2026-07-14T14:15:00Z
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import json
 import math
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -110,6 +116,49 @@ def fetch_json(url, timeout=10):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def iter_range_pages(api_base, start, end, page_limit=100, max_pages=500,
+                     fetch=fetch_json):
+    """Yield item pages from /detections/range, following the `next`
+    cursor until exhaustion or max_pages."""
+    next_token = None
+    for _ in range(max_pages):
+        url = (
+            f"{api_base}/detections/range?start={urllib.parse.quote(start)}"
+            f"&end={urllib.parse.quote(end)}&limit={page_limit}"
+        )
+        if next_token:
+            url += f"&next={urllib.parse.quote(next_token)}"
+        data = fetch(url)
+        yield data.get("items", [])
+        next_token = data.get("next")
+        if not next_token:
+            return
+    print(f"stopped at max_pages={max_pages}; results truncated", file=sys.stderr)
+
+
+def run_historical(args):
+    seen_events = set()
+    lag_rows = []
+    pages = 0
+    for items in iter_range_pages(
+        args.api_base, args.start, args.end,
+        page_limit=args.page_limit, max_pages=args.max_pages,
+    ):
+        pages += 1
+        for record in items:
+            event_id = record.get("event_id")
+            if not event_id or event_id in seen_events:
+                continue
+            seen_events.add(event_id)
+            lags = record_lags(record)
+            if lags is not None:
+                lag_rows.append(lags)
+    summary = summarize(lag_rows, [], pages)
+    summary["mode"] = "historical"
+    summary["window"] = {"start": args.start, "end": args.end}
+    return summary, lag_rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration", type=float, default=600.0)
@@ -122,7 +171,26 @@ def main() -> int:
         default="https://w0j9m7dgpg.execute-api.us-west-1.amazonaws.com",
     )
     parser.add_argument("--output", default=None)
+    parser.add_argument("--historical", action="store_true")
+    parser.add_argument("--start", default=None)
+    parser.add_argument("--end", default=None)
+    parser.add_argument("--page-limit", type=int, default=100)
+    parser.add_argument("--max-pages", type=int, default=500)
     args = parser.parse_args()
+
+    if args.historical:
+        if not args.start or not args.end:
+            parser.error("--historical requires --start and --end")
+        summary, lag_rows = run_historical(args)
+        output = json.dumps(summary, indent=2)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(output + "\n")
+        print(output)
+        if not lag_rows:
+            print("no usable detection records in window", file=sys.stderr)
+            return 1
+        return 0
 
     seen_events = set()
     lag_rows = []

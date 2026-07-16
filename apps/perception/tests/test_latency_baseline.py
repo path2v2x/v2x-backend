@@ -47,6 +47,35 @@ def test_record_lags_rejects_negative_decode_lag():
     assert latency_baseline.record_lags(bad) is None
 
 
+def test_iter_range_pages_follows_cursor_and_stops():
+    calls = []
+
+    def fake_fetch(url):
+        calls.append(url)
+        if "next=" not in url:
+            return {"items": [{"event_id": "a"}], "next": "tok=="}
+        return {"items": [{"event_id": "b"}], "next": None}
+
+    pages = list(latency_baseline.iter_range_pages(
+        "https://api", "2026-07-13T17:00:00Z", "2026-07-14T14:15:00Z",
+        fetch=fake_fetch,
+    ))
+    assert [p[0]["event_id"] for p in pages] == ["a", "b"]
+    assert len(calls) == 2
+    assert "next=tok%3D%3D" in calls[1]
+    assert "start=2026-07-13T17%3A00%3A00Z" in calls[0]
+
+
+def test_iter_range_pages_bounded_by_max_pages():
+    def endless(url):
+        return {"items": [], "next": "more"}
+
+    pages = list(latency_baseline.iter_range_pages(
+        "https://api", "s", "e", max_pages=3, fetch=endless,
+    ))
+    assert len(pages) == 3
+
+
 def test_summarize_shape():
     rows = [(4.0, 1.0, 5.0), (6.0, 1.0, 7.0)]
     summary = latency_baseline.summarize(rows, [4500.0, 6500.0], 12)
