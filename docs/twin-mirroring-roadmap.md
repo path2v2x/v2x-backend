@@ -17,12 +17,16 @@ days, and alerting when it breaks.
   session API returns `video_session_unavailable` /
   `ResourceNotFoundException` (no live media), and the coverage API shows
   zero fragments since the onset.
-- The producer host `path-rfs-1` (100.126.56.83, tailnet) is up — it
-  answers tailscale-ping and serves the dashboard on :443 — so site power
-  and network are fine. All four channels stopping in the same second
-  points at the producer process itself (crash, or expired AWS
-  credentials). Restoring it requires a login on `path-rfs-1`; the Path PC
-  has no producer code and no SSH access to it (Tailscale SSH ACL).
+- ROOT CAUSE (confirmed 2026-07-16 via CloudTrail + on-site probes): the
+  producer is a separate **PeMS camera server at 128.32.234.154**
+  (campus subnet, no reverse DNS), pushing as IAM user
+  `pems-rfs-camera-server`. Its last KVS call was **2026-07-14T14:01Z**
+  with no auth errors and its access key still Active — then silence.
+  The host is now completely dark (no ping, no open ports) even from
+  inside the campus network, so **the machine itself is down** and needs
+  an on-site power cycle or campus IT intervention. Note `path-rfs-1`
+  (fixed-128-32-129-4.path.berkeley.edu) is a drive-stack host, not the
+  producer; it stays healthy.
 - The perception service handled the outage exactly as designed: no crash,
   no restart, bounded reconnects (6,500+ on ch1 by 07-16), fail-closed
   health, sanitized errors. This validates the PR 48–52 lifecycle work.
