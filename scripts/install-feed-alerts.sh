@@ -41,9 +41,14 @@ install_file "$UNIT_SRC/dropins/v2x-perception-link-health.service.d/v2x-alerts.
   /etc/systemd/system/v2x-perception-link-health.service.d/v2x-alerts.conf
 install_file "$UNIT_SRC/dropins/v2x-perception.service.d/v2x-alerts.conf" \
   /etc/systemd/system/v2x-perception.service.d/v2x-alerts.conf
+install_file "$UNIT_SRC/v2x-feed-recovery.service" \
+  /etc/systemd/system/v2x-feed-recovery.service
+install_file "$UNIT_SRC/v2x-feed-recovery.timer" \
+  /etc/systemd/system/v2x-feed-recovery.timer
 
 $SUDO systemctl daemon-reload
-echo "daemon-reload complete."
+$SUDO systemctl enable --now v2x-feed-recovery.timer
+echo "daemon-reload complete; v2x-feed-recovery.timer enabled."
 
 echo
 echo "Optional webhook: put V2X_ALERT_WEBHOOK_URL=https://... in /etc/v2x-alerts.env"

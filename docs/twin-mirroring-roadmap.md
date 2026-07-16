@@ -64,10 +64,16 @@ days, and alerting when it breaks.
   strictness unchanged. Classification verified against the archived
   July 13 evidence (round 66 → clean, round 67 → occupied). Blocked by M0
   to actually run.
-- **M4 — Latency baseline.** Per-stage p50/p95 from a live hour:
-  camera → KVS → HLS decode (4.6–6.5 s at last live run) → inference →
-  upload (≥1 s interval) → poller (5 s cadence) → twin actor. Blocked by
-  M0.
+- **M4 — Latency baseline.** TOOLING DONE (2026-07-16):
+  `apps/perception/tools/latency_baseline.py` reports p50/p95/max for
+  decode / ingest / end-to-end from trusted schema-v2 records plus health
+  decode latency; unit-tested. It runs automatically on feed recovery via
+  `v2x-feed-recovery.timer` (`scripts/check-feed-recovery.sh`), which
+  also re-runs the live-feed gate and an observational phase-4 probe and
+  archives evidence — so M4's first capture and M2's observational
+  precheck execute unattended the moment M0 lands. Mutating gates (the
+  PR 54 parity canary `--apply` run, the long upload watch) remain
+  operator-initiated per the controlled deployment doctrine.
 
 ### Phase 2 — Localization accuracy ("confidently")
 
