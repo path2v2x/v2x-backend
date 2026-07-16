@@ -56,8 +56,9 @@
 	}
 </script>
 
+<!-- Docked console (devtools-style): fills the side column the page provides. -->
 <div
-	class="absolute bottom-16 right-2 z-30 flex w-[600px] max-w-[92vw] flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-900/95 text-gray-200 shadow-xl backdrop-blur-md pointer-events-auto"
+	class="flex h-full w-full flex-col overflow-hidden border-l border-gray-700 bg-gray-950 text-gray-200 pointer-events-auto"
 	data-testid="packet-log-panel"
 >
 	<div class="flex items-center justify-between gap-2 border-b border-gray-700 px-3 py-2">
@@ -108,7 +109,7 @@
 	<div
 		bind:this={streamEl}
 		onscroll={onScroll}
-		class="h-72 overflow-auto bg-gray-950/80 px-2 py-1 font-mono text-[11px] leading-relaxed"
+		class="flex-1 overflow-auto bg-gray-950/80 px-2 py-1 font-mono text-[11px] leading-relaxed"
 	>
 		{#if shown.length === 0}
 			<p class="p-2 italic text-gray-600">
