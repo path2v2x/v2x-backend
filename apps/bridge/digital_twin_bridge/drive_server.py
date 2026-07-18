@@ -2586,7 +2586,23 @@ async def serve_drive(
             if isinstance(raw_message, bytes):
                 continue
 
-            msg = json.loads(raw_message)
+            # Malformed frames are ignored rather than fatal: a client typo
+            # (or a raw-injector experiment) must not cost the whole session.
+            # Only well-formed JSON objects reach the dispatcher.
+            try:
+                msg = json.loads(raw_message)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Ignoring non-JSON frame from client (%d chars)", len(raw_message)
+                )
+                continue
+            if not isinstance(msg, dict):
+                logger.warning(
+                    "Ignoring non-object JSON frame from client (%s)",
+                    type(msg).__name__,
+                )
+                continue
+
             response = await handle_message(session, msg, map_controller=map_controller)
             await websocket.send(json.dumps(response))
 
