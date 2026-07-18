@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a WebSocket connection becomes a car — Drive API</title>
+<style>
+  :root{
+    --ground:#101317; --surface:#171C22; --inset:#0C0F13; --ink:#ECEAE4; --muted:#9AA3AE; --faint:#68737F;
+    --line:#262D36; --accent:#FFB300; --accent-ink:#1A1206; --ok:#3FBF7F; --rx:#7FB8D8;
+    --mono:'B612 Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--mono);line-height:1.5;padding:22px}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:16px;font-weight:700;letter-spacing:.04em;margin:0}
+  h1 span{color:var(--accent)}
+  .sub{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:4px 0 14px}
+  .steps{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .steps button{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.06em;padding:7px 12px;
+    border:1px solid var(--line);border-radius:4px;background:var(--inset);color:var(--muted);cursor:pointer}
+  .steps button:hover{border-color:var(--accent);color:var(--ink)}
+  .steps button.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .caption{background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:11px 14px;
+    font-size:13px;color:var(--ink);min-height:64px;margin-bottom:14px}
+  .caption b{color:var(--accent)}
+  .caption .k{color:var(--faint)}
+  svg{width:100%;height:auto;display:block;background:var(--inset);border:1px solid var(--line);border-radius:6px}
+  /* ── DriveSession explainer ── */
+  .h2{font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--ink);
+    margin:26px 0 4px;display:flex;align-items:center;gap:10px}
+  .h2::after{content:"";flex:1;height:1px;background:var(--line)}
+  .lead{font-size:13px;color:var(--muted);margin:8px 0 14px;max-width:78ch}
+  .lead b{color:var(--ink)} .lead .a{color:var(--accent)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:12px 14px}
+  .card h3{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 8px}
+  .card p,.card li{font-size:12px;color:var(--muted);margin:0}
+  .card ul{margin:0;padding-left:16px;display:grid;gap:5px}
+  .card code{color:var(--ink);background:var(--inset);border:1px solid var(--line);border-radius:2px;padding:0 4px;font-size:11px}
+  .card pre{background:#08090C;border:1px solid var(--line);border-radius:4px;padding:8px 10px;margin:8px 0 0;
+    font-size:10.5px;color:#E3C98B;white-space:pre-wrap;word-break:break-all}
+  .life{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:10px}
+  .stage{background:var(--inset);border:1px solid var(--line);border-radius:5px;padding:11px 13px;position:relative}
+  .stage .n{font-size:10px;font-weight:700;color:var(--accent);letter-spacing:.1em}
+  .stage h4{font-size:12px;color:var(--ink);margin:3px 0 5px}
+  .stage p{font-size:11.5px;color:var(--muted);margin:0}
+  .conseq{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:12px}
+  .co{border:1px solid var(--accent-line,rgba(255,179,0,.38));background:rgba(255,179,0,.07);border-radius:5px;padding:11px 14px;font-size:12px;color:var(--ink)}
+  .co b{color:var(--accent)}
+  text{font-family:var(--mono)}
+  .box{fill:var(--surface);stroke:var(--line);stroke-width:1}
+  .lbl{fill:var(--faint);font-size:9px;letter-spacing:.14em;text-transform:uppercase}
+  .t{fill:var(--ink);font-size:11px}
+  .tm{fill:var(--muted);font-size:10px}
+  .ts{fill:var(--faint);font-size:9.5px}
+  .amber{fill:var(--accent)}
+  .okc{fill:var(--ok)}
+  .rxc{fill:var(--rx)}
+  .pipe{stroke:var(--faint);stroke-width:1.8;fill:none}
+  .flow{stroke:var(--accent);stroke-width:1.6;fill:none;stroke-dasharray:5 4}
+  .flowrx{stroke:var(--rx);stroke-width:1.5;fill:none;stroke-dasharray:5 4}
+  .handle{stroke:var(--ok);stroke-width:1.7;fill:none}
+  .handleb{stroke:#4E7A93;stroke-width:1.5;fill:none}
+  .chip{fill:#08090C;stroke:var(--line)}
+  .g{transition:opacity .25s}
+  .dim{opacity:.14}
+  @media (prefers-reduced-motion:no-preference){
+    .dash{animation:dashmove 1.2s linear infinite}
+    @keyframes dashmove{to{stroke-dashoffset:-18}}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>HOW A CONNECTION BECOMES A CAR <span>· drive-by-wire routing</span></h1>
+  <div class="sub">the websocket is the identity — vehicle_id is just the car's name in the world</div>
+
+  <div class="steps" id="steps">
+    <button data-s="0" class="on">Overview</button>
+    <button data-s="1">1 · Connect</button>
+    <button data-s="2">2 · Spawn</button>
+    <button data-s="3">3 · Control</button>
+    <button data-s="4">4 · Tick &amp; telemetry</button>
+    <button data-s="5">5 · Two clients</button>
+  </div>
+  <div class="caption" id="cap"></div>
+
+  <svg viewBox="0 0 1080 660" role="img" aria-label="Diagram of WebSocket connections binding to DriveSessions and CARLA actors">
+    <defs>
+      <marker id="ahA" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#FFB300"/>
+      </marker>
+      <marker id="ahB" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#7FB8D8"/>
+      </marker>
+      <marker id="ahG" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#3FBF7F"/>
+      </marker>
+      <marker id="ahS" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#4E7A93"/>
+      </marker>
+    </defs>
+
+    <!-- column headers -->
+    <text class="lbl" x="40" y="30">BROWSER (CLIENT)</text>
+    <text class="lbl" x="420" y="30">DRIVE SERVER · PYTHON, ONE PROCESS</text>
+    <text class="lbl" x="812" y="30">CARLA · SHARED WORLD</text>
+
+    <!-- ══ CARLA world (drawn first so nothing overlaps it) ══ -->
+    <g id="world" class="g">
+      <rect class="box" x="790" y="50" width="250" height="400" rx="5"/>
+      <text class="lbl" x="806" y="72">WORLD · RICHMOND</text>
+      <g id="carA">
+        <rect x="812" y="96" width="206" height="64" rx="4" fill="#0C0F13" stroke="#3FBF7F"/>
+        <text class="t" x="826" y="118">actor <tspan class="amber">id 106</tspan></text>
+        <text class="ts" x="826" y="136">role_name: ego_vehicle_a3f2</text>
+        <text class="ts" x="826" y="150">latest input: t=1.0 s=0 b=0</text>
+      </g>
+      <g id="carB">
+        <rect x="812" y="300" width="206" height="64" rx="4" fill="#0C0F13" stroke="#4E7A93"/>
+        <text class="t" x="826" y="322">actor <tspan class="amber">id 42</tspan></text>
+        <text class="ts" x="826" y="340">role_name: ego_vehicle_9c41</text>
+        <text class="ts" x="826" y="354">latest input: t=0 s=-0.7 b=0</text>
+      </g>
+      <g id="tick">
+        <rect x="812" y="392" width="206" height="42" rx="4" fill="#0C0F13" stroke="#262D36"/>
+        <text class="tm" x="826" y="410">world.tick() @ 20 Hz</text>
+        <text class="ts" x="826" y="426">applies each actor's LATEST input</text>
+      </g>
+    </g>
+
+    <!-- ══ client A ══  box: x 40-240, y 50-170 -->
+    <g id="cliA" class="g">
+      <rect class="box" x="40" y="50" width="200" height="120" rx="5"/>
+      <text class="t" x="56" y="76">Browser tab A</text>
+      <text class="tm" x="56" y="96">dev console / drive site</text>
+      <text class="ts" x="56" y="118">injector · pads · scripts —</text>
+      <text class="ts" x="56" y="132">everything exits through</text>
+      <text class="ts" x="56" y="146">ONE WebSocket</text>
+    </g>
+
+    <!-- pipe A: client right edge (240,110) → session left edge (380,110) -->
+    <g id="pipeA" class="g">
+      <path class="pipe" d="M240 110 H 380"/>
+      <circle cx="240" cy="110" r="2.6" fill="#68737F"/>
+      <circle cx="380" cy="110" r="2.6" fill="#68737F"/>
+      <text class="ts" x="252" y="104">WebSocket №1</text>
+    </g>
+
+    <!-- ══ session A ══  box: x 380-680, y 50-200 -->
+    <g id="sessA" class="g">
+      <rect class="box" x="380" y="50" width="300" height="150" rx="5"/>
+      <text class="lbl" x="396" y="72">DRIVESESSION — BOUND TO SOCKET №1</text>
+      <text class="tm" x="396" y="94">_ego_role: <tspan class="amber">"ego_vehicle_a3f2"</tspan></text>
+      <text class="tm" x="396" y="114">vehicle:  <tspan class="okc">● live actor HANDLE</tspan></text>
+      <text class="ts" x="396" y="136">apply_control() · teleport() · respawn()</text>
+      <text class="ts" x="396" y="150">— all act through the handle, never by id</text>
+      <text class="ts" x="396" y="184">cleanup on disconnect: destroys owned actors</text>
+    </g>
+
+    <!-- handle A: session right edge (680,110) → car A left edge (812,128) -->
+    <g id="handleA" class="g">
+      <circle cx="680" cy="110" r="2.6" fill="#3FBF7F"/>
+      <path class="handle" d="M680 110 C 735 110, 755 124, 806 128" marker-end="url(#ahG)"/>
+      <text class="ts okc" x="700" y="100">handle (object ref)</text>
+    </g>
+
+    <!-- spawn chips: ride ON pipe A (they travel the same socket) -->
+    <g id="pktStart" class="g">
+      <rect class="chip" x="246" y="76" width="122" height="20" rx="4"/>
+      <text class="ts amber" x="254" y="90">start_session ▶</text>
+      <rect class="chip" x="242" y="120" width="134" height="20" rx="4"/>
+      <text class="ts rxc" x="250" y="134">◀ session_ready 106</text>
+    </g>
+
+    <!-- ══ control lane: client bottom (100,170) → chip → session bottom (430,200) ══ -->
+    <g id="pktCtrl" class="g">
+      <circle cx="100" cy="170" r="2.6" fill="#FFB300"/>
+      <path class="flow dash" d="M100 170 C 100 214, 108 249, 150 249"/>
+      <rect class="chip" x="150" y="238" width="252" height="22" rx="4"/>
+      <text class="ts amber" x="158" y="253">{"type":"control","t":1,…} ← NO ID FIELD</text>
+      <path class="flow dash" d="M402 249 C 430 249, 430 232, 430 206" marker-end="url(#ahA)"/>
+      <text class="ts" x="418" y="264">routed by WHICH SOCKET it arrived on —</text>
+      <text class="ts" x="418" y="278">nothing inside the packet addresses a car</text>
+    </g>
+
+    <!-- ══ telemetry lane: session bottom (610,200) → chip → client bottom (70,170) ══ -->
+    <g id="pktTelem" class="g">
+      <circle cx="610" cy="200" r="2.6" fill="#7FB8D8"/>
+      <path class="flowrx dash" d="M610 200 C 610 250, 600 300, 540 300 H 446"/>
+      <rect class="chip" x="178" y="289" width="268" height="22" rx="4"/>
+      <text class="ts rxc" x="186" y="304">◀ telemetry {speed, pos, …} same socket only</text>
+      <path class="flowrx dash" d="M178 300 C 120 300, 70 282, 70 176" marker-end="url(#ahB)"/>
+    </g>
+
+    <!-- ══ client B ══  box: x 40-240, y 330-430 -->
+    <g id="cliB" class="g">
+      <rect class="box" x="40" y="330" width="200" height="100" rx="5"/>
+      <text class="t" x="56" y="356">Browser tab B</text>
+      <text class="tm" x="56" y="376">a second developer</text>
+      <text class="ts" x="56" y="398">same server, same world</text>
+      <path class="pipe" d="M240 380 H 380"/>
+      <circle cx="240" cy="380" r="2.6" fill="#68737F"/>
+      <circle cx="380" cy="380" r="2.6" fill="#68737F"/>
+      <text class="ts" x="252" y="374">WebSocket №2</text>
+    </g>
+
+    <!-- ══ session B ══  box: x 380-680, y 330-430; handle → car B left edge (812,332) -->
+    <g id="sessB" class="g">
+      <rect class="box" x="380" y="330" width="300" height="100" rx="5"/>
+      <text class="lbl" x="396" y="352">DRIVESESSION — BOUND TO SOCKET №2</text>
+      <text class="tm" x="396" y="374">_ego_role: <tspan class="amber">"ego_vehicle_9c41"</tspan></text>
+      <text class="tm" x="396" y="394">vehicle: <tspan style="fill:#4E7A93">● live actor HANDLE</tspan></text>
+      <circle cx="680" cy="390" r="2.6" fill="#4E7A93"/>
+      <path class="handleb" d="M680 390 C 740 390, 760 352, 806 334" marker-end="url(#ahS)"/>
+    </g>
+
+    <!-- isolation note -->
+    <g id="isol" class="g">
+      <rect class="chip" x="380" y="470" width="480" height="46" rx="4"/>
+      <text class="tm" x="396" y="490">Socket №1 can NEVER reach actor 42 — there is no id field to spoof.</text>
+      <text class="ts" x="396" y="506">Routing lives a layer below the protocol: connection → session → handle.</text>
+    </g>
+
+    <!-- legend -->
+    <g id="legend" class="g">
+      <path class="flow" d="M46 556 H 86"/><text class="ts" x="96" y="560">client → server (TX)</text>
+      <path class="flowrx" d="M46 578 H 86"/><text class="ts" x="96" y="582">server → client (RX: telemetry, frames)</text>
+      <path class="handle" d="M46 600 H 86"/><text class="ts" x="96" y="604">in-process object reference (Python handle → CARLA RPC)</text>
+      <text class="ts amber" x="46" y="632">vehicle_id (106) = the car's NAME in the world · display, logs, correlation — never routing</text>
+    </g>
+  </svg>
+
+  <!-- ══ what the middle box actually is ══ -->
+  <div class="h2">The middle box — what a DriveSession is</div>
+  <p class="lead">
+    A <b>DriveSession</b> is a plain Python object (<code class="a">drive_server.py:418</code>), created
+    <b>once per WebSocket connection</b>, living only in the drive server's memory. Think of it as a
+    <b>hotel folio</b>: opened at check-in (connect), it records everything you're assigned and everything
+    you owe — so checkout (disconnect) can settle the room completely.
+  </p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>Identity — minted at connect</h3>
+      <p>Named the instant the socket opens, before any car exists. <code>id(self)</code> is the object's
+      memory address — the session's unique name literally <i>is</i> its Python identity:</p>
+      <pre>self._ego_role = f"ego_vehicle_{id(self):x}"</pre>
+    </div>
+    <div class="card">
+      <h3>Possessions — empty until spawn</h3>
+      <ul>
+        <li><code>vehicle</code> — live actor handle (the green arrow)</li>
+        <li><code>_camera_sensor</code> — your streaming camera</li>
+        <li><code>_perception</code> — the 8-camera / 16-sensor rig</li>
+        <li>scene actors reconstructed for your time window</li>
+      </ul>
+      <p style="margin-top:7px">The "17 sensors · 18 owned" in <code>session_ready</code> is this inventory.</p>
+    </div>
+    <div class="card">
+      <h3>Guards — sanity at 20 Hz</h3>
+      <ul>
+        <li><code>_starting</code> — no double-spawn</li>
+        <li><code>_accepting_frames</code> — a dead session's camera can't write</li>
+        <li><code>_frame_lock</code> — CARLA's camera thread meets the WebSocket thread here</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Verbs — where packets land</h3>
+      <p>Every world-touching message you inject resolves to a method on <i>your</i> session:</p>
+      <ul style="margin-top:7px">
+        <li><code>apply_control()</code> · <code>teleport()</code> · <code>respawn()</code></li>
+        <li><code>spawn_object()</code> · <code>set_camera_settings()</code></li>
+        <li><code>get_latest_frame()</code> — what the streamer ships you</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="life">
+    <div class="stage"><span class="n">STAGE 1</span><h4>Connect</h4>
+      <p>Object created. Exists only in RAM — the world doesn't know you yet.</p></div>
+    <div class="stage"><span class="n">STAGE 2</span><h4>start_session</h4>
+      <p>Acquires possessions — car, camera, sensors, scene — all tagged with its role name.</p></div>
+    <div class="stage"><span class="n">STAGE 3</span><h4>Drive</h4>
+      <p>Your packets dispatch to this object's methods; telemetry &amp; frames flow back on your socket.</p></div>
+    <div class="stage"><span class="n">STAGE 4</span><h4>Disconnect</h4>
+      <p>Walks its stored handles and destroys everything it owns. <i>"Session cleaned up after disconnect."</i></p></div>
+  </div>
+
+  <div class="conseq">
+    <div class="co"><b>Why restarts log everyone out:</b> sessions live only in the server process's RAM.
+      New process → no folios → every client must reconnect and spawn again.</div>
+    <div class="co"><b>Why identity is the connection:</b> it's implemented as "identity is this object" —
+      exactly one per socket, so no packet content can ever reach someone else's car.</div>
+  </div>
+</div>
+
+<script>
+  const CAP = {
+    0:'<b>Overview.</b> Two browser tabs, one drive server, one shared CARLA world. Every arrow here is something you can watch live in the console’s flight recorder — use the steps to follow one packet at a time.',
+    1:'<b>1 · Connect.</b> Opening the WebSocket makes the server create a <b>DriveSession object dedicated to this exact socket</b>. It already has a unique role name (<span class="k">ego_vehicle_a3f2</span>) — but no car yet. Nothing about you exists in the world so far.',
+    2:'<b>2 · Spawn.</b> <span class="k">start_session</span> travels down the socket; the session spawns an actor in CARLA and keeps a <b>live handle</b> (green arrow) to it. CARLA’s numeric name for that car — <b>id 106</b> — comes back in <span class="k">session_ready.vehicle_id</span>. It’s a name tag, not a routing key.',
+    3:'<b>3 · Control.</b> Follow the amber lane: the packet <b>has no id field</b>. It arrives on <i>your</i> socket, whose message loop belongs to <i>your</i> session, which calls <span class="k">apply_control()</span> through <i>its</i> handle. The connection itself is the address.',
+    4:'<b>4 · Tick &amp; telemetry.</b> CARLA applies each actor’s <b>latest</b> stored input at the 20 Hz world tick (sending faster than 20 Hz changes nothing). After the tick the server reads your car’s state through the same handle and the blue lane returns <span class="k">telemetry</span> down <b>the same socket only</b>.',
+    5:'<b>5 · Two clients.</b> A second tab is a second socket → its own session, role, and car (id 42). Same world — the cars can physically collide — but socket №1 has <b>no way to name, address, or drive actor 42</b>. Isolation is structural, not a validation rule.'
+  }
+  const SHOW = {
+    0:['cliA','pipeA','sessA','handleA','world','cliB','sessB','legend'],
+    1:['cliA','pipeA','sessA'],
+    2:['cliA','pipeA','sessA','handleA','world','pktStart'],
+    3:['cliA','pipeA','sessA','handleA','world','pktCtrl'],
+    4:['cliA','pipeA','sessA','handleA','world','pktTelem'],
+    5:['cliA','pipeA','sessA','world','cliB','sessB','isol']
+  }
+  const all=['cliA','pipeA','sessA','handleA','world','cliB','sessB','pktStart','pktCtrl','pktTelem','isol','legend']
+  function setStep(n){
+    document.querySelectorAll('#steps button').forEach(b=>b.classList.toggle('on', b.dataset.s==String(n)))
+    document.getElementById('cap').innerHTML = CAP[n]
+    const show = SHOW[n]
+    all.forEach(id=>{
+      const el=document.getElementById(id); if(!el) return
+      el.classList.toggle('dim', !show.includes(id))
+    })
+  }
+  document.getElementById('steps').addEventListener('click',(e)=>{
+    const b=e.target.closest('button'); if(b) setStep(+b.dataset.s)
+  })
+  setStep(0)
+</script>
+</body>
+</html>
