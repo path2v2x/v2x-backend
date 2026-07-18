@@ -3,17 +3,40 @@ import { render } from '@testing-library/svelte';
 import InstrumentCluster from '$lib/components/dashboard/InstrumentCluster.svelte';
 
 describe('InstrumentCluster', () => {
-	it('mounts and renders the throttle gauge + steering path', () => {
-		const { getByTestId, queryByTestId } = render(InstrumentCluster, {
-			props: { speed: 50, gear: 'D', throttle: 0.3, steer: 0 },
+	it('mounts and renders gauge, steering path, and the vertical throttle/brake bars', () => {
+		const { getByTestId } = render(InstrumentCluster, {
+			props: { speed: 50, gear: 'D', throttle: 0.3, brake: 0, steer: 0 },
 		});
 		expect(getByTestId('instrument-cluster')).toBeInTheDocument();
 		expect(getByTestId('throttle-gauge')).toBeInTheDocument();
 		expect(getByTestId('gauge-speed')).toBeInTheDocument();
 		expect(getByTestId('gauge-gear')).toBeInTheDocument();
 		expect(getByTestId('steering-path')).toBeInTheDocument();
-		// Brake bar was removed by user request.
-		expect(queryByTestId('brake-bar')).toBeNull();
+		// Vertical throttle/brake bars restored by user request (2026-07-15).
+		expect(getByTestId('throttle-bar')).toBeInTheDocument();
+		expect(getByTestId('brake-bar')).toBeInTheDocument();
+	});
+
+	it('reflects throttle as bar fill', () => {
+		const { getByTestId } = render(InstrumentCluster, {
+			props: { speed: 0, gear: 'D', throttle: 0.7, brake: 0, steer: 0 },
+		});
+		expect(getByTestId('throttle-bar').dataset.fill).toBe('0.700');
+	});
+
+	it('reflects brake as bar fill', () => {
+		const { getByTestId } = render(InstrumentCluster, {
+			props: { speed: 0, gear: 'D', throttle: 0, brake: 0.4, steer: 0 },
+		});
+		expect(getByTestId('brake-bar').dataset.fill).toBe('0.400');
+	});
+
+	it('clamps out-of-range throttle/brake on the bars', () => {
+		const { getByTestId } = render(InstrumentCluster, {
+			props: { speed: 0, gear: 'D', throttle: 1.5, brake: -0.2, steer: 0 },
+		});
+		expect(getByTestId('throttle-bar').dataset.fill).toBe('1.000');
+		expect(getByTestId('brake-bar').dataset.fill).toBe('0.000');
 	});
 
 	it('shows the converted speed in the gauge centre (50 km/h ≈ 31 mph)', () => {

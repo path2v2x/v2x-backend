@@ -15,6 +15,6 @@
   "perceptionStreamUrls": {},
   "perceptionStreamBaseUrl": "http://100.72.252.40:8090",
   "perceptionStreamPathTemplate": "/streams/{camera_id}.mjpg",
-  "cloudflareDriveWsUrl": "",
+  "cloudflareDriveWsUrl": "ws://localhost:8765",
   "tailscaleDriveWsUrl": "wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net"
 }

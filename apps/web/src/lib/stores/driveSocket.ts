@@ -144,6 +144,92 @@ function isTeleportErrorMessage(msg: DriveMessage): msg is TeleportErrorMessage 
 		&& typeof msg.message === 'string';
 }
 
+// ── Wire log (live packet inspector) ──
+// Records every frame on the socket verbatim: exact TX/RX JSON strings,
+// binary frames as size markers, plus connection lifecycle events.
+
+export type WirePacket = {
+	i: number;
+	t: string;
+	dir: 'TX' | 'RX' | 'EVT';
+	kind: 'json' | 'bin' | 'evt';
+	ptype: string;
+	data: string;
+	bytes?: number;
+};
+
+const WIRE_CAP = 3000;
+export const wireLog = writable<WirePacket[]>([]);
+export const wirePaused = writable<boolean>(false);
+export const wireTotal = writable<number>(0);
+let wireBuf: WirePacket[] = [];
+let wireSeq = 0;
+let wireCount = 0;
+let wireDirty = false;
+let wireFlushTimer: ReturnType<typeof setInterval> | null = null;
+
+function wireTimestamp(): string {
+	const d = new Date();
+	return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+
+function recordWire(
+	dir: WirePacket['dir'],
+	kind: WirePacket['kind'],
+	ptype: string,
+	data: string,
+	bytes?: number
+): void {
+	wireCount += 1;
+	wireBuf.push({ i: wireSeq++, t: wireTimestamp(), dir, kind, ptype, data, bytes });
+	if (wireBuf.length > WIRE_CAP) {
+		// Evict the oldest high-frequency entry first so one-shot commands
+		// (start_session, session_ready, teleport…) survive the control/
+		// telemetry/frame flood instead of scrolling out of the buffer.
+		const evictIdx = wireBuf.findIndex(
+			(p) => p.ptype === 'control' || p.ptype === 'telemetry' || p.kind === 'bin'
+		);
+		wireBuf.splice(evictIdx === -1 ? 0 : evictIdx, 1);
+	}
+	wireDirty = true;
+	if (!wireFlushTimer) {
+		// Batch store updates (~3/s) so 40 pkt/s doesn't thrash subscribers.
+		wireFlushTimer = setInterval(() => {
+			if (!wireDirty || get(wirePaused)) return;
+			wireDirty = false;
+			wireLog.set([...wireBuf]);
+			wireTotal.set(wireCount);
+		}, 300);
+	}
+}
+
+export function clearWireLog(): void {
+	wireBuf = [];
+	wireSeq = 0;
+	wireCount = 0;
+	wireDirty = false;
+	wireLog.set([]);
+	wireTotal.set(0);
+}
+
+/** Full buffer as JSON Lines — `raw` is the exact string that crossed the wire. */
+export function exportWireLog(): string {
+	return (
+		wireBuf
+			.map((p) =>
+				JSON.stringify({
+					t: p.t,
+					dir: p.dir,
+					kind: p.kind,
+					type: p.ptype,
+					...(p.bytes !== undefined ? { bytes: p.bytes } : {}),
+					raw: p.data
+				})
+			)
+			.join('\n') + '\n'
+	);
+}
+
 // ── WebSocket ──
 
 let ws: WebSocket | null = null;
@@ -171,6 +257,7 @@ export function connect(wsUrl: string): void {
 
 	socket.onopen = () => {
 		if (ws !== socket) return;
+		recordWire('EVT', 'evt', 'open', `connection OPEN → ${wsUrl}`);
 		driveConnected.set(true);
 		console.log('[DriveWS] Connected');
 	};
@@ -179,6 +266,7 @@ export function connect(wsUrl: string): void {
 		if (ws !== socket) return;
 		// Binary message = JPEG camera frame
 		if (event.data instanceof Blob) {
+			recordWire('RX', 'bin', 'frame', '[binary JPEG camera frame]', event.data.size);
 			if (onFrameCallback) {
 				onFrameCallback(event.data);
 			}
@@ -188,14 +276,17 @@ export function connect(wsUrl: string): void {
 		// Text message = JSON (telemetry, session events, errors)
 		try {
 			const msg: DriveMessage = JSON.parse(event.data);
+			recordWire('RX', 'json', typeof msg.type === 'string' ? msg.type : '?', event.data);
 			handleServerMessage(msg);
 		} catch (e) {
+			recordWire('RX', 'json', 'unparsed', String(event.data));
 			console.warn('[DriveWS] Invalid message:', event.data);
 		}
 	};
 
 	socket.onclose = () => {
 		if (ws !== socket) return;
+		recordWire('EVT', 'evt', 'close', 'connection CLOSED');
 		ws = null;
 		driveConnected.set(false);
 		console.log('[DriveWS] Disconnected');
@@ -217,6 +308,7 @@ export function connect(wsUrl: string): void {
 
 	socket.onerror = (e) => {
 		if (ws !== socket) return;
+		recordWire('EVT', 'evt', 'error', 'socket error');
 		console.error('[DriveWS] Error:', e);
 		lastError.set('WebSocket connection error');
 	};
@@ -532,7 +624,9 @@ function handleServerMessage(msg: DriveMessage): void {
 function send(msg: DriveMessage): boolean {
 	if (ws && ws.readyState === WebSocket.OPEN) {
 		try {
-			ws.send(JSON.stringify(msg));
+			const raw = JSON.stringify(msg);
+			ws.send(raw);
+			recordWire('TX', 'json', typeof msg.type === 'string' ? msg.type : '?', raw);
 			return true;
 		} catch {
 			return false;

@@ -69,6 +69,7 @@
 	import TrafficPanel from '$lib/components/TrafficPanel.svelte';
 	import TrajectoryPanel from '$lib/components/TrajectoryPanel.svelte';
 	import TeleportPanel from '$lib/components/TeleportPanel.svelte';
+	import PacketLogPanel from '$lib/components/PacketLogPanel.svelte';
 	import CameraSettingsPanel from '$lib/components/CameraSettingsPanel.svelte';
 	import ScenarioPicker from '$lib/components/ScenarioPicker.svelte';
 	import TwinPanel from '$lib/components/TwinPanel.svelte';
@@ -109,6 +110,7 @@
 	let showCameraPanel = $state(false);
 	let showTrajectoryPanel = $state(false);
 	let showTeleportPanel = $state(false);
+	let showPacketPanel = $state(false);
 	let showXoscPicker = $state(false);
 
 	// Split-panel width for the right-side map (px). Persisted in localStorage.
@@ -127,8 +129,10 @@
 	type MapMode = 'panel' | 'overlay';
 	const MAP_MODE_STORAGE_KEY = 'drive-map-mode';
 	function loadStoredMapMode(): MapMode {
-		if (typeof localStorage === 'undefined') return 'panel';
-		return localStorage.getItem(MAP_MODE_STORAGE_KEY) === 'overlay' ? 'overlay' : 'panel';
+		// Default is the floating mini-map (overlay); the full right-side panel
+		// only when the user explicitly toggled to it (persisted preference).
+		if (typeof localStorage === 'undefined') return 'overlay';
+		return localStorage.getItem(MAP_MODE_STORAGE_KEY) === 'panel' ? 'panel' : 'overlay';
 	}
 	let mapMode = $state<MapMode>(loadStoredMapMode());
 	function toggleMapMode() {
@@ -430,22 +434,53 @@
 		inputMode = mode;
 	}
 
+	// Control send policy: event-driven + heartbeat.
+	// The server's physics ticks at 20 Hz and only reads the LATEST input per
+	// tick, so sending faster than that is pure overhead (the old
+	// requestAnimationFrame loop re-sent every display frame — 60-240 pkt/s).
+	// Instead: send immediately when the input changes (no added latency),
+	// plus a 20 Hz heartbeat so the server always has a fresh value.
+	const CONTROL_HEARTBEAT_MS = 50; // matches the server's 20 Hz tick
+
+	function currentInput() {
+		return inputMode === 'wheel' ? $normalizedInput : $keyboardInput;
+	}
+
 	function startControlLoop() {
 		if (controlLoopId !== null) return;
-		function loop() {
-			const input = inputMode === 'wheel' ? $normalizedInput : $keyboardInput;
+		controlLoopId = window.setInterval(() => {
+			const input = currentInput();
 			sendControl(input.steer, input.throttle, input.brake, input.reverse);
-			controlLoopId = requestAnimationFrame(loop);
-		}
-		controlLoopId = requestAnimationFrame(loop);
+		}, CONTROL_HEARTBEAT_MS);
 	}
 
 	function stopControlLoop() {
 		if (controlLoopId !== null) {
-			cancelAnimationFrame(controlLoopId);
+			clearInterval(controlLoopId);
 			controlLoopId = null;
 		}
 	}
+
+	// Immediate send on input change (keydown/keyup, wheel movement) so
+	// steering never waits for the next heartbeat. The keyboard store updates
+	// every animation frame (smooth steer ramping) even when values are
+	// unchanged, so dedupe identical values and enforce a minimum gap —
+	// otherwise this effect would re-create the per-frame flood.
+	const CONTROL_MIN_GAP_MS = 25;
+	let lastCtrlSent = { steer: NaN, throttle: NaN, brake: NaN, reverse: false, at: 0 };
+	$effect(() => {
+		const input = inputMode === 'wheel' ? $normalizedInput : $keyboardInput;
+		if (controlLoopId === null) return; // only while driving
+		const now = performance.now();
+		const changed =
+			input.steer !== lastCtrlSent.steer ||
+			input.throttle !== lastCtrlSent.throttle ||
+			input.brake !== lastCtrlSent.brake ||
+			input.reverse !== lastCtrlSent.reverse;
+		if (!changed || now - lastCtrlSent.at < CONTROL_MIN_GAP_MS) return;
+		lastCtrlSent = { steer: input.steer, throttle: input.throttle, brake: input.brake, reverse: input.reverse, at: now };
+		sendControl(input.steer, input.throttle, input.brake, input.reverse);
+	});
 
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -779,6 +814,8 @@
 			<!-- Left: Camera feed + HUD -->
 			<div class="relative flex-1 min-w-0">
 				<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
+				<!-- Classic on-camera HUD (throttle/brake bars, speed, steering dot) —
+				     reverted to the pre-dashboard-overhaul look by user request. -->
 				<HudOverlay telemetry={currentTelemetry} isRecording={true} />
 
 				{#if mapMode === 'overlay' && mapData}
@@ -860,6 +897,14 @@
 						title="Teleport this session's ego to a coordinate">
 						Teleport
 					</button>
+					<button onclick={() => { showPacketPanel = !showPacketPanel; }}
+						aria-pressed={showPacketPanel}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showPacketPanel
+							? 'bg-blue-600 text-white shadow-[0_0_8px_rgba(37,99,235,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}"
+						title="Live WebSocket wire log — every packet, verbatim">
+						Packets
+					</button>
 					<button onclick={() => { showXoscPicker = !showXoscPicker; showTeleportPanel = false; }}
 						aria-pressed={showXoscPicker}
 						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showXoscPicker
@@ -920,8 +965,14 @@
 
 				<!-- Teleport Panel -->
 				{#if showTeleportPanel}
-					<TeleportPanel onClose={() => { showTeleportPanel = false; }} />
+					<TeleportPanel
+						onClose={() => { showTeleportPanel = false; }}
+						roadLines={mapData?.road_network ?? []}
+						originLat={mapData?.geo_ref?.origin_lat ?? null}
+						originLon={mapData?.geo_ref?.origin_lon ?? null}
+					/>
 				{/if}
+
 			</div>
 
 			<!-- Draggable divider -->
@@ -951,6 +1002,13 @@
 						originLon={mapData.geo_ref.origin_lon}
 						fullPanel={true}
 					/>
+				</div>
+			{/if}
+
+			<!-- Right: docked packet console (devtools-style side panel) -->
+			{#if showPacketPanel}
+				<div class="flex-shrink-0 h-full w-[420px] max-w-[40vw]">
+					<PacketLogPanel onClose={() => { showPacketPanel = false; }} />
 				</div>
 			{/if}
 		</div>

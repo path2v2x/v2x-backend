@@ -36,6 +36,7 @@
 	const speed = $derived(telemetry?.speed ?? 0);
 	const gear = $derived(gearFromCarla(telemetry?.gear ?? 1));
 	const throttle = $derived(telemetry?.throttle ?? 0);
+	const brake = $derived(telemetry?.brake ?? 0);
 	const steer = $derived(telemetry?.steer ?? 0);
 	const detections = $derived(telemetry?.detections ?? []);
 </script>
@@ -77,7 +78,7 @@
 
 	<!-- Left: instrument cluster — sized to its content, no wasted width -->
 	<div class="shrink-0">
-		<InstrumentCluster {speed} {gear} {throttle} {steer} {speedUnit} />
+		<InstrumentCluster {speed} {gear} {throttle} {brake} {steer} {speedUnit} />
 	</div>
 
 	<!-- Center divider with subtle glow -->
